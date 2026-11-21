@@ -53,6 +53,17 @@ test('requested 6.2 cannot hide actual 6.1, missing effort or a different checkp
   assert.throws(() => attestReview(job(),observation({checkpoint:'01234567'})),/checkpoint/i);
 });
 
+test('explicit Astra requires Astra at BB startup and at the native checkpoint', () => {
+  const expected = { ...preset, model: 'openai/gpt-6.2-astra' };
+  const astra = { ...job(), ...prepareReview(request, expected) };
+  const observed = observation({ model: 'gpt-6.2-astra' });
+  observed.events[0].data.execution.model = expected.model;
+  assert.equal(attestReview(astra, observed).actual.model, 'gpt-6.2-astra');
+  observed.session[1].message.model = 'gpt-6.2-sol';
+  assert.throws(() => attestReview(astra, observed), /runtime model/i);
+  assert.throws(() => attestReview(job(), observed), /request route/i);
+});
+
 test('drift, absent launch receipt, and absent verdict fail closed', () => {
   assert.throws(() => attestReview(job(),observation({head:'2'.repeat(40)})),/revision/i);
   assert.throws(() => attestReview({...job(),phase:'intent'},observation()),/launch/i);

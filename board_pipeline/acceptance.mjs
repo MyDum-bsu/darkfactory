@@ -33,7 +33,7 @@ const ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 const REVIEW_OK = 'REVIEW_OK';
 const REVIEW_BLOCKED = 'REVIEW_BLOCKED';
 const FINISH = new Set(['verified', 'deployed']);
-const REVIEW_ROUTE = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
+const REVIEW_MODELS = new Set(['gpt-6.2-sol', 'gpt-6.2-astra']);
 
 class Denied extends Error {
   constructor(reason) {
@@ -81,7 +81,8 @@ function validatePolicy(policy, checkProfile) {
   if (profile === null || typeof profile !== 'object') {
     throw new Denied(`unknown_profile:${checkProfile}`);
   }
-  if (Object.entries(REVIEW_ROUTE).some(([key, value]) => profile.review?.[key] !== value)) {
+  if (profile.review?.provider !== 'openai' || profile.review.reasoningLevel !== 'medium' ||
+      !REVIEW_MODELS.has(profile.review.model)) {
     throw new Denied('review_profile_not_approved');
   }
   return profile;
@@ -227,7 +228,8 @@ async function runVerification({ binding, profile, ports, intent, step }) {
   const actual = rev?.actual ?? {};
   if (rev?.task !== binding.task_id) return { status: 'hold', reason: `review_task_mismatch:${rev?.task}` };
   if (rev.sha !== binding.candidate_sha) return { status: 'hold', reason: `review_sha_mismatch:${rev.sha}` };
-  for (const [key, expected] of Object.entries(REVIEW_ROUTE)) {
+  for (const key of ['provider', 'model', 'reasoningLevel']) {
+    const expected = profile.review[key];
     if (actual[key] !== expected) return { status: 'hold', reason: `review_${key}_mismatch` };
   }
   if (!/^[0-9a-f]{8,64}$/.test(rev.checkpoint ?? '')) return { status: 'hold', reason: 'review_unconfirmed' };

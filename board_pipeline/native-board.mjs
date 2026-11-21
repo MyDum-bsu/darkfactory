@@ -53,11 +53,21 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
   return {
     lookup,
     verifyHeld,
-    async claim(taskId) {
+    async claim(taskId, { token } = {}) {
       await lookup(taskId);
-      const claim = await handle.tasks.claim(taskId, { lease });
+      const claim = await handle.tasks.claim(taskId, token === undefined ? { lease } : { lease, token });
       held.set(taskId, claim);
       return { epoch: claim.epoch };
+    },
+    async adopt(taskId, { epoch, token }) {
+      if (!Number.isSafeInteger(epoch) || !/^[a-zA-Z0-9_-]{43}$/.test(token ?? '')) {
+        throw new Error('A trusted held capability is required');
+      }
+      const root = await lookup(taskId);
+      if (root.state !== 'claimed' || root.epoch !== epoch) throw new Error('Held epoch no longer owns the card');
+      const capability = handle.tasks.held(taskId, { epoch, token });
+      held.set(taskId, { epoch, until: null, renew: () => capability.renew(lease),
+        complete: result => capability.complete(result), block: (reason, opts) => capability.block(reason, opts) });
     },
     async complete(taskId, epoch, evidence) {
       const claim = claimFor(taskId, epoch);

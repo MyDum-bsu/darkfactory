@@ -8,12 +8,21 @@ import { parseArgs } from 'node:util';
 import { requireWorkspaceSpace } from './check-workspace-space.mjs';
 
 const home = dirname(fileURLToPath(import.meta.url));
-const REVIEW = Object.freeze({ provider: 'pi', model: 'openai/gpt-6.2-sol', reasoningLevel: 'medium' });
-const POLICY = 'review.pi.sol62.medium.v1';
+const POLICIES = new Map([
+  ['openai/gpt-6.2-sol', 'review.pi.sol62.medium.v1'],
+  ['openai/gpt-6.2-astra', 'review.pi.astra62.medium.v1'],
+]);
+const approvedPreset = model => ({ provider: 'pi', model, reasoningLevel: 'medium' });
+function jobPreset(job) {
+  const preset = approvedPreset(job.preset?.model);
+  requireThat(POLICIES.has(preset.model) && POLICIES.get(preset.model) === job.policy &&
+    Object.entries(preset).every(([k, v]) => job.preset?.[k] === v), 'invalid review receipt preset');
+  return preset;
+}
 const SESSION_ID = /^pi_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const THREAD_ID = /^thr_[a-z0-9]+$/;
 const JOB_DIR = join(home, 'review-jobs');
-const BOARD_URL = 'http://127.0.0.1:44100/api/board';
+const BOARD_URL = process.env.DF_REVIEW_BOARD_URL ?? 'http://127.0.0.1:44100/api/board';
 
 function requireThat(value, message) {
   if (!value) throw new Error(message);
@@ -27,21 +36,24 @@ function validateIdentity(task, sha) {
 export function prepareReview(request, configured) {
   validateIdentity(request.task, request.sha);
   requireThat(THREAD_ID.test(request.source ?? ''), 'source must be a BB thread ID');
-  for (const [key, value] of Object.entries(REVIEW)) {
-    requireThat(configured?.[key] === value, `review preset does not match ${POLICY}: ${key}`);
+  const preset = approvedPreset(configured?.model);
+  const policy = POLICIES.get(preset.model);
+  requireThat(policy, 'review preset does not match an approved route');
+  for (const [key, value] of Object.entries(preset)) {
+    requireThat(configured?.[key] === value, `review preset does not match ${policy}: ${key}`);
     requireThat(request[key] === undefined || request[key] === value,
-      `review requires pi / openai/gpt-6.2-sol / medium: incompatible ${key}`);
+      `review requires ${preset.provider} / ${preset.model} / ${preset.reasoningLevel}: incompatible ${key}`);
   }
-  return { policy: POLICY, preset: { ...REVIEW }, task: request.task, sha: request.sha, source: request.source };
+  return { policy, preset, task: request.task, sha: request.sha, source: request.source };
 }
 
 export function reviewerArguments(job, scope, promptFile) {
   requireThat(/^proj_[a-z0-9]+$/.test(scope.projectId ?? '') && /^env_[a-z0-9]+$/.test(scope.environmentId ?? ''),
     'review requires an existing BB project and environment');
-  requireThat(job.policy === POLICY && Object.entries(REVIEW).every(([k,v]) => job.preset?.[k] === v), 'invalid review preset');
+  const preset = jobPreset(job);
   return ['thread','spawn','--project',scope.projectId,'--environment',scope.environmentId,
-    '--parent-thread',job.source,'--parent-notifications','off', '--provider',REVIEW.provider,'--model',REVIEW.model,
-    '--reasoning-level',REVIEW.reasoningLevel,'--title',`Ревью #${job.task} · ${job.sha.slice(0,7)}`,
+    '--parent-thread',job.source,'--parent-notifications','off', '--provider',preset.provider,'--model',preset.model,
+    '--reasoning-level',preset.reasoningLevel,'--title',`Ревью #${job.task} · ${job.sha.slice(0,7)}`,
     '--prompt-file',promptFile,'--json'];
 }
 
@@ -51,12 +63,12 @@ function oneEvent(events, type) {
   return matching[0];
 }
 
-function binding(events) {
+function binding(events, preset) {
   const request = oneEvent(events, 'client/turn/requested');
   const start = oneEvent(events, 'turn/started');
   const end = oneEvent(events, 'turn/completed');
   requireThat(request.seq < start.seq && start.seq < end.seq && end.data?.status === 'completed', 'review turn not completed');
-  requireThat(request.data?.execution?.model === REVIEW.model && request.data.execution.reasoningLevel === REVIEW.reasoningLevel,
+  requireThat(request.data?.execution?.model === preset.model && request.data.execution.reasoningLevel === preset.reasoningLevel,
     'review request route does not match preset');
   const sessionId = start.data?.providerThreadId;
   requireThat(SESSION_ID.test(sessionId ?? '') && end.data?.providerThreadId === sessionId,
@@ -68,12 +80,12 @@ function binding(events) {
 
 export function attestReview(job, observed) {
   requireThat(job.phase === 'launched' && THREAD_ID.test(job.threadId ?? ''), 'no confirmed launch receipt');
-  requireThat(job.policy === POLICY && Object.entries(REVIEW).every(([k,v]) => job.preset?.[k] === v), 'invalid review receipt preset');
+  const preset = jobPreset(job);
   requireThat(observed.head === job.sha && observed.clean, 'reviewed revision changed or checkout has tracked changes');
-  requireThat(observed.reviewer?.providerId === REVIEW.provider && observed.reviewer.environmentId === job.environmentId,
+  requireThat(observed.reviewer?.providerId === preset.provider && observed.reviewer.environmentId === job.environmentId,
     'review thread provider or environment has changed');
   requireThat(observed.reviewer.status === 'idle', 'review thread is not idle');
-  const { sessionId, checkpoint } = binding(observed.events);
+  const { sessionId, checkpoint } = binding(observed.events, preset);
   const at = observed.session.findIndex(e => e.id === checkpoint);
   requireThat(at >= 0, 'native Pi checkpoint not found');
   let effort;
@@ -82,15 +94,15 @@ export function attestReview(job, observed) {
     if (entry.type === 'thinking_level_change') effort = entry.thinkingLevel;
     if (entry.type !== 'message' || entry.message?.role !== 'assistant') continue;
     assistantCount++;
-    requireThat(`${entry.message.provider}/${entry.message.model}` === REVIEW.model, 'runtime model does not match preset');
-    requireThat(effort === REVIEW.reasoningLevel, 'runtime reasoning does not match preset');
+    requireThat(`${entry.message.provider}/${entry.message.model}` === preset.model, 'runtime model does not match preset');
+    requireThat(effort === preset.reasoningLevel, 'runtime reasoning does not match preset');
   }
   const last = observed.session[at].message;
   requireThat(assistantCount > 0 && last?.role === 'assistant' && last.stopReason === 'stop', 'checkpoint is not a final assistant message');
   const verdicts = last.content.filter(part=>part.type==='text').flatMap(part=>part.text.split(/\r?\n/))
     .map(line=>line.trim()).filter(line=>line==='REVIEW_OK'||line==='REVIEW_BLOCKED');
   requireThat(verdicts.length === 1, 'missing or ambiguous final review verdict');
-  return { policy: POLICY, task: job.task, sha: job.sha, threadId: job.threadId, sessionId, checkpoint,
+  return { policy: job.policy, task: job.task, sha: job.sha, threadId: job.threadId, sessionId, checkpoint,
     actual: { provider: last.provider, model: last.model, reasoningLevel: effort }, verdict: verdicts[0] };
 }
 
@@ -104,6 +116,7 @@ function invokeJson(bin, args, env = process.env) {
 }
 const bb = (...args) => invokeJson('bb', args);
 function vb(...args) {
+  requireThat(/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/api\/board$/.test(BOARD_URL), 'review Board must be loopback');
   return invokeJson(join(home,'node_modules/.bin/vb'), ['--url',BOARD_URL,...args,'--json'],
     { ...process.env, XDG_CONFIG_HOME:join(home,'config') });
 }
@@ -155,7 +168,7 @@ async function start(values) {
   const temp=receipt+'.tmp';
   await saveNew(temp,launched);
   await rename(temp,receipt);
-  return { policy:POLICY, task:plan.task, sha:plan.sha, threadId:spawned.id, state:spawned.status };
+  return { policy:plan.policy, task:plan.task, sha:plan.sha, threadId:spawned.id, state:spawned.status };
 }
 
 async function verify(values) {
@@ -166,13 +179,13 @@ async function verify(values) {
   requireThat(reviewer.environment?.path===job.worktree,'reviewer workspace changed');
   const state=gitState(job.worktree);
   const events=bb('thread','log',job.threadId,'--all','--json');
-  const {sessionId}=binding(events);
+  const {sessionId}=binding(events, jobPreset(job));
   const native=join(homedir(),'.bb/plugins/provider-pi/bridge-data/sessions',sessionId+'.jsonl');
   requireThat((await lstat(native)).isFile(),'native Pi evidence is not a regular file');
   const session=(await readFile(native,'utf8')).split('\n').filter(Boolean).map(row=>JSON.parse(row));
   const proof=attestReview(job,{ ...state, reviewer:reviewer.thread,events,session });
   if (values.publish) {
-    vb('--as','review-gate','reply',job.task,`[Подтверждённый запуск ревью] ${proof.verdict}; BB ${proof.threadId}; Pi/openai/gpt-6.2-sol, medium; SHA ${proof.sha}; native checkpoint ${proof.checkpoint}.`,
+    vb('--as','review-gate','reply',job.task,`[Подтверждённый запуск ревью] ${proof.verdict}; BB ${proof.threadId}; Pi/${proof.actual.provider}/${proof.actual.model}, ${proof.actual.reasoningLevel}; SHA ${proof.sha}; native checkpoint ${proof.checkpoint}.`,
       '--no-sync','--idempotency-key',`review-proof-${job.task}-${job.sha}`);
   }
   return proof;
