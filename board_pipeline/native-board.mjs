@@ -45,7 +45,7 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
     }
     let renewed;
     try {
-      renewed = await claim.renew();
+      renewed = await claim.renew(lease);
     } catch (error) {
       held.delete(taskId);
       throw error;

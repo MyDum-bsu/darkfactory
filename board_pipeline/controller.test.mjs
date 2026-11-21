@@ -76,6 +76,20 @@ test('an unapproved route does not take a claim or spawn', async t => {
   assert.equal(x.effects.spawn, 0);
 });
 
+test('owner and label still match after another actor took the claim, but no worker is spawned', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  x.cfg.authorize = async state => {
+    if (state === 'claimed') {
+      t.mock.timers.tick(31_000);
+      await x.handle.tasks.claim(x.cfg.route.taskId);
+    }
+    return true;
+  };
+  assert.equal((await x.tick()).reason, 'lease_lost_before_spawn');
+  assert.equal(x.effects.spawn, 0);
+});
+
 test('an ambiguous spawn response does not retry after restart', async t => {
   const x = await lab(t);
   x.cfg.bb.spawn = async () => { x.effects.spawn++; throw new Error('lost transport response'); };

@@ -44,6 +44,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         await save({ phase: 'hold', reason: 'route_changed_before_spawn' });
         return visible();
       }
+      const proof = await board.verifyHeld(route.taskId, claim.epoch).catch(() => null);
+      if (proof?.epoch !== claim.epoch) {
+        await save({ phase: 'lease_lost', reason: 'lease_lost_before_spawn' });
+        return visible();
+      }
       const launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
       if (!/^thr_[a-z0-9]+$/.test(launched?.threadId ?? '')) throw new Error('No confirmed BB thread');
       await save({ phase: 'working', threadId: launched.threadId });
