@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Vercel Board
+Comment=Локальная рабочая доска проектов
+Type=Application
+Exec=/usr/bin/bash @HOME@/.local/share/vercel-board/open-board.sh
+Icon=@HOME@/.local/share/vercel-board/electron-app/assets/vercel-board.svg
+Terminal=false
+Categories=Office;ProjectManagement;

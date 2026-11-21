@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "workerPresets": {
+    "implementation": {
+      "provider": "acp-devin",
+      "model": "swe-2-high"
+    },
+    "reviewer": {
+      "provider": "pi",
+      "model": "openai/gpt-6.2-sol",
+      "reasoningLevel": "medium"
+    },
+    "localFlash": {
+      "provider": "pi",
+      "model": "opencode-go/deepseek-v4.1-flash"
+    },
+    "zcodeStart": {
+      "provider": "acp-zcode-start",
+      "model": "builtin:zai-start-plan\\GLM-5.3-Flash",
+      "reasoningLevel": "max"
+    }
+  },
+  "execution": "manual-bb",
+  "reviewGate": "board-review.mjs",
+  "workspaceBudget": {
+    "preflight": "check-workspace-space.mjs",
+    "worktreeSpawn": "guarded-worktree-spawn.sh"
+  },
+  "automaticGitHubActions": false,
+  "intakeThreadId": "thr_replace",
+  "routes": [
+    {
+      "project": "PROJECT",
+      "channel": "project/work",
+      "leadThreadId": "thr_replace",
+      "scope": "Проверяемая работа"
+    }
+  ]
+}

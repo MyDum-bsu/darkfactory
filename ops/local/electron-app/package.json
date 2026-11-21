@@ -1,0 +1,6 @@
+{
+  "name": "vercel-board-desktop",
+  "productName": "Vercel Board",
+  "private": true,
+  "main": "main.cjs"
+}

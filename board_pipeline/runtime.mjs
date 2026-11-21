@@ -1,0 +1,193 @@
+import { execFile } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, isAbsolute, join, posix } from 'node:path';
+import { promisify } from 'node:util';
+
+const exec = promisify(execFile);
+const SHA = /^[a-f0-9]{40}$/;
+const IMAGE = /^sha256:[a-f0-9]{64}$/;
+
+async function git(worktree, ...args) {
+  return (await exec('git', ['-C', worktree, ...args], { timeout: 20_000 })).stdout.trimEnd();
+}
+
+export function worktreeInspector(policy) {
+  return async handoff => {
+    const profile = policy.profiles[handoff.check_profile];
+    if (handoff.worker_thread_id !== profile.worker || handoff.task_id !== profile.task ||
+        handoff.base_sha !== profile.base || !isAbsolute(profile.worktree ?? '') ||
+        handoff.worktree !== profile.worktree) {
+      throw new Error('Handoff does not match the enrolled task, worker, worktree and base');
+    }
+    const worktree = await realpath(profile.worktree);
+    if (await git(worktree, 'rev-parse', '--show-toplevel') !== worktree) {
+      throw new Error('Enrolled path is not the Git worktree root');
+    }
+    if (await git(worktree, 'branch', '--show-current') !== profile.branch) {
+      throw new Error('Enrolled feature branch changed');
+    }
+    const head = await git(worktree, 'rev-parse', 'HEAD');
+    const clean = !(await git(worktree, 'status', '--porcelain=v1', '--untracked-files=all'));
+    const baseAncestor = await git(worktree, 'merge-base', handoff.base_sha, head) === handoff.base_sha;
+    return { head, clean, baseAncestor };
+  };
+}
+
+function checkCommand(recipe) {
+  if (!IMAGE.test(recipe.image ?? '') || !Array.isArray(recipe.argv) || !recipe.argv.length ||
+      !recipe.argv.every(arg => typeof arg === 'string' && arg.length > 0) ||
+      !Number.isSafeInteger(recipe.timeoutMs) || recipe.timeoutMs <= 0 ||
+      typeof recipe.cwd !== 'string' || posix.isAbsolute(recipe.cwd) ||
+      recipe.cwd.split('/').includes('..')) {
+    throw new Error('The operator check profile must pin an image, argv, relative cwd and timeout');
+  }
+  return recipe;
+}
+
+const HOST_SYSTEM_DIRS = new Set(['/usr', '/etc/fonts', '/etc/texmf', '/var/lib/texmf']);
+const SANDBOX_ENV = new Set(['PYTHONPATH', 'PYTHONDONTWRITEBYTECODE', 'MO_TRACKER_DATA', 'MO_TRACKER_DB']);
+
+async function sandboxExtras(recipe, source) {
+  const args = [];
+  for (const { from, to } of recipe.mounts ?? []) {
+    if (!isAbsolute(from ?? '') || await realpath(from) !== from || !(await lstat(from)).isDirectory()) {
+      throw new Error('An operator dependency mount must be a canonical directory');
+    }
+    if ((to === '/deps' && basename(from) === 'site-packages') || (HOST_SYSTEM_DIRS.has(to) && from === to)) {
+      args.push('--mount', `type=bind,src=${from},dst=${to},readonly`);
+    } else if (to === '/candidate/tracker/web/node_modules' && basename(from) === 'node_modules') {
+      const inside = join(source, 'tracker', 'web');
+      if (await realpath(inside) !== inside) throw new Error('Dependency mount target crosses a symlink');
+      await mkdir(join(inside, 'node_modules'));
+      args.push('--mount', `type=bind,src=${from},dst=${to},readonly`);
+    } else {
+      throw new Error('An operator dependency mount is outside the allowlist');
+    }
+  }
+  for (const [key, value] of Object.entries(recipe.env ?? {})) {
+    if (!SANDBOX_ENV.has(key) || typeof value !== 'string') throw new Error('Unsupported test environment key');
+    args.push('-e', `${key}=${value}`);
+  }
+  return args;
+}
+
+async function unpackExact(worktree, sha, archive, source) {
+  await git(worktree, 'archive', '--format=tar', '-o', archive, sha);
+  const output = await git(worktree, 'ls-tree', '-rz', sha);
+  const entries = output.split('\0').filter(Boolean).map(entry => {
+    const match = /^(100644|100755|120000) blob ([a-f0-9]{40})\t([^\n]+)$/.exec(entry);
+    if (!match) throw new Error('Unsupported candidate tree entry (e.g. submodule)');
+    return { mode: match[1], blob: match[2], path: match[3] };
+  });
+  const members = (await exec('tar', ['--quoting-style=literal', '-tf', archive], { timeout: 30_000 })).stdout
+    .split('\n').filter(name => name && !name.endsWith('/')).sort();
+  if (JSON.stringify(members) !== JSON.stringify(entries.map(entry => entry.path).sort())) {
+    throw new Error('Git archive omitted tracked files or used unsupported paths');
+  }
+  await exec('tar', ['--no-same-owner', '--same-permissions', '-xf', archive, '-C', source], { timeout: 30_000 });
+  for (const { mode, blob, path } of entries) {
+    const file = join(source, path);
+    const info = await lstat(file);
+    const data = mode === '120000' && info.isSymbolicLink() ? Buffer.from(await readlink(file))
+      : info.isFile() && mode !== '120000' ? await readFile(file) : null;
+    if (!data || createHash('sha1').update(`blob ${data.length}\0`).update(data).digest('hex') !== blob) {
+      throw new Error('Archived file bytes differ from the Git tree');
+    }
+  }
+}
+
+async function cleanupContainer(name) {
+  try {
+    await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
+  } catch (error) {
+    if (!String(error.stderr).includes('No such container')) throw error;
+  }
+}
+
+export function offlineDockerRunner(journal) {
+  return async (handoff, profile) => {
+    const recipe = checkCommand(profile.check ?? {});
+    const { image, argv, cwd, timeoutMs } = recipe;
+    if (!SHA.test(handoff.candidate_sha)) throw new Error('Local runner requires a full SHA');
+    const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
+      timeout: 12_000,
+    })).stdout);
+    if (!security.includes('name=rootless')) throw new Error('The test runner requires rootless Docker');
+
+    const scratch = await mkdtemp(join(tmpdir(), 'board-check-'));
+    const name = `board-check-${randomUUID()}`;
+    try {
+      const archive = join(scratch, 'candidate.tar');
+      const source = join(scratch, 'candidate');
+      await mkdir(source);
+      // The scratch parent stays private; only the mounted checkout is traversable to the mapped UID.
+      await chmod(source, 0o755);
+      await unpackExact(handoff.worktree, handoff.candidate_sha, archive, source);
+      const extras = await sandboxExtras(recipe, source);
+      const args = ['run', '--rm', '--name', name, '--pull=never', '--network=none', '--read-only',
+        '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
+        '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777', '-e', 'HOME=/tmp',
+        '--mount', `type=bind,src=${source},dst=/candidate,readonly`, ...extras,
+        '--workdir', posix.join('/candidate', cwd), image, ...argv];
+      let output;
+      let exit = 0;
+      try {
+        const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
+        output = `${run.stdout}${run.stderr}`;
+      } catch (error) {
+        exit = typeof error.code === 'number' ? error.code : null;
+        output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+      } finally {
+        await cleanupContainer(name);
+      }
+      const file = `checks-${handoff.task_id}-${handoff.candidate_sha}-${randomUUID()}.log`;
+      await writeFile(join(journal, file), output, { flag: 'wx', mode: 0o600 });
+      return {
+        sha: handoff.candidate_sha, ok: exit === 0,
+        evidence: { file, sha256: createHash('sha256').update(output).digest('hex'), exit },
+      };
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  };
+}
+
+export function offlineProfileRunner(journal) {
+  const check = offlineDockerRunner(journal);
+  return async (handoff, profile) => {
+    if (!Array.isArray(profile.checks) || !profile.checks.length) throw new Error('An approved check list is required');
+    const evidence = [];
+    for (const recipe of profile.checks) {
+      const result = await check(handoff, { check: recipe });
+      evidence.push(result.evidence);
+      if (!result.ok) return { sha: result.sha, ok: false, evidence };
+    }
+    return { sha: handoff.candidate_sha, ok: true, evidence };
+  };
+}
+
+// Only the operator chooses this trusted verifier. The handoff cannot supply a receipt or command.
+export function nativeReviewVerifier(gate, prompt) {
+  if (!isAbsolute(gate ?? '')) throw new Error('Configure the absolute board-review.mjs path');
+  if (prompt !== undefined && !isAbsolute(prompt)) throw new Error('Review prompt must be an operator file');
+  return async handoff => {
+    const args = ['--task', handoff.task_id, '--sha', handoff.candidate_sha];
+    if (prompt) {
+      const launch = await exec(process.execPath, [gate, 'launch', ...args,
+        '--source', handoff.worker_thread_id, '--prompt-file', prompt], { timeout: 70_000 });
+      const { threadId } = JSON.parse(launch.stdout);
+      if (!/^thr_[a-z0-9]+$/.test(threadId ?? '')) throw new Error('No verified BB review launch');
+      await exec('bb', ['thread', 'wait', threadId, '--status', 'idle', '--timeout', '8m', '--json'], {
+        timeout: 490_000,
+      });
+    }
+    const { stdout } = await exec(process.execPath, [gate, 'verify', ...args], { timeout: 70_000 });
+    return JSON.parse(stdout);
+  };
+}
+
+export async function readJson(file) {
+  return JSON.parse(await readFile(file, 'utf8'));
+}

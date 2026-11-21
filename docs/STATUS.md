@@ -1,0 +1,8 @@
+# Статус новой фабрики
+
+- Исходник приёмки экспортирован только из `board_pipeline/` и заключительной v1-спеки Darkfactory `feat/board-pipeline-v1` на `eae2f73`. Legacy-модули, старая история Git, настройки среды, `SOURCES.txt`, данные и секреты не импортированы.
+- V1 прошёл [изолированный пилот Tracker](/home/mydum/.bb/thread-storage/thr_45h5ewmiwp/board-v1-pilot-evidence/board-result.json): `a98be4d`, настоящие локальные проверки и Pi/Sol `REVIEW_OK`. Это не выпуск и не тест действующего маршрута готовых задач.
+- P0.0/P0.1 (`eae2f73`) реализуют приёмку на уже удерживаемом claim. P0.2 — автоматический захват, один BB-запуск и восстановление — ещё не подключён; P0.3 — возврат исправления воркеру. План: [implementation-plan.md](implementation-plan.md).
+- Источники решения: [Puh/Eve/Board](/home/mydum/.bb/thread-storage/thr_45h5ewmiwp/factory-autonomy-research.md), [Шима/TLA+](/home/mydum/.bb/thread-storage/thr_45h5ewmiwp/factory-shima-research.md). Для P0.2 нужен тест «истёк lease, но старый BB ещё может писать». Модель legacy — не доказательство v2, TLA+ не гейт каждого тикета.
+- Исполнение: **Devin SWE-2 High** и **ZCode Start GLM-5.3 Flash (`max`)** — допустимые реализации по профилю. Состояние квоты проверяется отдельно при выборе; не утверждаем, что оно неизменно. Ревью остаётся **Pi/Sol 6.2 `medium`**. Пример с точными идентификаторами в `ops/local/routes.example.json`; фактический маршрут живой установки не переписан.
+- Живая SQLite, токены, UI и текущие BB-треды остаются на прежних местах. Старый Git и все его worktree сохраняются как архив; не запускать старый диспетчер через этот проект.
