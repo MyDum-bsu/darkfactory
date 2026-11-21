@@ -17,7 +17,7 @@ async function lab(t, finish = 'verified') {
   let candidate;
   const effects = { spawn: 0, feedback: [], verify: 0 };
   const cfg = {
-    route, state: { load: async () => structuredClone(stored), save: async value => { stored = structuredClone(value); } },
+    route, authorize: async () => true, state: { load: async () => structuredClone(stored), save: async value => { stored = structuredClone(value); } },
     board: nativeBoardPort(handle, { channel: 'pilot', lease: 30 }),
     bb: { async spawn() { effects.spawn++; return { threadId: 'thr_fixture' }; },
       async feedback(packet) { effects.feedback.push(packet); return { confirmed: true }; } },
@@ -66,6 +66,14 @@ test('lost lease with a still-bound worker neither verifies nor launches a secon
   assert.equal((await x.tick()).phase, 'lease_lost');
   assert.equal(x.effects.spawn, 1);
   assert.equal(x.effects.verify, 0);
+});
+
+test('an unapproved route does not take a claim or spawn', async t => {
+  const x = await lab(t);
+  x.cfg.authorize = async () => false;
+  assert.equal((await x.tick()).reason, 'route_not_authorized');
+  assert.equal((await x.inspect()).state, 'ready');
+  assert.equal(x.effects.spawn, 0);
 });
 
 test('an ambiguous spawn response does not retry after restart', async t => {

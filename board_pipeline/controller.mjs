@@ -18,8 +18,9 @@ function attemptOf(record, route) {
 
 // One serialized tick. Board keeps the work queue; state records only effects of this attempt.
 // Unconfirmed external effects never become another spawn, tell or settle on restart.
-export async function advance({ route, state, board, bb, submissions, verify }) {
+export async function advance({ route, state, board, bb, submissions, verify, authorize }) {
   checkRoute(route);
+  if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const binding = createHash('sha256').update(JSON.stringify(route)).digest('hex');
   let record = await state.load();
   if (record && record.binding !== binding) throw new Error('The enrolled route changed');
@@ -32,12 +33,17 @@ export async function advance({ route, state, board, bb, submissions, verify }) 
 
   if (!record) {
     if ((await board.lookup(route.taskId)).state !== 'ready') return { phase: 'idle' };
+    if (!await authorize('ready')) return { phase: 'hold', reason: 'route_not_authorized' };
     await save({ binding, phase: 'claiming', attemptId: randomUUID(),
       token: randomBytes(32).toString('base64url'), seenShas: [] });
     try {
       const claim = await board.claim(route.taskId, { token: record.token });
       if (!Number.isSafeInteger(claim.epoch) || claim.epoch < 1) throw new Error('No native claim epoch');
-      await save({ phase: 'launching', epoch: claim.epoch });
+      await save({ phase: 'launching', epoch: claim.epoch, until: claim.until });
+      if (!await authorize('claimed')) {
+        await save({ phase: 'hold', reason: 'route_changed_before_spawn' });
+        return visible();
+      }
       const launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
       if (!/^thr_[a-z0-9]+$/.test(launched?.threadId ?? '')) throw new Error('No confirmed BB thread');
       await save({ phase: 'working', threadId: launched.threadId });

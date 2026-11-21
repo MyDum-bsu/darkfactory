@@ -99,11 +99,15 @@ export function attestReview(job, observed) {
   }
   const last = observed.session[at].message;
   requireThat(assistantCount > 0 && last?.role === 'assistant' && last.stopReason === 'stop', 'checkpoint is not a final assistant message');
-  const verdicts = last.content.filter(part=>part.type==='text').flatMap(part=>part.text.split(/\r?\n/))
-    .map(line=>line.trim()).filter(line=>line==='REVIEW_OK'||line==='REVIEW_BLOCKED');
+  const lines = last.content.filter(part=>part.type==='text').flatMap(part=>part.text.split(/\r?\n/));
+  const isVerdict = line => ['REVIEW_OK', 'REVIEW_BLOCKED'].includes(line.trim());
+  const verdicts = lines.filter(isVerdict).map(line=>line.trim());
   requireThat(verdicts.length === 1, 'missing or ambiguous final review verdict');
+  const excerpt = verdicts[0] === 'REVIEW_BLOCKED'
+    ? lines.filter(line => !isVerdict(line)).join('\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').trim().slice(0, 1400)
+    : undefined;
   return { policy: job.policy, task: job.task, sha: job.sha, threadId: job.threadId, sessionId, checkpoint,
-    actual: { provider: last.provider, model: last.model, reasoningLevel: effort }, verdict: verdicts[0] };
+    actual: { provider: last.provider, model: last.model, reasoningLevel: effort }, verdict: verdicts[0], excerpt };
 }
 
 function invokeJson(bin, args, env = process.env) {

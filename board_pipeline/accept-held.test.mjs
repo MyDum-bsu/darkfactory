@@ -237,6 +237,25 @@ test('потерянная эпоха: отказ до runner/review/settle', as
   assert.ok(!text.includes('"phase":"complete"'));
 });
 
+test('истечение во время локального теста запрещает запуск ревью', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id, 30);
+  const fixture = stubs();
+  const local = fixture.ports.local;
+  fixture.ports.local = async (...args) => {
+    const result = await local(...args);
+    t.mock.timers.tick(3_601_000);
+    return result;
+  };
+  const result = await acceptHeld({ attempt: attempt(id, epoch), submission: submission(id, epoch),
+    policy: policy(id), journal: await tmpJournal(), ports: { ...fixture.ports, board: port } });
+  assert.equal(result.outcome, 'denied');
+  assert.match(result.reason, /claim_lost_before_review/);
+  assert.equal(fixture.calls.review, 0);
+});
+
 test('чужая/подменённая эпоха в сдаче: отказ без эффектов', async (t) => {
   const { handle, ported } = await isolated(t);
   const id = await task(handle);

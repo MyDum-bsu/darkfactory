@@ -178,7 +178,7 @@ function messageOf(error) {
 
 // Один общий механизм Git-снимка, проверок и ревью для ручного v1 и для приёмки по аренде.
 // Возвращает verified | rework (исправимый дефект) | hold (среда/неизвестный эффект).
-async function runVerification({ binding, profile, ports, intent, step }) {
+async function runVerification({ binding, profile, ports, intent, step, beforeReview }) {
   await intent('inspect');
   let ins;
   try {
@@ -215,7 +215,12 @@ async function runVerification({ binding, profile, ports, intent, step }) {
     return { status: 'hold', reason: 'missing_evidence' };
   }
 
-  // Независимое ревью, квитанция на тот же SHA.
+  // Независимое ревью, квитанция на тот же SHA; не запускать после потери hold.
+  if (beforeReview) {
+    try { await beforeReview(); } catch (error) {
+      return { status: 'lost', reason: `claim_lost_before_review:${messageOf(error)}` };
+    }
+  }
   await intent('review');
   let rev;
   try {
@@ -237,7 +242,8 @@ async function runVerification({ binding, profile, ports, intent, step }) {
     return {
       status: rev.verdict === REVIEW_BLOCKED ? 'rework' : 'hold',
       reason: `review_verdict:${rev.verdict}`,
-      feedback: { reason: `review_verdict:${rev.verdict}`, verdict: rev.verdict, checkpoint: rev.checkpoint },
+      feedback: { reason: `review_verdict:${rev.verdict}`, verdict: rev.verdict, checkpoint: rev.checkpoint,
+        threadId: rev.threadId, excerpt: rev.excerpt },
     };
   }
 
@@ -517,7 +523,9 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     return settle('denied', { reason: `claim_not_held:${messageOf(e)}` });
   }
 
-  const verdict = await runVerification({ binding, profile, ports, intent, step });
+  const verdict = await runVerification({ binding, profile, ports, intent, step,
+    beforeReview: () => ports.board.verifyHeld(attempt.task_id, attempt.epoch) });
+  if (verdict.status === 'lost') return settle('denied', { reason: verdict.reason });
 
   if (verdict.status === 'rework') {
     // Исправимый дефект: та же аренда остаётся живой, никаких settle-эффектов.

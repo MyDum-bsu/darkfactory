@@ -2,12 +2,16 @@
 export function nativeBoardPort(handle, { channel, lease = 1800 }) {
   const held = new Map();
 
-  async function lookup(taskId) {
+  async function rootOf(taskId) {
     const { message } = await handle.thread(taskId, { limit: 1 });
     if (message?.id !== taskId || message.channel !== channel || !message.task) {
       throw new Error('No task root in the permitted Board channel');
     }
-    const { state, epoch, result } = message.task;
+    return message;
+  }
+
+  async function lookup(taskId) {
+    const { state, epoch, result } = (await rootOf(taskId)).task;
     let decoded;
     if (typeof result === 'string') {
       try {
@@ -53,11 +57,15 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
   return {
     lookup,
     verifyHeld,
+    async matches(taskId, { owner, label, state }) {
+      const root = await rootOf(taskId);
+      return root.task.state === state && root.task.owner === owner && root.labels?.[label.key] === label.value;
+    },
     async claim(taskId, { token } = {}) {
       await lookup(taskId);
       const claim = await handle.tasks.claim(taskId, token === undefined ? { lease } : { lease, token });
       held.set(taskId, claim);
-      return { epoch: claim.epoch };
+      return { epoch: claim.epoch, until: claim.until };
     },
     async adopt(taskId, { epoch, token }) {
       if (!Number.isSafeInteger(epoch) || !/^[a-zA-Z0-9_-]{43}$/.test(token ?? '')) {

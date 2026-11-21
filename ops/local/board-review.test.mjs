@@ -68,5 +68,7 @@ test('drift, absent launch receipt, and absent verdict fail closed', () => {
   assert.throws(() => attestReview(job(),observation({head:'2'.repeat(40)})),/revision/i);
   assert.throws(() => attestReview({...job(),phase:'intent'},observation()),/launch/i);
   assert.throws(() => attestReview(job(),observation({verdict:'looks fine'})),/verdict/i);
-  assert.equal(attestReview(job(),observation({verdict:'REVIEW_BLOCKED'})).verdict,'REVIEW_BLOCKED');
+  const blocked = attestReview(job(), observation({ verdict: 'Bad input: expected refusal\nREVIEW_BLOCKED' }));
+  assert.equal(blocked.verdict, 'REVIEW_BLOCKED');
+  assert.equal(blocked.excerpt, 'Bad input: expected refusal');
 });
