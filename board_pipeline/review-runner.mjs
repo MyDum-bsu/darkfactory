@@ -652,10 +652,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts,
         timeoutMs });
       if (run.code !== 0) {
-        const tail = String(run.stderr || run.stdout || '')
-          .replace(/\s+/g, ' ').trim().slice(-400);
-        throw new ReviewDenied(
-          `review_runner_exit:${run.code ?? 'timeout'}${tail ? `:${tail}` : ''}`);
+        throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
       }
 
       // Приватный сырой транскрипт: контроллер владеет каталогом журнала.

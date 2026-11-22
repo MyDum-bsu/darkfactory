@@ -86,8 +86,13 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
         !CONTRACT_MIN.every(key => filter.required.includes(key))) {
       throw new Error('A trusted claim filter is required');
     }
+    if (filter.repoId !== undefined &&
+        (typeof filter.repoId !== 'string' || !REPO_LABEL.test(filter.repoId))) {
+      throw new Error('A trusted claim filter is required');
+    }
     return { owner: filter.owner, label: { key, value }, finish: filter.finish,
-      profileId: filter.profileId, required: [...new Set(filter.required)] };
+      profileId: filter.profileId, required: [...new Set(filter.required)],
+      ...(filter.repoId !== undefined ? { repoId: filter.repoId } : {}) };
   }
 
   // Значения контрактных меток валидируются, не только presence: дайджесты — 64 hex,
@@ -110,6 +115,8 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
     if (root.labels?.[filter.label.key] !== filter.label.value) return false;
     if (root.labels?.finish !== filter.finish) return false;
     if (root.labels?.profile_id !== filter.profileId) return false;
+    // Явный repoId фильтра: карточка чужого repo_id никогда не захватывается.
+    if (filter.repoId !== undefined && root.labels?.repo_id !== filter.repoId) return false;
     const labels = root.labels;
     if (labels === null || typeof labels !== 'object' || !contractLabelsValid(labels)) return false;
     for (const key of filter.required) {

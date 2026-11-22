@@ -126,6 +126,20 @@ test('claimReady does not claim on an empty, foreign, mislabeled or incomplete q
   await assert.rejects(port.claimReady({ required: 'spec_digest' }), /trusted claim filter/);
 });
 
+test('claimReady with a repoId filter never takes a card of a foreign repo_id', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  const foreign = await contractTask(handle, { ...CONTRACT, queue: 'vs1', repo_id: 'other-repo' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  assert.equal(await port.claimReady({ ...FILTER, repoId: 'fixture-repo' }), null,
+    'карточка чужого repo_id не захватывается');
+  assert.equal(seen.claim, 0, '0 native claim на чужой карточке');
+  await assert.rejects(port.claimReady({ ...FILTER, repoId: '' }), /trusted claim filter/);
+  await assert.rejects(port.claimReady({ ...FILTER, repoId: 42 }), /trusted claim filter/);
+  const picked = await port.claimReady({ ...FILTER, repoId: 'other-repo' });
+  assert.equal(picked.taskId, foreign.task.id, 'совпадающий repo_id захватывается');
+  assert.equal(picked.labels.repo_id, 'other-repo');
+});
+
 test('claimReady never touches a waiting card and unlocks it only after native completion', async t => {
   const { handle, ported, seen } = await claimedBoard(t);
   const [head, dependent] = await handle.tasks.createMany('pilot', [

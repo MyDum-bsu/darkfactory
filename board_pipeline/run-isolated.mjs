@@ -26,7 +26,8 @@ const approved = new Map([['acp-devin', 'swe-2-high'], ['acp-zcode-start', 'buil
 
 async function execute() {
   const { values } = parseArgs({ options: { execute: { type: 'boolean' }, policy: { type: 'string' },
-    state: { type: 'string' }, 'recheck-rejected-handoff': { type: 'boolean' } } });
+    state: { type: 'string' }, 'recheck-rejected-handoff': { type: 'boolean' },
+    'stop-on-idle': { type: 'boolean' } } });
   if (!values.execute || !values.policy || !values.state) throw new Error('Use --execute --policy FILE --state DIR');
   const policyFile = await realpath(values.policy);
   const p = await readJson(policyFile);
@@ -40,7 +41,7 @@ async function execute() {
   // git-команд и записи конверта без интерактивных подтверждений;
   // 'accept-edits' оставлен для обратной совместимости со старым стендом.
   const PERMISSION_MODES = new Set(['full', 'accept-edits']);
-  const permissionMode = p.bb.permissionMode ?? 'full';
+  const permissionMode = p.bb.permissionMode ?? 'accept-edits';
   if (!PERMISSION_MODES.has(permissionMode)) {
     throw new Error('Implementation preset is not approved');
   }
@@ -251,11 +252,11 @@ async function execute() {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
-    // Дайджест политики для seal: в queue-режиме источник истины — контракт
-    // карточки (attempt.policy_digest), затем явный дайджест политики оператора
-    // и лишь потом отпечаток файлов. Ручной маршрут сохраняет отпечаток файлов.
+    // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
+    // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
+    // сверяется с доверенным значением, а не сам с собой.
     const policy = { version: p.version,
-      digest: attempt.policy_digest ?? p.policyDigest ?? route.policyDigest,
+      digest: p.policyDigest ?? route.policyDigest,
       profiles: { [attempt.check_profile]: { ...profile, visual: profile.visual,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
@@ -320,6 +321,8 @@ async function execute() {
         if (result.phase !== 'done') process.exitCode = 1;
         return;
       }
+      // Чистый выход пустого тика: очередь пуста — ждать нечего.
+      if (values['stop-on-idle'] && result.phase === 'idle') return;
       await delay(3500);
     }
     throw new Error('Pilot wait elapsed; current attempt is preserved');

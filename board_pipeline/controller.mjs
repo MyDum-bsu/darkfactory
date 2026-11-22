@@ -40,6 +40,7 @@ function queueFilter(route) {
     finish: route.finish,
     profileId: route.checkProfile,
     required: [...new Set([...CONTRACT_LABELS, ...(route.allowlist.required ?? [])])],
+    ...(route.allowlist.repoId ? { repoId: route.allowlist.repoId } : {}),
   };
 }
 
@@ -49,9 +50,9 @@ function contractOf(labels) {
     spec_digest: labels?.spec_digest,
     policy_digest: labels?.policy_digest,
     fixtures_digest: typeof labels?.fixtures_digest === 'string' ? labels.fixtures_digest : null,
-    // Метка has_ui карточки — строка 'true'/'false'; отсутствие — undefined,
-    // решение о L3 отдаётся профилю оператора (binding.has_ui ?? profile.has_ui).
-    has_ui: labels?.has_ui === 'true' ? true : labels?.has_ui === 'false' ? false : undefined,
+    // Метка has_ui карточки может только ВКЛЮЧИТЬ L3; 'false' не выключает
+    // обязательный profile.has_ui — решение остаётся у оператора.
+    has_ui: labels?.has_ui === 'true' ? true : undefined,
   };
 }
 

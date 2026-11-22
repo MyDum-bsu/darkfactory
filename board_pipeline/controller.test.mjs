@@ -325,6 +325,18 @@ test('queue mode does not claim foreign, unauthorized, incomplete-contract or he
   assert.equal((await x.card(0)).state, 'ready');
 });
 
+test('queue mode never claims a card of a foreign repo_id', async t => {
+  const x = await queueLab(t); // карточка с repo_id = fixture-repo
+  x.route.allowlist.repoId = 'other-repo';
+  const result = await x.tick();
+  assert.equal(result.phase, 'idle');
+  assert.equal(x.seen.claim, 0, '0 claim на чужом repo_id');
+  assert.equal((await x.card(0)).state, 'ready');
+  x.route.allowlist.repoId = 'fixture-repo';
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(x.seen.claim, 1);
+});
+
 test('queue mode returns rework feedback to the same worker under the same lease', async t => {
   const x = await queueLab(t);
   await x.tick();

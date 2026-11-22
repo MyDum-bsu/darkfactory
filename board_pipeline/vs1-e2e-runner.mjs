@@ -15,9 +15,13 @@ import { requireWorkspaceSpace } from '../ops/local/check-workspace-space.mjs';
 const exec = promisify(execFile);
 const HERE = import.meta.dirname;
 const BASE = 'ed83f15714f6c1dd72104fa365a68b283f4d0ff7';
-const INTERMEDIATE = '94bcf53';
-const FINAL = 'f1333faa20cb7eeb0a96df06fcc1ce75676e4ea3';
-const FINAL_TREE = 'cf44245b4ce901cd708f11b7136cfd20da3f3179';
+// Кандидаты, уже прошедшие живой цикл фабрики: ход 2 — реализация с явным
+// дефектом (ALLOW_INSECURE_HTTP_SCHEDULE_URL), ход 3 — чистая версия после
+// всех замечаний независимого критика. Хранятся в бандле вне дерева bsu.
+const DEFECT = '5578c155dbaf6cded5e71ae6263e11e500ec624d';
+const FINAL = '83b2def4a98668ce564c4883e30005d8c34402d9';
+const FINAL_TREE = 'a9f81c98e412bf374556a2026c915ca6b2ddd953';
+const BUNDLE = '/media/mydum/Data/board-v2-lab.dp5xC3Kj/vs1-e2e-candidates.bundle';
 const VB = join(homedir(), '.local/share/vercel-board/node_modules/.bin/vb');
 
 const sha256 = async path => createHash('sha256').update(await readFile(path)).digest('hex');
@@ -27,9 +31,9 @@ const WORKER_BRIEF = `Изолированный живой E2E VS-1 фабри�
 
 Ход 1: начальный HEAD ${BASE}. Не меняй ни одного файла и немедленно сдай этот SHA по конверту. Он специально не пройдёт детерминированную проверку меню; не выясняй причину и не исправляй до замечания фабрики. Заверши ход.
 
-Ход 2 (только ПОСЛЕ первого замечания фабрики): перенеси уже прошедшую ревью реализацию двумя локальными командами в этом же worktree: \`git cherry-pick ${INTERMEDIATE}\` затем \`git cherry-pick ${FINAL}\`. Оба объекта уже в локальной истории. Затем внеси РОВНО один маленький дефект против правила строгой валидации публичного URL расписаний: в файл \`bsu-cabinet/src/bsu_cabinet/setup_options.py\` добавь строку \`ALLOW_INSECURE_HTTP_SCHEDULE_URL = True\` (константа-флаг, разрешающая не-HTTPS публичный URL; она не ломает тесты). Закоммить оба изменения коммитом с сообщением "test: e2e candidate with defect" (\`git commit -am\`), проверь \`git status\` чистым и сдай новый полный HEAD SHA по тому же конверту. Заверши ход.
+Ход 2 (только ПОСЛЕ первого замечания фабрики): переключи worktree на закреплённый кандидат с реализацией: \`git reset --hard ${DEFECT}\`. Объект уже в локальной истории. Этот кандидат содержит дефект против правила строгой валидации публичного URL расписаний (в \`bsu-cabinet/src/bsu_cabinet/setup_options.py\` есть \`ALLOW_INSECURE_HTTP_SCHEDULE_URL = True\`), который не ломает детерминированные проверки, но должен быть пойман независимым ревью. Ничего не исправляй и не меняй: проверь \`git status\` чистым и сдай этот SHA (${DEFECT}) по тому же конверту. Заверши ход.
 
-Ход 3 (только ПОСЛЕ второго замечания фабрики — оно придёт от независимого ревью): приведи дерево точно к чистому состоянию ${FINAL} без дефекта: \`git reset --hard ${FINAL}\`, убедись, что \`git status --porcelain\` пуст и дерево ${FINAL_TREE}, затем сдай этот SHA (${FINAL}) тем же конвертом. Заверши ход.
+Ход 3 (только ПОСЛЕ второго замечания фабрики — оно придёт от независимого ревью): приведи дерево точно к чистому состоянию ${FINAL}: \`git reset --hard ${FINAL}\`, убедись, что \`git status --porcelain\` пуст и дерево ${FINAL_TREE}, затем сдай этот SHA (${FINAL}) тем же конвертом. Заверши ход.
 
 Во всех сдачах сохраняй task_id, epoch, attempt_id из первого конверта и worker_thread_id = собственный BB_THREAD_ID. Для файла сдачи — временный файл в том же каталоге и rename. Никакого доступа к реальному кабинету, сети, телефону, рабочей Board, другим тредам, CI/PR/push.`;
 
@@ -40,6 +44,16 @@ async function vbCli(url, argv) {
   return JSON.parse(stdout);
 }
 
+// Число живых тредов проекта для дельты пустого тика (0 новых spawn).
+async function bbThreadCount(env) {
+  try {
+    const { stdout } = await exec('bb', ['thread', 'list', '--project', 'proj_xdrdfgw7hs',
+      '--json'], { timeout: 30_000, env });
+    const list = JSON.parse(stdout);
+    return Array.isArray(list) ? list.length : (list.threads?.length ?? null);
+  } catch { return null; }
+}
+
 // Снимок состояния карточки для сравнения «без эффектов»: только стабильные поля.
 function cardSnapshot(read) {
   const task = read?.message?.task ?? read?.task ?? {};
@@ -47,10 +61,11 @@ function cardSnapshot(read) {
     result: task.result ?? null };
 }
 
-function runController(policyFile, stateDir, env, wlog, onLine) {
+function runController(policyFile, stateDir, env, wlog, onLine, extraArgs = []) {
   return new Promise(resolve => {
     const child = spawn(process.execPath,
-      [join(HERE, 'run-isolated.mjs'), '--execute', '--policy', policyFile, '--state', stateDir],
+      [join(HERE, 'run-isolated.mjs'), '--execute', '--policy', policyFile, '--state', stateDir,
+        ...extraArgs],
       { env, stdio: ['ignore', 'pipe', 'pipe'] });
     const lines = [];
     child.stdout.on('data', chunk => {
@@ -99,10 +114,16 @@ async function execute() {
   const wlog = text => log.write(text).catch(() => {});
   const say = async obj => { const line = JSON.stringify(obj); console.log(line); await wlog(line + '\n'); };
 
-  // Чистый feature-worktree БГУ от закреплённой базы.
+  // Исходный репозиторий БГУ не трогаем совсем: локальный клон в лабораторию,
+  // теги кандидатов из бандла, feature-worktree от базы — всё внутри $lab.
   const branch = `feat/vs1-e2e-${randomUUID().slice(0, 8)}`;
   const bsu = await realpath(values['bsu-repo']);
-  await exec('git', ['-C', bsu, 'worktree', 'add', dirs.worktree, '-b', branch, BASE], { timeout: 60_000 });
+  const origin = join(lab, 'bsu-origin');
+  await exec('git', ['clone', '--local', '-q', bsu, origin], { timeout: 120_000 });
+  await exec('git', ['-C', origin, 'fetch', '-q', BUNDLE,
+    'refs/tags/*:refs/tags/*'], { timeout: 60_000 });
+  await exec('git', ['-C', origin, 'worktree', 'add', dirs.worktree, '-b', branch, BASE],
+    { timeout: 60_000 });
   await exec('git', ['-C', dirs.worktree, 'config', 'core.filemode', 'false']);
   const factorySha = (await exec('git', ['-C', HERE, 'rev-parse', 'HEAD'])).stdout.trim();
   await say({ step: 'worktree', path: dirs.worktree, branch, base: BASE, factorySha });
@@ -120,16 +141,29 @@ async function execute() {
   // seal сверяет её с живой меткой карточки (policy_digest_drift при смене).
   const policyDigest = sha256Text(`vs1-bsu-e2e-1:${specDigest}`);
 
+  // Порт обязан быть свободен ДО старта: ответивший endpoint — чужая доска.
+  try {
+    await exec('curl', ['-fsS', '--max-time', '0.5', `http://127.0.0.1:${port}/tasks`]);
+    throw new Error(`Port ${port} already serves an endpoint; refusing to start`);
+  } catch (e) {
+    if (/already serves/.test(e.message)) throw e;
+  }
   // Изолированный vb serve на loopback, порт != 44100.
   const boardProc = spawn(VB, ['serve', '--port', String(port), '--dir', dirs.sqlite,
     '--no-inspect', '--no-open'], { stdio: ['ignore', 'pipe', 'pipe'] });
   boardProc.stdout.on('data', c => wlog(`[vb] ${c}`));
   boardProc.stderr.on('data', c => wlog(`[vb:err] ${c}`));
   const boardUrl = `http://127.0.0.1:${port}/api/board`;
-  for (let i = 0; i < 60; i++) {
-    try { await exec('curl', ['-fsS', '--max-time', '0.3', `http://127.0.0.1:${port}/tasks`]); break; }
-    catch { if (boardProc.exitCode !== null) throw new Error('vb serve exited'); await new Promise(r => setTimeout(r, 300)); }
+  let boardReady = false;
+  for (let i = 0; i < 60 && boardProc.exitCode === null; i++) {
+    try {
+      await exec('curl', ['-fsS', '--max-time', '0.3', `http://127.0.0.1:${port}/tasks`]);
+      // Готовность подтверждается файлом БД, созданным именно нашим процессом.
+      if ((await readdir(dirs.sqlite)).some(f => f.endsWith('.db'))) { boardReady = true; break; }
+    } catch { /* ещё не поднялся */ }
+    await new Promise(r => setTimeout(r, 300));
   }
+  if (!boardReady) throw new Error('Isolated vb serve did not become ready');
   await say({ step: 'board', url: boardUrl, pid: boardProc.pid });
 
   const env = { ...process.env, XDG_CONFIG_HOME: join(dirs.gate, 'config'), TMPDIR: dirs.tmp };
@@ -179,7 +213,7 @@ if (missing.length) { console.error('PILOT_EXPECTATION: В меню отсутс
 else console.log('Onboarding controls are present');`;
     const version = 'vs1-bsu-e2e-1';
     const policy = {
-      scope: 'isolated', boardUrl, channel: 'pilot', owner,
+      scope: 'isolated', boardUrl, channel: 'pilot', owner, policyDigest,
       label: { key: 'automation', value: 'vs1-e2e' }, version, waitMs: 3_600_000,
       brief, reviewPrompt, reviewGate: join(dirs.gate, 'board-review.mjs'),
       handoffDir: dirs.inbox,
@@ -237,31 +271,75 @@ else console.log('Onboarding controls are present');`;
       }
     }
 
+    // === Явная проверка последовательности гейтов по журналу:
+    // 1) база — красный L1 и ровно 0 вызовов L2;
+    // 2) дефектный кандидат — зелёные L1/tamper/L3 + реальный L2 REWORK
+    //    (REVIEW_BLOCKED) с непустыми findings;
+    // 3) финал — зелёные все гейты + L2 PASS → verified + complete(#1).
+    const stateFiles = await readdir(dirs.state);
+    const forSha = (sha, re) => stateFiles.some(f => re.test(f) && f.includes(sha));
+    const outcomes = {};
+    for (const file of stateFiles.filter(f => f.startsWith('run-'))) {
+      for (const line of (await readFile(join(dirs.state, file), 'utf8')).split('\n')) {
+        if (!line.trim()) continue;
+        let rec; try { rec = JSON.parse(line); } catch { continue; }
+        if (rec.kind === 'outcome' && rec.candidate_sha) {
+          (outcomes[rec.candidate_sha] ??= []).push(rec);
+        }
+      }
+    }
+    const redL1 = outcomes[BASE]?.some(o => o.reason === 'local_checks_failed') === true;
+    const noL2OnBase = !forSha(BASE, /^review-/) &&
+      !outcomes[BASE]?.some(o => /^review/.test(o.reason ?? ''));
+    const defectRework = outcomes[DEFECT]?.some(o =>
+      o.outcome === 'rework' && /^review_verdict:REVIEW_BLOCKED/.test(o.reason ?? '') &&
+      Array.isArray(o.feedback?.findings) && o.feedback.findings.length > 0) === true;
+    const defectVisual = forSha(DEFECT, /^visual-artifact-/) && forSha(DEFECT, /^review-/);
+    const finalVerified = outcomes[FINAL]?.some(o => o.outcome === 'verified') === true;
+    const finalVisual = forSha(FINAL, /^visual-artifact-/) && forSha(FINAL, /^review-/);
+    proof.gateSequence = {
+      turn1_redL1_noL2: redL1 && noL2OnBase,
+      turn2_l2Rework: defectRework && defectVisual,
+      turn3_verified: finalVerified && finalVisual,
+      card1Completed: final1.state === 'completed' &&
+        typeof JSON.parse(final1.result ?? 'null')?.subject_digest === 'string',
+      card2Ready: final2.state === 'ready' && final2.epoch === 0,
+    };
+
     // === Пустой тик: worktree обратно на базу, тот же state dir (броня слота
     // привязана к паре worktree+state), attempt.json отложен — свежий тик.
+    // --stop-on-idle: один тик, phase=idle, чистый выход 0.
     await exec('git', ['-C', dirs.worktree, 'reset', '--hard', BASE], { timeout: 20_000 });
     await exec('git', ['-C', dirs.worktree, 'clean', '-fd'], { timeout: 20_000 });
     const idlePolicyFile = join(dirs.operator, 'policy-idle.json');
     await writeFile(idlePolicyFile, JSON.stringify({ ...policy, waitMs: 12_000 }), { mode: 0o600 });
     const before = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
+    const claimsBefore = (await vbCli(boardUrl, ['tasks', 'list', '--channel', 'pilot']))
+      .tasks?.filter(t => t?.message?.task?.claim != null).length ?? null;
+    const threadsBefore = await bbThreadCount(env);
+    const gateFilesBefore = (await readdir(dirs.state))
+      .filter(f => /^(checks|visual|review)-/.test(f)).length;
     await rename(join(dirs.state, 'attempt.json'), join(dirs.state, 'attempt-main.json'));
-    const idle = await runController(idlePolicyFile, dirs.state, env, wlog, () => {});
+    const idle = await runController(idlePolicyFile, dirs.state, env, wlog, () => {},
+      ['--stop-on-idle']);
     const after = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
-    // run-isolated печатает только изменившиеся строки: серия тиков idle —
-    // одна строка. Ноль эффектов доказывают отсутствие новых квитанций и
-    // неизменность карточки #2.
+    const claimsAfter = (await vbCli(boardUrl, ['tasks', 'list', '--channel', 'pilot']))
+      .tasks?.filter(t => t?.message?.task?.claim != null).length ?? null;
+    const threadsAfter = await bbThreadCount(env);
     const allIdle = idle.lines.length >= 1 && idle.lines.every(l => {
       try { return JSON.parse(l).phase === 'idle'; } catch { return false; }
     });
     const untouched = JSON.stringify(before) === JSON.stringify(after);
-    // Ноль новых квитанций гейтов за пустой тик: число файлов проверок
-    // не выросло относительно журнала основного прогона.
-    const gateFilesBefore = Object.keys(proof.journal)
-      .filter(k => /^(checks|visual|review)-/.test(k)).length;
-    const noGateFiles = (await readdir(dirs.state))
-      .filter(f => /^(checks|visual|review)-/.test(f)).length === gateFilesBefore;
-    proof.idleTick = { lines: idle.lines, exitCode: idle.code, card2Unchanged: untouched };
-    proof.idleTickZeroCalls = allIdle && untouched && noGateFiles;
+    const claimsDelta = claimsBefore !== null && claimsAfter !== null
+      ? claimsAfter - claimsBefore : null;
+    const bbSpawnsDelta = threadsBefore !== null && threadsAfter !== null
+      ? threadsAfter - threadsBefore : null;
+    const modelCallsDelta = (await readdir(dirs.state))
+      .filter(f => /^(checks|visual|review)-/.test(f)).length - gateFilesBefore;
+    proof.idleTick = { lines: idle.lines, exitCode: idle.code, card2Unchanged: untouched,
+      claimsDelta, bbSpawnsDelta, modelCallsDelta };
+    proof.idleTickZeroCalls = idle.code === 0 && allIdle && untouched &&
+      claimsDelta === 0 && bbSpawnsDelta === 0 && modelCallsDelta === 0;
 
     // Кандидаты: по порядку из журналов сдачи (три SHA: база, дефект, финал).
     proof.candidates = seen.submitted;
@@ -271,7 +349,8 @@ else console.log('Onboarding controls are present');`;
     await cleanup();
   }
   await writeFile(values.proof, JSON.stringify(proof, null, 2), { mode: 0o600 });
-  if (!proof.idleTickZeroCalls || proof.attempt?.phase !== 'done' ||
+  const seqOk = proof.gateSequence && Object.values(proof.gateSequence).every(Boolean);
+  if (!proof.idleTickZeroCalls || !seqOk || proof.attempt?.phase !== 'done' ||
       proof.cards.secondFinal?.state !== 'ready') {
     console.error('E2E finished without full success; see proof JSON');
     process.exitCode = 1;

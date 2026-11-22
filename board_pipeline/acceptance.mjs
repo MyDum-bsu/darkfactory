@@ -1134,6 +1134,14 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
           return { fail: `${field}_drift` };
         }
       }
+      // Обязательный UI-гейт не отключается меткой карточки: если has_ui
+      // требуется (контракт или профиль), а на карточке появилось live 'false',
+      // кандидат останавливается до complete.
+      if ((attempt.has_ui === true || profile.has_ui === true) &&
+          labels.has_ui === 'false') {
+        await step('seal', false, 'has_ui_drift');
+        return { fail: 'has_ui_drift' };
+      }
       // fixtures_digest сверяется всегда и нормализуется как в манифесте: отсутствие
       // значения в контракте и на карточке — null, появление метки во время L2 — дрейф.
       const expectedFixtures = attempt.fixtures_digest ?? null;
