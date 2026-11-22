@@ -89,6 +89,7 @@ function monitorAgy(cwd, { snapshotTools = false } = {}) {
           if (!Number.isSafeInteger(step.step_index) || step.step_index < 0 ||
               !['ACTIVE', 'DONE'].includes(step.state)) throw error('agy_stream_corrupt');
           if (step.step_type === 'tool') { reader.push(step); break; }
+          if (step.step_type === 'error_message') throw error('agy_provider_error');
           if (!SAFE_STEPS.has(step.step_type) || Object.hasOwn(step, 'tool_name') || Object.hasOwn(step, 'tool_info')) {
             throw error('review_tool_use_forbidden');
           }
