@@ -1,0 +1,26 @@
+# Шаблон systemd user-service для фабричного сторожа диска и RAM.
+# УСТАНОВКА В ЖИВУЮ СИСТЕМУ — ТОЛЬКО ВЛАДЕЛЬЦЕМ И ВРУЧНУЮ (см. RESOURCE-STEWARD.md).
+# Во время испытаний фабрики юниты не устанавливать: правь пути под свой чекаут.
+
+[Unit]
+Description=Darkfactory resource steward (Tier-1 disk/RAM cleanup)
+Documentation=file:%h/Desktop/projects/darkfactory/ops/local/RESOURCE-STEWARD.md
+
+[Service]
+Type=oneshot
+# bb (AppImage) и node должны быть в PATH: symlink bb в ~/.local/bin, node при
+# нестандартной установке — поправь путь ниже.
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# ВНИМАНИЕ: репозиторию нужен node >= 22.18 (engines). Системный
+# /usr/bin/node на этой машине v18 — укажи актуальный node из nvm.
+# Путь к репозиторию и журналу отредактируй под актуальный чекаут.
+ExecStart=%h/.nvm/versions/node/v22.23.2/bin/node %h/Desktop/projects/darkfactory/board_pipeline/resource-steward.mjs --journal %h/.local/state/resource-steward/journal.jsonl
+# Сторож обязан видеть НАСТОЯЩИЙ /tmp: PrivateTmp спрятал бы записи df-*.
+PrivateTmp=false
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Дефис перед путём = путь может не существовать, юнит не падает.
+ReadWritePaths=/tmp -%h/.cache -%h/.npm -%h/.local/state/resource-steward
+Nice=10
+IOSchedulingClass=idle
