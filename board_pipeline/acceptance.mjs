@@ -5,6 +5,7 @@ import { open, readFile, appendFile, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
+import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
 
 const HANDOFF_KEYS = [
   'task_id',
@@ -37,6 +38,7 @@ const ATTEMPT_OPTIONAL = [
   'fixtures_digest',
   'release_target',
   'has_ui',
+  'executor',
 ];
 const CONTRACT_REQUIRED = ['repo_id', 'spec_digest', 'policy_digest'];
 const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
@@ -50,6 +52,7 @@ const REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 const ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 const REVIEW_OK = 'REVIEW_OK';
 const REVIEW_BLOCKED = 'REVIEW_BLOCKED';
+const REVIEW_ESCALATE = 'REVIEW_ESCALATE';
 const FINISH = new Set(['verified', 'deployed']);
 const REVIEW_MODELS = new Set(['gpt-6.2-sol', 'gpt-6.2-astra']);
 
@@ -183,6 +186,14 @@ function validateAttempt(attempt) {
   if (!FINISH.has(attempt.finish)) throw new Denied('invalid_finish');
   if (attempt.has_ui !== undefined && typeof attempt.has_ui !== 'boolean') {
     throw new Denied('invalid_has_ui');
+  }
+  if (attempt.executor !== undefined) {
+    const ok = (typeof attempt.executor === 'string' && attempt.executor.length > 0 &&
+        attempt.executor.length <= 128) ||
+      (attempt.executor !== null && typeof attempt.executor === 'object' &&
+        !Array.isArray(attempt.executor) &&
+        typeof attempt.executor.provider === 'string' && attempt.executor.provider.length > 0);
+    if (!ok) throw new Denied('invalid_executor');
   }
   validateContract(attempt);
 }
@@ -362,6 +373,7 @@ function compactEvidence(evidence, run) {
       checkpoint: review.checkpoint,
       provider: review.actual?.provider,
       model: review.actual?.model,
+      t: typeof review.transcript_sha256 === 'string' ? review.transcript_sha256.slice(0, 16) : undefined,
     },
     run,
   };
@@ -381,7 +393,7 @@ function compactEvidence(evidence, run) {
 
 // Один общий механизм Git-снимка, проверок и ревью для ручного v1 и для приёмки по аренде.
 // Возвращает verified | rework (исправимый дефект) | hold (среда/неизвестный эффект).
-async function runVerification({ binding, profile, ports, intent, step, beforeReview, onSnapshot }) {
+async function runVerification({ binding, profile, ports, intent, step, beforeReview, onSnapshot, subjectDigest }) {
   await intent('inspect');
   let ins;
   try {
@@ -536,15 +548,36 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     if (actual[key] !== expected) return { status: 'hold', reason: `review_${key}_mismatch` };
   }
   if (!/^[0-9a-f]{8,64}$/.test(rev.checkpoint ?? '')) return { status: 'hold', reason: 'review_unconfirmed' };
+  // Расширенный ReviewReceipt (review-runner.mjs) несёт доказательства сверх
+  // legacy-ответа board-review.mjs: subject_digest манифеста и хэш транскрипта.
+  if (rev.isolation !== undefined || rev.transcript_sha256 !== undefined ||
+      rev.subject_digest !== undefined) {
+    if (!SHA256_RE.test(rev.transcript_sha256 ?? '')) {
+      return { status: 'hold', reason: 'review_transcript_missing' };
+    }
+    const digestNow = typeof subjectDigest === 'function' ? subjectDigest() : null;
+    if (digestNow === null) {
+      if (!SHA256_RE.test(rev.subject_digest ?? '')) {
+        return { status: 'hold', reason: 'review_subject_missing' };
+      }
+    } else if (rev.subject_digest !== digestNow) {
+      return { status: 'hold', reason: 'review_subject_mismatch' };
+    }
+  }
   if (rev.verdict !== REVIEW_OK) {
-    if (rev.verdict === REVIEW_BLOCKED && (typeof rev.excerpt !== 'string' || !rev.excerpt.trim())) {
+    // REVIEW_BLOCKED/REWORK требует содержательного возражения: валидный finding
+    // (file/expected/actual) или непустой excerpt; пустое — операционный hold.
+    if (rev.verdict === REVIEW_BLOCKED &&
+        !hasValidFinding(rev.findings) &&
+        (typeof rev.excerpt !== 'string' || !rev.excerpt.trim())) {
       return { status: 'hold', reason: 'review_objection_missing' };
     }
     return {
       status: rev.verdict === REVIEW_BLOCKED ? 'rework' : 'hold',
       reason: `review_verdict:${rev.verdict}`,
       feedback: { reason: `review_verdict:${rev.verdict}`, verdict: rev.verdict, checkpoint: rev.checkpoint,
-        threadId: rev.threadId, excerpt: rev.excerpt },
+        threadId: rev.threadId, excerpt: rev.excerpt, findings: rev.findings,
+        summary: rev.summary },
     };
   }
 
@@ -562,6 +595,14 @@ export async function accept({ handoff, policy, journal, ports }) {
   try {
     validateHandoff(handoff);
     profile = validatePolicy(policy, handoff.check_profile);
+    // Кросс-семейственный инвариант до любого эффекта, когда исполнитель известен.
+    if (profile.executor !== undefined) {
+      try {
+        assertCrossFamily(profile.executor, profile.review);
+      } catch (e) {
+        throw new Denied(e instanceof ReviewDenied ? e.reason : 'review_same_family');
+      }
+    }
   } catch (e) {
     if (e instanceof Denied) {
       return { outcome: 'denied', reason: e.reason, task_id: handoff?.task_id ?? null };
@@ -720,6 +761,15 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     validateSubmission(submission, attempt);
     profile = validatePolicy(policy, attempt.check_profile);
     validateEnrolled(attempt, profile);
+    // Исполнитель из доверенной попытки (или профиля) и критик — разные семейства.
+    const executor = attempt.executor ?? profile.executor;
+    if (executor !== undefined) {
+      try {
+        assertCrossFamily(executor, profile.review);
+      } catch (e) {
+        throw new Denied(e instanceof ReviewDenied ? e.reason : 'review_same_family');
+      }
+    }
   } catch (e) {
     if (e instanceof Denied) {
       return {
@@ -741,6 +791,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     check_profile: attempt.check_profile,
     candidate_sha: submission.candidate_sha,
     has_ui: attempt.has_ui,
+    executor: attempt.executor ?? profile.executor,
   };
   // Ключ запуска включает контракт и требование L3: новый манифест или смена
   // has_ui при том же SHA не переиспользуют терминальный вердикт старого запуска.
@@ -914,7 +965,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
 
   const verdict = await runVerification({ binding, profile, ports, intent, step,
     beforeReview: () => ports.board.verifyHeld(attempt.task_id, attempt.epoch),
-    onSnapshot: finalizeSubject });
+    onSnapshot: finalizeSubject,
+    subjectDigest: () => digest });
   if (verdict.status === 'lost') return settle('denied', { reason: verdict.reason });
 
   if (verdict.status === 'rework') {

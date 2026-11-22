@@ -75,7 +75,7 @@ async function sandboxExtras(recipe, source) {
   return args;
 }
 
-async function unpackExact(worktree, sha, archive, source) {
+export async function unpackExact(worktree, sha, archive, source) {
   await git(worktree, 'archive', '--format=tar', '-o', archive, sha);
   const output = await git(worktree, 'ls-tree', '-rz', sha);
   const entries = output.split('\0').filter(Boolean).map(entry => {

@@ -10,8 +10,9 @@ import { reserveWorktree, saveState } from './slot.mjs';
 import { advance } from './controller.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
-import { nativeReviewVerifier, offlineProfileRunner, offlineVisualRunner, readJson,
+import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
+import { isolatedPiReviewRunner } from './review-runner.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 
 const exec = promisify(execFile);
@@ -163,7 +164,8 @@ async function execute() {
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
     const policy = { version: p.version, digest: await fingerprint(), profiles: { [attempt.check_profile]: { ...profile,
-      worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish } } };
+      worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
+      executor: { provider: p.bb.provider, model: p.bb.model } } } };
     let lost = false;
     let renewal = Promise.resolve();
     const timer = setInterval(() => {
@@ -171,17 +173,20 @@ async function execute() {
         .catch(() => { lost = true; });
     }, 20_000);
     try {
-      const review = nativeReviewVerifier(reviewGate, reviewPrompt, { permissionMode: 'accept-edits' });
+      // Независимый L2-критик: реальный Pi на системно read-only снимке в
+      // rootless Docker, harness-agnostic адаптер вместо сломанного BB accept-edits.
+      const review = isolatedPiReviewRunner({ journal: root,
+        prompt: await readFile(reviewPrompt, 'utf8') });
       return await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: worktreeInspector(policy), local: offlineProfileRunner(root),
         tamper: tamperGate, visual: offlineVisualRunner(root),
         // Смена брифа/файлов политики во время проверок останавливает кандидата до complete.
         verifyPinned: assertPinned,
-        review: async handoff => {
+        review: async (handoff, trusted) => {
           await renewal;
           if (lost) throw new Error('Lease lost');
           await assertPinned();
-          return review(handoff);
+          return review(handoff, trusted);
         },
       } });
     } finally {
