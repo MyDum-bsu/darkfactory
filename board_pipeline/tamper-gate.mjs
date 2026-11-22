@@ -49,6 +49,19 @@ const SECRET_RULES = [
 
 const cmpStr = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
+// Ключ сравнения — непосредственный левый операнд оператора: от последнего
+// разделителя (&&, ||, (, ,, ;, ?, :) до позиции оператора, без пробелов.
+// Тогда в `assert(x >= 1 && y >= 10)` ключи — 'x' и 'y', и ослабление одного
+// операнда при ужесточении другого сопоставляется и ловится точно.
+const operandKey = (text, index) => {
+  const left = text.slice(0, index);
+  const cut = Math.max(
+    left.lastIndexOf('&&'), left.lastIndexOf('||'), left.lastIndexOf('('),
+    left.lastIndexOf(','), left.lastIndexOf(';'), left.lastIndexOf('?'),
+    left.lastIndexOf(':'));
+  return left.slice(cut + 1).replace(/\s+/g, '');
+};
+
 // Метаданные изменений из `git diff-tree -r -z --no-commit-id -M base cand`:
 // NUL-разделитель даёт точные пути с пробелами и ' b/', точные статусы и режимы.
 function parseDiffTree(raw) {
@@ -161,7 +174,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
         if (STRONG_ASSERT.test(text)) tally.strongRemoved++;
         const tallyB = boundTally();
         tallyB.removed.push(...[...text.matchAll(CMP_BOUND)]
-          .map((m) => ({ expr: text.slice(0, m.index).replace(/\s+/g, ''),
+          .map((m) => ({ expr: operandKey(text, m.index),
             op: m[1], num: Number(m[2]) })));
         tallyB.removedAnds += (text.match(/&&|\|\|/g) ?? []).length;
       }
@@ -186,7 +199,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
         if (STRONG_ASSERT.test(text)) tally.strongAdded++;
         const tallyB = boundTally();
         tallyB.added.push(...[...text.matchAll(CMP_BOUND)]
-          .map((m) => ({ expr: text.slice(0, m.index).replace(/\s+/g, ''),
+          .map((m) => ({ expr: operandKey(text, m.index),
             op: m[1], num: Number(m[2]) })));
         tallyB.addedAnds += (text.match(/&&|\|\|/g) ?? []).length;
       }

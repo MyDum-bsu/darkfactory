@@ -220,9 +220,11 @@ export function offlineVisualRunner(journal) {
       // У контейнера нет ни одного writable-монтирования на диск хоста:
       // только tmpfs /tmp (64m) и tmpfs /artifacts (size=32m, nr_inodes=66) —
       // ядро ограничивает запись на лету, переполнить диск журнала нельзя.
-      // Рецепт пишет вывод в /tmp/run.log и код в /tmp/rc, затем ждёт; хост,
-      // пока контейнер жив и tmpfs смонтирован, извлекает артефакты через
-      // `docker exec tar` и снимает контейнер. docker cp tmpfs не видит.
+      // Контейнер — изолированный sandbox со sleep; сама проверка выполняется
+      // через `docker exec` напрямую: код возврата и stdout/stderr приходят
+      // на хост от Docker, а не из файлов tmpfs, которые кандидат мог бы
+      // подделать. docker cp tmpfs не видит — артефакты забираются через
+      // `docker exec tar`, пока контейнер жив и tmpfs смонтирован.
       const args = ['run', '-d', '--name', name, '--pull=never', '--network=none', '--read-only',
         '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
         '--ulimit', `fsize=${ARTIFACT_MAX_FILE_BYTES}:${ARTIFACT_MAX_FILE_BYTES}`,
@@ -231,42 +233,25 @@ export function offlineVisualRunner(journal) {
           `size=${ARTIFACT_MAX_TOTAL_BYTES},nr_inodes=${ARTIFACT_MAX_FILES + 2}`,
         '--mount', `type=bind,src=${source},dst=/candidate,readonly`, ...extras,
         '--workdir', posix.join('/candidate', cwd), image,
-        '/bin/sh', '-c', '"$@" > /tmp/run.log 2>&1; rc=$?; echo "$rc" > /tmp/rc; sleep 3600',
-        'board-visual', ...argv];
-      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-      let exit = null;
+        '/bin/sh', '-c', 'sleep 3600'];
       let output;
+      let exit;
       try {
         await exec('docker', args, { timeout: 15_000 });
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          const probe = await exec('docker', ['exec', name, 'cat', '/tmp/rc'],
-            { timeout: 10_000 }).then((r) => r.stdout, () => null);
-          if (probe !== null) {
-            exit = Number.parseInt(probe.trim(), 10);
-            break;
-          }
-          const running = await exec('docker',
-            ['inspect', '-f', '{{.State.Running}} {{.State.ExitCode}}', name],
-            { timeout: 10_000 }).then((r) => r.stdout.trim().split(' '), () => null);
-          if (running !== null && running[0] !== 'true') {
-            exit = Number.parseInt(running[1] ?? '', 10);
-            break;
-          }
-          await sleep(200);
+        try {
+          const run = await exec('docker',
+            ['exec', '--workdir', posix.join('/candidate', cwd), name, ...argv],
+            { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
+          output = `${run.stdout}${run.stderr}`;
+          exit = 0;
+        } catch (error) {
+          exit = typeof error.code === 'number' ? error.code : null;
+          output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
         }
-        if (exit === null || Number.isNaN(exit)) {
-          throw new Error('visual_runner_timeout');
+        // Коды 125/126/127 и недоступный код — проверка не состоялась: среда.
+        if (exit === null || exit === 125 || exit === 126 || exit === 127) {
+          throw new Error(`visual_runner_not_executed:${String(output).slice(-200)}`);
         }
-        // Коды 125/126/127 — проверка не состоялась: среда, не дефект кандидата.
-        if (exit === 125 || exit === 126 || exit === 127) {
-          const tail = await exec('docker', ['logs', '--tail', '20', name],
-            { timeout: 10_000 }).then((r) => `${r.stdout}${r.stderr}`, () => '');
-          throw new Error(`visual_runner_not_executed:${tail.slice(-200)}`);
-        }
-        const log = await exec('docker', ['exec', name, 'cat', '/tmp/run.log'],
-          { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 });
-        output = `${log.stdout}${log.stderr}`;
         // Выгрузка из tmpfs живого контейнера; сбой tar — это ошибка, не тихий pass.
         const bundle = join(scratch, 'artifacts.tar');
         const packed = await exec('docker',
