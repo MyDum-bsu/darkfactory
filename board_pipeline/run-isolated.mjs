@@ -425,10 +425,13 @@ async function execute() {
       const intervalMs = values['interval-ms'] === undefined ? DEFAULT_INTERVAL_MS
         : Number(values['interval-ms']);
       const switchPath = values.switch ?? p.pilot?.killSwitch;
-      const daemonOpen = switchPath && await createPilotSwitch(switchPath, {
+      // Демон без kill-switch не стартует: операторский стоп обязан существовать.
+      if (!switchPath) throw new Error('Daemon mode requires --switch or pilot.killSwitch');
+      const daemonOpen = await createPilotSwitch(switchPath, {
         permitDirectory: dir => [tree, inbox, root].every(path => !inside(path, dir) && !inside(dir, path)),
       });
-      await daemonOpen?.();
+      // Стартовый 'stop' не отказ: цикл сам зафиксирует kill_switch в журнале
+      // и выйдет с кодом 0 — Restart=on-failure под systemd не зациклится.
       const journal = new RotatingJournal({ directory: root });
       await runDaemon({
         intervalMs, journal, diskPath: tree, assertOpen: daemonOpen,
@@ -441,6 +444,7 @@ async function execute() {
           const line = JSON.stringify(activation && result.reason ? { ...result, reason: 'see_private_attempt' } : result);
           if (line !== previous) console.log(line);
           previous = line;
+          if (result.phase === 'release_ready' && !releasePort) return 'stop';
           if (!TERMINAL_PHASES.has(result.phase)) return;
           // Закреплённая карточка: терминал завершает демон. Очередь: done/hold
           // освобождают слот для следующей карточки; неопределённый исход стопит.

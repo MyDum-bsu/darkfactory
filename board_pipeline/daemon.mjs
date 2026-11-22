@@ -78,7 +78,7 @@ export async function runDaemon({ tick, intervalMs = DEFAULT_INTERVAL_MS, assert
   // Стартовый preflight: демон с переполненным диском не запускается вообще.
   if (disk) await disk();
 
-  let stopping = false;
+  let stopping = Boolean(signal?.aborted);
   let wake = null;
   const requestStop = () => { stopping = true; wake?.(); };
   const installed = [];
@@ -91,6 +91,7 @@ export async function runDaemon({ tick, intervalMs = DEFAULT_INTERVAL_MS, assert
   signal?.addEventListener('abort', requestStop, { once: true });
 
   const wait = async ms => {
+    if (stopping) return;
     if (sleep !== delay || wake) return sleep(ms);
     const ac = new AbortController();
     wake = () => ac.abort();
@@ -114,6 +115,7 @@ export async function runDaemon({ tick, intervalMs = DEFAULT_INTERVAL_MS, assert
       if (disk) {
         try { await disk(); } catch (error) {
           await report({ event: 'disk_budget_blocked', message: error.message });
+          if (stopping) break;
           await wait(intervalMs);
           continue;
         }
@@ -125,6 +127,7 @@ export async function runDaemon({ tick, intervalMs = DEFAULT_INTERVAL_MS, assert
         if (error instanceof PilotDenied) { stopped = 'kill_switch'; break; }
         // Ошибка тика — не повод убивать фоновый сервис; журналируем и ждём.
         await report({ event: 'tick_error', message: error.message });
+        if (stopping) break;
         await wait(intervalMs);
         continue;
       }
