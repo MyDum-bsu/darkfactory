@@ -275,7 +275,13 @@ async function readExistingRun(file) {
   for (const line of text.split('\n')) {
     if (line.trim() === '') continue;
     try {
-      entries.push(JSON.parse(line));
+      const parsed = JSON.parse(line);
+      // JSON-литерал null и примитивы не являются записями журнала: это порча строки.
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        entries.push({ kind: 'corrupt', raw: line });
+      } else {
+        entries.push(parsed);
+      }
     } catch {
       entries.push({ kind: 'corrupt', raw: line });
     }
@@ -284,8 +290,8 @@ async function readExistingRun(file) {
 }
 
 function terminalOutcome(entries) {
-  const last = [...entries].reverse().find((e) => e.kind === 'outcome');
-  if (!last || entries.some((entry) => entry.kind === 'corrupt')) return null;
+  const last = [...entries].reverse().find((e) => e?.kind === 'outcome');
+  if (!last || entries.some((entry) => entry?.kind === 'corrupt')) return null;
   const { kind, seq, ...record } = last;
   return record;
 }
@@ -455,6 +461,17 @@ export async function accept({ handoff, policy, journal, ports }) {
   } catch (e) {
     if (e.code !== 'EEXIST') throw e;
     const entries = (await readExistingRun(file)) ?? [];
+    // Журнал без записи run не подтверждает ни один исход.
+    if (!entries.find((entry) => entry?.kind === 'run')) {
+      return {
+        outcome: 'uncertain',
+        reason: 'journal_run_entry_missing',
+        run: id,
+        repeated: true,
+        task_id: handoff.task_id,
+        candidate_sha: handoff.candidate_sha,
+      };
+    }
     const done = terminalOutcome(entries);
     if (done !== null) {
       return { ...done, repeated: true, run: id };
@@ -471,7 +488,7 @@ export async function accept({ handoff, policy, journal, ports }) {
       reason: 'interrupted_run',
       run: id,
       repeated: true,
-      phase: entries.filter((e) => e.kind === 'intent').map((e) => e.phase).at(-1) ?? null,
+      phase: entries.filter((e) => e?.kind === 'intent').map((e) => e.phase).at(-1) ?? null,
       board_state: boardState ? boardState.state : null,
       task_id: handoff.task_id,
       candidate_sha: handoff.candidate_sha,
@@ -617,7 +634,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   } catch (e) {
     if (e.code !== 'EEXIST') throw e;
     const entries = (await readExistingRun(file)) ?? [];
-    const runEntry = entries.find((entry) => entry.kind === 'run');
+    const runEntry = entries.find((entry) => entry?.kind === 'run');
     // Журнал без записи run несогласован: старый исход не подтверждается ничем.
     if (!runEntry) {
       return {
@@ -652,7 +669,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       reason: 'interrupted_run',
       run: id,
       repeated: true,
-      phase: entries.filter((e) => e.kind === 'intent').map((e) => e.phase).at(-1) ?? null,
+      phase: entries.filter((e) => e?.kind === 'intent').map((e) => e.phase).at(-1) ?? null,
       board_state: boardState,
       task_id: attempt.task_id,
       attempt_id: attempt.attempt_id,
@@ -818,12 +835,13 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         return hold(`${field}_drift`);
       }
     }
-    if (attempt.fixtures_digest !== undefined) {
-      const actualFixtures = typeof labels.fixtures_digest === 'string' ? labels.fixtures_digest : null;
-      if (actualFixtures !== (attempt.fixtures_digest ?? null)) {
-        await step('seal', false, 'fixtures_digest_drift');
-        return hold('fixtures_digest_drift');
-      }
+    // fixtures_digest сверяется всегда и нормализуется как в манифесте: отсутствие
+    // значения в контракте и на карточке — null, появление метки во время L2 — дрейф.
+    const expectedFixtures = attempt.fixtures_digest ?? null;
+    const liveFixtures = typeof labels.fixtures_digest === 'string' ? labels.fixtures_digest : null;
+    if (liveFixtures !== expectedFixtures) {
+      await step('seal', false, 'fixtures_digest_drift');
+      return hold('fixtures_digest_drift');
     }
     if (policy.digest !== undefined && policy.digest !== attempt.policy_digest) {
       await step('seal', false, 'policy_digest_drift');

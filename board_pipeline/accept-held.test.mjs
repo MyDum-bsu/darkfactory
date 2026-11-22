@@ -976,3 +976,75 @@ test('компактная квитанция ужимается при 20 пр�
   assert.equal(receipt.review.checkpoint, 'feed80ab');
   assert.equal(receipt.run, res.run);
 });
+
+test('появившаяся при L2 метка fixtures_digest останавливает контракт без фикстур', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs();
+  // Контракт не закрепляет fixtures_digest (undefined): манифест фиксирует null.
+  const attemptNoFixtures = contractAttempt(id, epoch);
+  delete attemptNoFixtures.fixtures_digest;
+  // Во время L2 на карточке появилась метка фикстур — seal обязан остановить кандидата.
+  await handle.label(id, { set: { fixtures_digest: OTHER_256 } });
+  const res = await acceptHeld({
+    attempt: attemptNoFixtures,
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(res.outcome, 'hold');
+  assert.equal(res.reason, 'fixtures_digest_drift');
+  assert.equal(calls.review, 1, 'L2 прошёл, complete не делался');
+  assert.equal((await settled(handle, id)).state, 'blocked');
+});
+
+test('JSON null и примитивы в журнале не роняют чтение и не переиспользуют вердикт', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports } = stubs();
+  const first = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(first.outcome, 'verified');
+  const { readFile, writeFile, readdir } = await import('node:fs/promises');
+  const runFile = path.join(journal,
+    (await readdir(journal)).find((name) => name.endsWith('.jsonl')));
+
+  // (a) Запись run заменена на литерал null: исход не подтверждается.
+  const lines = (await readFile(runFile, 'utf8')).split('\n').filter(Boolean);
+  const withoutRun = lines.filter((line) => !line.includes('"kind":"run"'));
+  await writeFile(runFile, ['null', '7', ...withoutRun].join('\n') + '\n');
+  const noRun = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(noRun.outcome, 'uncertain');
+  assert.equal(noRun.reason, 'journal_run_entry_missing');
+  assert.equal(noRun.repeated, true);
+
+  // (b) Запись run на месте, но между ней и исходом появилась порченая строка null:
+  // старый терминальный исход не возвращается, журнал несогласован.
+  await writeFile(runFile, [lines[0], 'null', ...lines.slice(1)].join('\n') + '\n');
+  const corrupted = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(corrupted.outcome, 'uncertain');
+  assert.equal(corrupted.reason, 'interrupted_run');
+  assert.notEqual(corrupted.receipt?.settle, 'completed', 'вердикт старого запуска не возвращается');
+});

@@ -286,3 +286,16 @@ test('нет свидетельства от локального runner — blo
   assert.equal(res.outcome, 'blocked');
   assert.equal(res.reason, 'missing_evidence');
 });
+
+test('журнал v1 с JSON null вместо записи run даёт uncertain, не TypeError', async () => {
+  const journal = await tmpJournal();
+  const { ports } = makePorts();
+  const first = await accept({ handoff: makeHandoff(), policy: POLICY, journal, ports });
+  assert.equal(first.outcome, 'completed');
+  const runFile = path.join(journal, `run-129-${SHA_A}-v1.jsonl`);
+  const lines = (await readFile(runFile, 'utf8')).split('\n').filter(Boolean);
+  await writeFile(runFile, ['null', ...lines.filter((line) => !line.includes('"kind":"run"'))].join('\n') + '\n');
+  const res = await accept({ handoff: makeHandoff(), policy: POLICY, journal, ports });
+  assert.equal(res.outcome, 'uncertain');
+  assert.equal(res.reason, 'journal_run_entry_missing');
+});
