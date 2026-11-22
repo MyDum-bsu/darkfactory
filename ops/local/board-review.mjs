@@ -145,7 +145,9 @@ async function saveNew(path, object) {
   await writeFile(path, JSON.stringify(object,null,2)+'\n', { flag:'wx', mode:0o600 });
 }
 async function start(values) {
-  const preset = (await loadJson(join(home,'routes.json'))).workerPresets?.reviewer;
+  const routes = process.env.DF_REVIEW_ROUTES ?? join(home,'routes.json');
+  requireThat(isAbsolute(routes), 'review policy must be an absolute operator file');
+  const preset = (await loadJson(routes)).workerPresets?.reviewer;
   const plan = prepareReview({...values, reasoningLevel:values['reasoning-level']},preset);
   const boardTask = lookupBoardTask(vb('read',plan.task),plan.task);
   requireThat(boardTask && ['ready','claimed'].includes(boardTask.task.state), 'Board task is not ready or claimed');

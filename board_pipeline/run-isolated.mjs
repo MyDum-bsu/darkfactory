@@ -40,7 +40,8 @@ async function execute() {
   const brief = await realpath(p.brief);
   const reviewPrompt = await realpath(p.reviewPrompt);
   const reviewGate = await realpath(p.reviewGate);
-  const files = [policyFile, brief, reviewPrompt, reviewGate, await realpath(join(dirname(reviewGate), 'routes.json'))];
+  const reviewRoutes = await realpath(join(dirname(reviewGate), 'routes.json'));
+  const files = [policyFile, brief, reviewPrompt, reviewGate, reviewRoutes];
   for (const path of [root, ...files]) {
     if (inside(tree, path) || inside(inbox, path)) throw new Error('Operator files must be outside worker paths');
   }
@@ -57,6 +58,7 @@ async function execute() {
   delete process.env.BOARD_TOKEN;
   process.env.BOARD_URL = p.boardUrl;
   process.env.DF_REVIEW_BOARD_URL = p.boardUrl;
+  process.env.DF_REVIEW_ROUTES = reviewRoutes;
   const { board } = loadSdk();
   const port = nativeBoardPort(board(), { channel: p.channel });
   const record = join(root, 'attempt.json');
@@ -88,8 +90,16 @@ async function execute() {
         '--provider', p.bb.provider, '--model', p.bb.model, '--title', `Пилот #${route.taskId}`, '--prompt-file', initial,
         '--parent-notifications', 'off', '--json'];
       if (p.bb.effort) argv.push('--reasoning-level', p.bb.effort);
-      const { stdout } = await exec('bb', argv, { timeout: 60_000 });
-      return { threadId: JSON.parse(stdout).id };
+      const live = await port.verifyHeld(attempt.task_id, attempt.epoch);
+      if (live.epoch !== attempt.epoch) throw new Error('lease_lost_before_bb_call');
+      try {
+        const { stdout } = await exec('bb', argv, { timeout: 60_000 });
+        return { threadId: JSON.parse(stdout).id };
+      } catch (error) {
+        const http = /Failed to create thread: HTTP (\d\d\d)/.exec(String(error.stderr));
+        console.error(`BB spawn failed (${http ? `HTTP ${http[1]}` : error.code ?? 'invalid response'}); no automatic retry`);
+        throw error;
+      }
     },
     async feedback(packet) {
       const message = join(root, `feedback-${packet.sha}.md`);
