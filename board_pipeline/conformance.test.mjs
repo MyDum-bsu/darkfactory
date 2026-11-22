@@ -6,7 +6,7 @@
 // проверяет, что снятие каждого гварда ломает соответствующий инвариант.
 
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { execFile, execFileSync, spawn as spawnProcess } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
@@ -18,7 +18,8 @@ import { test } from 'node:test';
 import { acceptHeld } from './acceptance.mjs';
 import { advance } from './controller.mjs';
 import { nativeBoardPort } from './native-board.mjs';
-import { reserveWorktree } from './slot.mjs';
+import { reserveWorktree, saveState } from './slot.mjs';
+import { answerBytes, signedAnswerVerifier } from './question-gate.mjs';
 import { loadSdk } from './sdk.mjs';
 import { worktreeInspector } from './runtime.mjs';
 import { tamperGate } from './tamper-gate.mjs';
@@ -79,7 +80,7 @@ async function startBoard(cli, t) {
 
 // Полный лабораторный стенд: живая Board, git worktree, слот-бронь, порты со
 // счётчиками и хранилище записи попытки — всё как в run-isolated, но под тестом.
-async function lab(t, { finish = 'verified', lease = 900, mutants } = {}) {
+async function lab(t, { finish = 'verified', lease = 900, mutants, questions = false } = {}) {
   const { url, dir } = await startBoard(boardCli(), t);
   process.env.BOARD_URL = url;
   const { board } = loadSdk();
@@ -109,14 +110,14 @@ async function lab(t, { finish = 'verified', lease = 900, mutants } = {}) {
   const candidate = git(tree, 'rev-parse', 'HEAD');
 
   const { task } = await handle.tasks.create('pilot', { text: 'Synthetic conformance',
-    noSync: true, labels: LABELS });
+    noSync: true, labels: { ...LABELS, finish } });
   const owner = (await handle.thread(task.id, { limit: 1 })).message.task.owner;
   const card = async () => (await handle.thread(task.id, { limit: 1 })).message.task;
 
   // Счётчики эффектов на стороне портов — внешний факт, не журнал контроллера.
   const effects = { spawnCalls: 0, feedbackCalls: 0, completeCalls: 0, blockCalls: 0,
     verifyCalls: 0, localCalls: 0, reviewCalls: 0, arbiterCalls: 0, delivered: [] };
-  const port = nativeBoardPort(handle, { channel: 'pilot', lease });
+  const port = nativeBoardPort(handle, { channel: 'pilot', lease, isolatedQuestionOwner: questions });
   const realComplete = port.complete.bind(port);
   const realBlock = port.block.bind(port);
   port.complete = async (...args) => { effects.completeCalls++; return realComplete(...args); };
@@ -156,9 +157,10 @@ async function lab(t, { finish = 'verified', lease = 900, mutants } = {}) {
   const submissions = { async read(attempt, after) {
     const next = turns.find(entry => entry.seq > after || entry.replay === true);
     if (!next) return;
-    return { turnSeq: next.seq, submission: next.sha && {
+    return { turnSeq: next.seq, submission: (next.sha || next.question) && {
       task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
-      worker_thread_id: attempt.bb_thread_id, candidate_sha: next.sha,
+      worker_thread_id: attempt.bb_thread_id,
+      ...(next.question ? { question: next.question } : { candidate_sha: next.sha }),
       ...(next.dispute ? { dispute: next.dispute } : {}) } };
   } };
 
@@ -592,4 +594,154 @@ test('specs/tla/check.mjs: green base and 5/5 mutants by exact invariant name', 
     [join(new URL('..', import.meta.url).pathname, 'specs', 'tla', 'check.mjs')],
     { timeout: 60_000 });
   assert.match(stdout, /5\/5 mutants caught/);
+});
+
+function ownerAnswers(x) {
+  const owner = generateKeyPairSync('ed25519');
+  const foreign = generateKeyPairSync('ed25519');
+  const principal = x.cfg.route.allowlist.owner;
+  const stateFile = join(x.stateDir, 'attempt.json');
+  const load = () => {
+    try { return JSON.parse(readFileSync(stateFile, 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; return null; }
+  };
+  x.cfg.state = { load, save: record => saveState(stateFile, record) };
+  let now = Date.now();
+  let response = null;
+  x.cfg.questionGate = { principal, ttlMs: 10_000, now: () => now,
+    capture: async () => x.candidate,
+    canResume: async ({ stage, question }) => (await x.card()).state === stage && question.checkpoint.sha === x.candidate,
+    read: async () => response,
+    verify: signedAnswerVerifier({ principal, publicKey: owner.publicKey.export({ type: 'spki', format: 'pem' }) }),
+  };
+  return { load, expire: () => { now += 10_001; },
+    submit(question, decision, answer, foreignActor = false) {
+      const reply = { decision, answer };
+      response = { ...reply, signature: sign(null, answerBytes(question, reply),
+        (foreignActor ? foreign : owner).privateKey).toString('base64url') };
+    },
+  };
+}
+
+const productTurn = { seq: 10, question: { prompt: 'CSV or JSON?', evidence: 'Both formats satisfy the current spec.' } };
+
+test('VS-2 owner question: native hold, verified signature, restarts/lost acks, same worker under next epoch', async t => {
+  const x = await lab(t, { questions: true });
+  const owner = ownerAnswers(x);
+  const started = await x.tick();
+  const nativeBlock = x.port.block;
+  x.port.block = async (...args) => { await nativeBlock(...args); throw new Error('lost native block ack'); };
+  x.pushTurn(productTurn);
+  const waiting = await x.tick();
+  assert.equal(waiting.phase, 'awaiting_answer');
+  assert.equal((await x.card()).state, 'blocked');
+  const old = owner.load();
+  const question = JSON.parse((await x.card()).blocked.reason);
+  assert.equal(waiting.question_id, question.question_id);
+  assert.equal((await x.tick()).question_id, waiting.question_id);
+  owner.submit(question, 'resolve', 'Use CSV.', true);
+  assert.equal((await x.tick()).phase, 'awaiting_answer');
+  owner.submit({ ...question, attempt_id: 'unrelated' }, 'resolve', 'Use CSV.');
+  assert.equal((await x.tick()).phase, 'awaiting_answer');
+  assert.equal(x.effects.blockCalls, 1);
+
+  const nativeUnblock = x.port.unblockQuestion;
+  let unblocks = 0;
+  x.port.unblockQuestion = async (...args) => {
+    unblocks++;
+    await nativeUnblock(...args);
+    throw new Error('lost native unblock ack');
+  };
+  const store = x.cfg.state.save;
+  x.cfg.state.save = async record => {
+    if (record.phase === 'resume_pending') throw new Error('power lost before WAL receipt');
+    await store(record);
+  };
+  owner.submit(question, 'resolve', 'Use CSV.');
+  await assert.rejects(x.tick(), /power lost/);
+  assert.equal(owner.load().phase, 'unblocking');
+  assert.equal((await x.card()).state, 'ready');
+  assert.equal(unblocks, 1);
+  x.cfg.state.save = store;
+  x.cfg.board = nativeBoardPort(x.handle, { channel: 'pilot', isolatedQuestionOwner: true });
+  x.cfg.board.unblockQuestion = x.port.unblockQuestion;
+  assert.equal((await x.tick()).phase, 'resume_pending');
+  const claim = x.cfg.board.claimForQuestion;
+  let claims = 0;
+  x.cfg.board.claimForQuestion = async (...args) => {
+    claims++;
+    await claim(...args);
+    throw new Error('lost next claim ack');
+  };
+  let delivered;
+  const send = x.bb.feedback.bind(x.bb);
+  x.bb.feedback = packet => { delivered = packet; return send(packet); };
+  const resumed = await x.tick();
+  assert.equal(resumed.phase, 'working');
+  assert.equal(resumed.epoch, started.epoch + 1);
+  assert.notEqual(resumed.attemptId, old.attemptId);
+  assert.equal(resumed.threadId, started.threadId);
+  assert.equal(delivered.attempt.epoch, resumed.epoch);
+  assert.equal(delivered.attempt.attempt_id, resumed.attemptId);
+  assert.equal(delivered.evidence.ownerAnswer, 'Use CSV.');
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(x.effects.spawnCalls, 1);
+  assert.equal(x.effects.feedbackCalls, 1);
+  assert.equal(claims, 1);
+  assert.equal(unblocks, 1);
+});
+
+test('VS-2 release approval resumes at release_ready without starting or waking a coder', async t => {
+  const x = await lab(t, { questions: true, finish: 'deployed' });
+  const owner = ownerAnswers(x);
+  const started = await x.tick();
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'awaiting_answer');
+  const question = JSON.parse((await x.card()).blocked.reason);
+  assert.equal(question.kind, 'release');
+  assert.equal(question.checkpoint.sha, x.candidate);
+  assert.match(question.checkpoint.subject_digest, /^[a-f0-9]{64}$/);
+  owner.submit(question, 'approve', '');
+  assert.equal((await x.tick()).phase, 'resume_pending');
+  const resumed = await x.tick();
+  assert.equal(resumed.phase, 'release_ready');
+  assert.equal(resumed.epoch, started.epoch + 1);
+  assert.equal((await x.tick()).phase, 'release_ready');
+  assert.equal(x.effects.spawnCalls, 1);
+  assert.equal(x.effects.feedbackCalls, 0);
+  assert.equal(x.effects.verifyCalls, 1);
+  assert.equal(x.effects.completeCalls, 0);
+  assert.equal((await x.card()).state, 'claimed');
+  assert.equal(owner.load().releaseVerification.evidence.sha, x.candidate);
+});
+
+test('VS-2 replacement hold, expiry and ambiguous unblock never unlock another question', async t => {
+  for (const scenario of ['replaced', 'expired', 'unknown']) {
+    const x = await lab(t, { questions: true });
+    const owner = ownerAnswers(x);
+    await x.tick();
+    x.pushTurn(productTurn);
+    assert.equal((await x.tick()).phase, 'awaiting_answer');
+    const question = owner.load().question;
+    owner.submit(question, 'resolve', 'Use CSV.');
+    let writes = 0;
+    const unblock = x.port.unblockQuestion;
+    x.port.unblockQuestion = (...args) => {
+      writes++;
+      if (scenario === 'unknown') throw new Error('no observable effect');
+      return unblock(...args);
+    };
+    if (scenario === 'expired') owner.expire();
+    if (scenario === 'replaced') {
+      await x.handle.tasks.unblock(question.task_id);
+      await x.handle.tasks.block(question.task_id, 'different question');
+    }
+    const stopped = await x.tick();
+    assert.equal(stopped.phase, scenario === 'expired' ? 'hold' : 'uncertain');
+    assert.equal((await x.tick()).phase, stopped.phase);
+    assert.equal((await x.card()).state, 'blocked');
+    assert.equal(writes, scenario === 'unknown' ? 1 : 0);
+    assert.equal(x.effects.spawnCalls, 1);
+    assert.equal(x.effects.feedbackCalls, 0);
+  }
 });

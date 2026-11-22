@@ -1,4 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createQuestion, questionBlockText } from './question-gate.mjs';
+import { advanceQuestion, QUESTION_PHASES } from './question-resume.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
@@ -76,7 +78,8 @@ function attemptOf(record, route) {
 // Unconfirmed external effects never become another spawn, tell or settle on restart.
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
-export async function advance({ route, state, board, bb, submissions, verify, authorize, recheckRejectedHandoff, workerSelector, mutants }) {
+export async function advance({ route, state, board, bb, submissions, verify, authorize,
+  recheckRejectedHandoff, workerSelector, mutants, questionGate }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const hazards = mutants ?? {};
@@ -88,7 +91,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     await state.save(record);
   };
   const visible = () => ({ phase: record.phase, attemptId: record.attemptId,
-    epoch: record.epoch, threadId: record.threadId, reason: record.reason, sha: record.sha });
+    epoch: record.epoch, threadId: record.threadId, reason: record.reason, sha: record.sha,
+    ...(record.question ? { question_id: record.question.question_id } : {}) });
 
   // Долговечный WAL: перед spawn/feedback/block пишется intent, после
   // подтверждения — receipt. Рестарт с IN_FLIGHT записью никогда не повторяет
@@ -127,7 +131,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         cardReason === intent.blockText;
       if (looked?.state === 'blocked' &&
           (looked.epoch === undefined || looked.epoch === intent.epoch) && reasonMatches) {
-        await save({ phase: 'hold', reason: intent.reason ?? 'blocked',
+        await save({ phase: record.question?.question_id === intent.questionId && intent.questionId
+          ? 'awaiting_answer' : 'hold', reason: intent.reason ?? 'blocked',
           receipt: { kind: 'block', confirmed: 'observed' } });
         return visible();
       }
@@ -297,6 +302,24 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     return visible();
   }
   if (TERMINAL.has(record.phase) && !recheck) return visible();
+  if (QUESTION_PHASES.has(record.phase)) {
+    if (!questionGate) throw new Error('An enrolled owner answer gate is required to resume');
+    return advanceQuestion({ record, save, visible, board, gate: questionGate,
+      feedback: ({ feedbackId, answer, question }) => bb.feedback({
+        attempt: attemptOf(record, route), feedbackId, sha: question.checkpoint.sha,
+        question, contract: record.contract, reason: 'owner_answer_confirmed',
+        evidence: { questionId: question.question_id, ownerAnswer: answer },
+      }), reconcileFeedback: reconcileInFlight });
+  }
+  if (record.phase === 'release_ready') {
+    if (!questionGate) throw new Error('An enrolled owner answer gate is required for release');
+    if (!await leaseAlive()) return lostLease();
+    if (!await questionGate.canResume({ stage: 'claimed', question: record.question,
+      threadId: record.threadId, contract: record.contract })) {
+      await save({ phase: 'hold', reason: 'question_resume_checkpoint_drift' });
+    }
+    return visible();
+  }
   if (IN_FLIGHT.has(record.phase)) return reconcileInFlight();
   if (record.phase !== 'working' && !recheck) throw new Error('Unknown attempt state');
 
@@ -336,11 +359,52 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     }
     return visible();
   };
+  const askOwner = async ({ kind, prompt, evidence, result, extraState }) => {
+    const sha = await questionGate.capture({ attempt, turnSeq });
+    const candidateSha = result?.receipt?.evidence?.sha;
+    if (!sha || (kind === 'release' && (sha !== record.sha || sha !== candidateSha ||
+        !/^[a-f0-9]{64}$/.test(result.subject_digest ?? '') ||
+        result.receipt.evidence.subject_digest !== result.subject_digest))) {
+      return stopWith('owner_question_checkpoint_unconfirmed', extraState);
+    }
+    let question;
+    try {
+      question = createQuestion({ attempt, kind, prompt, evidence,
+        principal: questionGate.principal, ttlMs: questionGate.ttlMs, now: questionGate.now(),
+        checkpoint: { sha, turn_seq: turnSeq, subject_digest: result?.subject_digest },
+      });
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      return stopWith('owner_question_too_large', extraState);
+    }
+    const blockText = questionBlockText(question);
+    await save({ phase: 'blocking', turnSeq, question, ownerAnswer: null, ...(extraState ?? {}),
+      releaseVerification: kind === 'release' ? result.receipt : null,
+      intent: { kind: 'block', reason: 'owner_answer_required', questionId: question.question_id,
+        attemptId: attempt.attempt_id, epoch: attempt.epoch, blockText } });
+    try { await board.block(attempt.task_id, attempt.epoch, blockText); }
+    catch { return reconcileInFlight(); }
+    await save({ phase: 'awaiting_answer', reason: 'owner_answer_required', receipt: { kind: 'block' } });
+    return visible();
+  };
+  const askRelease = result => askOwner({ kind: 'release', result,
+    prompt: 'Передать проверенный кандидат в стадию допуска к выпуску?',
+    evidence: 'Проверки и seal пройдены. Ответ не запускает выпуск.' });
   if (!submission) return stopWith(after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
   const taskId = Number.isSafeInteger(submission.task_id) ? String(submission.task_id) : submission.task_id;
   if (taskId !== attempt.task_id || submission.epoch !== attempt.epoch ||
-      submission.attempt_id !== attempt.attempt_id || submission.worker_thread_id !== attempt.bb_thread_id ||
-      typeof submission.candidate_sha !== 'string' || !shaRE.test(submission.candidate_sha)) {
+      submission.attempt_id !== attempt.attempt_id || submission.worker_thread_id !== attempt.bb_thread_id) {
+    return stopWith('invalid_or_stale_submission');
+  }
+  if (questionGate && submission.question !== undefined) {
+    const { prompt, evidence } = submission.question ?? {};
+    if (submission.candidate_sha !== undefined || typeof prompt !== 'string' || !prompt.trim() ||
+        prompt.length > 220 || typeof evidence !== 'string' || evidence.length > 120) {
+      return stopWith('invalid_product_question');
+    }
+    return askOwner({ kind: 'product', prompt, evidence });
+  }
+  if (typeof submission.candidate_sha !== 'string' || !shaRE.test(submission.candidate_sha)) {
     return stopWith('invalid_or_stale_submission');
   }
   if (record.seenShas.includes(submission.candidate_sha)) return stopWith('worker_turn_finished_without_new_handoff');
@@ -430,6 +494,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
             return visible();
           }
           if (sealed.outcome === 'verified' && sealed.receipt?.settle === 'deferred') {
+            if (questionGate) return askRelease(sealed);
             const blockText = `Выпуск не разрешён этим контуром. Проверен SHA ${record.sha}`;
             await save({ phase: 'blocking',
               intent: { kind: 'block', attemptId: record.attemptId, epoch: attempt.epoch,
@@ -455,6 +520,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           await save({ phase: 'hold', reason: sealed.reason ?? 'arbitrated_seal_failed' });
           return visible();
         } else if (ruling.decision === 'escalate_owner') {
+          if (questionGate && ruling.question.length <= 220) {
+            return askOwner({ kind: 'product', prompt: ruling.question, evidence: 'Содержательный спор L2.',
+              extraState: { roundsHistory } });
+          }
           return stopWith('arbiter_escalated_to_owner', { roundsHistory }, ruling.question);
         } else {
           return stopWith(ruling.reason ?? 'arbitration_hold', { roundsHistory },
@@ -485,6 +554,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       await save({ phase: 'done' });
     }
   } else if (result.outcome === 'verified' && result.receipt?.settle === 'deferred' && route.finish === 'deployed') {
+    if (questionGate) return askRelease(result);
     const blockText = `Выпуск не разрешён этим контуром. Проверен SHA ${record.sha}`;
     await save({ phase: 'blocking',
       intent: { kind: 'block', attemptId: record.attemptId, epoch: attempt.epoch,

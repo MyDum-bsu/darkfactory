@@ -1,5 +1,5 @@
 // The native claim token never leaves this adapter.
-export function nativeBoardPort(handle, { channel, lease = 1800 }) {
+export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestionOwner = false }) {
   const held = new Map();
 
   async function rootOf(taskId) {
@@ -125,6 +125,12 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
     return true;
   }
 
+  async function acquire(taskId, token) {
+    const claim = await handle.tasks.claim(taskId, token === undefined ? { lease } : { lease, token });
+    held.set(taskId, claim);
+    return { epoch: claim.epoch, until: claim.until };
+  }
+
   async function claimById(taskId, { token } = {}) {
     const root = await lookup(taskId);
     // Захват только готовой карточки: waiting/blocked и живой чужой claim не берутся.
@@ -134,13 +140,31 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
     if (root.state !== 'ready' && !expiredLease) {
       throw new Error('Task is not ready for a native claim');
     }
-    const claim = await handle.tasks.claim(taskId, token === undefined ? { lease } : { lease, token });
-    held.set(taskId, claim);
-    // Токен аренды и capability остаются внутри адаптера; наружу идут только факт и срок.
-    return { epoch: claim.epoch, until: claim.until };
+    return acquire(taskId, token);
+  }
+
+  async function questionState(question, blockText) {
+    if (!isolatedQuestionOwner) throw new Error('QuestionGate requires an exclusive isolated Board owner');
+    const { task } = await rootOf(question.task_id);
+    if (task.owner !== question.respondent || task.epoch !== question.epoch) return 'stale';
+    if (task.state === 'blocked') {
+      return task.blocked?.kind === 'needs_input' && task.blocked.reason === blockText ? 'blocked' : 'stale';
+    }
+    return task.state;
   }
 
   return {
+    questionState,
+    async unblockQuestion(question, blockText) {
+      if (await questionState(question, blockText) !== 'blocked') throw new Error('Question hold changed');
+      // Board 0.54.0 has no CAS on unblock. This capability is only enabled on
+      // the isolated owner-exclusive queue, never on the public pilot route.
+      await handle.tasks.unblock(question.task_id);
+    },
+    async claimForQuestion(question, { token }) {
+      if (await questionState(question) !== 'ready') throw new Error('Question epoch is no longer ready');
+      return acquire(question.task_id, token);
+    },
     lookup,
     labels,
     verifyHeld,
