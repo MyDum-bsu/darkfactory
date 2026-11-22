@@ -1,7 +1,7 @@
 // Ядро приёмки F1: submit → local_checks → review → completed | blocked.
 // Все внешние эффекты — только через порты. Журнал append-only: intent ДО эффекта.
 
-import { open, readFile, appendFile, stat } from 'node:fs/promises';
+import { open, readFile, appendFile, lstat, realpath, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
@@ -558,10 +558,13 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   // requireAttestation — подмена legacy-квитанцией не проходит.
   const hasAttestationFields = rev.isolation !== undefined ||
     rev.transcript_sha256 !== undefined || rev.transcript_file !== undefined ||
-    rev.status !== undefined || rev.findings !== undefined;
+    rev.status !== undefined || rev.findings !== undefined ||
+    rev.subject_digest !== undefined;
   const digestNow = typeof subjectDigest === 'function' ? subjectDigest() : null;
+  // Полный набор обязателен при любом из признаков аттестации ИЛИ когда
+  // профиль требует аттестацию — независимо от наличия манифеста.
   const attestationRequired = hasAttestationFields ||
-    (digestNow !== null && profile.review?.requireAttestation === true);
+    profile.review?.requireAttestation === true;
   if (attestationRequired) {
     if (rev.isolation !== 'docker-ro-v1') {
       return { status: 'hold', reason: 'review_isolation_missing' };
@@ -574,9 +577,18 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
         !/^[A-Za-z0-9_.-]{1,200}$/.test(transcriptName) || journal === undefined) {
       return { status: 'hold', reason: 'review_transcript_missing' };
     }
+    const transcriptPath = path.join(journal, transcriptName);
     let transcriptBytes;
     try {
-      transcriptBytes = await readFile(path.join(journal, transcriptName));
+      // Транскрипт обязан быть обычным файлом внутри журнала: симлинк или
+      // уводящий за пределы realpath — подмена, не квитанция.
+      const st = await lstat(transcriptPath);
+      const expected = path.join(await realpath(journal), transcriptName);
+      if (!st.isFile() || st.isSymbolicLink() ||
+          await realpath(transcriptPath) !== expected) {
+        return { status: 'hold', reason: 'review_transcript_mismatch' };
+      }
+      transcriptBytes = await readFile(transcriptPath);
     } catch {
       return { status: 'hold', reason: 'review_transcript_mismatch' };
     }

@@ -7,7 +7,7 @@
 
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -25,6 +25,19 @@ export const REVIEW_IMAGE =
 // В контейнер критика монтируются только каталоги кода ~/.pi/agent:
 // sessions/, subagents/ и auth.json исключены — секрет едет копией в tmpfs.
 const PROXY_ENV = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'];
+
+// Дублирует правила pi-guard.cjs на стороне хоста: приватный прокси
+// не должен даже попадать в окружение контейнера.
+function privateProxyHost(hostname) {
+  const h = String(hostname ?? '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h.endsWith('.localhost') || h === '::1' || h === '::' ||
+      h.startsWith('fe80') || h.startsWith('fc') || h.startsWith('fd')) return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  const [a, b] = m.slice(1).map(Number);
+  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
 
 const READ_ONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
 
@@ -94,10 +107,8 @@ export function executorFamily(spec) {
     ? PROVIDER_FAMILY.get(provider.toLowerCase()) : undefined;
   const mf = typeof model === 'string' && model !== ''
     ? MODEL_FAMILY.get(model.toLowerCase()) : undefined;
-  if (typeof model === 'string' && model !== '') {
-    return pf !== undefined && pf === mf ? pf : null;
-  }
-  return pf ?? null;
+  // Оба поля обязательны и обязаны указывать на одно семейство.
+  return pf !== undefined && pf === mf ? pf : null;
 }
 
 // Жёсткий инвариант до любого эффекта: оба семейства известны и различны.
@@ -144,15 +155,22 @@ export function parseReviewTranscript(ndjson) {
   };
   const seen = [];
   let hasError = false;
-  let aborted = false;
+  let seenSettled = false;
+  let aborted = null;
   for (const event of events) {
     noteTools(event?.toolsAdded);
+    noteTools(event?.message?.toolsAdded);
     if (event?.type === 'session_info') noteTools(event.data?.toolsAdded);
-    if (event?.type === 'agent_end') noteTools(event.messages?.[0]?.toolsAdded);
+    if (Array.isArray(event?.messages)) {
+      for (const msg of event.messages) noteTools(msg?.toolsAdded);
+    }
     if (event?.type === 'error' || event?.type === 'auto_retry_end' && event.success === false) {
       hasError = true;
     }
-    if (event?.type === 'agent_settled' && event.aborted === true) aborted = true;
+    if (event?.type === 'agent_settled') {
+      seenSettled = true;
+      aborted = event.aborted === true;
+    }
     if (event?.type !== 'message_end') continue;
     const message = event.message ?? event.data?.message;
     if (message?.role !== 'assistant') continue;
@@ -190,7 +208,7 @@ export function parseReviewTranscript(ndjson) {
   // текст из более ранних ходов не засчитывается.
   const last = seen.at(-1);
   const toolsAdded = tools.size ? [...tools] : null;
-  if (hasError || aborted || last.stopReason !== 'stop' ||
+  if (hasError || !seenSettled || aborted !== false || last.stopReason !== 'stop' ||
       (last.rawStopReason !== undefined && last.rawStopReason !== 'completed') ||
       !last.text.trim()) {
     throw new ReviewDenied('review_incomplete_turn');
@@ -259,6 +277,12 @@ export function parseReviewVerdict(text) {
     throw new ReviewDenied('review_ambiguous_verdict');
   }
   if (verdictObjects.length === 1) {
+    // Текстовый маркер, противоречащий JSON-вердикту, делает ответ
+    // неоднозначным: PASS + REVIEW_BLOCKED или REWORK/ESCALATE + REVIEW_OK.
+    const isPass = ['PASS', 'REVIEW_OK'].includes(verdictObjects[0].verdict);
+    const contradicts = isPass ? markerLines.includes('REVIEW_BLOCKED')
+      : markerLines.includes('REVIEW_OK');
+    if (contradicts) throw new ReviewDenied('review_ambiguous_verdict');
     return canonicalVerdict(verdictObjects[0]);
   }
   // Legacy-формат: маркер принимается только в первой или последней непустой
@@ -379,9 +403,18 @@ export async function worktreeFingerprint(worktree) {
   const filesHash = createHash('sha256');
   for (const rel of paths) {
     filesHash.update(rel + '\0');
+    const full = join(worktree, rel);
+    try {
+      const st = await lstat(full);
+      if (st.isSymbolicLink()) {
+        // Симлинк (в т.ч. битый): хэшируем цель ссылки, а не содержимое.
+        filesHash.update('symlink:' + await readlink(full));
+        continue;
+      }
+    } catch { /* файл пропал между status и lstat */ }
     let bytes = null;
     try {
-      bytes = await readFile(join(worktree, rel));
+      bytes = await readFile(full);
     } catch { /* файл удалён или недоступен — сам факт фиксируем */ }
     filesHash.update(bytes ?? '<absent>');
   }
@@ -407,13 +440,12 @@ export function assertToolsAllowed(toolsAdded) {
   }
 }
 
-// Универсальный вызов команды внутри rootless Docker read-only контура.
-// Сеть по умолчанию отключена (--network=none); allowModelNetwork:true
-// включает egress только для модельного вызова (дополнительно режется
-// pi-guard.cjs внутри процесса) и уводит 'localhost' с loopback-адреса.
-export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAGE,
+// Внутренний вызов команды внутри rootless Docker read-only контура.
+// Публичный раннер всегда работает с --network=none; сеть для модельного
+// вызова включает только piSandbox (дополнительно режется pi-guard.cjs).
+async function sandboxExec({ snapshot, argv, image = REVIEW_IMAGE,
   env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate',
-  allowModelNetwork = false }) {
+  modelNetwork = false }) {
   if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length) {
     throw new ReviewDenied('sandbox_request_invalid');
   }
@@ -426,7 +458,7 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   const name = `board-review-${randomUUID()}`;
   const args = ['run', '--rm', '--name', name, '--pull=never', '--read-only',
     '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0'];
-  if (allowModelNetwork) {
+  if (modelNetwork) {
     args.push('--add-host', 'localhost:127.0.0.254');
   } else {
     args.push('--network=none');
@@ -465,10 +497,20 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   return { code, stdout, stderr };
 }
 
+// Публичный sandbox-раннер: сеть физически отключена всегда.
+export function runInReadOnlySandbox(opts) {
+  return sandboxExec({ ...opts, modelNetwork: false });
+}
+
+// Внутренний раннер ревьюера: единственный, кому нужен egress модели.
+function piSandbox(opts) {
+  return sandboxExec({ ...opts, modelNetwork: true });
+}
+
 // Адаптер ReviewPort: реальный Pi/Sol в read-only rootless Docker на снимке
 // unpackExact(candidate_sha). Возвращает аттестованный ReviewReceipt.
 export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
-  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = runInReadOnlySandbox }) {
+  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox }) {
   if (!isAbsolute(journal ?? '') || !isAbsolute(piRoot ?? '')) {
     throw new ReviewDenied('review_runner_misconfigured');
   }
@@ -541,7 +583,11 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         } catch {
           throw new ReviewDenied('review_proxy_invalid');
         }
-        if (u.port === '44100') throw new ReviewDenied('review_proxy_blocked');
+        // Прокси на приватном/loopback адресе или порту Board запрещён до
+        // запуска: такой endpoint дал бы контейнеру выход к локальным службам.
+        if (u.port === '44100' || privateProxyHost(u.hostname)) {
+          throw new ReviewDenied('review_proxy_blocked');
+        }
         env[key] = value;
         allow.push(`${u.hostname.toLowerCase()}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`);
       }
@@ -583,7 +629,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         '--session-dir', '/tmp/session', instruction];
 
       const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts,
-        timeoutMs, allowModelNetwork: true });
+        timeoutMs });
       if (run.code !== 0) {
         throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
       }
@@ -601,8 +647,10 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       }
       assertToolsAllowed(parsed.toolsAdded);
       const verdict = parseReviewVerdict(parsed.finalText);
-      if (verdict.subject_digest !== undefined && binding.subject_digest &&
+      if (binding.subject_digest != null &&
           verdict.subject_digest !== binding.subject_digest) {
+        // При заданном binding.subject_digest вердикт обязан подтвердить тот
+        // же дайджест; отсутствие или расхождение — отказ.
         throw new ReviewDenied('review_verdict_subject_mismatch');
       }
 
@@ -622,7 +670,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         task: binding.task_id,
         sha: binding.candidate_sha,
         tree_sha: treeSha,
-        subject_digest: binding.subject_digest ?? null,
+        subject_digest: verdict.subject_digest ?? null,
         verdict: verdict.verdict,
         status: verdict.status,
         summary: verdict.summary,

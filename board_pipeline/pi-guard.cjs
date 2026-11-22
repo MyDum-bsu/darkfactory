@@ -1,9 +1,14 @@
 'use strict';
-// Песочный прелоад ревьюера (--require). Две обязанности:
-// 1. После первого чтения auth.json или первого исходящего запроса секрет
-//    перезаписывается {} и удаляется; дальнейшие обращения к /tmp/.pi — EACCES.
+// Песочный прелоад ревьюера (--require). Три обязанности:
+// 1. До старта pi auth.json читается в память и стирается с диска: на ФС его
+//    нет ни для тулов, ни для симлинков, ни для внешних утилит. Креденшельный
+//    код pi получает байты из замыкания — и только если его вызвал именно
+//    креденшельный стек (RuntimeCredentials/ModelsImpl).
 // 2. Egress ограничен allowlist PI_ALLOW_CONNECT + api.openai.com/chatgpt.com:443;
-//    loopback/приватные адреса и порт 44100 заблокированы (кроме явного прокси).
+//    приватные/loopback адреса и порт 44100 отклоняются ДО allowlist — даже
+//    явно разрешённый приватный прокси не пройдёт.
+// 3. child_process ограничен read-only утилитами (rg/grep/find/ls), чтобы
+//    внутри контейнера нельзя было поднять curl/wget/nc/bash/node без гарда.
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
@@ -11,33 +16,41 @@ const http = require('http');
 const https = require('https');
 const { EventEmitter } = require('events');
 
+// Исходники fs фиксируются до обёрток — гард сам пользуется ими без рекурсии.
+const origReadFileSync = fs.readFileSync.bind(fs);
+const origUnlinkSync = fs.unlinkSync.bind(fs);
+const origRealpathSync = fs.realpathSync.bind(fs);
+const origReadlinkSync = fs.readlinkSync.bind(fs);
+const origLstatSync = fs.lstatSync.bind(fs);
+const origStatSync = fs.statSync.bind(fs);
+
 const PI_HOME = '/tmp/.pi';
 const AUTH = '/tmp/.pi/agent/auth.json';
 const ALLOW_DIRS = ['/candidate', '/pi-ro/bin', '/pi-ro/install', '/pi-ro/npm',
   '/pi-guard', '/tmp/session', '/tmp', '/usr', '/lib', '/lib64',
   '/etc', '/proc', '/dev', '/sys', '/run', '/.agents', '/home', '/root', '/opt'];
-// После первого исходящего соединения (locked) секретные конфиги закрыты
-// для всех — включая файловые тулы; /pi-cfg с копией auth.json закрыт всегда.
+// Конфиги, к которым после lock доступ имеет только внутренний код pi.
 const SECRET_FILES = new Set(['/tmp/.pi/agent/auth.json',
   '/tmp/.pi/agent/auth.json.lock', '/tmp/.pi/agent/settings.json',
   '/tmp/.pi/agent/models.json', '/tmp/.pi/agent/models-store.json',
   '/tmp/.pi/agent/keybindings.json']);
+
+// Секрет уходит в память до любого кода pi: файл исчезает ещё в прелоаде.
+let authBytes = null;
+try {
+  authBytes = origReadFileSync(AUTH);
+  origUnlinkSync(AUTH);
+  try { origUnlinkSync(AUTH + '.lock'); } catch { /* lock ещё не создан */ }
+} catch { /* auth.json не был скопирован в cfg — ревью без сети всё равно упадёт */ }
+
 let locked = false;
 const lock = () => { locked = true; };
-let scrubbed = false;
 
-function scrub() {
-  // Файл не удаляем: pi перечитывает креденшел на каждый запрос. Доступ
-  // рубится в guardFn по стеку — только креденшельный код pi его ещё видит.
-  if (scrubbed) return;
-  scrubbed = true;
-}
-
-const eacces = (target) => {
-  const err = new Error(`EACCES: permission denied, open '${target}'`);
+const eacces = (target, syscall = 'open') => {
+  const err = new Error(`EACCES: permission denied, ${syscall} '${target}'`);
   err.code = 'EACCES';
   err.errno = -13;
-  err.syscall = 'open';
+  err.syscall = syscall;
   err.path = String(target);
   return err;
 };
@@ -49,50 +62,144 @@ function pathOf(arg) {
   return null;
 }
 
+// Внутренний код pi работает в /pi-ro; туловые вызовы идут из /tools/-частей
+// бандла. auth.json отдаётся только креденшельным функциям pi — стек
+// RuntimeCredentials/readCredential воспроизвести тулом нельзя.
+const PI_STACK = /\/pi-ro\//;
+const TOOL_STACK = /\/tools\//;
+const CRED_STACK = /RuntimeCredentials|readCredential|CredentialStore|AuthStorage/;
+const stackOf = () => new Error().stack || '';
+const piInternal = () => PI_STACK.test(stackOf()) && !TOOL_STACK.test(stackOf());
+const isCredentialRead = () => CRED_STACK.test(stackOf());
+
+// realpath уводит симлинки /candidate за пределы снимка (в т.ч. в /tmp/.pi) —
+// такие пути запрещены. Битая ссылка проверяется по lstat+readlink.
+function escapesCandidate(norm) {
+  try {
+    const real = origRealpathSync(norm);
+    return real !== '/candidate' && !real.startsWith('/candidate/');
+  } catch {
+    try {
+      if (origLstatSync(norm).isSymbolicLink()) {
+        const target = path.resolve(path.dirname(norm), origReadlinkSync(norm));
+        return target !== '/candidate' && !target.startsWith('/candidate/');
+      }
+    } catch { /* файл не существует — пусть реальная fs ответит ENOENT */ }
+    return false;
+  }
+}
+
 function fsForbidden(p) {
   if (p === null) return false;
   const norm = path.resolve(p);
   if (norm === '/pi-cfg' || norm.startsWith('/pi-cfg/')) return true;
-  if (SECRET_FILES.has(norm)) return locked || scrubbed;
+  if (norm === PI_HOME || norm.startsWith(PI_HOME + '/')) {
+    if (SECRET_FILES.has(norm)) return !piInternal();
+    return !piInternal();
+  }
+  if (norm === '/candidate' || norm.startsWith('/candidate/')) {
+    return escapesCandidate(norm);
+  }
   return !ALLOW_DIRS.some(dir => norm === dir || norm.startsWith(dir + '/'));
 }
 
-// auth.json нужен pi при каждом разрешении креденшелов (читается лениво,
-// без кэша) — нельзя удалить после первого чтения. Отличить чтение самого pi
-// от файлового тула можно только по стеку: креденшелы читаются из
-// RuntimeCredentials/ModelsImpl внутри /pi-ro, тулы — из своих чанков.
-const CRED_STACK = /RuntimeCredentials|readCredential|CredentialStore|AuthStorage/;
-const isCredentialRead = () => CRED_STACK.test(new Error().stack || '');
+// Поддельный stat для auth.json: файл удалён, но креденшельный код pi может
+// спросить его размер/тип до чтения.
+function fakeAuthStat() {
+  const st = origStatSync(__filename);
+  try {
+    st.size = authBytes ? authBytes.length : 0;
+    st.mtime = new Date(0);
+    st.mtimeMs = 0;
+    st.ctime = st.mtime;
+    st.ctimeMs = 0;
+  } catch { /* поля могут быть read-only — вернём как есть */ }
+  return st;
+}
+
+// Ответ на чтение auth.json из памяти по форме оригинальной функции.
+function serveAuth(original, args, { asyncCb = false, promise = false } = {}) {
+  const encOpt = args[1];
+  const enc = typeof encOpt === 'string' ? encOpt
+    : (encOpt !== null && typeof encOpt === 'object' ? encOpt.encoding : undefined);
+  const buf = () => enc ? authBytes.toString(enc === 'utf8' ? 'utf8' : enc)
+    : Buffer.from(authBytes);
+  if (promise) return Promise.resolve(buf());
+  if (asyncCb) {
+    const cb = args.at(-1);
+    if (typeof cb === 'function') {
+      process.nextTick(cb, null, buf());
+      return undefined;
+    }
+    return Promise.resolve(buf());
+  }
+  return buf();
+}
+
+const DEBUG = !!process.env.PI_GUARD_DEBUG;
+
+function deny(p, args, { asyncCb = false, promise = false } = {}) {
+  if (DEBUG) {
+    process.stderr.write(`[guard] deny ${p}\n${new Error().stack || ''}\n`);
+  }
+  const err = eacces(p);
+  if (promise) return Promise.reject(err);
+  if (asyncCb) {
+    const cb = args.at(-1);
+    if (typeof cb === 'function') {
+      process.nextTick(cb, err);
+      return undefined;
+    }
+    return Promise.reject(err);
+  }
+  throw err;
+}
 
 // Обернуть fs-функцию: отказ до вызова.
-function guardFn(obj, key, { asyncCb = false, promise = false } = {}) {
+function guardFn(obj, key, opts = {}) {
   const original = obj[key];
   if (typeof original !== 'function') return;
   obj[key] = function (...args) {
     const p = pathOf(args[0]);
-    if (p !== null && path.resolve(p) === AUTH && !(locked || scrubbed)) {
-      return original.apply(this, args);
-    }
-    if (p !== null && path.resolve(p) === AUTH && isCredentialRead()) {
-      // pi перечитывает креденшел на каждый запрос — разрешаем только его
-      // креденшельному коду; тул с обычным стеком ниже получит EACCES.
-      return original.apply(this, args);
-    }
-    if (fsForbidden(p)) {
-      const err = eacces(p);
-      if (promise) return Promise.reject(err);
-      if (asyncCb) {
-        const cb = args.at(-1);
-        if (typeof cb === 'function') return process.nextTick(cb, err);
-        return Promise.reject(err);
+    if (p !== null && path.resolve(p) === AUTH) {
+      // Файла на диске нет: байты из памяти отдаём только внутреннему коду pi
+      // (стек /pi-ro без /tools/ — миграции и RuntimeCredentials); тулы и
+      // внешние вызовы получают EACCES.
+      if (authBytes !== null && (piInternal() || isCredentialRead())) {
+        if (key === 'existsSync') return true;
+        if (key === 'exists') {
+          const cb = args.at(-1);
+          if (typeof cb === 'function') process.nextTick(cb, true);
+          return undefined;
+        }
+        if (key === 'statSync' || key === 'lstatSync') return fakeAuthStat();
+        if (key === 'stat' || key === 'lstat') {
+          const cb = args.at(-1);
+          if (typeof cb === 'function') process.nextTick(cb, null, fakeAuthStat());
+          return undefined;
+        }
+        if (key === 'realpath' || key === 'realpathSync') {
+          if (key.endsWith('Sync')) return AUTH;
+          const cb = args.at(-1);
+          if (typeof cb === 'function') return process.nextTick(cb, null, AUTH);
+          return Promise.resolve(AUTH);
+        }
+        if (key === 'access' || key === 'accessSync') {
+          const cb = args.at(-1);
+          if (typeof cb === 'function') return process.nextTick(cb, null);
+          return undefined;
+        }
+        return serveAuth(original, args, opts);
       }
-      throw err;
+      return deny(p, args, opts);
     }
+    if (fsForbidden(p)) return deny(p, args, opts);
     return original.apply(this, args);
   };
 }
 
-for (const key of ['readFile', 'open', 'readdir', 'stat', 'lstat', 'realpath', 'access', 'opendir']) {
+for (const key of ['readFile', 'open', 'readdir', 'stat', 'lstat', 'realpath',
+  'access', 'opendir', 'exists']) {
   guardFn(fs, key, { asyncCb: true });
 }
 for (const key of ['readFileSync', 'openSync', 'readdirSync', 'statSync', 'lstatSync',
@@ -100,7 +207,8 @@ for (const key of ['readFileSync', 'openSync', 'readdirSync', 'statSync', 'lstat
   guardFn(fs, key);
 }
 if (fs.promises) {
-  for (const key of ['readFile', 'open', 'readdir', 'stat', 'lstat', 'realpath', 'access', 'opendir']) {
+  for (const key of ['readFile', 'open', 'readdir', 'stat', 'lstat', 'realpath',
+    'access', 'opendir']) {
     guardFn(fs.promises, key, { promise: true });
   }
 }
@@ -122,9 +230,10 @@ function privateHost(host) {
 function connectAllowed(host, port) {
   const h = String(host ?? '').toLowerCase();
   const p = Number(port);
-  if (p === 44100) return false;
+  // Приватное/loopback и порт Board отклоняются ДО allowlist: прокси на
+  // приватном адресе не считается разрешённым даже при явном совпадении.
+  if (p === 44100 || privateHost(h)) return false;
   if (allowEndpoints.has(`${h}:${p}`)) return true;
-  if (privateHost(h)) return false;
   return (h === 'api.openai.com' || h === 'chatgpt.com') && p === 443;
 }
 
@@ -153,7 +262,6 @@ net.Socket.prototype.connect = function (...args) {
     return this;
   }
   lock();
-  scrub();
   return origConnect.apply(this, args);
 };
 
@@ -192,7 +300,7 @@ for (const [mod, defPort] of [[http, 80], [https, 443]]) {
   mod.request = function (...args) {
     const { host, port } = requestTarget(args, defPort);
     if (!connectAllowed(host, port)) return deniedRequest(host, port);
-    scrub();
+    lock();
     return origRequest.apply(this, args);
   };
 }
@@ -213,7 +321,7 @@ if (typeof globalThis.fetch === 'function') {
       if (e?.code === 'ENETUNREACH') throw e;
       return Promise.reject(e instanceof TypeError ? e : enet(String(url), '?'));
     }
-    scrub();
+    lock();
     return origFetch.call(this, input, init);
   };
 }
@@ -230,6 +338,49 @@ require('tls').connect = function (...args) {
     req.destroy = () => req;
     return req;
   }
-  scrub();
+  lock();
   return origTls.apply(this, args);
 };
+
+// Только read-only поисковые утилиты: внешние сетевые/шелл-бинарники внутри
+// песочницы не поднимаются. NODE_OPTIONS наследуется — гард живёт и в детях.
+const cp = require('child_process');
+const CHILD_ALLOW = new Set(['rg', 'grep', 'find', 'ls']);
+function guardChild(key, sync) {
+  const orig = cp[key];
+  if (typeof orig !== 'function') return;
+  cp[key] = function (file, ...rest) {
+    if (!CHILD_ALLOW.has(path.basename(String(file ?? '')))) {
+      if (DEBUG) {
+        process.stderr.write(`[guard] deny ${key} ${file}\n`);
+      }
+      const err = eacces(String(file), 'spawn');
+      // spawnSync не бросает при невозможном spawn — возвращает result с
+      // error; иначе синхронный throw ломает инициализацию pi.
+      if (key === 'spawnSync') {
+        return { status: 126, signal: null, output: [null, '', String(err.message)],
+          stdout: '', stderr: String(err.message), error: err, pid: 0 };
+      }
+      if (sync) throw err;
+      const cb = rest.find(a => typeof a === 'function');
+      if (cb) process.nextTick(cb, err);
+      const fake = new EventEmitter();
+      fake.pid = 0;
+      fake.kill = () => true;
+      fake.stdout = new EventEmitter();
+      fake.stderr = new EventEmitter();
+      process.nextTick(() => {
+        fake.emit('error', err);
+        fake.emit('exit', 126, null);
+      });
+      return fake;
+    }
+    return orig.call(this, file, ...rest);
+  };
+}
+guardChild('spawn');
+guardChild('exec');
+guardChild('execFile');
+guardChild('spawnSync', true);
+guardChild('execSync', true);
+guardChild('execFileSync', true);
