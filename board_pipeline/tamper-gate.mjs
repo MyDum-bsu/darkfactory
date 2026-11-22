@@ -20,6 +20,10 @@ const TEST_DEF = /(?:^|[^\w$.])(?:it|test|describe)\s*\(|(?:^|[^\w$])def\s+test_
 const SKIP_MARK = /\b(?:it|test|describe|context|xit|xtest)\s*\.\s*(?:skip|only)\s*\(|\.only\s*\(|@pytest\.mark\.(?:skip|skipif|xfail)|@?unittest\.skip|@skip\b/;
 // Проверки/утверждения: удаление без замены — ослабление гейта.
 const ASSERT_MARK = /\bassert\b|\bexpect\s*\(|\.assert\w*\s*\(/;
+// Строка- комментарий не является действующей проверкой.
+const COMMENT_MARK = /^\s*(?:\/\/|#|\*|<!--)/;
+// Содержательная проверка: сравнение, исключение или предикат expect(...).to*.
+const STRONG_ASSERT = /\bassert[\w.]*\s*\([^)]*(?:==|!=|>=|<=|>|<|\b(?:not\s+)?in\b|\b(?:raise|throws?|error)\w*\b)|\bassert[\w.]*(?:equal|strict|throws?|raises?|match|regex|contain|instance|true|false|close)\w*\s*\(|\bexpect\s*\([^)]*\)\s*\.\s*to\w+/i;
 // Тривиальное утверждение на месте содержательного — ослабление, а не проверка.
 const TRIVIAL_ASSERT = /\bassert\s*\(\s*(?:true|1)\s*\)|\bassert\s+True\b|\bexpect\s*\(\s*true\s*\)|\.assertTrue\s*\(\s*True/;
 // Файлы, из которых запускаются проверки.
@@ -58,12 +62,17 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
   let oldLine = 0;
   let newLine = 0;
 
+  const testScripts = new Map();
   const push = (kind, line, detail, target = file) => violations.push({ kind, file: target, line, detail });
-  const assertTally = (side, line) => {
-    if (!ASSERT_MARK.test(side)) return null;
-    const tally = asserts.get(file) ?? { removed: [], added: [] };
-    asserts.set(file, tally);
+  const tallyFor = (map, name, entry) => {
+    const tally = map.get(name) ?? { removed: [], added: [], strongRemoved: 0, strongAdded: 0 };
+    map.set(name, tally);
     return tally;
+  };
+  const assertTally = (side, line) => {
+    // Комментарии не считаются ни удалённой, ни добавленной проверкой.
+    if (!ASSERT_MARK.test(side) || COMMENT_MARK.test(side)) return null;
+    return tallyFor(asserts, file, line);
   };
 
   for (const raw of String(diff).split('\n')) {
@@ -125,7 +134,13 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
         push('test_deleted', oldLine, 'removed test case');
       }
       const tally = assertTally(text, oldLine);
-      if (tally) tally.removed.push(oldLine);
+      if (tally) {
+        tally.removed.push(oldLine);
+        if (STRONG_ASSERT.test(text)) tally.strongRemoved++;
+      }
+      if (RUNNER_FILE.test(file) && TEST_SCRIPT.test(text)) {
+        tallyFor(testScripts, file).removed.push(oldLine);
+      }
       oldLine++;
     } else if (raw.startsWith('+')) {
       const text = raw.slice(1);
@@ -144,9 +159,13 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
         if (script && !RUNS_TESTS.test(script[1])) {
           push('gate_bypass', newLine, 'test script no longer runs tests');
         }
+        if (script) tallyFor(testScripts, file).added.push(newLine);
       }
       const tally = assertTally(text, newLine);
-      if (tally) tally.added.push(newLine);
+      if (tally) {
+        tally.added.push(newLine);
+        if (STRONG_ASSERT.test(text)) tally.strongAdded++;
+      }
       newLine++;
     } else {
       oldLine++;
@@ -178,7 +197,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
     // файле — смена типа, вне зависимости от прежнего режима.
     if (metaNewMode !== null && metaNewMode !== '100644' && metaNewMode !== '100755' &&
         metaOldMode !== metaNewMode) {
-      push('file_type_changed', 0, `test file ${subject} changed type ${metaOldMode} -> ${metaNewMode}`);
+      push('file_type_changed', 0, `test file ${subject} changed type ${metaOldMode} -> ${metaNewMode}`, subject);
     }
   };
   // Второй проход ведёт учёт hunk-состояния: удалённая строка, чей текст
@@ -187,8 +206,12 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
   for (const raw of String(diff).split('\n')) {
     if (raw.startsWith('diff --git ')) {
       flushMeta();
+      // Имена файлов — из заголовка блока: у бинарных/пустых удалений может
+      // вообще не быть '---'/'+++', а у переименований — свои rename-строки.
+      const names = /^diff --git a\/(.+) b\/(.+)$/.exec(raw.replaceAll('"', ''));
       metaFile = null;
-      metaOld = null;
+      metaOld = names ? names[1] : null;
+      if (names) metaFile = names[2];
       metaDeleted = false;
       metaOldMode = null;
       metaNewMode = null;
@@ -196,10 +219,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       metaInHunk = false;
       continue;
     }
-    if (metaInHunk) {
-      if (raw.startsWith('@@')) continue;
-      continue;
-    }
+    if (metaInHunk) continue;
     if (raw.startsWith('@@')) { metaInHunk = true; continue; }
     if (raw.startsWith('rename from ')) { metaRenamedFrom = raw.slice(12); continue; }
     if (raw.startsWith('rename to ')) { metaFile = raw.slice(10); continue; }
@@ -224,6 +244,23 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
         line: tally.removed[tally.added.length],
         detail: `removed ${tally.removed.length} assertion(s), added ${tally.added.length}`,
       });
+    } else if ((tally.strongRemoved ?? 0) > (tally.strongAdded ?? 0)) {
+      violations.push({
+        kind: 'assertion_weakened',
+        file: name,
+        line: tally.removed[0] ?? 0,
+        detail: `strict assertions reduced ${tally.strongRemoved} -> ${tally.strongAdded ?? 0}`,
+      });
+    }
+  }
+  for (const [name, tally] of testScripts) {
+    if (tally.removed.length > tally.added.length) {
+      violations.push({
+        kind: 'gate_bypass',
+        file: name,
+        line: tally.removed[0],
+        detail: 'test script removed',
+      });
     }
   }
 
@@ -245,7 +282,11 @@ export async function tamperGate(binding, profile = {}) {
   }
   // Детерминированный вызов: без внешних diff-драйверов, textconv и любого
   // пользовательского/репозиторного конфига; локаль и окружение зафиксированы.
+  // Атрибуты читаются из пустого дерева: ни worktree/.gitattributes, ни
+  // .git/info/attributes не могут скрыть текстовый diff (-diff) или включить
+  // внешний драйвер кандидата.
   const { stdout } = await exec('git', ['-C', worktree,
+    '-c', 'core.attributesFile=/dev/null',
     'diff', '--no-ext-diff', '--no-textconv', '--unified=0', `${base_sha}..${candidate_sha}`],
     {
       timeout: 30_000,
@@ -259,6 +300,7 @@ export async function tamperGate(binding, profile = {}) {
         GIT_CONFIG_SYSTEM: '/dev/null',
         GIT_CONFIG_LOCAL: '/dev/null',
         GIT_CONFIG_COUNT: '0',
+        GIT_ATTR_SOURCE: '4b825dc642cb6eb9a060e54bf8d69288fbee4904',
       },
     });
   const violations = analyzeDiff(stdout, {

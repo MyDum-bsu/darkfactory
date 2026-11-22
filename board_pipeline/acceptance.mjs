@@ -68,6 +68,12 @@ function runId(taskId, sha, version) {
   return `run-${sanitize(taskId)}-${sanitize(sha)}-v${sanitize(version)}`;
 }
 
+// Имя журнала ограничено байтами ФС: длинный составной ключ детерминированно
+// сворачивается в хэш — тот же запуск всегда получает тот же файл.
+function journalId(id) {
+  return id.length <= 200 ? id : `run-${createHash('sha256').update(id).digest('hex')}`;
+}
+
 function validateHandoff(handoff) {
   if (handoff === null || typeof handoff !== 'object' || Array.isArray(handoff)) {
     throw new Denied('handoff_not_object');
@@ -82,7 +88,7 @@ function validateHandoff(handoff) {
     }
   }
   if (!/^[1-9][0-9]{0,14}$/.test(handoff.task_id)) throw new Denied('invalid_task_id');
-  if (!/^thr_[a-z0-9]+$/.test(handoff.worker_thread_id)) throw new Denied('invalid_worker_thread');
+  if (!/^thr_[a-z0-9]{1,60}$/.test(handoff.worker_thread_id)) throw new Denied('invalid_worker_thread');
   if (!path.isAbsolute(handoff.worktree)) throw new Denied('worktree_not_absolute');
   if (!SHA_RE.test(handoff.candidate_sha)) throw new Denied('candidate_sha_not_full');
   if (!SHA_RE.test(handoff.base_sha)) throw new Denied('base_sha_not_full');
@@ -171,7 +177,7 @@ function validateAttempt(attempt) {
   if (!/^[1-9][0-9]{0,14}$/.test(attempt.task_id)) throw new Denied('invalid_task_id');
   if (!Number.isSafeInteger(attempt.epoch) || attempt.epoch <= 0) throw new Denied('invalid_epoch');
   if (!ID_RE.test(attempt.attempt_id)) throw new Denied('invalid_attempt_id');
-  if (!/^thr_[a-z0-9]+$/.test(attempt.bb_thread_id)) throw new Denied('invalid_worker_thread');
+  if (!/^thr_[a-z0-9]{1,60}$/.test(attempt.bb_thread_id)) throw new Denied('invalid_worker_thread');
   if (!path.isAbsolute(attempt.worktree)) throw new Denied('worktree_not_absolute');
   if (!SHA_RE.test(attempt.base_sha)) throw new Denied('base_sha_not_full');
   if (!FINISH.has(attempt.finish)) throw new Denied('invalid_finish');
@@ -244,7 +250,7 @@ function validateSubmission(submission, attempt) {
   if (!/^[1-9][0-9]{0,14}$/.test(submission.task_id)) throw new Denied('invalid_task_id');
   if (!Number.isSafeInteger(submission.epoch) || submission.epoch <= 0) throw new Denied('invalid_epoch');
   if (!ID_RE.test(submission.attempt_id)) throw new Denied('invalid_attempt_id');
-  if (!/^thr_[a-z0-9]+$/.test(submission.worker_thread_id)) throw new Denied('invalid_worker_thread');
+  if (!/^thr_[a-z0-9]{1,60}$/.test(submission.worker_thread_id)) throw new Denied('invalid_worker_thread');
   if (!SHA_RE.test(submission.candidate_sha)) throw new Denied('candidate_sha_not_full');
   if (submission.task_id !== attempt.task_id) throw new Denied('task_mismatch');
   if (submission.epoch !== attempt.epoch) throw new Denied('epoch_mismatch');
@@ -481,8 +487,10 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
       Array.isArray(vis.artifacts) && vis.artifacts.length > 0 &&
       vis.artifacts.every((a) => a !== null && typeof a === 'object' &&
         typeof a.name === 'string' && a.name.length > 0 &&
-        /^[0-9a-f]{64}$/.test(a.sha256 ?? '') && Number.isSafeInteger(a.bytes)) &&
-      vis.evidence !== undefined && vis.evidence !== null;
+        /^[0-9a-f]{64}$/.test(a.sha256 ?? '') &&
+        Number.isSafeInteger(a.bytes) && a.bytes >= 1) &&
+      vis.evidence !== null && typeof vis.evidence === 'object' &&
+      Object.keys(vis.evidence).length > 0;
     if (!attested) {
       return { status: 'hold', reason: 'visual_receipt_invalid' };
     }
@@ -545,7 +553,7 @@ export async function accept({ handoff, policy, journal, ports }) {
     throw e;
   }
 
-  const id = runId(handoff.task_id, handoff.candidate_sha, policy.version);
+  const id = journalId(runId(handoff.task_id, handoff.candidate_sha, policy.version));
   const file = path.join(journal, `${id}.jsonl`);
 
   // Атомарное создание запуска: блокировка параллельных/повторных запусков.
@@ -720,9 +728,9 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   };
   // Ключ запуска включает контракт и требование L3: новый манифест или смена
   // has_ui при том же SHA не переиспользуют терминальный вердикт старого запуска.
-  const id = runId(`${attempt.task_id}.${attempt.attempt_id}.${attempt.epoch}`,
+  const id = journalId(runId(`${attempt.task_id}.${attempt.attempt_id}.${attempt.epoch}`,
     submission.candidate_sha, policy.version) + (key ? `-s${key}` : '') +
-    (attempt.has_ui === true ? '-ui' : '');
+    (attempt.has_ui === true ? '-ui' : attempt.has_ui === false ? '-u0' : ''));
   const file = path.join(journal, `${id}.jsonl`);
 
   let fh;

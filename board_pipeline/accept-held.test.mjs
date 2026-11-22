@@ -1394,3 +1394,109 @@ test('collectVisualArtifacts: лимиты по числу и объёму, syml
   for (let i = 0; i < 65; i++) await writeFile(path.join(overCount, `a${i}.txt`), 'x');
   await assert.rejects(() => collectVisualArtifacts(overCount, journal, binding), /limits/);
 });
+
+test('артефакт в 0 байт и пустое evidence не аттестуют зелёный L3', async (t) => {
+  for (const [name, receipt] of [
+    ['нулевой артефакт', { ok: true, status: 'pass',
+      artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 0 }], evidence: { exit: 0 } }],
+    ['пустое evidence', { ok: true, status: 'pass',
+      artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: {} }],
+  ]) {
+    const { handle, ported } = await isolated(t);
+    const id = await task(handle);
+    const { epoch, port } = await held(ported, id);
+    const { ports, calls } = stubs();
+    const res = await acceptHeld({
+      attempt: attempt(id, epoch, { has_ui: true }),
+      submission: submission(id, epoch),
+      policy: policy(id, { has_ui: true }),
+      journal: await tmpJournal(),
+      ports: { ...ports, board: port,
+        visual: async (binding) => ({ sha: binding.candidate_sha, ...receipt }) },
+    });
+    assert.equal(res.outcome, 'hold', name);
+    assert.equal(res.reason, 'visual_receipt_invalid', name);
+    assert.equal(calls.review, 0, name);
+    assert.equal((await settled(handle, id)).state, 'blocked', name);
+  }
+});
+
+test('has_ui: false затем отсутствие поля при has_ui в профиле — L3 выполняется заново', async (t) => {
+  const { handle, ported, seen } = await isolated(t);
+  const id = await contractTask(handle);
+  await handle.label(id, { set: { finish: 'deployed' } });
+  const { epoch, port } = await held(ported, id);
+  const { ports } = stubs();
+  const journal = await tmpJournal();
+  let visual = 0;
+  const extra = {
+    visual: async (binding) => {
+      visual++;
+      return { ok: true, status: 'pass', sha: binding.candidate_sha,
+        artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: { exit: 0 } };
+    },
+  };
+  const first = await acceptHeld({
+    attempt: contractAttempt(id, epoch, { has_ui: false, finish: 'deployed' }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal,
+    ports: { ...ports, board: port, ...extra },
+  });
+  assert.equal(first.outcome, 'verified');
+  assert.equal(visual, 0, 'явное has_ui:false отключает гейт');
+  const attemptNoFlag = contractAttempt(id, epoch, { finish: 'deployed' });
+  const second = await acceptHeld({
+    attempt: attemptNoFlag,
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal,
+    ports: { ...ports, board: port, ...extra },
+  });
+  assert.equal(second.outcome, 'verified');
+  assert.equal(second.repeated, undefined, 'вердикт с na не переиспользован при смене требования L3');
+  assert.notEqual(second.run, first.run);
+  assert.equal(visual, 1, 'L3 выполнен для попытки без явного has_ui');
+  assert.equal(seen.claim, 1);
+});
+
+test('длинный bb_thread_id отклоняется до любых проверок', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, { bb_thread_id: `thr_${'x'.repeat(200)}` }),
+    submission: submission(id, epoch, { worker_thread_id: `thr_${'x'.repeat(200)}` }),
+    policy: policy(id, { worker: `thr_${'x'.repeat(200)}` }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port },
+  });
+  assert.equal(res.outcome, 'denied');
+  assert.equal(res.reason, 'invalid_worker_thread');
+  assert.deepEqual(calls, { inspect: 0, local: 0, review: 0 });
+});
+
+test('максимально длинный составной ключ: журнал ограничен, квитанция <= 1000', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  const journal = await tmpJournal();
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch, { attempt_id: `att-${'a'.repeat(60)}` }),
+    submission: submission(id, epoch, { attempt_id: `att-${'a'.repeat(60)}` }),
+    policy: { ...policy(id), version: 'v'.repeat(64) },
+    journal,
+    ports: { ...ports, board: port },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+  assert.equal(calls.review, 1);
+  const { readdir } = await import('node:fs/promises');
+  const files = (await readdir(journal)).filter((name) => name.endsWith('.jsonl'));
+  assert.equal(files.length, 1);
+  assert.equal(files[0].length <= 255, true, `имя журнала ограничено ФС: ${files[0]}`);
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'completed');
+  assert.equal(JSON.stringify(after.result).length <= 1000, true);
+});

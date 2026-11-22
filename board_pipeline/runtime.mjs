@@ -163,17 +163,24 @@ const ARTIFACT_MAX_FILE_BYTES = 8 * 1024 * 1024;
 const ARTIFACT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 
 // Сбор артефактов из rw-каталога контейнера в приватный журнал: только регулярные
-// файлы, побайтово, с sha256 и лимитами. Превышение — отказ гейта, не усечка.
+// файлы, побайтово, с sha256 и лимитами. Перебор идёт потоково через opendir —
+// список имён не загружается целиком и обрывается на первом превышении лимита.
 export async function collectVisualArtifacts(dropped, journal, binding) {
+  const { opendir } = await import('node:fs/promises');
+  const entries = [];
+  for await (const entry of await opendir(dropped)) {
+    if (entries.length >= ARTIFACT_MAX_FILES) {
+      throw new Error('Visual artifacts exceed the count or byte limits');
+    }
+    entries.push(entry.name);
+  }
   const artifacts = [];
   let total = 0;
-  const { readdir } = await import('node:fs/promises');
-  for (const entry of (await readdir(dropped)).sort()) {
+  for (const entry of entries.sort()) {
     const from = join(dropped, entry);
     const info = await lstat(from);
     if (!info.isFile()) continue;
-    if (artifacts.length >= ARTIFACT_MAX_FILES || info.size > ARTIFACT_MAX_FILE_BYTES ||
-        total + info.size > ARTIFACT_MAX_TOTAL_BYTES) {
+    if (info.size > ARTIFACT_MAX_FILE_BYTES || total + info.size > ARTIFACT_MAX_TOTAL_BYTES) {
       throw new Error('Visual artifacts exceed the count or byte limits');
     }
     const data = await readFile(from);
@@ -211,14 +218,28 @@ export function offlineVisualRunner(journal) {
       await chmod(dropped, 0o777);
       await unpackExact(binding.worktree, binding.candidate_sha, archive, source);
       const extras = await sandboxExtras(recipe, source);
+      // Лимиты при записи, а не только при сборе: fsize капает размер одного
+      // файла, tmpfs /tmp ограничен по объёму, а сторож суммарного объёма
+      // /artifacts убивает контейнер при выходе за бюджет журнала.
       const args = ['run', '--rm', '--name', name, '--pull=never', '--network=none', '--read-only',
         '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
-        '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777', '-e', 'HOME=/tmp',
+        '--ulimit', `fsize=${ARTIFACT_MAX_FILE_BYTES}:${ARTIFACT_MAX_FILE_BYTES}`,
+        '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,size=64m', '-e', 'HOME=/tmp',
         '--mount', `type=bind,src=${source},dst=/candidate,readonly`,
         '--mount', `type=bind,src=${dropped},dst=/artifacts`, ...extras,
         '--workdir', posix.join('/candidate', cwd), image, ...argv];
       let output;
       let exit = 0;
+      let oversized = false;
+      const guard = setInterval(async () => {
+        try {
+          const usage = (await exec('du', ['-sb', dropped], { timeout: 5_000 })).stdout;
+          if (Number.parseInt(usage, 10) > ARTIFACT_MAX_TOTAL_BYTES) {
+            oversized = true;
+            await exec('docker', ['kill', name], { timeout: 5_000 }).catch(() => {});
+          }
+        } catch { /* Пропуск тика сторожа не открывает гейт. */ }
+      }, 250);
       try {
         const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
         output = `${run.stdout}${run.stderr}`;
@@ -226,8 +247,10 @@ export function offlineVisualRunner(journal) {
         exit = typeof error.code === 'number' ? error.code : null;
         output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
       } finally {
+        clearInterval(guard);
         await cleanupContainer(name);
       }
+      if (oversized) throw new Error('visual_artifacts_oversized');
       // Коды 125/126/127 (и невозможность получить код) — проверка не состоялась:
       // контейнер не запустился или команда не найдена. Это среда, не дефект кандидата.
       if (exit === null || exit === 125 || exit === 126 || exit === 127) {

@@ -246,3 +246,62 @@ test('конфиг Git и .gitattributes кандидата не влияют н
   const again = await tamperGate({ worktree: repo, base_sha: base, candidate_sha: candidate });
   assert.equal(again.digest, res.digest);
 });
+
+test('атрибут -diff кандидата не прячет текстовый diff от гейта', async () => {
+  const res = await gate({
+    base: {
+      'tests/app.test.js': 'test("a", () => {});\ntest("b", () => {});\n',
+      '.gitattributes': '*.test.js -diff\n',
+    },
+    candidate: {
+      'tests/app.test.js': 'test("a", () => {});\n',
+      '.gitattributes': '*.test.js -diff\n',
+    },
+  });
+  assert.equal(res.ok, false);
+  const v = res.violations.find((x) => x.kind === 'test_deleted');
+  assert.ok(v, JSON.stringify(res.violations));
+  assert.equal(v.file, 'tests/app.test.js');
+  assert.equal(v.line, 2);
+});
+
+test('удалённый бинарный тест-файл без текстового hunk фиксируется по метаданным', async () => {
+  const repo = await mkdtemp(path.join(testRoot, 'repo-'));
+  git(repo, 'init', '--initial-branch=pilot');
+  await mkdir(path.join(repo, 'tests'));
+  await writeFile(path.join(repo, 'tests/bin.test.js'), Buffer.from([0x00, 0x01, 0x02, 0xde, 0xad]));
+  const base = commit(repo, 'Base');
+  git(repo, 'rm', '-q', 'tests/bin.test.js');
+  const candidate = commit(repo, 'Delete');
+  const res = await tamperGate({ worktree: repo, base_sha: base, candidate_sha: candidate });
+  assert.equal(res.ok, false);
+  const v = res.violations.find((x) => x.kind === 'test_file_deleted');
+  assert.ok(v, JSON.stringify(res.violations));
+  assert.equal(v.file, 'tests/bin.test.js');
+});
+
+test('содержательный assert заменён слабым при том же числе строк — отказ', async () => {
+  const res = await gate({
+    base: { 'src/lib.js': 'assert.strictEqual(x, 1);\nassert(x > 0);\nexport const x = 1;\n' },
+    candidate: { 'src/lib.js': 'assert(x);\nassert(y);\nexport const x = 1;\n' },
+  });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
+});
+
+test('удалённый scripts.test в package.json — gate_bypass', async () => {
+  const res = await gate({
+    base: { 'package.json': '{"scripts":{"test":"node --test","lint":"echo ok"}}\n' },
+    candidate: { 'package.json': '{"scripts":{"lint":"echo ok"}}\n' },
+  });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.kind === 'gate_bypass'), JSON.stringify(res.violations));
+});
+
+test('удаление закомментированной проверки не считается ослаблением', async () => {
+  const res = await gate({
+    base: { 'src/lib.js': 'assert(x === 1);\n// assert(y === 2);\nexport const x = 1;\n' },
+    candidate: { 'src/lib.js': 'assert(x === 1);\nexport const x = 1;\n' },
+  });
+  assert.equal(res.ok, true, JSON.stringify(res.violations));
+});
