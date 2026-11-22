@@ -305,3 +305,49 @@ test('удаление закомментированной проверки н�
   });
   assert.equal(res.ok, true, JSON.stringify(res.violations));
 });
+
+test('локальный color.diff=always в .git/config не меняет нарушения и digest', async () => {
+  const { repo, base, candidate } = await fixture({
+    base: { 'tests/app.test.js': 'test("a", () => {});\ntest("b", () => {});\n' },
+    candidate: { 'tests/app.test.js': 'test("a", () => {});\n' },
+  });
+  const binding = { worktree: repo, base_sha: base, candidate_sha: candidate };
+  git(repo, 'config', 'color.diff', 'always');
+  const colored = await tamperGate(binding);
+  git(repo, 'config', 'color.diff', 'never');
+  const plain = await tamperGate(binding);
+  assert.equal(colored.ok, false);
+  assert.ok(colored.violations.some((v) => v.kind === 'test_deleted'), JSON.stringify(colored.violations));
+  assert.equal(colored.digest, plain.digest, 'digest одинаков при разном color.diff');
+});
+
+test('удаление пустого тест-файла с пробелом и " b/" в имени — точный путь', async () => {
+  const res = await gate({
+    base: { 'tests/dir b/empty': '' },
+    candidate: { 'tests/dir b/empty': null },
+  });
+  assert.equal(res.ok, false);
+  const v = res.violations.find((x) => x.kind === 'test_file_deleted');
+  assert.ok(v, JSON.stringify(res.violations));
+  assert.equal(v.file, 'tests/dir b/empty');
+});
+
+test('ослабление порога assert(>= 10) -> assert(>= 0) — отказ', async () => {
+  const res = await gate({
+    base: { 'src/lib.js': 'assert(value >= 10);\nexport const x = 1;\n' },
+    candidate: { 'src/lib.js': 'assert(value >= 0);\nexport const x = 1;\n' },
+  });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
+});
+
+test('scripts.test удалён на строке с metadata.test — gate_bypass по семантике JSON', async () => {
+  const res = await gate({
+    base: { 'package.json': '{"scripts":{"test":"node --test"},"metadata":{"test":"stay"}}\n' },
+    candidate: { 'package.json': '{"scripts":{},"metadata":{"test":"stay"}}\n' },
+  });
+  assert.equal(res.ok, false);
+  const v = res.violations.find((x) => x.kind === 'gate_bypass');
+  assert.ok(v, JSON.stringify(res.violations));
+  assert.match(v.detail, /scripts\.test/);
+});

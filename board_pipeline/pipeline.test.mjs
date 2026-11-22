@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { accept } from './acceptance.mjs';
 import { nativeBoardPort } from './native-board.mjs';
-import { offlineDockerRunner, worktreeInspector } from './runtime.mjs';
+import { offlineDockerRunner, offlineVisualRunner, worktreeInspector } from './runtime.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 import { loadSdk } from './sdk.mjs';
 
@@ -83,3 +83,60 @@ for (const red of [false, true]) {
     assert.equal(reviewed, red ? 0 : 1);
   });
 }
+
+test('визуальный гейт: tmpfs-квота при записи, артефакты возвращаются и аттестуются', async (t) => {
+  const temp = await mkdtemp(join(tmpdir(), 'board-visual-integration-'));
+  t.after(() => rm(temp, { recursive: true, force: true }));
+  const journal = join(temp, 'journal');
+  await mkdir(journal, { mode: 0o700 });
+  const tree = join(temp, 'tree');
+  await mkdir(tree);
+  const git = (...args) => command('git', ['-C', tree, ...args]);
+  git('init', '--initial-branch=pilot');
+  await writeFile(join(tree, 'page.txt'), 'hello\n');
+  git('add', 'page.txt');
+  git('-c', 'user.email=fixture@example.invalid', '-c', 'user.name=Fixture',
+    '-c', 'commit.gpgsign=false', 'commit', '-m', 'base');
+  const candidate = git('rev-parse', 'HEAD');
+  const image = command('docker', ['image', 'inspect', 'node:22.23.2-bookworm-slim', '--format', '{{.Id}}']);
+  const runner = offlineVisualRunner(journal);
+  const binding = { task_id: 't-visual', worktree: tree, candidate_sha: candidate };
+  const visual = (argv) => ({ visual: { image, argv, cwd: '.', timeoutMs: 60_000 } });
+
+  // Обычный артефакт возвращается через tmpfs-квоту и копирование в /out.
+  const res = await runner(binding, visual(['sh', '-c', 'echo shot > /artifacts/shot.png']));
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(res.status, 'pass');
+  assert.equal(res.artifacts.length, 1);
+  assert.match(res.artifacts[0].sha256, /^[0-9a-f]{64}$/);
+  assert.ok(res.artifacts[0].bytes >= 1);
+
+  // Квота nr_inodes при записи: ядро не даёт создать все 200 файлов; сверх 64
+  // собранных артефактов сбор отказывает — оба исхода безопасны.
+  const many = await runner(binding, visual(['sh', '-c',
+    'for i in $(seq 1 200); do echo x > /artifacts/f$i; done; true']))
+    .then((r) => r, (e) => ({ error: String(e) }));
+  if ('error' in many) {
+    assert.match(many.error, /Visual artifacts exceed|visual/);
+  } else {
+    assert.ok(many.artifacts.length < 200,
+      `ядро ограничило число файлов tmpfs: ${many.artifacts.length}`);
+  }
+
+  // Квота при записи: 40 МиБ в tmpfs size=32m и fsize=8MiB — на хост попадает
+  // только ограниченный объём, заполнить диск журнала рецепт не может.
+  const big = await runner(binding, visual(['sh', '-c',
+    'dd if=/dev/zero of=/artifacts/big.bin bs=1M count=40 2>/dev/null; ' +
+    'for i in $(seq 1 8); do dd if=/dev/zero of=/artifacts/p$i bs=1M count=9 2>/dev/null; done; true']))
+    .then((r) => r, (e) => ({ error: String(e) }));
+  if ('error' in big) {
+    // Лимит сбора — второй контур после ядерной квоты: переполнение невозможно.
+    assert.match(big.error, /Visual artifacts exceed/);
+  } else {
+    const total = big.artifacts.reduce((sum, a) => sum + a.bytes, 0);
+    assert.ok(total <= 32 * 1024 * 1024, `сумма ограничена квотой tmpfs: ${total}`);
+    assert.ok(big.artifacts.every((a) => a.bytes <= 8 * 1024 * 1024),
+      'каждый файл ограничен fsize');
+    assert.ok(big.artifacts.length <= 64, 'число файлов ограничено nr_inodes/сбором');
+  }
+});

@@ -489,8 +489,16 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
         typeof a.name === 'string' && a.name.length > 0 &&
         /^[0-9a-f]{64}$/.test(a.sha256 ?? '') &&
         Number.isSafeInteger(a.bytes) && a.bytes >= 1) &&
-      vis.evidence !== null && typeof vis.evidence === 'object' &&
-      Object.keys(vis.evidence).length > 0;
+      (() => {
+        const ev = vis.evidence;
+        if (ev === null || typeof ev !== 'object') return false;
+        const items = Array.isArray(ev) ? ev : [ev];
+        // Каждая наблюдаемая запись — аттестованный артефакт с нулевым кодом.
+        return items.length > 0 && items.every((item) =>
+          item !== null && typeof item === 'object' && !Array.isArray(item) &&
+          item.exit === 0 && typeof item.file === 'string' && item.file.length > 0 &&
+          /^[0-9a-f]{64}$/.test(item.sha256 ?? ''));
+      })();
     if (!attested) {
       return { status: 'hold', reason: 'visual_receipt_invalid' };
     }
@@ -730,7 +738,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   // has_ui при том же SHA не переиспользуют терминальный вердикт старого запуска.
   const id = journalId(runId(`${attempt.task_id}.${attempt.attempt_id}.${attempt.epoch}`,
     submission.candidate_sha, policy.version) + (key ? `-s${key}` : '') +
-    (attempt.has_ui === true ? '-ui' : attempt.has_ui === false ? '-u0' : ''));
+    '-h' + createHash('sha256').update(JSON.stringify([
+      attempt.task_id, attempt.attempt_id, attempt.epoch, submission.candidate_sha,
+      String(policy.version), attempt.has_ui ?? null, key ?? null,
+    ])).digest('hex').slice(0, 16));
   const file = path.join(journal, `${id}.jsonl`);
 
   let fh;
@@ -750,6 +761,16 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         task_id: attempt.task_id,
         attempt_id: attempt.attempt_id,
         candidate_sha: submission.candidate_sha,
+      };
+    }
+    if (runEntry.policy_version !== policy.version ||
+        (runEntry.has_ui ?? null) !== (attempt.has_ui ?? null)) {
+      return {
+        outcome: 'denied',
+        reason: 'journal_subject_mismatch',
+        task_id: attempt.task_id,
+        attempt_id: attempt.attempt_id,
+        run: id,
       };
     }
     if (!sameContract(runEntry, attempt)) {
@@ -796,6 +817,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     candidate_sha: submission.candidate_sha,
     policy_version: policy.version,
     finish: attempt.finish,
+    has_ui: attempt.has_ui ?? null,
     subject_digest: null,
     ...(key ? { contract: {
       repo_id: attempt.repo_id,

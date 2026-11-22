@@ -1256,7 +1256,7 @@ test('явное attempt.has_ui: false отключает L3 даже при has
 
 test('неаттестованный зелёный L3 — hold, а не pass: sha, статус, артефакты, evidence обязательны', async (t) => {
   for (const [name, receipt] of [
-    ['без артефактов', { ok: true, status: 'pass', artifacts: [], evidence: { exit: 0 } }],
+    ['без артефактов', { ok: true, status: 'pass', artifacts: [], evidence: { exit: 0, file: 'v.log', sha256: 'f'.repeat(64) } }],
     ['чужой sha', { ok: true, status: 'pass', sha: 'd'.repeat(40), artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: {} }],
     ['без status', { ok: true, artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: {} }],
   ]) {
@@ -1340,7 +1340,7 @@ test('смена has_ui при том же SHA не переиспользует
       visual: async (binding) => {
         visual++;
         return { ok: true, status: 'pass', sha: binding.candidate_sha,
-          artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: { exit: 0 } };
+          artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: { exit: 0, file: 'v.log', sha256: 'f'.repeat(64) } };
       } },
   });
   const first = await run(false);
@@ -1398,7 +1398,7 @@ test('collectVisualArtifacts: лимиты по числу и объёму, syml
 test('артефакт в 0 байт и пустое evidence не аттестуют зелёный L3', async (t) => {
   for (const [name, receipt] of [
     ['нулевой артефакт', { ok: true, status: 'pass',
-      artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 0 }], evidence: { exit: 0 } }],
+      artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 0 }], evidence: { exit: 0, file: 'v.log', sha256: 'f'.repeat(64) } }],
     ['пустое evidence', { ok: true, status: 'pass',
       artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: {} }],
   ]) {
@@ -1433,7 +1433,7 @@ test('has_ui: false затем отсутствие поля при has_ui в п
     visual: async (binding) => {
       visual++;
       return { ok: true, status: 'pass', sha: binding.candidate_sha,
-        artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: { exit: 0 } };
+        artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: { exit: 0, file: 'v.log', sha256: 'f'.repeat(64) } };
     },
   };
   const first = await acceptHeld({
@@ -1499,4 +1499,59 @@ test('максимально длинный составной ключ: жур�
   const after = await settled(handle, id);
   assert.equal(after.state, 'completed');
   assert.equal(JSON.stringify(after.result).length <= 1000, true);
+});
+
+test('зелёный L3 с evidence.exit!==0 или [null] — hold до L2', async (t) => {
+  for (const [name, evidence] of [
+    ['exit: 1', { exit: 1, file: 'v.log', sha256: 'f'.repeat(64) }],
+    ['массив [null]', [null]],
+  ]) {
+    const { handle, ported } = await isolated(t);
+    const id = await task(handle);
+    const { epoch, port } = await held(ported, id);
+    const { ports, calls } = stubs();
+    const res = await acceptHeld({
+      attempt: attempt(id, epoch, { has_ui: true }),
+      submission: submission(id, epoch),
+      policy: policy(id, { has_ui: true }),
+      journal: await tmpJournal(),
+      ports: { ...ports, board: port, visual: async (binding) => ({
+        ok: true, status: 'pass', sha: binding.candidate_sha,
+        artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 4 }], evidence }) },
+    });
+    assert.equal(res.outcome, 'hold', name);
+    assert.equal(res.reason, 'visual_receipt_invalid', name);
+    assert.equal(calls.review, 0, name);
+  }
+});
+
+test('без манифеста: (v1, has_ui:false) и (v1-u0, без has_ui) — разные запуски, L3 выполняется', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  await handle.label(id, { set: { finish: 'deployed' } });
+  const { epoch, port } = await held(ported, id);
+  const journal = await tmpJournal();
+  const run = (version, hasUi, visual) => {
+    const { ports } = stubs();
+    return acceptHeld({
+      attempt: attempt(id, epoch, { has_ui: hasUi, finish: 'deployed' }),
+      submission: submission(id, epoch),
+      policy: { ...policy(id, { has_ui: true }), version },
+      journal,
+      ports: { ...ports, board: port, ...(visual ? { visual } : {}) },
+    });
+  };
+  // Старый ключ 'run-…-vv1-u0' совпадал бы с 'run-…-vv1-u0' версии 'v1-u0'.
+  const first = await run('v1', false);
+  assert.equal(first.outcome, 'verified');
+  let visualCalls = 0;
+  const second = await run('v1-u0', undefined, async (binding) => {
+    visualCalls++;
+    return { ok: true, status: 'pass', sha: binding.candidate_sha,
+      artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 3 }],
+      evidence: { exit: 0, file: 'v.log', sha256: 'f'.repeat(64) } };
+  });
+  assert.equal(visualCalls, 1, 'L3 выполнен для нового эффективного требования');
+  assert.equal(second.outcome, 'verified');
+  assert.notEqual(second.run, first.run, 'коллизия ключа устранена хэшем кортежа');
 });
