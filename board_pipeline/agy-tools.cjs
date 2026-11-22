@@ -5,7 +5,7 @@ const { dirname, isAbsolute, relative, resolve, sep } = require('node:path');
 
 const schemas = new Map([
   ['view_file', ['AbsolutePath', 'StartLine', 'EndLine', 'IsSkillFile']],
-  ['read_file', ['Path', 'StartLine', 'EndLine', 'Offset', 'Limit']],
+  ['read_file', ['Path', 'StartLine', 'EndLine', 'Offset', 'ByteOffset', 'Limit']],
   ['grep_search', ['SearchPath', 'Query', 'IsRegex', 'CaseInsensitive', 'Includes', 'MatchPerLine']],
   ['grep', ['path', 'query', 'pattern', 'includes']],
   ['find_by_name', ['SearchDirectory', 'Pattern', 'Type', 'Excludes', 'Extensions', 'FullPath', 'MaxDepth']],
@@ -59,7 +59,7 @@ function safePattern(value) {
 }
 
 function safeArgument(key, value) {
-  if (key === 'Offset') return Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000;
+  if (key === 'Offset' || key === 'ByteOffset') return Number.isSafeInteger(value) && value >= 0 && value <= 100_000_000;
   if (['StartLine', 'EndLine', 'Limit', 'MaxDepth'].includes(key)) {
     return Number.isSafeInteger(value) && value > 0 && value <= 1_000_000;
   }

@@ -29,6 +29,7 @@ test('snapshot tool schema admits only known read/search operations with contain
   await symlink(outside, join(snapshot, 'candidate', 'escape'));
   for (const [name, args, expected] of [
     ['read_file', { Path: path }, 'candidate/ok.txt'],
+    ['read_file', { Path: path, StartLine: 1, EndLine: 100, ByteOffset: 46080 }, 'candidate/ok.txt'],
     ['view_file', { AbsolutePath: path, StartLine: 1 }, 'candidate/ok.txt'],
     ['grep_search', { SearchPath: 'candidate', Query: 'fixture', Includes: ['*.txt'] }, 'candidate'],
     ['find_by_name', { SearchDirectory: snapshot, Pattern: 'ok.*' }, '.'],
