@@ -168,7 +168,9 @@ export function isolatedNeonReviewRunner({ journal, prompt = '', timeoutMs = 480
       const verdict = neonVerdict(observed.text, binding.subject_digest);
       return { ...verdict, task: binding.task_id, sha: binding.candidate_sha, tree_sha: before.tree,
         checkpoint: transcript_sha256.slice(0, 32), transcript_sha256, transcript_file: name,
-        actual: observed.actual, attestation: observed.evidence, snapshot_reads: observed.verifiedReads.length, isolation: NEON_ISOLATION };
+        actual: observed.actual, attestation: observed.evidence, snapshot_reads: observed.verifiedReads.length, isolation: NEON_ISOLATION,
+        // VS-3: usage провайдера из потока agy; отсутствует — явный null.
+        usage: observed.usage ?? null };
     } finally {
       await chmod(join(scratch, 'review'), 0o700).catch(cause => { if (cause.code !== 'ENOENT') throw cause; });
       await rm(scratch, { recursive: true, force: true });
