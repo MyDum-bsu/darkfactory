@@ -26,6 +26,19 @@ node board_pipeline/run-isolated.mjs --execute --daemon \
 - Очередной маршрут: `done`/`hold` освобождают слот для следующей карточки,
   `uncertain`/`lease_lost` останавливают демон с кодом 1. Маршрут с
   закреплённой карточкой завершается на любом терминале.
+
+Карта кодов выхода:
+
+| Исход | Код | Restart=on-failure |
+| --- | --- | --- |
+| SIGTERM/SIGINT (`systemctl stop`) | 0 | нет |
+| kill-switch `stop`/удалён (в т.ч. уже на старте) | 0 | нет |
+| Очередь: `done`/`hold` — слот освобождается, опрос продолжается | — | — |
+| Очередь: `release_ready` без releasePort | 0 | нет |
+| Очередь: `uncertain`/`lease_lost` | 1 | да |
+| Закреплённая карточка: `done` | 0 | нет |
+| Закреплённая карточка: `hold`/`uncertain`/`lease_lost` | 1 | да |
+| Ошибка запуска (политика, дисковый preflight, нет switch) | 1 | да |
 - `--stop-on-idle` в режиме `--daemon` игнорируется: холостой опрос —
   штатная работа фонового сервиса.
 
@@ -54,9 +67,11 @@ systemctl --user enable --now darkfactory-daemon
 
 Поведение юнита:
 
-- `Restart=on-failure` + `RestartSec=15` — рестарт только после сбоя.
-  Корректные завершения (SIGTERM от `systemctl stop`, kill-switch `stop`,
-  терминальная фаза попытки) дают код 0 и рестарт-лупа не создают.
+- `Restart=on-failure` + `RestartSec=15` — рестарт только после сбоя
+  (код 1: `uncertain`/`lease_lost`, не-`done` терминал закреплённой
+  карточки, ошибка запуска). Корректные завершения (SIGTERM от
+  `systemctl stop`, kill-switch `stop`, `done`, `release_ready`) дают
+  код 0 и рестарт-лупа не создают — см. карту кодов выше.
 - `TimeoutStopSec=120` — бюджет на завершение активного тика при стопе;
   по его истечении systemd шлёт SIGKILL.
 - `MemoryMax=2G`, `NoNewPrivileges=true` — ограничения сервиса.

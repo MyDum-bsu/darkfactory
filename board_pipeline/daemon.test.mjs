@@ -232,7 +232,7 @@ async function startBoard(cli, t) {
   return { url, dir };
 }
 
-async function daemonFixture(t, url) {
+async function daemonFixture(t, url, { pilot = false } = {}) {
   // Фикстура на ФС с реальными правами и >= 8 GiB (state/switch требуют 0700,
   // дисковый preflight проверяет tree): worktree-раздел может не давать 0700.
   const base = await mkdtemp(join(homedir(), '.df-daemon-it-'));
@@ -262,9 +262,14 @@ async function daemonFixture(t, url) {
   await writeFile(join(ops, 'logika.md'), 'Synthetic review skill\n');
   await writeFile(join(gate, 'gate.json'), '{}\n');
   await writeFile(join(gate, 'routes.json'), '{}\n');
+  const switchFile = join(switchDir, 'daemon.switch');
   const policy = join(ops, 'policy.json');
   await writeFile(policy, JSON.stringify({
-    scope: 'isolated', boardUrl: url, channel: 'pilot', version: 'daemon-it-1',
+    ...(pilot
+      ? { scope: 'pilot', channel: 'bgu-cabinet',
+          pilot: { enabled: true, killSwitch: switchFile } }
+      : { scope: 'isolated', channel: 'pilot' }),
+    boardUrl: url, version: 'daemon-it-1',
     owner: 'daemon-it', label: { key: 'queue', value: 'daemon-it' },
     waitMs: 1000,
     bb: { provider: 'acp-devin', model: 'swe-2-high', project: 'proj_daemonit' },
@@ -277,7 +282,6 @@ async function daemonFixture(t, url) {
     brief: join(ops, 'brief.md'), reviewPrompt: join(ops, 'review.md'),
     reviewGate: join(gate, 'gate.json'), handoffDir: inbox,
   }));
-  const switchFile = join(switchDir, 'daemon.switch');
   const spawn = () => {
     const child = spawnProcess(process.execPath,
       [join(repoRoot, 'board_pipeline', 'run-isolated.mjs'), '--execute', '--daemon',
@@ -362,6 +366,23 @@ test('run-isolated --daemon: starting under stop switch exits 0 without ticks', 
   t.after(() => child.kill('SIGKILL'));
   const stopped = await fx.stop(child);
   assert.equal(stopped.code, 0, 'stopped switch must not crash-loop under Restart=on-failure');
+  const events = (await readFile(fx.journal, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(events.at(-1).event, 'daemon_stop');
+  assert.equal(events.at(-1).reason, 'kill_switch');
+  assert.equal(events.filter(e => e.event === 'tick').length, 0);
+});
+
+test('run-isolated --daemon: pilot scope under stop switch also exits 0', async t => {
+  // scope=pilot активирует eager switchOpen: регрессия — остановленный
+  // kill-switch обязан дойти до runDaemon (kill_switch, exit 0), а не бросать
+  // PilotDenied до цикла.
+  const { url } = await startBoard(boardCli(), t);
+  const fx = await daemonFixture(t, url, { pilot: true });
+  await writeFile(fx.switchFile, 'stop\n', { mode: 0o600 });
+  const child = fx.spawn();
+  t.after(() => child.kill('SIGKILL'));
+  const stopped = await fx.stop(child);
+  assert.equal(stopped.code, 0, `pilot stopped switch must exit cleanly, output: ${stopped.output}`);
   const events = (await readFile(fx.journal, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   assert.equal(events.at(-1).event, 'daemon_stop');
   assert.equal(events.at(-1).reason, 'kill_switch');

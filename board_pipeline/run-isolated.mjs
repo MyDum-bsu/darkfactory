@@ -116,7 +116,10 @@ async function execute() {
   const switchOpen = activation && await createPilotSwitch(activation.killSwitch, {
     permitDirectory: dir => [tree, inbox, root].every(path => !inside(path, dir) && !inside(dir, path)),
   });
-  await switchOpen?.();
+  // В daemon-режиме eager-проверка пропускается: остановленный на старте
+  // kill-switch ловит первый тик runDaemon и завершает процесс чисто (exit 0,
+  // kill_switch в журнале), а не PilotDenied -> restart-луп под systemd.
+  if (!values.daemon) await switchOpen?.();
   const brief = await realpath(p.brief);
   const reviewPrompt = await realpath(p.reviewPrompt);
   const reviewGate = await realpath(p.reviewGate);
