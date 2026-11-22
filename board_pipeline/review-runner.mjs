@@ -563,7 +563,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         const { stdout: patch } = await exec('git',
           ['-C', binding.worktree, 'diff', `${binding.base_sha}..${binding.candidate_sha}`],
           { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
-        await writeFile(diffFile, patch, { mode: 0o600 });
+        if (patch.trim()) await writeFile(diffFile, patch, { mode: 0o600 });
       } catch { /* без diff ревью всё равно идёт по снимку */ }
 
       // Контрольные значения ДО запуска: дерево, байты снимка и worktree.
@@ -628,6 +628,10 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       }
       env.PI_ALLOW_CONNECT = [...new Set(allow)].join(',');
 
+      const hasDiff = mounts.some((m) => m.dst === '/review/diff.patch');
+      const diffLine = hasDiff
+        ? 'and the exact diff base→candidate is mounted read-only at /review/diff.patch'
+        : 'and the base→candidate diff is not available (review the tree as a whole)';
       const subjectLine = binding.subject_digest
         ? `The required subject_digest for this candidate is "${binding.subject_digest}". ` +
           'Echo that exact string as "subject_digest" inside the verdict JSON — ' +
@@ -635,9 +639,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         : '';
       const instruction = [
         `Independent, read-only review for Board #${binding.task_id} at ${binding.candidate_sha}.`,
-        'The candidate tree is mounted read-only at /candidate, and the exact diff',
-        'base→candidate is mounted read-only at /review/diff.patch. Review the diff and the tree',
-        'against the spec below. You have read-only tools only; do not attempt to write.',
+        `The candidate tree is mounted read-only at /candidate, ${diffLine}.`,
+        'Review against the spec below. You have read-only tools only;',
+        'do not attempt to write.',
         'Finish with exactly one verdict: a JSON code block {"verdict":"PASS"|"REWORK"|"ESCALATE",',
         '"summary":"...","findings":[{"file","line","input","expected","actual","freq","harm"}],',
         '"checked_invariants":["..."]}, or a final line REVIEW_OK or REVIEW_BLOCKED.',
