@@ -6,7 +6,7 @@
   "engines": { "node": ">=22.18" },
   "scripts": {
     "doctor": "node ops/check-host.mjs",
-    "test": "node --test board_pipeline/acceptance.test.mjs board_pipeline/accept-held.test.mjs board_pipeline/tamper-gate.test.mjs board_pipeline/native-board.test.mjs board_pipeline/controller.test.mjs board_pipeline/subject.test.mjs board_pipeline/slot.test.mjs board_pipeline/neon-review.test.mjs board_pipeline/model-proxy.test.mjs board_pipeline/question-gate.test.mjs board_pipeline/release-contract.test.mjs board_pipeline/pilot-gate.test.mjs board_pipeline/review-runner.test.mjs board_pipeline/worker-selector.test.mjs board_pipeline/bb-reconcile.test.mjs ops/local/*.test.mjs",
+    "test": "node --test board_pipeline/acceptance.test.mjs board_pipeline/accept-held.test.mjs board_pipeline/tamper-gate.test.mjs board_pipeline/native-board.test.mjs board_pipeline/controller.test.mjs board_pipeline/subject.test.mjs board_pipeline/slot.test.mjs board_pipeline/neon-review.test.mjs board_pipeline/agy-tools.test.mjs board_pipeline/model-proxy.test.mjs board_pipeline/question-gate.test.mjs board_pipeline/release-contract.test.mjs board_pipeline/pilot-gate.test.mjs board_pipeline/review-runner.test.mjs board_pipeline/worker-selector.test.mjs board_pipeline/bb-reconcile.test.mjs ops/local/*.test.mjs",
     "test:integration": "node --test board_pipeline/pipeline.test.mjs board_pipeline/subject-flow.test.mjs board_pipeline/review-runner.integration.test.mjs board_pipeline/conformance.test.mjs",
     "test:live:review": "node --test board_pipeline/review-runner.live.test.mjs",
     "test:neon:live": "node --test --test-name-pattern='Neon live' board_pipeline/review-runner.live.test.mjs",

@@ -1,4 +1,4 @@
-export const NEON_ISOLATION = 'docker-ro-pack+host-agy-notool-v1';
+export const NEON_ISOLATION = 'docker-ro-pack+host-agy-rotools-v2';
 export const NEON_CRITIC = Object.freeze({ provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' });
 export const SOL_ARBITER = Object.freeze({ provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' });
 

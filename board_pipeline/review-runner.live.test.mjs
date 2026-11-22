@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { lstat, mkdtemp, rm } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -81,9 +81,14 @@ test('Sol arbiter live: isolated actual model, medium effort and exact review su
   assert.equal(decision.decision, 'directed_rework');
 });
 
-test('Neon live: real medium model returns bound REWORK then PASS', async t => {
-  const { repo, journal, binding, profile } = await neonFixture(t);
-  const run = isolatedNeonReviewRunner({ journal, prompt: SPEC });
+test('Neon live: medium model reads the snapshot and returns bound REWORK then PASS', async t => {
+  const { repo, journal, binding, profile } = await neonFixture(t, {
+    'contract.txt': SPEC + '\n',
+    'unrelated-archive.txt': 'fixture archive\n'.repeat(45_000),
+  });
+  const prompt = 'Judge sum.js against the rule in candidate/contract.txt. Use read_file yourself on both exact paths ' +
+    'candidate/contract.txt and candidate/sum.js before returning the verdict. Do not delegate or read unrelated-archive.txt.';
+  const run = isolatedNeonReviewRunner({ journal, prompt });
   for (const [expression, status, digit] of [['a + b + 1', 'REWORK', 'b'], ['a + b', 'PASS', 'c']]) {
     const candidate_sha = await commitFile(repo, `export function sum(a, b) { return ${expression}; }\n`);
     const subject_digest = digit.repeat(64);
@@ -93,6 +98,11 @@ test('Neon live: real medium model returns bound REWORK then PASS', async t => {
     assert.deepEqual(receipt.actual, NEON_CRITIC);
     assert.equal(receipt.isolation, NEON_ISOLATION);
     assert.deepEqual(receipt.attestation, { model: 'agy_stream_init', effort: 'agy_cli_request' });
+    assert.ok(receipt.snapshot_reads >= 2);
+    const trace = JSON.parse(await readFile(join(journal, receipt.transcript_file), 'utf8'));
+    const paths = trace.reads.map(read => read.path);
+    assert.ok(paths.includes('candidate/contract.txt'));
+    assert.ok(paths.includes('candidate/sum.js'));
     assert.match(receipt.transcript_sha256, /^[a-f0-9]{64}$/);
   }
 });

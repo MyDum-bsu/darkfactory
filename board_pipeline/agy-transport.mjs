@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ReviewDenied } from './review-runner.mjs';
 import { withModelProxy } from './model-proxy.mjs';
 import agyStream from './agy-stream.cjs';
@@ -74,18 +75,39 @@ async function withAgyKeyring({ address, path, item }, run) {
   }
 }
 
-// Host model transport only. All source material comes from an offline pack;
-// the child gets neither worktree/state paths nor inherited ambient env.
-export async function hostAgyTransport({ prompt, timeoutMs = 210_000, env = process.env,
+const local = filename => fileURLToPath(new URL(`./${filename}`, import.meta.url));
+const sh = value => `'${value.replaceAll("'", "'\\''")}'`;
+
+async function snapshotBoundary(cwd, scratch, home, runtime) {
+  if (!isAbsolute(cwd) || await realpath(cwd) !== cwd) throw new ReviewDenied('agy_snapshot_workspace_invalid');
+  if ((await readdir(cwd)).length !== 0) throw new ReviewDenied('agy_snapshot_workspace_invalid');
+  const control = join(scratch, 'control');
+  const events = join(scratch, 'events');
+  const tmp = join(scratch, 'tmp');
+  const hooks = join(home, '.gemini', 'config');
+  await Promise.all([control, events, tmp, hooks].map(dir => mkdir(dir, { recursive: true, mode: 0o700 })));
+  const node = await realpath(process.execPath);
+  for (const file of ['agy-pre-tool.cjs', 'agy-tools.cjs']) await copyFile(local(file), join(control, file));
+  const command = [node, join(control, 'agy-pre-tool.cjs'), cwd, control, events].map(sh).join(' ');
+  await writeFile(join(hooks, 'hooks.json'), JSON.stringify({
+    'snapshot-guard': { PreToolUse: [{ matcher: '', hooks: [{ command }] }] },
+  }), { mode: 0o600, flag: 'wx' });
+  return { launcher: local('agy-landlock.py'), snapshot: cwd, control, events, tmp, home, runtime, node };
+}
+
+// Host model transport over the offline snapshot; no ambient env or worker path.
+export async function hostAgyTransport({ prompt, snapshot, publishSnapshot, timeoutMs = 210_000, env = process.env,
   launch = agyStream.runAgy, beforeEffect }) {
   const binary = await ownedFile(env.DF_AGY_BINARY ?? join(homedir(), '.local', 'opt', 'antigravity-cli', 'agy'),
     'agy_binary_not_enrolled');
   const scope = await ownedFile(env.DF_AGY_SCOPE_FILE ?? join(homedir(), '.config', 'antigravity', 'credential-user-scope'),
     'agy_scope_not_enrolled');
   const scratch = await mkdtemp(join(tmpdir(), 'df-agy-'));
-  const empty = join(scratch, 'empty');
+  const cwd = snapshot;
   try {
-    await mkdir(empty, { mode: 0o500 });
+    if (!isAbsolute(cwd ?? '') || typeof publishSnapshot !== 'function') throw new ReviewDenied('agy_snapshot_workspace_invalid');
+    const initial = await lstat(cwd);
+    if (!initial.isDirectory() || (initial.mode & 0o777) !== 0o500) throw new ReviewDenied('agy_snapshot_workspace_invalid');
     const home = join(scratch, 'home');
     const config = join(home, '.config');
     const runtime = join(scratch, 'run');
@@ -93,24 +115,27 @@ export async function hostAgyTransport({ prompt, timeoutMs = 210_000, env = proc
     await mkdir(runtime, { mode: 0o700 });
     await mkdir(join(config, 'antigravity'), { recursive: true, mode: 0o700 });
     await copyFile(scope, join(config, 'antigravity', 'credential-user-scope'));
+    const boundary = await snapshotBoundary(cwd, scratch, home, runtime);
     const username = userInfo().username;
     const proxyEnv = env.DF_AGY_HTTPS_PROXY ? { HTTPS_PROXY: env.DF_AGY_HTTPS_PROXY } : env;
     const result = await withAgyKeyring({ address: env.DBUS_SESSION_BUS_ADDRESS, path: keyring, item: env.DF_AGY_KEYRING_ITEM },
       revokeKeyring => withModelProxy({ allow: EGRESS, bootstrap: BOOTSTRAP, env: proxyEnv,
         hostClient: true, beforeConnect: beforeEffect },
-        (proxy, sealModelBootstrap) => launch({ binary, cwd: empty, prompt, timeoutMs, beforeEffect,
+        (proxy, sealModelBootstrap) => launch({ binary, cwd, prompt, timeoutMs, beforeEffect, publishSnapshot,
+          boundary: { ...boundary, proxyPort: Number(new URL(proxy).port) },
           sealBootstrap: () => { sealModelBootstrap(); return revokeKeyring(); },
           env: { PATH: '/usr/bin:/bin', HOME: home, XDG_CONFIG_HOME: config, XDG_RUNTIME_DIR: runtime,
+            TMPDIR: boundary.tmp,
             USER: username, LOGNAME: username, LANG: 'C.UTF-8',
             DBUS_SESSION_BUS_ADDRESS: `unix:path=${keyring}`,
             HTTPS_PROXY: proxy, HTTP_PROXY: proxy, https_proxy: proxy, http_proxy: proxy,
             NO_PROXY: '', no_proxy: '' } })));
-    if (((await lstat(empty)).mode & 0o777) !== 0o500 || (await readdir(empty)).length !== 0) {
+    const final = await lstat(cwd);
+    if (final.dev !== initial.dev || final.ino !== initial.ino || (final.mode & 0o777) !== 0o500) {
       throw new ReviewDenied('agy_cwd_mutated');
     }
     return result;
   } finally {
-    try { await chmod(empty, 0o700); } catch (cause) { if (cause.code !== 'ENOENT') throw cause; }
     await rm(scratch, { recursive: true, force: true });
   }
 }

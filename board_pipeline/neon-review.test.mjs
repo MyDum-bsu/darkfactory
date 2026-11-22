@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, lstat, readFile, readdir, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
@@ -14,8 +14,9 @@ import { PilotDenied } from './pilot-gate.mjs';
 const subject_digest = 'a'.repeat(64);
 const verdict = { verdict: 'PASS', subject_digest, summary: 'Matches the spec',
   findings: [], checked_invariants: ['arithmetic'] };
-const snapshot = async () => ({ code: 0, stdout: '[{"path":"sum.js","text":"code"}]' });
-const wire = (result = verdict, options) => ({ code: 0, cwd: '/candidate', stdout: agyStreamFixture(result, options) });
+const snapshot = async () => ({ code: 0, stdout: '["candidate/sum.js"]' });
+const wire = (cwd, result = verdict, options) => ({ code: 0, cwd,
+  stdout: agyStreamFixture(result, { cwd, reads: ['candidate/sum.js'], ...options }) });
 
 async function fixture(t) {
   const { repo, journal, binding, profile } = await neonFixture(t);
@@ -32,19 +33,24 @@ test('Neon ReviewPort separates offline snapshot and Agy model-only request', as
       assert.equal(request.mounts, undefined);
       assert.match(await readFile(join(request.snapshot, 'sum.js'), 'utf8'), /a\+b/);
       return snapshot();
-    }, transport: async ({ prompt }) => {
+    }, transport: async ({ prompt, snapshot: cwd, publishSnapshot }) => {
+      assert.deepEqual(await readdir(cwd), []);
+      await publishSnapshot();
       assert.match(prompt, /approved logika/);
       assert.match(prompt, new RegExp(subject_digest));
-      const { diff, files } = JSON.parse(prompt.split('BEGIN CANDIDATE DATA\n')[1].split('\nEND CANDIDATE DATA')[0]);
-      assert.match(diff, /\+export const sum/);
-      assert.deepEqual(files, [{ path: 'sum.js', text: 'code' }]);
-      return wire();
+      assert.match(prompt, /diff\.patch/);
+      assert.match(prompt, /candidate\/sum\.js/);
+      assert.doesNotMatch(prompt, /export const sum/);
+      assert.match(await readFile(join(cwd, 'diff.patch'), 'utf8'), /\+export const sum/);
+      assert.deepEqual(JSON.parse(await readFile(join(cwd, 'files.json'), 'utf8')), ['candidate/sum.js']);
+      return wire(cwd);
     } });
   const receipt = await runner(binding, profile);
   assert.equal(receipt.verdict, 'REVIEW_OK');
   assert.equal(receipt.subject_digest, subject_digest);
   assert.deepEqual(receipt.actual, profile.review);
   assert.equal(receipt.isolation, NEON_ISOLATION);
+  assert.equal(receipt.snapshot_reads, 1);
   assert.deepEqual(receipt.attestation, { model: 'agy_stream_init', effort: 'agy_cli_request' });
   assert.match(receipt.transcript_sha256, /^[a-f0-9]{64}$/);
 });
@@ -52,15 +58,22 @@ test('Neon ReviewPort separates offline snapshot and Agy model-only request', as
 test('Neon never retries unavailable, mismatched or tool-using attempts', async t => {
   const { journal, binding, profile } = await fixture(t);
   const outcomes = [
-    [wire(verdict, { model: 'wrong-model' }), 'agy_init_unattested'],
-    [wire({ ...verdict, subject_digest: 'b'.repeat(64) }), 'review_verdict_subject_mismatch'],
-    [wire(verdict, { step: { step_type: 'tool', tool_info: { name: 'view_file' } } }), 'review_tool_use_forbidden'],
-    [{ code: 1, stderr: 'agy_auth_unavailable\n' }, 'agy_auth_unavailable'],
+    [cwd => wire(cwd, verdict, { model: 'wrong-model' }), 'agy_init_unattested'],
+    [cwd => wire(cwd, { ...verdict, subject_digest: 'b'.repeat(64) }), 'review_verdict_subject_mismatch'],
+    [cwd => wire(cwd, verdict, { step: { step_type: 'tool', tool_info: { name: 'view_file' } } }), 'review_tool_use_forbidden'],
+    [cwd => wire(cwd, verdict, { reads: ['../../outside.txt'] }), 'review_tool_use_forbidden'],
+    [cwd => wire(cwd, verdict, { reads: [] }), 'agy_snapshot_unread'],
+    [() => ({ code: 1, stderr: 'agy_auth_unavailable\n' }), 'agy_auth_unavailable'],
   ];
   for (const [response, reason] of outcomes) {
     let calls = 0;
     const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot,
-      transport: async () => { calls++; return response; } });
+      transport: async ({ snapshot: cwd, publishSnapshot }) => {
+        calls++;
+        const result = response(cwd);
+        if (result.code === 0) await publishSnapshot();
+        return result;
+      } });
     await assert.rejects(run(binding, profile), { reason });
     assert.equal(calls, 1);
   }
@@ -69,10 +82,11 @@ test('Neon never retries unavailable, mismatched or tool-using attempts', async 
 test('Neon rejects same-family and drifting worktree', async t => {
   const { journal, binding, profile } = await fixture(t);
   let calls = 0;
-  const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot, transport: async () => {
+  const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot, transport: async ({ snapshot: cwd, publishSnapshot }) => {
     calls++;
+    await publishSnapshot();
     await writeFile(join(binding.worktree, 'sum.js'), 'changed during review');
-    return wire();
+    return wire(cwd);
   } });
   await assert.rejects(run({ ...binding, executor: 'google/gemini-4-neon' }, profile),
     { reason: 'review_same_family' });
@@ -80,27 +94,48 @@ test('Neon rejects same-family and drifting worktree', async t => {
   await assert.rejects(run(binding, profile), { reason: 'worktree_drift_during_review' });
 });
 
-test('Agy transport launches with an empty 0500 directory and never inherits task authority', async t => {
+test('a 640 KiB candidate patch remains complete on disk, not clipped or embedded in the Agy prompt', async t => {
+  const { repo, journal, binding, profile } = await neonFixture(t);
+  const body = 'a'.repeat(640 * 1024) + '\nLARGE_PATCH_TRAILER\n';
+  const candidate_sha = await commitFile(repo, body);
+  const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot, transport: async ({ prompt, snapshot: cwd, publishSnapshot }) => {
+    await publishSnapshot();
+    assert.ok(Buffer.byteLength(prompt) < 4096);
+    assert.doesNotMatch(prompt, /LARGE_PATCH_TRAILER/);
+    const patch = await readFile(join(cwd, 'diff.patch'), 'utf8');
+    assert.ok(patch.includes(`+${body.split('\n')[0]}\n+LARGE_PATCH_TRAILER\n`));
+    return wire(cwd);
+  } });
+  const receipt = await run({ ...binding, candidate_sha, subject_digest }, profile);
+  assert.equal(receipt.snapshot_reads, 1);
+});
+
+test('Agy transport launches in the read-only staged snapshot and never inherits task authority', async t => {
   const { journal, binding } = await fixture(t);
   const binary = join(journal, 'synthetic-binary');
   const scope = join(journal, 'synthetic-scope');
   await writeFile(binary, '', { mode: 0o500 });
   await writeFile(scope, 'synthetic-provider-label', { mode: 0o600 });
+  const cwd = join(journal, 'review');
+  await mkdir(cwd, { mode: 0o500 });
   const env = { DF_AGY_BINARY: binary, DF_AGY_SCOPE_FILE: scope, DF_AGY_KEYRING_ITEM: '/org/freedesktop/secrets/collection/login/0',
     DBUS_SESSION_BUS_ADDRESS: 'unix:path=/nonexistent-session-bus', HTTPS_PROXY: 'http://127.0.0.1:3189',
     BOARD_TOKEN: 'fake-lease', BOARD_URL: 'http://127.0.0.1:44100/api/board', BB_THREAD_ID: 'thr_fake',
     WORKTREE: binding.worktree, STATE: journal };
-  await hostAgyTransport({ env, prompt: 'synthetic prompt', launch: async request => {
-    assert.equal((await lstat(request.cwd)).mode & 0o777, 0o500);
-    assert.deepEqual(await readdir(request.cwd), []);
-    for (const key of ['BOARD_TOKEN', 'BOARD_URL', 'BB_THREAD_ID', 'WORKTREE', 'STATE']) {
-      assert.equal(Object.hasOwn(request.env, key), false);
-    }
-    assert.notEqual(request.env.HOME, process.env.HOME);
-    assert.equal(new URL(request.env.HTTPS_PROXY).hostname, '127.0.0.1');
-    await request.sealBootstrap();
-    return { code: 0, cwd: request.cwd };
-  } });
+  try {
+    await hostAgyTransport({ env, snapshot: cwd, publishSnapshot: async () => {}, prompt: 'synthetic prompt', launch: async request => {
+      assert.equal(request.cwd, cwd);
+      assert.equal((await lstat(request.cwd)).mode & 0o777, 0o500);
+      assert.deepEqual(await readdir(request.cwd), []);
+      for (const key of ['BOARD_TOKEN', 'BOARD_URL', 'BB_THREAD_ID', 'WORKTREE', 'STATE']) {
+        assert.equal(Object.hasOwn(request.env, key), false);
+      }
+      assert.notEqual(request.env.HOME, process.env.HOME);
+      assert.equal(new URL(request.env.HTTPS_PROXY).hostname, '127.0.0.1');
+      await request.sealBootstrap();
+      return { code: 0, cwd: request.cwd };
+    } });
+  } finally { await chmod(cwd, 0o700); }
 });
 
 test('Agy pilot cut after init withholds the prompt from the already-started process', async t => {

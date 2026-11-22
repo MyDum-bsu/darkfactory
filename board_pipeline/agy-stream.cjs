@@ -2,23 +2,61 @@
 
 const { execFile, spawn } = require('node:child_process');
 const { once } = require('node:events');
-const { promisify } = require('node:util');
+const { lstat, readFile, writeFile } = require('node:fs/promises');
+const { join } = require('node:path');
+const { isDeepStrictEqual, promisify } = require('node:util');
+const { checkSnapshotTool, isSnapshotTool } = require('./agy-tools.cjs');
 const MODEL = 'gemini-4-neon';
 const EFFORT = 'medium';
 const LIMIT = 2 * 1024 * 1024;
 const STEP_FIELDS = new Set(['conversation_id', 'step_index', 'state', 'step_type',
-  'text_delta', 'duration_seconds', 'usage']);
+  'text_delta', 'duration_seconds', 'usage', 'tool_name', 'tool_info']);
 const SAFE_STEPS = new Set(['user_input', 'agent_response', 'checkpoint']);
 const INIT_FIELDS = new Set(['model', 'cwd', 'tools', 'permission_mode', 'agent', 'json_schema']);
 const RESULT_FIELDS = new Set(['conversation_id', 'status', 'response', 'duration_seconds', 'num_turns', 'usage',
   'error', 'finished_reason', 'structured_output', 'json_schema']);
-const SETTINGS = JSON.stringify({ toolPermission: 'request-review', permissions: { deny: [
-  'read_file(*)', 'write_file(*)', 'command(*)', 'mcp(*)', 'read_url(*)', 'execute_url(*)', 'download_url(*)',
-] } });
+const settings = (cwd, snapshotTools) => JSON.stringify({ toolPermission: 'request-review',
+  ...(snapshotTools ? { trustedWorkspaces: [cwd] } : {}), permissions: { deny: [
+    ...(!snapshotTools ? ['read_file(*)'] : []), 'write_file(*)', 'command(*)', 'mcp(*)',
+    'read_url(*)', 'execute_url(*)', 'download_url(*)',
+  ] } });
 
 function error(reason) { return Object.assign(new Error(reason), { reason }); }
 
-function monitorAgy(cwd) {
+function trackSnapshotReads(cwd, enabled) {
+  const pending = new Map();
+  const reads = new Map();
+  const successful = new Set();
+  return {
+    push(step) {
+      const { step_index: index, tool_name: name, tool_info: info } = step;
+      if (!enabled || !isSnapshotTool(name) || reads.has(index) ||
+          (info?.name !== undefined && info.name !== name)) throw error('review_tool_use_forbidden');
+      const prior = pending.get(index);
+      if (prior && prior.name !== name) throw error('review_tool_use_forbidden');
+      const args = info?.parameters;
+      const checked = args === undefined ? null : checkSnapshotTool(cwd, name, args);
+      if (prior?.path !== undefined && checked && prior.path !== checked.path) throw error('review_tool_use_forbidden');
+      if (step.state === 'ACTIVE') {
+        pending.set(index, checked ?? prior ?? { name });
+        return;
+      }
+      if (!checked) throw error('review_tool_use_forbidden');
+      pending.delete(index);
+      reads.set(index, { stepIdx: index, ...checked });
+      if (info.error == null) successful.add(index);
+    },
+    finish() {
+      if (pending.size) throw error('agy_incomplete_turn');
+      if (enabled && !successful.size) throw error('agy_snapshot_unread');
+      const recorded = [...reads.values()];
+      return { reads: recorded, verifiedReads: recorded.filter(read => successful.has(read.stepIdx)) };
+    },
+  };
+}
+
+function monitorAgy(cwd, { snapshotTools = false } = {}) {
+  const reader = trackSnapshotReads(cwd, snapshotTools);
   let conversation;
   let result;
   let prompts = 0;
@@ -47,11 +85,13 @@ function monitorAgy(cwd) {
         case 'step_update': {
           const step = event.step_update;
           if (!conversation || step?.conversation_id !== conversation ||
-              !SAFE_STEPS.has(step?.step_type) || Object.keys(step).some(key => !STEP_FIELDS.has(key))) {
-            throw error('review_tool_use_forbidden');
-          }
+              Object.keys(step).some(key => !STEP_FIELDS.has(key))) throw error('review_tool_use_forbidden');
           if (!Number.isSafeInteger(step.step_index) || step.step_index < 0 ||
               !['ACTIVE', 'DONE'].includes(step.state)) throw error('agy_stream_corrupt');
+          if (step.step_type === 'tool') { reader.push(step); break; }
+          if (!SAFE_STEPS.has(step.step_type) || Object.hasOwn(step, 'tool_name') || Object.hasOwn(step, 'tool_info')) {
+            throw error('review_tool_use_forbidden');
+          }
           if (step.step_type === 'user_input' && step.state === 'DONE' && ++prompts !== 1) {
             throw error('agy_stream_extra_turn');
           }
@@ -75,21 +115,21 @@ function monitorAgy(cwd) {
     },
     finish() {
       if (!result) throw error('agy_incomplete_turn');
-      return { text: result, actual: { provider: 'google', model: MODEL, reasoningLevel: EFFORT },
+      return { text: result, ...reader.finish(), actual: { provider: 'google', model: MODEL, reasoningLevel: EFFORT },
         evidence: { model: 'agy_stream_init', effort: 'agy_cli_request' } };
     },
   };
 }
 
-function parseAgyStream(stream, cwd) {
-  const monitor = monitorAgy(cwd);
+function parseAgyStream(stream, cwd, options) {
+  const monitor = monitorAgy(cwd, options);
   if (Buffer.byteLength(stream) > LIMIT) throw error('agy_stream_too_large');
   for (const line of stream.trimEnd().split('\n')) monitor.push(line);
   return monitor.finish();
 }
 
-async function superviseAgy(child, settled, { cwd, onInit, emit, kill = () => child.kill('SIGKILL') }) {
-  const monitor = monitorAgy(cwd);
+async function superviseAgy(child, settled, { cwd, onInit, emit, snapshotTools, kill = () => child.kill('SIGKILL') }) {
+  const monitor = monitorAgy(cwd, { snapshotTools });
   let pending = '';
   let bytes = 0;
   let initialized = false;
@@ -116,7 +156,7 @@ async function superviseAgy(child, settled, { cwd, onInit, emit, kill = () => ch
     }
     if (pending) await acceptLine(pending);
     if ((await settled)[0] !== 0) throw error('agy_process_failed');
-    monitor.finish();
+    return monitor.finish();
   } catch (cause) {
     kill();
     await settled.catch(() => {});
@@ -124,17 +164,51 @@ async function superviseAgy(child, settled, { cwd, onInit, emit, kill = () => ch
   }
 }
 
-async function runAgy({ binary, cwd, env, prompt, timeoutMs, sealBootstrap, beforeEffect }) {
+async function guardedReads(boundary, observed) {
+  const path = join(boundary.events, 'reads.ndjson');
+  const st = await lstat(path).catch(() => null);
+  if (!st?.isFile() || st.size > LIMIT) throw error('agy_snapshot_tool_proof_missing');
+  const entries = (await readFile(path, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line));
+  const byStep = (a, b) => a.stepIdx - b.stepIdx;
+  if (!isDeepStrictEqual(entries.sort(byStep), [...observed].sort(byStep))) {
+    throw error('agy_snapshot_tool_proof_mismatch');
+  }
+}
+
+async function failureReason(cause, boundary, diagnostic, timedOut) {
+  if (boundary && await lstat(join(boundary.events, 'forbidden')).catch(() => null)) return 'review_tool_use_forbidden';
+  if (diagnostic.split('\n').includes('agy_snapshot_sandbox_unavailable')) return 'agy_snapshot_sandbox_unavailable';
+  if (timedOut) return 'agy_timeout';
+  const reason = cause.reason ?? 'agy_transport_failed';
+  return ['agy_incomplete_turn', 'agy_process_failed'].includes(reason) &&
+    /authentication required|authentication failed/i.test(diagnostic) ? 'agy_auth_unavailable' : reason;
+}
+
+async function deliverPrompt(child, { boundary, sealBootstrap, beforeEffect, publishSnapshot, prompt }) {
+  // No candidate data is present in Agy's cwd while bootstrap is authorized.
+  if (boundary) await writeFile(join(boundary.control, 'group'), String(child.pid), { mode: 0o400, flag: 'wx' });
+  await sealBootstrap();
+  await beforeEffect?.();
+  if (boundary) {
+    await publishSnapshot();
+    await beforeEffect?.();
+  }
+  child.stdin.end(`${JSON.stringify({ event: 'user', message: { content: prompt } })}\n`);
+}
+
+async function runAgy({ binary, cwd, env, prompt, timeoutMs, sealBootstrap, beforeEffect, boundary, publishSnapshot }) {
   let version;
   try {
     version = await promisify(execFile)(binary, ['--version'], { cwd, env, timeout: 5000, maxBuffer: 4096 });
   } catch { throw error('agy_version_unattested'); }
   if (version.stdout.trim() !== '1.5.14') throw error('agy_version_unattested');
   await beforeEffect?.();
-  const child = spawn(binary, ['--print', '', '--model', MODEL, '--effort', EFFORT,
-    '--mode', 'plan', '--disable-slash-commands', '--settings', SETTINGS,
-    '--input-format', 'stream-json', '--output-format', 'stream-json', '--print-timeout', '180s'],
-  { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  const args = ['--print', '', '--model', MODEL, '--effort', EFFORT,
+    '--mode', 'plan', '--disable-slash-commands', '--settings', settings(cwd, Boolean(boundary)),
+    '--input-format', 'stream-json', '--output-format', 'stream-json', '--print-timeout', '180s'];
+  const command = boundary ? '/usr/bin/python3' : binary;
+  const child = spawn(command, boundary ? [boundary.launcher, JSON.stringify({ ...boundary, binary }), ...args] : args,
+    { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
   const settled = once(child, 'close');
   settled.catch(() => {});
   const kill = () => {
@@ -149,20 +223,13 @@ async function runAgy({ binary, cwd, env, prompt, timeoutMs, sealBootstrap, befo
   child.stderr.on('data', chunk => { diagnostic = (diagnostic + chunk).slice(-4096); });
   child.stdin.on('error', kill);
   try {
-    await superviseAgy(child, settled, { cwd, kill, emit: line => { stdout += line; },
-      onInit: async () => {
-        // Withhold every candidate byte until the startup-only tunnels are revoked.
-        await sealBootstrap();
-        await beforeEffect?.();
-        child.stdin.end(`${JSON.stringify({ event: 'user', message: { content: prompt } })}\n`);
-      } });
+    const observed = await superviseAgy(child, settled, { cwd, kill, snapshotTools: Boolean(boundary),
+      emit: line => { stdout += line; },
+      onInit: () => deliverPrompt(child, { boundary, sealBootstrap, beforeEffect, publishSnapshot, prompt }) });
+    if (boundary) await guardedReads(boundary, observed.reads);
     return { code: 0, stdout, cwd };
   } catch (cause) {
-    let reason = cause.reason ?? 'agy_transport_failed';
-    if (timedOut) reason = 'agy_timeout';
-    else if (['agy_incomplete_turn', 'agy_process_failed'].includes(reason) &&
-        /authentication required|authentication failed/i.test(diagnostic)) reason = 'agy_auth_unavailable';
-    return { code: 1, stdout: '', stderr: reason, cwd };
+    return { code: 1, stdout: '', stderr: await failureReason(cause, boundary, diagnostic, timedOut), cwd };
   } finally {
     clearTimeout(deadline);
     kill();

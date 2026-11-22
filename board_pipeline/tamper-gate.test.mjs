@@ -58,6 +58,29 @@ test('чистый дифф: новый код и новый тест прохо
   assert.deepEqual(again, []);
 });
 
+test('удаление driver.py и изменение runtime assert вне тестов не являются assertion_weakened', async () => {
+  const res = await gate({
+    base: {
+      'bsu-cabinet/src/bsu_cabinet/driver.py': 'def old_driver(value):\n    assert value > 0\n    return value\n',
+      'src/runtime.js': 'assert(value >= 10);\n',
+    },
+    candidate: {
+      'bsu-cabinet/src/bsu_cabinet/driver.py': null,
+      'src/runtime.js': 'assert(value >= 0);\nassert(true);\n',
+    },
+  });
+  assert.deepEqual(res.violations, []);
+});
+
+test('разрешение переименования теста не разрешает ослабление его проверок', async () => {
+  const lines = 'export const unchanged = 1;\n'.repeat(12);
+  const result = await gate({
+    base: { 'tests/invariant.mjs': `${lines}assert(value >= 10);\n` },
+    candidate: { 'tests/invariant.mjs': null, 'src/invariant.mjs': `${lines}assert(value >= 0);\n` },
+  }, { allowTestDeletion: true });
+  assert.ok(result.violations.some(v => v.kind === 'assertion_weakened' && v.file === 'src/invariant.mjs'));
+});
+
 test('удаление тестового файла и тест-кейса отклоняются', async () => {
   const res = await gate({
     base: {
@@ -113,11 +136,11 @@ test('добавленные skip/only/xfail маркеры отклоняютс
 test('ослабление проверок: удалённые assert без замены и exit 0 в runner', async () => {
   const res = await gate({
     base: {
-      'src/lib.js': 'assert(typeof x === "number");\nassert(x > 0);\nexport const x = 1;\n',
+      'src/lib.test.js': 'assert(typeof x === "number");\nassert(x > 0);\nexport const x = 1;\n',
       'package.json': '{"scripts":{"test":"node --test"}}\n',
     },
     candidate: {
-      'src/lib.js': 'export const x = 1;\n',
+      'src/lib.test.js': 'export const x = 1;\n',
       'package.json': '{"scripts":{"test":"node --test || exit 0"}}\n',
     },
   });
@@ -203,11 +226,11 @@ test('смена типа тестового файла на symlink откло�
 test('тривиальный assert(true) и подмена test-скрипта отклоняются', async () => {
   const res = await gate({
     base: {
-      'src/lib.js': 'assert.strictEqual(x, 1);\nexport const x = 1;\n',
+      'src/lib.test.js': 'assert.strictEqual(x, 1);\nexport const x = 1;\n',
       'package.json': '{"scripts":{"test":"node --test tests/"}}\n',
     },
     candidate: {
-      'src/lib.js': 'assert.strictEqual(x, 1);\nassert(true);\nexport const x = 1;\n',
+      'src/lib.test.js': 'assert.strictEqual(x, 1);\nassert(true);\nexport const x = 1;\n',
       'package.json': '{"scripts":{"test":"echo done"}}\n',
     },
   });
@@ -282,8 +305,8 @@ test('удалённый бинарный тест-файл без тексто�
 
 test('содержательный assert заменён слабым при том же числе строк — отказ', async () => {
   const res = await gate({
-    base: { 'src/lib.js': 'assert.strictEqual(x, 1);\nassert(x > 0);\nexport const x = 1;\n' },
-    candidate: { 'src/lib.js': 'assert(x);\nassert(y);\nexport const x = 1;\n' },
+    base: { 'src/lib.test.js': 'assert.strictEqual(x, 1);\nassert(x > 0);\nexport const x = 1;\n' },
+    candidate: { 'src/lib.test.js': 'assert(x);\nassert(y);\nexport const x = 1;\n' },
   });
   assert.equal(res.ok, false);
   assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
@@ -300,8 +323,8 @@ test('удалённый scripts.test в package.json — gate_bypass', async ()
 
 test('удаление закомментированной проверки не считается ослаблением', async () => {
   const res = await gate({
-    base: { 'src/lib.js': 'assert(x === 1);\n// assert(y === 2);\nexport const x = 1;\n' },
-    candidate: { 'src/lib.js': 'assert(x === 1);\nexport const x = 1;\n' },
+    base: { 'src/lib.test.js': 'assert(x === 1);\n// assert(y === 2);\nexport const x = 1;\n' },
+    candidate: { 'src/lib.test.js': 'assert(x === 1);\nexport const x = 1;\n' },
   });
   assert.equal(res.ok, true, JSON.stringify(res.violations));
 });
@@ -334,8 +357,8 @@ test('удаление пустого тест-файла с пробелом и
 
 test('ослабление порога assert(>= 10) -> assert(>= 0) — отказ', async () => {
   const res = await gate({
-    base: { 'src/lib.js': 'assert(value >= 10);\nexport const x = 1;\n' },
-    candidate: { 'src/lib.js': 'assert(value >= 0);\nexport const x = 1;\n' },
+    base: { 'src/lib.test.js': 'assert(value >= 10);\nexport const x = 1;\n' },
+    candidate: { 'src/lib.test.js': 'assert(value >= 0);\nexport const x = 1;\n' },
   });
   assert.equal(res.ok, false);
   assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
@@ -354,8 +377,8 @@ test('scripts.test удалён на строке с metadata.test — gate_bypa
 
 test('одновременное ужесточение разных assert — не ослабление', async () => {
   const res = await gate({
-    base: { 'src/lib.js': 'assert(x >= 1);\nassert(y >= 10);\nexport const z = 1;\n' },
-    candidate: { 'src/lib.js': 'assert(x >= 2);\nassert(y >= 11);\nexport const z = 1;\n' },
+    base: { 'src/lib.test.js': 'assert(x >= 1);\nassert(y >= 10);\nexport const z = 1;\n' },
+    candidate: { 'src/lib.test.js': 'assert(x >= 2);\nassert(y >= 11);\nexport const z = 1;\n' },
   });
   assert.equal(res.ok, true, JSON.stringify(res.violations));
 });
@@ -370,8 +393,8 @@ test('неизменный scripts.test при смене metadata.test — не
 
 test('ослабление второго операнда в составном assert — отказ', async () => {
   const res = await gate({
-    base: { 'src/lib.js': 'assert(x >= 1 && y >= 10);\nexport const z = 1;\n' },
-    candidate: { 'src/lib.js': 'assert(x >= 2 && y >= 0);\nexport const z = 1;\n' },
+    base: { 'src/lib.test.js': 'assert(x >= 1 && y >= 10);\nexport const z = 1;\n' },
+    candidate: { 'src/lib.test.js': 'assert(x >= 2 && y >= 0);\nexport const z = 1;\n' },
   });
   assert.equal(res.ok, false);
   assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
@@ -379,8 +402,8 @@ test('ослабление второго операнда в составном
 
 test('ослабление операнда после && против одиночного assert — отказ', async () => {
   const res = await gate({
-    base: { 'src/lib.js': 'assert(y >= 10);\nexport const z = 1;\n' },
-    candidate: { 'src/lib.js': 'assert(x >= 1 && y >= 0);\nexport const z = 1;\n' },
+    base: { 'src/lib.test.js': 'assert(y >= 10);\nexport const z = 1;\n' },
+    candidate: { 'src/lib.test.js': 'assert(x >= 1 && y >= 0);\nexport const z = 1;\n' },
   });
   assert.equal(res.ok, false);
   assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
