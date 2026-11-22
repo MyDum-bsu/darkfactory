@@ -555,6 +555,17 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // unpackExact из runtime.mjs: git archive + побайтовая сверка каждого blob.
       await unpackExact(binding.worktree, binding.candidate_sha, archive, source);
 
+      // Точный diff base→candidate: снимок read-only без .git, поэтому
+      // ревьюеру монтируется готовый patch — иначе он реконструирует историю
+      // умозрительно и выдумывает находки.
+      const diffFile = join(scratch, 'candidate.diff');
+      try {
+        const { stdout: patch } = await exec('git',
+          ['-C', binding.worktree, 'diff', `${binding.base_sha}..${binding.candidate_sha}`],
+          { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+        await writeFile(diffFile, patch, { mode: 0o600 });
+      } catch { /* без diff ревью всё равно идёт по снимку */ }
+
       // Контрольные значения ДО запуска: дерево, байты снимка и worktree.
       const treeSha = await git(binding.worktree, 'rev-parse', `${binding.candidate_sha}^{tree}`);
       const before = await snapshotDigest(source);
@@ -583,6 +594,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         { src: cfgDir, dst: '/pi-cfg' },
         { src: GUARD_FILE, dst: '/pi-guard/pi-guard.cjs' },
       ];
+      if (await lstat(diffFile).catch(() => null)) {
+        mounts.push({ src: diffFile, dst: '/review/diff.patch' });
+      }
       for (const component of PI_MOUNT_DIRS) {
         const src = join(piRoot, component);
         const info = await lstat(src).catch(() => null);
@@ -616,11 +630,13 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
 
       const subjectLine = binding.subject_digest
         ? `The required subject_digest for this candidate is "${binding.subject_digest}". ` +
-          'Include "subject_digest":"<that value>" inside the verdict JSON.'
+          'Echo that exact string as "subject_digest" inside the verdict JSON — ' +
+          'copy it verbatim, do NOT compute or invent a digest yourself.'
         : '';
       const instruction = [
         `Independent, read-only review for Board #${binding.task_id} at ${binding.candidate_sha}.`,
-        'The candidate tree is mounted read-only at /candidate. Review the diff and the tree',
+        'The candidate tree is mounted read-only at /candidate, and the exact diff',
+        'base→candidate is mounted read-only at /review/diff.patch. Review the diff and the tree',
         'against the spec below. You have read-only tools only; do not attempt to write.',
         'Finish with exactly one verdict: a JSON code block {"verdict":"PASS"|"REWORK"|"ESCALATE",',
         '"summary":"...","findings":[{"file","line","input","expected","actual","freq","harm"}],',
