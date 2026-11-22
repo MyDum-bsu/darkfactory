@@ -6,7 +6,7 @@
 // Границы: никогда порт 44100, никакой живой Board/кабинета/сети кандидата.
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -405,7 +405,9 @@ else console.log('Onboarding controls are present');`;
     const bbCallsDelta = idleCalls.filter(c => c === 'bb').length;
     const dockerCallsDelta = idleCalls.filter(c => c === 'docker').length;
     const piCallsDelta = idleCalls.filter(c => c === 'pi').length;
-    const attemptCreated = await stat(join(dirs.state, 'attempt.json')).then(() => true, () => false);
+    const idleAttempt = await readFile(join(dirs.state, 'attempt.json'), 'utf8')
+      .then(s => JSON.parse(s), () => null);
+    const attemptCreated = idleAttempt !== null;
     const allIdle = idle.lines.length >= 1 && idle.lines.every(l => {
       try { return JSON.parse(l).phase === 'idle'; } catch { return false; }
     });
