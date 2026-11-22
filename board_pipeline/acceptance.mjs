@@ -239,6 +239,9 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   }
   if (!/^[0-9a-f]{8,64}$/.test(rev.checkpoint ?? '')) return { status: 'hold', reason: 'review_unconfirmed' };
   if (rev.verdict !== REVIEW_OK) {
+    if (rev.verdict === REVIEW_BLOCKED && (typeof rev.excerpt !== 'string' || !rev.excerpt.trim())) {
+      return { status: 'hold', reason: 'review_objection_missing' };
+    }
     return {
       status: rev.verdict === REVIEW_BLOCKED ? 'rework' : 'hold',
       reason: `review_verdict:${rev.verdict}`,

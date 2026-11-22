@@ -347,7 +347,7 @@ test('REVIEW_BLOCKED: rework с цитатой checkpoint, без закрыти
         sha: binding.candidate_sha,
         actual: { ...REVIEW_ROUTE },
         verdict: 'REVIEW_BLOCKED',
-        checkpoint: 'deadbeef',
+        checkpoint: 'deadbeef', excerpt: 'Expected native refusal, got an effect',
       };
     },
   });
@@ -361,8 +361,22 @@ test('REVIEW_BLOCKED: rework с цитатой checkpoint, без закрыти
   assert.equal(res.outcome, 'rework');
   assert.match(res.reason, /review_verdict:REVIEW_BLOCKED/);
   assert.equal(res.feedback.checkpoint, 'deadbeef');
+  assert.match(res.feedback.excerpt, /Expected native refusal/);
   assert.equal(calls.review, 1);
   assert.equal((await settled(handle, id)).state, 'claimed');
+});
+
+test('REVIEW_BLOCKED без возражения останавливает, а не возвращает на исправление', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports } = stubs({ review: async binding => ({ task: binding.task_id, sha: binding.candidate_sha,
+    actual: REVIEW_ROUTE, verdict: 'REVIEW_BLOCKED', checkpoint: 'deadbeef', excerpt: '' }) });
+  const result = await acceptHeld({ attempt: attempt(id, epoch), submission: submission(id, epoch),
+    policy: policy(id), journal: await tmpJournal(), ports: { ...ports, board: port } });
+  assert.equal(result.outcome, 'hold');
+  assert.equal(result.reason, 'review_objection_missing');
+  assert.equal((await settled(handle, id)).state, 'blocked');
 });
 
 test('ошибка среды — hold с видимым стопом, не «исправь код»', async (t) => {

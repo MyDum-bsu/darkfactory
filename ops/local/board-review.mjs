@@ -106,6 +106,7 @@ export function attestReview(job, observed) {
   const excerpt = verdicts[0] === 'REVIEW_BLOCKED'
     ? lines.filter(line => !isVerdict(line)).join('\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').trim().slice(0, 1400)
     : undefined;
+  requireThat(verdicts[0] !== 'REVIEW_BLOCKED' || excerpt, 'blocked review has no objection');
   return { policy: job.policy, task: job.task, sha: job.sha, threadId: job.threadId, sessionId, checkpoint,
     actual: { provider: last.provider, model: last.model, reasoningLevel: effort }, verdict: verdicts[0], excerpt };
 }
