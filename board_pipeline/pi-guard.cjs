@@ -373,10 +373,14 @@ const CHILD_PATHS = new Set(['/usr/bin/rg', '/usr/bin/grep', '/bin/grep',
 const FIND_DENY = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete',
   '-fls', '-fprint', '-fprint0', '-fprintf']);
 
-function fileAllowed(file) {
+// Базовые имена резолвятся в точный системный путь, чтобы PATH не участвовал
+// в выборе бинарника: злонамеренный PATH в окружении не подсунет свой `ls`.
+function resolveChild(file) {
   const f = String(file ?? '');
-  if (f.includes('/')) return CHILD_PATHS.has(f);
-  return CHILD_ALLOW.has(f);
+  if (f.includes('/')) return CHILD_PATHS.has(f) ? f : null;
+  if (!CHILD_ALLOW.has(f)) return null;
+  if (origExistsSync(`/usr/bin/${f}`)) return `/usr/bin/${f}`;
+  return `/bin/${f}`;
 }
 
 function argsAllowed(file, rest) {
@@ -390,8 +394,13 @@ function optionsAllowed(rest) {
   if (!opt) return true;
   if (opt.shell) return false;
   if (opt.cwd !== undefined) {
-    const cwd = path.resolve(String(opt.cwd));
-    if (cwd !== '/candidate' && !cwd.startsWith('/candidate/')) return false;
+    // Симлинк внутри /candidate не должен увести cwd наружу — по realpath.
+    try {
+      const cwd = origRealpathSync(String(opt.cwd));
+      if (cwd !== '/candidate' && !cwd.startsWith('/candidate/')) return false;
+    } catch {
+      return false;
+    }
   }
   return true;
 }
@@ -400,9 +409,11 @@ function guardChild(key, sync) {
   const orig = cp[key];
   if (typeof orig !== 'function') return;
   cp[key] = function (file, ...rest) {
-    // exec() по определению идёт через шелл — запрещён целиком.
-    const blocked = key === 'exec' || !fileAllowed(file) ||
-      !argsAllowed(file, rest) || !optionsAllowed(rest);
+    // exec()/execSync()/fork() всегда через шелл или произвольный модуль —
+    // запрещены безусловно.
+    const resolved = resolveChild(file);
+    const blocked = key === 'exec' || key === 'execSync' || key === 'fork' ||
+      resolved === null || !argsAllowed(file, rest) || !optionsAllowed(rest);
     if (blocked) {
       if (DEBUG) {
         process.stderr.write(`[guard] deny ${key} ${file}\n`);
@@ -430,12 +441,13 @@ function guardChild(key, sync) {
       });
       return fake;
     }
-    return orig.call(this, file, ...rest);
+    return orig.call(this, resolved, ...rest);
   };
 }
 guardChild('spawn');
 guardChild('exec');
 guardChild('execFile');
+guardChild('fork');
 guardChild('spawnSync', true);
 guardChild('execSync', true);
 guardChild('execFileSync', true);

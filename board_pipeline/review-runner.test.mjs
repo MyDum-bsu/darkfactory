@@ -476,6 +476,12 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
     probe('shellOpt', cp.spawnSync('ls', ['/tmp'], { shell: true }));
     probe('cwdOut', cp.spawnSync('ls', { cwd: '/etc' }));
     probe('cwdCand', cp.spawnSync('ls', { cwd: '/candidate' }));
+    // PATH не участвует: пустой PATH не должен помешать системному ls.
+    probe('pinPath', cp.spawnSync('ls', ['/tmp'], { env: { PATH: '/nonexistent' }, timeout: 3000 }));
+    try { cp.execSync('ls /tmp'); console.log('execSync:allowed'); }
+    catch (e) { console.log('execSync:' + e.code); }
+    try { const f = cp.fork('/tmp/evil.js'); f.on('error', e => console.log('fork:' + e.code)); }
+    catch (e) { console.log('fork:' + e.code); }
     probe('candPath', cp.spawnSync('/candidate/evil.sh'));
     probe('sysPath', cp.spawnSync('/usr/bin/ls', ['/tmp'], { timeout: 3000 }));
     probe('tmpPath', cp.spawnSync('/tmp/ls'));
@@ -512,8 +518,11 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
   assert.match(out, /findOk:allowed:0/, `чистый find должен работать:\n${out}`);
   assert.match(out, /shellOpt:EACCES/, `shell:true не заблокирован:\n${out}`);
   assert.match(out, /cwdOut:EACCES/, `cwd вне /candidate не заблокирован:\n${out}`);
-  // cwd=/candidate разрешён гардом (ENOENT — значит гард пропустил, но каталога нет на хосте).
-  assert.match(out, /cwdCand:(allowed|ENOENT)/, `cwd=/candidate не должен быть EACCES:\n${out}`);
+  // /candidate нет на хосте → realpath падает → EACCES (в контейнере разрешён).
+  assert.match(out, /cwdCand:EACCES/, `cwd без realpath в /candidate не заблокирован:\n${out}`);
+  assert.match(out, /pinPath:allowed:0/, `PATH-подмена сломала системный бинарник:\n${out}`);
+  assert.match(out, /execSync:EACCES/, `execSync (шелл) не заблокирован:\n${out}`);
+  assert.match(out, /fork:EACCES/, `fork не заблокирован:\n${out}`);
   assert.match(out, /candPath:EACCES/, `бинарник из /candidate запущен:\n${out}`);
   assert.match(out, /sysPath:allowed:0/, `системный /usr/bin/ls должен работать:\n${out}`);
   assert.match(out, /tmpPath:EACCES/, `бинарник из /tmp запущен:\n${out}`);
