@@ -20,6 +20,7 @@ const { EventEmitter } = require('events');
 const origReadFileSync = fs.readFileSync.bind(fs);
 const origUnlinkSync = fs.unlinkSync.bind(fs);
 const origRealpathSync = fs.realpathSync.bind(fs);
+const origRealpathNativeSync = fs.realpathSync.native.bind(fs.realpathSync);
 const origReadlinkSync = fs.readlinkSync.bind(fs);
 const origLstatSync = fs.lstatSync.bind(fs);
 const origStatSync = fs.statSync.bind(fs);
@@ -389,20 +390,52 @@ function argsAllowed(file, rest) {
   return !argv.some(a => FIND_DENY.has(String(a)));
 }
 
-function optionsAllowed(rest) {
-  const opt = rest.find(a => a !== null && typeof a === 'object' && !Array.isArray(a));
-  if (!opt) return true;
-  if (opt.shell) return false;
-  if (opt.cwd !== undefined) {
-    // Симлинк внутри /candidate не должен увести cwd наружу — по realpath.
-    try {
-      const cwd = origRealpathSync(String(opt.cwd));
-      if (cwd !== '/candidate' && !cwd.startsWith('/candidate/')) return false;
-    } catch {
-      return false;
+// Проверка каждого компонента пути под /candidate: симлинк не должен
+// выводить наружу — его цель тоже канонизируется через native realpath.
+function noSymlinkInCandidate(raw) {
+  const lex = path.resolve(String(raw));
+  if (lex !== '/candidate' && !lex.startsWith('/candidate/')) return false;
+  let cur = '/candidate';
+  for (const seg of lex.slice('/candidate/'.length).split('/')) {
+    if (!seg) continue;
+    cur = `${cur}/${seg}`;
+    let st;
+    try { st = origLstatSync(cur); } catch { return false; }
+    if (st.isSymbolicLink()) {
+      let target;
+      try {
+        const t = origReadlinkSync(cur);
+        const abs = path.isAbsolute(t) ? t : path.resolve(path.dirname(cur), t);
+        target = origRealpathNativeSync(abs);
+      } catch { return false; }
+      if (target !== '/candidate' && !target.startsWith('/candidate/')) return false;
+      cur = target;
     }
   }
   return true;
+}
+
+// Возвращает rest с канонизированным options.cwd либо null при отказе.
+// В оригинальный spawn уходит только проверенный путь — сырой cwd с '..'
+// никогда не доходит до chdir.
+function cwdOptions(rest) {
+  const idx = rest.findIndex(a => a !== null && typeof a === 'object' && !Array.isArray(a));
+  if (idx === -1) return rest;
+  const opt = rest[idx];
+  if (opt.shell) return null;
+  if (opt.cwd === undefined) return rest;
+  const raw = String(opt.cwd);
+  let real;
+  try {
+    // native realpath(3) резолвит симлинки ДО '..' — лексическая проверка
+    // fs.realpathSync пропускала бы '/candidate/symlink_out/..'.
+    real = origRealpathNativeSync(raw);
+  } catch { return null; }
+  if (real !== '/candidate' && !real.startsWith('/candidate/')) return null;
+  if (!noSymlinkInCandidate(raw)) return null;
+  const next = rest.slice();
+  next[idx] = { ...opt, cwd: real };
+  return next;
 }
 
 function guardChild(key, sync) {
@@ -412,8 +445,9 @@ function guardChild(key, sync) {
     // exec()/execSync()/fork() всегда через шелл или произвольный модуль —
     // запрещены безусловно.
     const resolved = resolveChild(file);
+    const cleanRest = cwdOptions(rest);
     const blocked = key === 'exec' || key === 'execSync' || key === 'fork' ||
-      resolved === null || !argsAllowed(file, rest) || !optionsAllowed(rest);
+      resolved === null || !argsAllowed(file, rest) || cleanRest === null;
     if (blocked) {
       if (DEBUG) {
         process.stderr.write(`[guard] deny ${key} ${file}\n`);
@@ -441,7 +475,7 @@ function guardChild(key, sync) {
       });
       return fake;
     }
-    return orig.call(this, resolved, ...rest);
+    return orig.call(this, resolved, ...cleanRest);
   };
 }
 guardChild('spawn');

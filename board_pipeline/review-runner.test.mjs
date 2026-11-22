@@ -601,6 +601,8 @@ test('sandbox: симлинк из /candidate наружу и child_process в �
     // Ссылка на секрет ревьюера: даже отсутствующий файл-цель обязан быть
     // недоступен — realpath/readlink уводит за пределы /candidate.
     await symlink('/tmp/.pi/agent/auth.json', join(source, 'evil.json'));
+    // Симлинк наружу для проверки cwd-эскейпа через '..' и напрямую.
+    await symlink('/tmp', join(source, 'out'));
     const guard = new URL('./pi-guard.cjs', import.meta.url).pathname;
     const probe = `
       const fs = require('fs');
@@ -615,6 +617,13 @@ test('sandbox: симлинк из /candidate наружу и child_process в �
       console.log('sh:' + (r.error ? r.error.code : 'allowed:' + r.status));
       try { cp.execFileSync('ls', ['/candidate'], { encoding: 'utf8' }); console.log('ls:allowed'); }
       catch (e) { console.log('ls:' + e.code); }
+      // cwd через симлинк наружу и через '..' — ядро резолвит симлинк до '..',
+      // поэтому проверка обязана идти по native realpath, а не лексически.
+      const cwdP = (c) => { const r = cp.spawnSync('ls', ['.'], { cwd: c });
+        return r.error ? r.error.code : 'allowed:' + r.status; };
+      console.log('cwdSym:' + cwdP('/candidate/out'));
+      console.log('cwdEsc:' + cwdP('/candidate/out/..'));
+      console.log('cwdOk:' + cwdP('/candidate'));
     `;
     const run = await runInReadOnlySandbox({
       snapshot: source,
@@ -628,6 +637,9 @@ test('sandbox: симлинк из /candidate наружу и child_process в �
     assert.match(out, /safe:safe/, `обычный файл не читается:\n${out}`);
     assert.match(out, /sh:EACCES/, `шелл в песочнице не заблокирован:\n${out}`);
     assert.match(out, /ls:allowed/, `read-only ls должен работать:\n${out}`);
+    assert.match(out, /cwdSym:EACCES/, `cwd через симлинк наружу разрешён:\n${out}`);
+    assert.match(out, /cwdEsc:EACCES/, `cwd '/candidate/out/..' ушёл наружу:\n${out}`);
+    assert.match(out, /cwdOk:allowed:0/, `cwd=/candidate не работает:\n${out}`);
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
