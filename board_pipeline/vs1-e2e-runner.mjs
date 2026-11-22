@@ -6,7 +6,7 @@
 // Границы: никогда порт 44100, никакой живой Board/кабинета/сети кандидата.
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, stat, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -97,6 +97,7 @@ PATH=${JSON.stringify(basePath)} exec ${execTarget} "$@"
   }
   await copyFile(join(shimDir, 'pi'), join(idleHome, '.pi', 'agent', 'bin', 'pi'));
   await chmod(join(idleHome, '.pi', 'agent', 'bin', 'pi'), 0o700);
+  await symlink(join(homedir(), '.local'), join(idleHome, '.local'));
 }
 
 // Снимок состояния карточки для сравнения «без эффектов»: только стабильные поля.
