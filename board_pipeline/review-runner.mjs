@@ -605,7 +605,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // Egress-allowlist для pi-guard: только адрес прокси и публичные
       // endpoint'ы модели. Прокси на :44100 запрещён до запуска; NO_PROXY
       // в контейнер не передаётся.
-      const allow = ['api.openai.com:443', 'chatgpt.com:443'];
+      const allow = ['api.openai.com:443', 'chatgpt.com:443', 'auth.openai.com:443'];
       // PI_OFFLINE: pi не скачивает внешние инструменты (fd/rg с github.com)
       // — иначе egress-allowlist роняет процесс на старте.
       const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1' };
@@ -668,6 +668,11 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts,
         timeoutMs });
       if (run.code !== 0) {
+        // Сырой вывод — только в приватный журнал (0600), не в причину Board.
+        try {
+          await writeFile(join(journal, `${name}.stderr`),
+            String(run.stderr || run.stdout || ''), { flag: 'wx', mode: 0o600 });
+        } catch { /* журнал недоступен — не маскируем исходную ошибку */ }
         throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
       }
 
