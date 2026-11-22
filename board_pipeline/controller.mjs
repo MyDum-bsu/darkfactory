@@ -49,6 +49,9 @@ function contractOf(labels) {
     spec_digest: labels?.spec_digest,
     policy_digest: labels?.policy_digest,
     fixtures_digest: typeof labels?.fixtures_digest === 'string' ? labels.fixtures_digest : null,
+    // Метка has_ui карточки — строка 'true'/'false'; отсутствие — undefined,
+    // решение о L3 отдаётся профилю оператора (binding.has_ui ?? profile.has_ui).
+    has_ui: labels?.has_ui === 'true' ? true : labels?.has_ui === 'false' ? false : undefined,
   };
 }
 
@@ -62,6 +65,7 @@ function attemptOf(record, route) {
     attempt.spec_digest = record.contract.spec_digest;
     attempt.policy_digest = record.contract.policy_digest;
     attempt.fixtures_digest = record.contract.fixtures_digest ?? null;
+    if (record.contract.has_ui !== undefined) attempt.has_ui = record.contract.has_ui;
   }
   return attempt;
 }
