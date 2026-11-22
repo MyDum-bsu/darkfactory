@@ -147,7 +147,7 @@ test('утечка секретов в диффе отклоняется', async
 test('добавленные test(/assert не считаются нарушением', async () => {
   const res = await gate({
     base: { 'tests/app.test.js': 'test("a", () => {\n  assert(true);\n});\n' },
-    candidate: { 'tests/app.test.js': 'test("a", () => {\n  assert(true);\n});\ntest("b", () => {\n  assert(true);\n});\n' },
+    candidate: { 'tests/app.test.js': 'test("a", () => {\n  assert(true);\n});\ntest("b", () => {\n  assert(x === 1);\n});\n' },
   });
   assert.equal(res.ok, true);
 });
@@ -155,4 +155,94 @@ test('добавленные test(/assert не считаются нарушен
 test('невалидные входы отклоняются до вызова git', async () => {
   await assert.rejects(() => tamperGate({ worktree: '/tmp', base_sha: 'abc', candidate_sha: 'd'.repeat(40) }));
   await assert.rejects(() => tamperGate({ base_sha: 'a'.repeat(40), candidate_sha: 'b'.repeat(40) }));
+});
+
+// --- Регрессии независимого ревью Pi/Sol ---
+
+test('RegExp.test() и вызовы методов не считаются удалёнными тестами', async () => {
+  const res = await gate({
+    base: { 'src/re.js': 'const ok = /x/.test(s);\nre.test(other);\n' },
+    candidate: { 'src/re.js': 'const ok = true;\n' },
+  });
+  assert.equal(res.ok, true, JSON.stringify(res.violations));
+});
+
+test('переименование теста за пределы discovery отклоняется', async () => {
+  const repo = await mkdtemp(path.join(testRoot, 'repo-'));
+  git(repo, 'init', '--initial-branch=pilot');
+  await mkdir(path.join(repo, 'tests'));
+  await writeFile(path.join(repo, 'tests/app.test.js'), 'test("a", () => {});\n');
+  const base = commit(repo, 'Base');
+  await mkdir(path.join(repo, 'src'));
+  git(repo, 'mv', 'tests/app.test.js', 'src/app.js');
+  const candidate = commit(repo, 'Rename');
+  const res = await tamperGate({ worktree: repo, base_sha: base, candidate_sha: candidate });
+  assert.equal(res.ok, false);
+  const v = res.violations.find((x) => x.kind === 'test_file_deleted');
+  assert.ok(v, JSON.stringify(res.violations));
+  assert.equal(v.file, 'tests/app.test.js');
+});
+
+test('смена типа тестового файла на symlink отклоняется', async () => {
+  const repo = await mkdtemp(path.join(testRoot, 'repo-'));
+  git(repo, 'init', '--initial-branch=pilot');
+  await mkdir(path.join(repo, 'tests'));
+  await writeFile(path.join(repo, 'tests/app.test.js'), 'test("a", () => {});\n');
+  const base = commit(repo, 'Base');
+  const { symlink, rm: remove } = await import('node:fs/promises');
+  await remove(path.join(repo, 'tests/app.test.js'));
+  await symlink('../target.js', path.join(repo, 'tests/app.test.js'));
+  git(repo, 'add', '-A');
+  git(repo, '-c', 'user.email=f@x', '-c', 'user.name=F', '-c', 'commit.gpgsign=false', 'commit', '-m', 'Symlink');
+  const candidate = git(repo, 'rev-parse', 'HEAD');
+  const res = await tamperGate({ worktree: repo, base_sha: base, candidate_sha: candidate });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.kind === 'file_type_changed'), JSON.stringify(res.violations));
+});
+
+test('тривиальный assert(true) и подмена test-скрипта отклоняются', async () => {
+  const res = await gate({
+    base: {
+      'src/lib.js': 'assert.strictEqual(x, 1);\nexport const x = 1;\n',
+      'package.json': '{"scripts":{"test":"node --test tests/"}}\n',
+    },
+    candidate: {
+      'src/lib.js': 'assert.strictEqual(x, 1);\nassert(true);\nexport const x = 1;\n',
+      'package.json': '{"scripts":{"test":"echo done"}}\n',
+    },
+  });
+  assert.equal(res.ok, false);
+  const kinds = res.violations.map((v) => v.kind);
+  assert.ok(kinds.includes('assertion_weakened'), JSON.stringify(res.violations));
+  assert.ok(kinds.includes('gate_bypass'), JSON.stringify(res.violations));
+});
+
+test('файл без завершающего перевода строки не сдвигает номера нарушений', async () => {
+  const res = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {});\ntest("b", () => {});' },
+    candidate: { 'tests/app.test.js': 'test("a", () => {});' },
+  });
+  assert.equal(res.ok, false);
+  const lines = res.violations.filter((x) => x.kind === 'test_deleted').map((x) => x.line);
+  assert.deepEqual(lines, [1, 2], JSON.stringify(res.violations));
+});
+
+test('конфиг Git и .gitattributes кандидата не влияют на отчёт и не выполняются', async () => {
+  const repo = await mkdtemp(path.join(testRoot, 'repo-'));
+  git(repo, 'init', '--initial-branch=pilot');
+  await writeFile(path.join(repo, 'app.js'), 'const a = 1;\n');
+  const base = commit(repo, 'Base');
+  // Враждебные атрибуты и diff-драйвер: при исполнении были бы командой кандидата.
+  await writeFile(path.join(repo, '.gitattributes'), '*.secret diff=spy\n');
+  await writeFile(path.join(repo, 'app.js'), 'const a = 2;\n');
+  git(repo, 'add', '-A');
+  git(repo, '-c', 'user.email=f@x', '-c', 'user.name=F', '-c', 'commit.gpgsign=false', 'commit', '-m', 'Attrs');
+  const candidate = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'config', 'diff.spy.command', 'echo PWNED >&2; cat');
+  await writeFile(path.join(repo, 'x.secret'), 'data\n');
+  const res = await tamperGate({ worktree: repo, base_sha: base, candidate_sha: candidate });
+  assert.equal(res.ok, true);
+  // Тот же вызов повторно даёт тот же digest — отчёт детерминирован.
+  const again = await tamperGate({ worktree: repo, base_sha: base, candidate_sha: candidate });
+  assert.equal(again.digest, res.digest);
 });

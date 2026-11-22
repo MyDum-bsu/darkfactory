@@ -15,6 +15,7 @@ import { nativeBoardPort } from './native-board.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
 import { loadSdk } from './sdk.mjs';
 import { worktreeInspector } from './runtime.mjs';
+import { tamperGate } from './tamper-gate.mjs';
 
 const REVIEW = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
 const SPEC = 'a'.repeat(64);
@@ -143,6 +144,7 @@ test('две связанные карточки на реальном vb serve:
               inspect: worktreeInspector(policy),
               local: async binding => ({ sha: binding.candidate_sha, ok: true,
                 evidence: [{ file: 'checks-vs1.log', sha256: 'c'.repeat(64), exit: 0 }] }),
+              tamper: tamperGate,
               review: async binding => ({ task: binding.task_id, sha: binding.candidate_sha,
                 actual: REVIEW, verdict: 'REVIEW_OK', checkpoint: 'feed80ab' }),
             },

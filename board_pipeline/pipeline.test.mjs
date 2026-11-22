@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import { accept } from './acceptance.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { offlineDockerRunner, worktreeInspector } from './runtime.mjs';
+import { tamperGate } from './tamper-gate.mjs';
 import { loadSdk } from './sdk.mjs';
 
 const REVIEW = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
@@ -58,6 +59,7 @@ for (const red of [false, true]) {
       board: nativeBoardPort(handle, { channel: 'pilot' }),
       inspect: worktreeInspector(policy),
       local: offlineDockerRunner(journal),
+      tamper: tamperGate,
       async review(handoff) {
         reviewed++;
         // Explicit fixture: this test proves the handoff, not the BB/model runtime.

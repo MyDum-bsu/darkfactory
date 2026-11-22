@@ -10,7 +10,9 @@ import { reserveWorktree, saveState } from './slot.mjs';
 import { advance } from './controller.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
-import { nativeReviewVerifier, offlineProfileRunner, readJson, worktreeInspector } from './runtime.mjs';
+import { nativeReviewVerifier, offlineProfileRunner, offlineVisualRunner, readJson,
+  worktreeInspector } from './runtime.mjs';
+import { tamperGate } from './tamper-gate.mjs';
 
 const exec = promisify(execFile);
 const inside = (root, p) => {
@@ -172,6 +174,7 @@ async function execute() {
       const review = nativeReviewVerifier(reviewGate, reviewPrompt, { permissionMode: 'accept-edits' });
       return await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: worktreeInspector(policy), local: offlineProfileRunner(root),
+        tamper: tamperGate, visual: offlineVisualRunner(root),
         // Смена брифа/файлов политики во время проверок останавливает кандидата до complete.
         verifyPinned: assertPinned,
         review: async handoff => {

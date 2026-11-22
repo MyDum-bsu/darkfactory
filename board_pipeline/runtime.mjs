@@ -156,6 +156,36 @@ export function offlineDockerRunner(journal) {
   };
 }
 
+// Недоверенные артефакты L3 ограничены по числу и объёму: контейнер не может
+// исчерпать память контроллера или диск журнала безразмерной выгрузкой.
+const ARTIFACT_MAX_FILES = 64;
+const ARTIFACT_MAX_FILE_BYTES = 8 * 1024 * 1024;
+const ARTIFACT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+
+// Сбор артефактов из rw-каталога контейнера в приватный журнал: только регулярные
+// файлы, побайтово, с sha256 и лимитами. Превышение — отказ гейта, не усечка.
+export async function collectVisualArtifacts(dropped, journal, binding) {
+  const artifacts = [];
+  let total = 0;
+  const { readdir } = await import('node:fs/promises');
+  for (const entry of (await readdir(dropped)).sort()) {
+    const from = join(dropped, entry);
+    const info = await lstat(from);
+    if (!info.isFile()) continue;
+    if (artifacts.length >= ARTIFACT_MAX_FILES || info.size > ARTIFACT_MAX_FILE_BYTES ||
+        total + info.size > ARTIFACT_MAX_TOTAL_BYTES) {
+      throw new Error('Visual artifacts exceed the count or byte limits');
+    }
+    const data = await readFile(from);
+    const safe = basename(entry).replace(/[^A-Za-z0-9_.-]/g, '_');
+    const stored = `visual-artifact-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}-${safe}`;
+    await writeFile(join(journal, stored), data, { flag: 'wx', mode: 0o600 });
+    total += data.length;
+    artifacts.push({ name: stored, sha256: createHash('sha256').update(data).digest('hex'), bytes: data.length });
+  }
+  return artifacts;
+}
+
 // L3 визуальный гейт: та же изоляция rootless Docker, плюс каталог артефактов,
 // смонтированный rw только для выгрузки скриншотов в приватный журнал контроллера.
 export function offlineVisualRunner(journal) {
@@ -198,23 +228,14 @@ export function offlineVisualRunner(journal) {
       } finally {
         await cleanupContainer(name);
       }
+      // Коды 125/126/127 (и невозможность получить код) — проверка не состоялась:
+      // контейнер не запустился или команда не найдена. Это среда, не дефект кандидата.
+      if (exit === null || exit === 125 || exit === 126 || exit === 127) {
+        throw new Error(`visual_runner_not_executed:${String(output).slice(-200)}`);
+      }
       const file = `visual-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}.log`;
       await writeFile(join(journal, file), output, { flag: 'wx', mode: 0o600 });
-
-      // Артефакты: только регулярные файлы, побайтово копируем в приватный журнал
-      // и фиксируем sha256 — квитанция привязана к тем же байтам, что видел гейт.
-      const artifacts = [];
-      const { readdir } = await import('node:fs/promises');
-      for (const entry of (await readdir(dropped)).sort()) {
-        const from = join(dropped, entry);
-        const info = await lstat(from);
-        if (!info.isFile()) continue;
-        const data = await readFile(from);
-        const safe = basename(entry).replace(/[^A-Za-z0-9_.-]/g, '_');
-        const stored = `visual-artifact-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}-${safe}`;
-        await writeFile(join(journal, stored), data, { flag: 'wx', mode: 0o600 });
-        artifacts.push({ name: stored, sha256: createHash('sha256').update(data).digest('hex'), bytes: data.length });
-      }
+      const artifacts = await collectVisualArtifacts(dropped, journal, binding);
       return {
         sha: binding.candidate_sha, ok: exit === 0, status: exit === 0 ? 'pass' : 'fail',
         artifacts,

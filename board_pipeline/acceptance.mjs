@@ -93,6 +93,7 @@ function validatePolicy(policy, checkProfile) {
   if (typeof policy.version !== 'string' && typeof policy.version !== 'number') {
     throw new Denied('policy_version_missing');
   }
+  if (String(policy.version).length > 64) throw new Denied('policy_version_too_long');
   const profiles = policy.profiles;
   if (profiles === null || typeof profiles !== 'object') throw new Denied('profiles_missing');
   const profile = Object.hasOwn(profiles, checkProfile) ? profiles[checkProfile] : null;
@@ -174,6 +175,9 @@ function validateAttempt(attempt) {
   if (!path.isAbsolute(attempt.worktree)) throw new Denied('worktree_not_absolute');
   if (!SHA_RE.test(attempt.base_sha)) throw new Denied('base_sha_not_full');
   if (!FINISH.has(attempt.finish)) throw new Denied('invalid_finish');
+  if (attempt.has_ui !== undefined && typeof attempt.has_ui !== 'boolean') {
+    throw new Denied('invalid_has_ui');
+  }
   validateContract(attempt);
 }
 
@@ -214,6 +218,7 @@ function contractKey(attempt) {
     fixtures_digest: attempt.fixtures_digest ?? null,
     release_target: attempt.release_target ?? null,
     finish: attempt.finish,
+    has_ui: attempt.has_ui ?? null,
   })).digest('hex');
 }
 
@@ -229,7 +234,8 @@ function sameContract(runEntry, attempt) {
     recorded.policy_digest === attempt.policy_digest &&
     (recorded.fixtures_digest ?? null) === (attempt.fixtures_digest ?? null) &&
     (JSON.stringify(recorded.release_target ?? null) ===
-      JSON.stringify(attempt.release_target ?? null));
+      JSON.stringify(attempt.release_target ?? null)) &&
+    (recorded.has_ui ?? null) === (attempt.has_ui ?? null);
 }
 
 // Сверка сдачи с доверенной попыткой. Любое расхождение — отказ до эффекта.
@@ -411,9 +417,14 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   }
 
   // L1 tamper-gate: статический diff base..candidate до любых вызовов L3 и L2.
+  // Гейт обязателен, пока доверенный профиль явно его не отключил; отсутствие
+  // подключённого порта — операционный стоп, а не молчаливый пропуск.
   // Красный гейт — исправимый дефект воркера, аренда остаётся живой.
   let tamper = null;
-  if (typeof ports.tamper === 'function' && profile.tamper !== false) {
+  if (profile.tamper !== false) {
+    if (typeof ports.tamper !== 'function') {
+      return { status: 'hold', reason: 'tamper_port_missing' };
+    }
     await intent('tamper');
     try {
       tamper = await ports.tamper(binding, profile);
@@ -435,10 +446,14 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     }
   }
 
-  // L3 визуальный UI-гейт: только при has_ui в попытке или профиле, на том же
-  // неизменяемом снимке, до вызова независимого ревьюера.
+  // L3 визуальный UI-гейт: на том же неизменяемом снимке, до вызова ревьюера.
+  // Явное has_ui:false в доверенной попытке отключает гейт даже при has_ui в
+  // профиле; иначе решает профиль оператора.
+  const hasUi = binding.has_ui !== undefined && binding.has_ui !== null
+    ? binding.has_ui === true
+    : profile.has_ui === true;
   let visual = { status: 'not_applicable' };
-  if (binding.has_ui === true || profile.has_ui === true) {
+  if (hasUi) {
     if (typeof ports.visual !== 'function') {
       return { status: 'hold', reason: 'visual_port_missing' };
     }
@@ -446,13 +461,10 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     let vis;
     try {
       vis = await ports.visual(binding, profile);
-      await step('visual', true, { status: vis?.status ?? null });
+      await step('visual', true, vis);
     } catch (e) {
       await step('visual', false, messageOf(e));
       return { status: 'hold', reason: `visual_error:${messageOf(e)}` };
-    }
-    if (vis?.sha !== undefined && vis.sha !== binding.candidate_sha) {
-      return { status: 'hold', reason: `visual_sha_mismatch:${vis.sha}` };
     }
     if (vis?.ok !== true) {
       return {
@@ -462,6 +474,17 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
           artifacts: vis?.artifacts ?? [], evidence: vis?.evidence ?? null },
         visual: vis,
       };
+    }
+    // Зелёный L3 должен быть аттестованной квитанцией: тот же SHA, статус pass,
+    // наблюдаемые артефакты с sha256 и evidence. Неаттестованный «pass» — стоп.
+    const attested = vis.status === 'pass' && vis.sha === binding.candidate_sha &&
+      Array.isArray(vis.artifacts) && vis.artifacts.length > 0 &&
+      vis.artifacts.every((a) => a !== null && typeof a === 'object' &&
+        typeof a.name === 'string' && a.name.length > 0 &&
+        /^[0-9a-f]{64}$/.test(a.sha256 ?? '') && Number.isSafeInteger(a.bytes)) &&
+      vis.evidence !== undefined && vis.evidence !== null;
+    if (!attested) {
+      return { status: 'hold', reason: 'visual_receipt_invalid' };
     }
     visual = vis;
   }
@@ -693,12 +716,13 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     base_sha: attempt.base_sha,
     check_profile: attempt.check_profile,
     candidate_sha: submission.candidate_sha,
-    has_ui: attempt.has_ui === true,
+    has_ui: attempt.has_ui,
   };
-  // Ключ запуска включает контракт: новый манифест при том же SHA не переиспользует
-  // терминальный вердикт старого.
+  // Ключ запуска включает контракт и требование L3: новый манифест или смена
+  // has_ui при том же SHA не переиспользуют терминальный вердикт старого запуска.
   const id = runId(`${attempt.task_id}.${attempt.attempt_id}.${attempt.epoch}`,
-    submission.candidate_sha, policy.version) + (key ? `-s${key}` : '');
+    submission.candidate_sha, policy.version) + (key ? `-s${key}` : '') +
+    (attempt.has_ui === true ? '-ui' : '');
   const file = path.join(journal, `${id}.jsonl`);
 
   let fh;
@@ -772,6 +796,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       policy_digest: attempt.policy_digest,
       fixtures_digest: attempt.fixtures_digest ?? null,
       release_target: attempt.release_target ?? null,
+      has_ui: attempt.has_ui ?? null,
     } } : {}),
   });
 
@@ -951,11 +976,19 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
   }, id);
 
+  // Полные квитанции L1-tamper и L3 остаются в локальном журнале, привязанные к
+  // (task_id, epoch, attempt_id, subject_digest) этой же записью settle.
+  const gateReceipts = {
+    tamper: tamper ? { ok: tamper.ok === true, sha: tamper.sha, base_sha: tamper.base_sha,
+      digest: tamper.digest, violations: tamper.violations ?? [] } : null,
+    visual: visual.status === 'not_applicable' ? { status: 'not_applicable' } : visual,
+  };
+
   // finish=verified закрывает карточку; finish=deployed ждёт выкладки и smoke.
   if (attempt.finish !== 'verified') {
     return settle('verified', {
       evidence: loc.evidence,
-      receipt: { settle: 'deferred', until: live.until, evidence },
+      receipt: { settle: 'deferred', until: live.until, evidence, ...gateReceipts },
     });
   }
 
@@ -974,13 +1007,13 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     return settle('uncertain', {
       reason: `complete_failed:${messageOf(e)}`,
       board_state: state,
-      receipt: { settle: 'unknown', evidence },
+      receipt: { settle: 'unknown', evidence, ...gateReceipts },
     });
   }
 
   return settle('verified', {
     evidence: loc.evidence,
-    receipt: { settle: 'completed', evidence },
+    receipt: { settle: 'completed', evidence, ...gateReceipts },
   });
 }
 

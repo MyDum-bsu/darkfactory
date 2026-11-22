@@ -3,7 +3,9 @@ import { isAbsolute, relative } from 'node:path';
 import { parseArgs } from 'node:util';
 import { accept } from './acceptance.mjs';
 import { nativeBoardPort } from './native-board.mjs';
-import { nativeReviewVerifier, offlineProfileRunner, readJson, worktreeInspector } from './runtime.mjs';
+import { nativeReviewVerifier, offlineProfileRunner, offlineVisualRunner, readJson,
+  worktreeInspector } from './runtime.mjs';
+import { tamperGate } from './tamper-gate.mjs';
 import { loadSdk } from './sdk.mjs';
 
 function inside(root, path) {
@@ -40,6 +42,7 @@ async function submit() {
     board: nativeBoardPort(board(), { channel: policy.channel }),
     inspect: worktreeInspector(policy),
     local: offlineProfileRunner(journal),
+    tamper: tamperGate, visual: offlineVisualRunner(journal),
     review: nativeReviewVerifier(policy.reviewGate, policy.reviewPrompt),
   } });
   console.log(JSON.stringify(result));

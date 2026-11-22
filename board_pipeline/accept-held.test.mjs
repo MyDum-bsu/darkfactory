@@ -104,6 +104,10 @@ function stubs(over = {}) {
         calls.local++;
         return { sha: binding.candidate_sha, ok: true, evidence: 'checks.json', exit: 0 };
       },
+      tamper: async (binding) => ({
+        ok: true, sha: binding.candidate_sha, base_sha: binding.base_sha,
+        violations: [], digest: 't'.repeat(64),
+      }),
       review: async (binding) => {
         calls.review++;
         return {
@@ -1169,7 +1173,7 @@ test('has_ui: false/отсутствует — порт visual не вызыва
   const after = await settled(handle, id);
   assert.equal(after.state, 'completed');
   assert.equal(after.result.visual.status, 'na');
-  assert.equal(after.result.tamper, 'na');
+  assert.equal(after.result.tamper, 'pass');
 });
 
 test('has_ui без подключённого порта visual — операционный hold, не слепой пропуск', async (t) => {
@@ -1188,4 +1192,205 @@ test('has_ui без подключённого порта visual — опера�
   assert.equal(res.reason, 'visual_port_missing');
   assert.equal(calls.review, 0);
   assert.equal((await settled(handle, id)).state, 'blocked');
+});
+
+test('отсутствующий порт tamper при включённом гейте — hold до L3 и L2', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  delete ports.tamper;
+  let visual = 0;
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, { has_ui: true }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port, visual: async () => { visual++; return {}; } },
+  });
+  assert.equal(res.outcome, 'hold');
+  assert.equal(res.reason, 'tamper_port_missing');
+  assert.equal(visual, 0);
+  assert.equal(calls.review, 0);
+  assert.equal((await settled(handle, id)).state, 'blocked');
+});
+
+test('профиль может явно отключить tamper-gate: проверки идут без порта', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  delete ports.tamper;
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id, { tamper: false }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+  assert.equal(calls.review, 1);
+  const after = await settled(handle, id);
+  assert.equal(after.result.tamper, 'na');
+});
+
+test('явное attempt.has_ui: false отключает L3 даже при has_ui в профиле', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  let visual = 0;
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, { has_ui: false }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port, visual: async () => { visual++; throw new Error('unreachable'); } },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+  assert.equal(visual, 0);
+  assert.equal(calls.review, 1);
+  const after = await settled(handle, id);
+  assert.equal(after.result.visual.status, 'na');
+});
+
+test('неаттестованный зелёный L3 — hold, а не pass: sha, статус, артефакты, evidence обязательны', async (t) => {
+  for (const [name, receipt] of [
+    ['без артефактов', { ok: true, status: 'pass', artifacts: [], evidence: { exit: 0 } }],
+    ['чужой sha', { ok: true, status: 'pass', sha: 'd'.repeat(40), artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: {} }],
+    ['без status', { ok: true, artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: {} }],
+  ]) {
+    const { handle, ported } = await isolated(t);
+    const id = await task(handle);
+    const { epoch, port } = await held(ported, id);
+    const { ports, calls } = stubs();
+    const res = await acceptHeld({
+      attempt: attempt(id, epoch, { has_ui: true }),
+      submission: submission(id, epoch),
+      policy: policy(id, { has_ui: true }),
+      journal: await tmpJournal(),
+      ports: { ...ports, board: port, visual: async (binding) => ({ sha: binding.candidate_sha, ...receipt }) },
+    });
+    assert.equal(res.outcome, 'hold', name);
+    assert.equal(res.reason, 'visual_receipt_invalid', name);
+    assert.equal(calls.review, 0, name);
+    assert.equal((await settled(handle, id)).state, 'blocked', name);
+  }
+});
+
+test('ошибка запуска L3-runner — hold среды, не rework воркеру', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, { has_ui: true }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port,
+      visual: async () => { throw new Error('visual_runner_not_executed:Unable to find image'); } },
+  });
+  assert.equal(res.outcome, 'hold');
+  assert.match(res.reason, /visual_error:visual_runner_not_executed/);
+  assert.equal(calls.review, 0);
+  assert.equal((await settled(handle, id)).state, 'blocked');
+});
+
+test('полная квитанция L3 с sha256 артефактов привязана к subject_digest в журнале', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports } = stubs();
+  const artifact = { name: 'shot.png', sha256: 'e'.repeat(64), bytes: 42 };
+  const journal = await tmpJournal();
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch, { has_ui: true }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal,
+    ports: { ...ports, board: port,
+      visual: async (binding) => ({ ok: true, status: 'pass', sha: binding.candidate_sha,
+        artifacts: [artifact], evidence: { file: 'v.log', sha256: 'f'.repeat(64), exit: 0 } }) },
+  });
+  assert.equal(res.outcome, 'verified');
+  assert.deepEqual(res.receipt.visual.artifacts, [artifact], 'полный VisualReceipt в квитанции');
+  assert.equal(res.receipt.visual.evidence.sha256, 'f'.repeat(64));
+  assert.equal(res.receipt.tamper.digest, 't'.repeat(64), 'полный tamper-отчёт в квитанции');
+  assert.equal(res.receipt.subject_digest, expectedDigest(), 'квитанция привязана к манифесту');
+  const text = await journalText(journal);
+  assert.ok(text.includes(artifact.sha256), 'журнал несёт sha256 артефакта L3');
+});
+
+test('смена has_ui при том же SHA не переиспользует терминальный вердикт', async (t) => {
+  const { handle, ported, seen } = await isolated(t);
+  const id = await contractTask(handle);
+  await handle.label(id, { set: { finish: 'deployed' } });
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  const journal = await tmpJournal();
+  let visual = 0;
+  // finish=deployed: первая приёмка откладывает complete, аренда живёт для второй.
+  const run = (hasUi) => acceptHeld({
+    attempt: contractAttempt(id, epoch, { has_ui: hasUi, finish: 'deployed' }),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: port,
+      visual: async (binding) => {
+        visual++;
+        return { ok: true, status: 'pass', sha: binding.candidate_sha,
+          artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 1 }], evidence: { exit: 0 } };
+      } },
+  });
+  const first = await run(false);
+  assert.equal(first.outcome, 'verified');
+  assert.equal(visual, 0);
+  const second = await run(true);
+  assert.equal(second.outcome, 'verified');
+  assert.equal(second.repeated, undefined, 'вердикт без L3 не переиспользован для UI-попытки');
+  assert.notEqual(second.run, first.run);
+  assert.equal(visual, 1, 'L3 выполнен для нового требования');
+  assert.equal(calls.review, 2, 'ревью повторено для нового манифеста');
+  assert.equal(seen.claim, 1);
+});
+
+test('длинная policy.version отклоняется до любых эффектов', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: { ...policy(id), version: 'v'.repeat(2000) },
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port },
+  });
+  assert.equal(res.outcome, 'denied');
+  assert.equal(res.reason, 'policy_version_too_long');
+  assert.deepEqual(calls, { inspect: 0, local: 0, review: 0 });
+});
+
+test('collectVisualArtifacts: лимиты по числу и объёму, symlink не считается файлом', async (t) => {
+  const { collectVisualArtifacts } = await import('./runtime.mjs');
+  const { symlink } = await import('node:fs/promises');
+  const dropped = await mkdtemp(path.join(testRoot, 'dropped-'));
+  const journal = await tmpJournal();
+  const binding = { task_id: '1', candidate_sha: CAND };
+  await writeFile(path.join(dropped, 'ok.txt'), 'artifact');
+  await symlink('ok.txt', path.join(dropped, 'link.txt'));
+  const artifacts = await collectVisualArtifacts(dropped, journal, binding);
+  assert.equal(artifacts.length, 1, 'symlink пропущен');
+  assert.equal(artifacts[0].sha256.length, 64);
+  const stored = await readFile(path.join(journal, artifacts[0].name), 'utf8');
+  assert.equal(stored, 'artifact', 'байты артефакта сохранены в приватный журнал');
+
+  const overFile = await mkdtemp(path.join(testRoot, 'dropped-'));
+  await writeFile(path.join(overFile, 'big.bin'), Buffer.alloc(9 * 1024 * 1024));
+  await assert.rejects(() => collectVisualArtifacts(overFile, journal, binding), /limits/);
+
+  const overCount = await mkdtemp(path.join(testRoot, 'dropped-'));
+  for (let i = 0; i < 65; i++) await writeFile(path.join(overCount, `a${i}.txt`), 'x');
+  await assert.rejects(() => collectVisualArtifacts(overCount, journal, binding), /limits/);
 });

@@ -43,6 +43,10 @@ function makePorts(over = {}) {
       calls.local++;
       return { sha: handoff.candidate_sha, ok: true, evidence: 'ev.json' };
     },
+    tamper: async (handoff) => ({
+      ok: true, sha: handoff.candidate_sha, base_sha: handoff.base_sha,
+      violations: [], digest: 't'.repeat(64),
+    }),
     review: async (handoff) => {
       calls.review++;
       return {
@@ -100,7 +104,7 @@ test('happy path: зелёная сдача завершает карточку'
   assert.deepEqual(calls, { lookup: 1, claim: 1, complete: 1, block: 0, inspect: 2, local: 1, review: 1 });
   const entries = await readRunFile(journal);
   const intents = entries.filter((e) => e.kind === 'intent').map((e) => e.phase);
-  assert.deepEqual(intents, ['claim', 'inspect', 'local', 'review', 'seal', 'complete']);
+  assert.deepEqual(intents, ['claim', 'inspect', 'local', 'tamper', 'review', 'seal', 'complete']);
 });
 
 test('грязный снимок и дрейф SHA не запускают ревью', async () => {
