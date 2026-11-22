@@ -133,6 +133,10 @@ async function execute() {
   await say({ step: 'board', url: boardUrl, pid: boardProc.pid });
 
   const env = { ...process.env, XDG_CONFIG_HOME: join(dirs.gate, 'config'), TMPDIR: dirs.tmp };
+  // Изолированный XDG_CONFIG_HOME: идентичность Board (~/.config/board)
+  // переносим в приватный config, чтобы claimReady мог аутентифицироваться.
+  await mkdir(join(dirs.gate, 'config'), { recursive: true });
+  await exec('cp', ['-a', join(homedir(), '.config/board'), join(dirs.gate, 'config/board')]);
   const proof = { factorySha, lab, stateDir: priv, boardUrl, channel: 'pilot', provider: 'acp-devin',
     model: 'swe-2-high', permissionMode: 'full', specDigest, policyDigest,
     cards: {}, candidates: [], journal: {}, idleTickZeroCalls: false };

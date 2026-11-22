@@ -592,7 +592,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // endpoint'ы модели. Прокси на :44100 запрещён до запуска; NO_PROXY
       // в контейнер не передаётся.
       const allow = ['api.openai.com:443', 'chatgpt.com:443'];
-      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs' };
+      // PI_OFFLINE: pi не скачивает внешние инструменты (fd/rg с github.com)
+      // — иначе egress-allowlist роняет процесс на старте.
+      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1' };
       for (const key of PROXY_ENV) {
         const value = process.env[key];
         if (typeof value !== 'string' || !value) continue;
@@ -650,7 +652,10 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts,
         timeoutMs });
       if (run.code !== 0) {
-        throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
+        const tail = String(run.stderr || run.stdout || '')
+          .replace(/\s+/g, ' ').trim().slice(-400);
+        throw new ReviewDenied(
+          `review_runner_exit:${run.code ?? 'timeout'}${tail ? `:${tail}` : ''}`);
       }
 
       // Приватный сырой транскрипт: контроллер владеет каталогом журнала.

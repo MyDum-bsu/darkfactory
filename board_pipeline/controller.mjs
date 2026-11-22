@@ -284,9 +284,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       if (!/^thr_[a-z0-9]+$/.test(launched?.threadId ?? '')) throw new Error('No confirmed BB thread');
       await save({ phase: 'working', threadId: launched.threadId,
         receipt: { kind: 'spawn', threadId: launched.threadId }, ...(workerTrail ?? {}) });
-    } catch {
+    } catch (e) {
       // Обрыв в любой точке claim/launch не повторяет эффект: та же сверка,
       // что и при рестарте процесса с записью IN_FLIGHT.
+      process.stderr.write(`claim/launch error: ${e?.stack ?? e}\n`);
       return reconcileInFlight();
     }
     return visible();
