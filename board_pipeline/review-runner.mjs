@@ -703,3 +703,160 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
     }
   };
 }
+
+// Публичные egress-endpoint'ы провайдеров моделей для allowlist pi-guard.
+const PROVIDER_EGRESS = new Map([
+  ['openai', ['api.openai.com:443', 'chatgpt.com:443']],
+  ['google', ['generativelanguage.googleapis.com:443']],
+  ['deepseek', ['api.deepseek.com:443']],
+  ['glm', ['open.bigmodel.cn:443']],
+  ['cognition', ['api.cognition.ai:443']],
+]);
+
+// Решение арбитра — ровно один JSON-объект в конце выдачи: код-блок ```json
+// или последний сбалансированный {...}. Нечитаемый ответ — null.
+function parseArbiterDecision(text) {
+  const body = String(text ?? '');
+  const fences = [...body.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
+  for (const m of fences.reverse()) {
+    try {
+      const v = JSON.parse(m[1]);
+      if (v !== null && typeof v === 'object' && !Array.isArray(v)) return v;
+    } catch { /* следующий блок */ }
+  }
+  const tail = body.lastIndexOf('{');
+  while (tail >= 0) {
+    try {
+      const v = JSON.parse(body.slice(tail));
+      if (v !== null && typeof v === 'object' && !Array.isArray(v)) return v;
+    } catch { /* хвост не JSON */ }
+    break;
+  }
+  return null;
+}
+
+// Изолированный раннер арбитра третьего независимого семейства. Тот же
+// rootless Docker read-only контур, что у критика, но без снимка кандидата:
+// арбитр судит по сериализованному спору (trigger + evidence + спека), а не
+// по дереву — дерево и worktree в контейнер не монтируются вообще.
+export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
+  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox }) {
+  if (!isAbsolute(piRoot ?? '')) {
+    throw new ReviewDenied('arbiter_runner_misconfigured');
+  }
+  return async (req) => {
+    const arbiter = req?.arbiter;
+    if (arbiter === null || typeof arbiter !== 'object' || Array.isArray(arbiter) ||
+        !nonEmpty(arbiter.provider) || !nonEmpty(arbiter.model)) {
+      throw new ReviewDenied('arbiter_profile_not_approved');
+    }
+    const scratch = await mkdtemp(join(tmpdir(), 'board-arbiter-'));
+    try {
+      // auth только одного провайдера арбитра — как у критика, копией в tmpfs.
+      const cfgDir = join(scratch, 'pi-cfg');
+      await mkdir(cfgDir, { mode: 0o700 });
+      const fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
+      const credential = fullAuth?.[arbiter.provider];
+      if (credential === undefined || credential === null) {
+        throw new ReviewDenied('arbiter_auth_missing');
+      }
+      await writeFile(join(cfgDir, 'auth.json'),
+        JSON.stringify({ [arbiter.provider]: credential }));
+      for (const file of PI_CONFIG_FILES) {
+        const src = join(piRoot, file);
+        if (await lstat(src).catch(() => null)) {
+          await writeFile(join(cfgDir, file), await readFile(src));
+        }
+      }
+      const mounts = [
+        { src: cfgDir, dst: '/pi-cfg' },
+        { src: GUARD_FILE, dst: '/pi-guard/pi-guard.cjs' },
+      ];
+      for (const component of PI_MOUNT_DIRS) {
+        const src = join(piRoot, component);
+        if (await lstat(src).catch(() => null)) {
+          mounts.push({ src, dst: `/pi-ro/${component}` });
+        }
+      }
+      const allow = [...(PROVIDER_EGRESS.get(arbiter.provider) ?? [])];
+      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs' };
+      for (const key of PROXY_ENV) {
+        const value = process.env[key];
+        if (typeof value !== 'string' || !value) continue;
+        let u;
+        try {
+          u = new URL(value);
+        } catch {
+          throw new ReviewDenied('arbiter_proxy_invalid');
+        }
+        if (u.port === '44100' || privateProxyHost(u.hostname)) {
+          throw new ReviewDenied('arbiter_proxy_blocked');
+        }
+        env[key] = value;
+        allow.push(`${u.hostname.toLowerCase()}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`);
+      }
+      env.PI_ALLOW_CONNECT = [...new Set(allow)].join(',');
+
+      const instruction = [
+        `Independent arbitration for Board #${req.task_id} attempt ${req.attempt_id}.`,
+        'You are the arbiter of the third independent family. Judge the dispute below',
+        'against the spec. You have read-only tools only; do not attempt to write.',
+        `The required subject_digest is "${req.subject_digest ?? ''}". Repeat it verbatim`,
+        'inside the decision JSON.',
+        'Finish with exactly one JSON code block:',
+        '{"decision":"directed_rework"|"accept_with_notes"|"escalate_owner",',
+        '"subject_digest":"<the required digest>",',
+        '"directive":"..."} or {"decision":"accept_with_notes","subject_digest":"...",',
+        '"notes":"..."} or {"decision":"escalate_owner","subject_digest":"...",',
+        '"question":"..."}.',
+        'You may never waive deterministic gates, DoD, or accept harm 10 findings.',
+        '',
+        `Trigger: ${JSON.stringify(req.trigger ?? null)}`,
+        `Evidence: ${JSON.stringify(req.evidence ?? null).slice(0, 8000)}`,
+        '',
+        prompt,
+      ].join('\n');
+
+      const piArgv = ['/bin/sh', '-c',
+        'mkdir -p /tmp/.pi/agent /tmp/session; ' +
+        'for f in bin install npm; do ' +
+        '[ -e "/pi-ro/$f" ] && ln -s "/pi-ro/$f" "/tmp/.pi/agent/$f"; done; ' +
+        'for f in auth.json settings.json models.json models-store.json; do ' +
+        '[ -e "/pi-cfg/$f" ] && cp "/pi-cfg/$f" "/tmp/.pi/agent/$f"; done; ' +
+        'cp /pi-guard/pi-guard.cjs /tmp/pi-guard.cjs; ' +
+        'exec /pi-ro/bin/pi "$@"', 'pi',
+        '--print', '--mode', 'json',
+        '--provider', arbiter.provider, '--model', arbiter.model,
+        '--thinking', arbiter.reasoningLevel ?? 'high',
+        '--no-mcp', '--no-extensions', '--no-skills', '--no-context-files',
+        '--no-approve', '--tools', READ_ONLY_TOOLS.join(','),
+        '--session-dir', '/tmp/session', instruction];
+
+      const snapshot = join(scratch, 'empty');
+      await mkdir(snapshot);
+      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, timeoutMs });
+      if (run.code !== 0) {
+        throw new ReviewDenied(`arbiter_runner_exit:${run.code ?? 'timeout'}`);
+      }
+      const transcript = run.stdout;
+      if (typeof journal === 'string' && isAbsolute(journal)) {
+        const name = `arbiter-${req.task_id}-${req.attempt_id}-${randomUUID()}.ndjson`;
+        await writeFile(join(journal, name), transcript, { flag: 'wx', mode: 0o600 });
+      }
+      const parsed = parseReviewTranscript(transcript);
+      for (const key of ['provider', 'model']) {
+        if (parsed.actual[key] !== arbiter[key]) {
+          throw new ReviewDenied(`arbiter_${key}_mismatch`);
+        }
+      }
+      assertToolsAllowed(parsed.toolsAdded);
+      const decision = parseArbiterDecision(parsed.finalText);
+      if (decision === null) {
+        throw new ReviewDenied('arbiter_response_invalid');
+      }
+      return decision;
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  };
+}

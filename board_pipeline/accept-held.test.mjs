@@ -1739,6 +1739,18 @@ test('пункт 1: невалидная arbitration квитанция — hold
     ['чужой digest', arbReceipt('f'.repeat(64))],
     ['арбитр того же семейства', arbReceipt(digest, { arbiter: REVIEW_ROUTE })],
     ['неизвестный арбитр', arbReceipt(digest, { arbiter: { provider: 'x', model: 'y' } })],
+    // Пункт 1 (ревью #3): экземпляр класса — не plain-объект.
+    ['квитанция — экземпляр класса',
+      Object.assign(new (class Receipt {})(), arbReceipt(digest))],
+    // Пункт 1 (ревью #3): truthy небулево dod_violation отклоняется.
+    ['dod_violation строкой', arbReceipt(digest, { dod_violation: 'yes' })],
+    // Пункт 1 (ревью #3): arbiter обязан быть plain-объектом с provider+model.
+    ['без арбитра', { ...arbReceipt(digest), arbiter: undefined }],
+    ['арбитр null', arbReceipt(digest, { arbiter: null })],
+    ['арбитр — экземпляр класса', arbReceipt(digest, {
+      arbiter: Object.assign(new (class Arb {})(),
+        { provider: 'google', model: 'gemini-4-neon' }) })],
+    ['арбитр без model', arbReceipt(digest, { arbiter: { provider: 'google' } })],
   ];
   for (const [label, receipt] of cases) {
     const { handle, ported } = await isolated(t);
@@ -1834,4 +1846,46 @@ test('пункт 9: pi/deepseek-исполнитель проходит приё
     ports: { ...ports, board: boardPort },
   });
   assert.equal(res.outcome, 'verified', res.reason ?? '');
+});
+
+// Пункт 4 (ревью #3): инспектор, возвращающий только { tree_sha } без { tree },
+// тоже строит манифест и проходит seal; а при отказе inspectionProblem
+// полученное дерево всё равно попадает в результат и квитанцию.
+test('пункт 4: манифест из ins.tree_sha и дерево в результате даже при отказе инспекции', async (t) => {
+  const TREE_SHA_ONLY = 'd'.repeat(40);
+  const insOnly = { head: CAND, clean: true, baseAncestor: true, tree_sha: TREE_SHA_ONLY };
+  // Контракт без закреплённого дерева: манифест достраивается из ins.tree_sha.
+  const a = await isolated(t);
+  const idA = await contractTask(a.handle);
+  const { epoch: eA, port: pA } = await held(a.ported, idA);
+  const jA = await tmpJournal();
+  const sA = stubs({ inspect: async () => insOnly });
+  const resA = await acceptHeld({
+    attempt: contractAttempt(idA, eA, { tree_sha: undefined }),
+    submission: submission(idA, eA), policy: policy(idA), journal: jA,
+    ports: { ...sA.ports, board: pA },
+  });
+  assert.equal(resA.outcome, 'verified', resA.reason ?? '');
+  assert.equal(resA.tree_sha, TREE_SHA_ONLY);
+  assert.equal(resA.receipt.tree_sha, TREE_SHA_ONLY);
+  const digestA = subjectDigest(buildSubject({
+    kind: 'git_tree', repoId: REPO, baseSha: BASE, candidateSha: CAND,
+    treeSha: TREE_SHA_ONLY, specDigest: SPEC, policyDigest: POL,
+    fixturesDigest: null, releaseTarget: { finish: 'verified' } }));
+  assert.equal(resA.subject_digest, digestA, 'манифест построен на ins.tree_sha');
+  // Отказ инспекции (грязное дерево): hold, но полученный tree_sha — в записи.
+  const b = await isolated(t);
+  const idB = await task(b.handle);
+  const { epoch: eB, port: pB } = await held(b.ported, idB);
+  const jB = await tmpJournal();
+  const sB = stubs({ inspect: async () => ({
+    head: CAND, clean: false, baseAncestor: true, tree_sha: TREE_SHA_ONLY }) });
+  const resB = await acceptHeld({
+    attempt: attempt(idB, eB), submission: submission(idB, eB),
+    policy: policy(idB), journal: jB,
+    ports: { ...sB.ports, board: pB },
+  });
+  assert.equal(resB.outcome, 'hold');
+  assert.equal(resB.tree_sha, TREE_SHA_ONLY, 'дерево снимка зафиксировано до отказа');
+  assert.equal(resB.receipt.tree_sha, TREE_SHA_ONLY);
 });

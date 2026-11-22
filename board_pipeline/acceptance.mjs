@@ -451,7 +451,7 @@ function compactEvidence(evidence, run) {
 
 // Один общий механизм Git-снимка, проверок и ревью для ручного v1 и для приёмки по аренде.
 // Возвращает verified | rework (исправимый дефект) | hold (среда/неизвестный эффект).
-async function runVerification({ binding, profile, ports, intent, step, beforeReview, onSnapshot, subjectDigest, journal }) {
+async function runVerification({ binding, profile, ports, intent, step, beforeReview, onInspect, onSnapshot, subjectDigest, journal }) {
   await intent('inspect');
   let ins;
   try {
@@ -461,6 +461,9 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     await step('inspect', false, messageOf(e));
     return { status: 'hold', reason: `inspect_failed:${messageOf(e)}` };
   }
+  // Дерево снимка фиксируется сразу после успешной инспекции — до любого
+  // отказа inspectionProblem, чтобы попасть в результат и квитанцию.
+  if (typeof onInspect === 'function') await onInspect(ins);
   const problem = inspectionProblem(ins, binding.candidate_sha);
   if (problem) return { status: 'hold', reason: problem };
   if (onSnapshot) {
@@ -1059,10 +1062,11 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   // расхождение закреплённого дерева с фактическим — дрейф.
   const finalizeSubject = async (ins) => {
     if (subject !== null || attempt.spec_digest === undefined) return null;
-    if (attempt.tree_sha !== undefined && ins.tree !== undefined && attempt.tree_sha !== ins.tree) {
+    const actualTree = ins?.tree ?? ins?.tree_sha ?? null;
+    if (attempt.tree_sha !== undefined && actualTree !== null && attempt.tree_sha !== actualTree) {
       return { status: 'hold', reason: 'tree_sha_drift' };
     }
-    const treeSha = attempt.tree_sha ?? ins.tree;
+    const treeSha = attempt.tree_sha ?? actualTree;
     if (!treeSha) return { status: 'hold', reason: 'subject_contract_incomplete' };
     try {
       subject = attemptSubject(attempt, submission, treeSha);
@@ -1156,7 +1160,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       return { fail: changed };
     }
     // tree_sha снимка не должен сдвинуться с момента инспекции манифеста.
-    if (subject?.source?.tree_sha && ins?.tree && ins.tree !== subject.source.tree_sha) {
+    const sealTree = ins?.tree ?? ins?.tree_sha ?? null;
+    if (subject?.source?.tree_sha && sealTree && sealTree !== subject.source.tree_sha) {
       await step('seal', false, 'tree_sha_drift');
       return { fail: 'tree_sha_drift' };
     }
@@ -1172,12 +1177,12 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
 
   const verdict = await runVerification({ binding, profile, ports, intent, step,
     beforeReview: () => ports.board.verifyHeld(attempt.task_id, attempt.epoch),
-    onSnapshot: async (ins) => {
+    onInspect: async (ins) => {
       if (ins !== null && typeof ins === 'object') {
         inspectedTreeSha = ins.tree_sha ?? ins.tree ?? inspectedTreeSha;
       }
-      return finalizeSubject(ins);
     },
+    onSnapshot: finalizeSubject,
     subjectDigest: () => digest,
     journal });
   if (verdict.status === 'lost') return settle('denied', { reason: verdict.reason });
@@ -1199,13 +1204,20 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       record.sealAndComplete = async (arbitrationReceipt) => {
       // Строгая валидация квитанции арбитра ДО seal: любой пропуск —
       // hold без complete.
-      let receiptOk = arbitrationReceipt !== null &&
-        typeof arbitrationReceipt === 'object' && !Array.isArray(arbitrationReceipt) &&
+      const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v) &&
+        (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
+      let receiptOk = isPlain(arbitrationReceipt) &&
         arbitrationReceipt.decision === 'accept_with_notes' &&
         typeof arbitrationReceipt.notes === 'string' && arbitrationReceipt.notes.trim().length > 0 &&
         Number.isFinite(arbitrationReceipt.max_harm) && arbitrationReceipt.max_harm < 10 &&
-        arbitrationReceipt.dod_violation !== true &&
-        arbitrationReceipt.subject_digest === digest;
+        (arbitrationReceipt.dod_violation === false ||
+          arbitrationReceipt.dod_violation === undefined) &&
+        arbitrationReceipt.subject_digest === digest &&
+        isPlain(arbitrationReceipt.arbiter) &&
+        typeof arbitrationReceipt.arbiter.provider === 'string' &&
+        arbitrationReceipt.arbiter.provider.trim().length > 0 &&
+        typeof arbitrationReceipt.arbiter.model === 'string' &&
+        arbitrationReceipt.arbiter.model.trim().length > 0;
       if (receiptOk) {
         try {
           assertTriadIndependent({

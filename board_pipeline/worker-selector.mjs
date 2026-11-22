@@ -457,20 +457,25 @@ export async function resolveArbitration({
   if (typeof arbitrate !== 'function') {
     return { decision: 'hold', reason: 'arbiter_unavailable', evidence };
   }
-  const ruling = await arbitrate({
-    arbiter,
-    task_id: attempt.task_id,
-    epoch: attempt.epoch,
-    attempt_id: attempt.attempt_id,
-    subject_digest: subjectDigest,
-    trigger: { trigger: trigger?.trigger, kind: trigger?.kind },
-    evidence,
-  });
+  let ruling;
+  try {
+    ruling = await arbitrate({
+      arbiter,
+      task_id: attempt.task_id,
+      epoch: attempt.epoch,
+      attempt_id: attempt.attempt_id,
+      subject_digest: subjectDigest,
+      trigger: { trigger: trigger?.trigger, kind: trigger?.kind },
+      evidence,
+    });
+  } catch {
+    return { decision: 'hold', reason: 'arbiter_unavailable', evidence };
+  }
   // Строгая привязка решения к манифесту приёмки для ВСЕХ решений арбитра:
   // subjectDigest манифеста обязан быть валидным 64-hex, а digest решения —
   // строго совпадать. Отсутствие манифеста или расхождение — hold.
-  const digestOk = DIGEST64.test(subjectDigest ?? '') &&
-    ruling?.subject_digest === subjectDigest;
+  const digestOk = typeof subjectDigest === 'string' && DIGEST64.test(subjectDigest) &&
+    typeof ruling?.subject_digest === 'string' && ruling.subject_digest === subjectDigest;
   const needsDigest = ['directed_rework', 'accept_with_notes', 'escalate_owner']
     .includes(ruling?.decision);
   if (needsDigest && !digestOk) {

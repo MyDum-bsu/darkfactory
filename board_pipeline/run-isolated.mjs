@@ -12,7 +12,7 @@ import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
-import { assertCrossFamily, isolatedPiReviewRunner } from './review-runner.mjs';
+import { assertCrossFamily, isolatedArbiterRunner, isolatedPiReviewRunner } from './review-runner.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
@@ -236,6 +236,15 @@ async function execute() {
   };
 
   const release = await reserveWorktree(join(homedir(), '.local', 'state', 'darkfactory-lab', 'slots'), tree, root);
+  // Порт арбитра: реальный изолированный раннер третьего семейства в том же
+  // rootless Docker read-only контуре, что и критик. Создаётся лениво —
+  // только когда арбитраж действительно запрошен.
+  let arbiterRunner = null;
+  const arbitrate = async (req) => {
+    arbiterRunner ??= isolatedArbiterRunner({ journal: root,
+      prompt: typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '' });
+    return arbiterRunner(req);
+  };
   try {
     const deadline = Date.now() + p.waitMs;
     let previous;
@@ -248,7 +257,7 @@ async function execute() {
         workerSelector: { ...workerSelector,
           critic: p.profiles[route.checkProfile]?.review,
           arbiter: p.arbiter ?? workerSelector.DEFAULT_ARBITER,
-          arbitrate: typeof p.arbitrate === 'function' ? p.arbitrate : undefined } });
+          arbitrate } });
       recheck = false;
       const line = JSON.stringify(result);
       if (line !== previous) console.log(line);

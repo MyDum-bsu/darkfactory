@@ -679,3 +679,21 @@ test('пункт 13: accept_with_notes receipt содержит max_harm', async
   assert.equal(r.receipt.max_harm, 4);
   assert.equal(r.receipt.dod_violation, false);
 });
+
+// Пункт 5 (ревью #3): digest проверяется строго как строка — массив/объект
+// не проходит через приведение типа в RegExp.test.
+test('пункт 5: subjectDigest нестрокового типа — arbiter_subject_mismatch', async () => {
+  for (const [subjectDigest, ruling] of [
+    [[DIGEST], { decision: 'directed_rework', directive: 'x', subject_digest: DIGEST }],
+    [DIGEST, { decision: 'directed_rework', directive: 'x', subject_digest: [DIGEST] }],
+    [undefined, { decision: 'escalate_owner', question: 'q', subject_digest: 'undefined' }],
+    [DIGEST, { decision: 'accept_with_notes', notes: 'n', subject_digest: [DIGEST] }],
+  ]) {
+    const r = await resolveArbitration({
+      attempt: arbAttempt, trigger: disputeTrigger, subjectDigest,
+      verifyHeld: liveHeld, arbitrate: async () => ruling,
+    });
+    assert.equal(r.decision, 'hold', JSON.stringify([typeof subjectDigest, ruling.decision]));
+    assert.equal(r.reason, 'arbiter_subject_mismatch');
+  }
+});
