@@ -2,8 +2,9 @@
 // на штатном ходе: модель просыпается ТОЛЬКО через хук эскалации, когда после
 // уборки Тира 1 свободное место всё ещё ниже критического порога. Тир 1 трогает
 // только 100% воспроизводимый мусор из фиксированного allowlist — Docker build
-// cache и висячие образы, просроченные /tmp/df-*, содержимое кэшей pip/npm/uv
-// старше N дней. Worktree, .bb, проекты и пользовательские файлы недостижимы
+// cache и висячие образы, просроченные /tmp/df-* и каталоги /tmp/pytest-of-*,
+// содержимое кэшей pip/npm/uv старше N дней. Worktree, .bb, проекты и
+// пользовательские файлы недостижимы
 // для удаления по построению: путь вне allowlist не классифицируется как
 // удаляемый и остаётся только в отчёте. RAM < 1.5 GiB MemAvailable → стоп
 // idle-тредов BB; активные, закреплённые, с очередью или фоновой работой и
@@ -33,7 +34,12 @@ export const RAM_MIN_GIB = 1.5;   // < 1.5 GiB MemAvailable → стоп idle-т
 export const RAM_MIN_BYTES = 1_610_612_736n;
 
 export const DEFAULT_MOUNTS = Object.freeze(['/', '/media/mydum/Data']);
-export const TMP_PATTERN = /^df-/;
+// Allowlist прямых детей /tmp: df-* (любые записи) и pytest-of-* (только
+// каталоги — pytest копит прогоны в /tmp/pytest-of-<user>/pytest-<N>).
+export const TMP_ALLOW_RULES = Object.freeze([
+  { pattern: /^df-/, dirOnly: false },
+  { pattern: /^pytest-of-/, dirOnly: true },
+]);
 
 // Кэши pip/npm/uv: фиксированные корни, привязка к XDG_CACHE_HOME для тестов
 // и нестандартных установок. npm — только _cacache, самый строгий вариант.
@@ -94,16 +100,18 @@ export const readMemAvailable = async () => parseMemInfo(await readFile('/proc/m
 
 // --- Тир 1: классификация и уборка -----------------------------------------
 
-// /tmp/df-* — единственное, что сторож удаляет вне кэшей: только прямые дети
-// tmpRoot, только по маске df-*, только просроченные по mtime. Символические
-// ссылки и специальные файлы не удаляются никогда.
+// /tmp — единственное место вне кэшей, где сторож удаляет: только прямые дети
+// tmpRoot, только по allowlist-маскам df-* / pytest-of-*, только просроченные
+// по mtime. Символические ссылки и специальные файлы не удаляются никогда.
 export function classifyTmpEntry(name, stat, { cutoffMs }) {
   if (typeof name !== 'string' || !name || name === '.' || name === '..' || name.includes('/') || name.includes('\0')) {
     return { action: 'refuse', reason: 'unsafe_name' };
   }
-  if (!TMP_PATTERN.test(name)) return { action: 'keep', reason: 'outside_df_pattern' };
+  const rule = TMP_ALLOW_RULES.find(r => r.pattern.test(name));
+  if (!rule) return { action: 'keep', reason: 'outside_allowlist' };
   if (stat.isSymbolicLink()) return { action: 'refuse', reason: 'symlink' };
   if (!stat.isFile() && !stat.isDirectory()) return { action: 'refuse', reason: 'special_file' };
+  if (rule.dirOnly && !stat.isDirectory()) return { action: 'keep', reason: 'allowlist_dir_only' };
   if (stat.mtimeMs >= cutoffMs) return { action: 'keep', reason: 'not_expired' };
   return { action: 'delete', kind: stat.isDirectory() ? 'dir' : 'file' };
 }
@@ -482,6 +490,10 @@ export async function runSteward(options) {
       await journal({ event: 'ram_low', thresholdGiB: RAM_MIN_GIB });
       if (typeof execBb === 'function') {
         const listed = await execBb(['thread', 'list', '--json']);
+        // runCommand не бросает исключений: ненулевой код — честная ошибка, а не пустой список.
+        if (listed.code !== 0) {
+          throw new Error(`bb thread list: ${String(listed.stderr ?? '').slice(-200) || `exit code ${listed.code}`}`);
+        }
         const threads = parseBbThreadList(listed.stdout);
         const { stoppable, skipped } = selectIdleThreads(threads, { pinnedThreads, selfThreadId });
         summary.ram.skipped = skipped;
@@ -490,15 +502,22 @@ export async function runSteward(options) {
           summary.ram.plannedStops = stoppable.map(s => s.id);
         } else {
           for (const { id } of stoppable) {
+            let outcome;
             try {
-              const outcome = await execBb(['thread', 'stop', id]);
-              await journal({ event: 'ram_stop', threadId: id, code: outcome.code });
-              summary.ram.stopped++;
+              outcome = await execBb(['thread', 'stop', id]);
             } catch (error) {
-              await journal({ event: 'ram_stop_error', threadId: id, error: error.message });
-              summary.ram.errors++;
-              errors.push(`stop ${id}: ${error.message}`);
+              outcome = { code: -1, stderr: error.message };
             }
+            // Ненулевой код возврата stop — не засчитанный стоп: ошибка, тик продолжается.
+            if (outcome.code !== 0) {
+              const reason = String(outcome.stderr ?? '').slice(-200) || `exit code ${outcome.code}`;
+              await journal({ event: 'ram_stop_error', threadId: id, code: outcome.code, error: reason });
+              summary.ram.errors++;
+              errors.push(`stop ${id}: ${reason}`);
+              continue;
+            }
+            await journal({ event: 'ram_stop', threadId: id, code: outcome.code });
+            summary.ram.stopped++;
           }
         }
       } else {
@@ -562,14 +581,22 @@ export const runCommand = (cmd, timeoutMs) => async args => {
 };
 
 // Хук эскалации: payload JSON на stdin указанного исполняемого файла, без
-// shell, с таймаутом. Команда решает сама, как разбудить LLM-агента Steward.
+// shell, с таймаутом. stderr дренируется всегда — буфер pipe не забивается,
+// хвост диагностики попадает в detail. Команда решает сама, как разбудить
+// LLM-агента Steward.
 export const escalateViaCommand = (executable, timeoutMs = 120_000) => async payload => {
   const child = spawn(executable, [], { stdio: ['pipe', 'ignore', 'pipe'] });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { if (stderr.length < 4096) stderr += chunk; });
   const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
   try {
     child.stdin.end(JSON.stringify(payload, null, 2));
-    const [code, signal] = await once(child, 'close');
-    return { code, detail: signal ? `signal ${signal}` : '' };
+    const [code, signal] = await Promise.race([
+      once(child, 'close'),
+      once(child, 'error').then(error => { throw error; }),
+    ]);
+    return { code, detail: [signal ? `signal ${signal}` : '', stderr.slice(-400)].filter(Boolean).join('; ') };
   } finally {
     clearTimeout(timer);
   }
@@ -580,7 +607,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     const flags = parseArgv(process.argv.slice(2));
     const summary = await runSteward({
       dryRun: flags.dryRun,
-      journalPath: flags.journalPath,
+      journalPath: flags.journalPath ?? defaultJournalPath(),
       mounts: flags.mounts.length ? flags.mounts : DEFAULT_MOUNTS,
       tmpDays: flags.tmpDays,
       cacheDays: flags.cacheDays,

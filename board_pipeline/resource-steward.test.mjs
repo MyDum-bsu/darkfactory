@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile, utimes } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
+import { once } from 'node:events';
 import { join } from 'node:path';
 import {
   availableGiB, classifyTmpEntry, defaultCacheRoots, defaultJournalPath, DOCKER_ACTIONS,
-  evaluateDisk, evaluateRam, openJournal, parseArgv, parseBbThreadList,
-  parseMemInfo, pruneCacheRoot, pruneExpiredTmp, raiseAlarm, runSteward,
+  escalateViaCommand, evaluateDisk, evaluateRam, measureMount, openJournal, parseArgv,
+  parseBbThreadList, parseMemInfo, pruneCacheRoot, pruneExpiredTmp, raiseAlarm, runSteward,
   selectIdleThreads,
 } from './resource-steward.mjs';
 
@@ -77,19 +79,26 @@ test('tmp allowlist: only expired df-* entries are deletable', () => {
   assert.equal(classifyTmpEntry('df-fresh', fileStat(cutoff), { cutoffMs: cutoff }).action, 'keep'); // ровно на пороге — жив
   assert.equal(classifyTmpEntry('other-session', fileStat(cutoff - 100), { cutoffMs: cutoff }).action, 'keep');
   assert.equal(classifyTmpEntry('dfx', fileStat(cutoff - 100), { cutoffMs: cutoff }).action, 'keep');
+  // pytest-of-* — тоже allowlist, но только каталоги (живой инцидент с /tmp)
+  assert.deepEqual(classifyTmpEntry('pytest-of-mydum', dirStat(cutoff - 1), { cutoffMs: cutoff }),
+    { action: 'delete', kind: 'dir' });
+  assert.equal(classifyTmpEntry('pytest-of-mydum', dirStat(cutoff), { cutoffMs: cutoff }).action, 'keep');
+  assert.equal(classifyTmpEntry('pytest-of-mydum', fileStat(cutoff - 1), { cutoffMs: cutoff }).action, 'keep');
+  assert.equal(classifyTmpEntry('pytest-of-mydum', fileStat(cutoff - 1), { cutoffMs: cutoff }).reason, 'allowlist_dir_only');
 });
 
 test('tmp refuse: symlinks, special files and unsafe names are never deleted', () => {
   const cutoff = now - 7 * DAY_MS;
   const symlinkStat = { isFile: () => false, isDirectory: () => false, isSymbolicLink: () => true, mtimeMs: 0 };
   assert.equal(classifyTmpEntry('df-link', symlinkStat, { cutoffMs: cutoff }).reason, 'symlink');
+  assert.equal(classifyTmpEntry('pytest-of-link', symlinkStat, { cutoffMs: cutoff }).reason, 'symlink');
   const fifoStat = { isFile: () => false, isDirectory: () => false, isSymbolicLink: () => false, mtimeMs: 0 };
   assert.equal(classifyTmpEntry('df-fifo', fifoStat, { cutoffMs: cutoff }).reason, 'special_file');
   assert.equal(classifyTmpEntry('..', fileStat(0), { cutoffMs: cutoff }).reason, 'unsafe_name');
   assert.equal(classifyTmpEntry('a/b', fileStat(0), { cutoffMs: cutoff }).reason, 'unsafe_name');
 });
 
-test('pruneExpiredTmp deletes only expired df-*, keeps everything else (real fs)', async () => {
+test('pruneExpiredTmp deletes only expired df-* and pytest-of-*, keeps everything else (real fs)', async () => {
   const root = await sandbox('tmp');
   try {
     await mkdir(join(root, 'df-old-dir'), { recursive: true });
@@ -97,7 +106,11 @@ test('pruneExpiredTmp deletes only expired df-*, keeps everything else (real fs)
     await writeFile(join(root, 'df-old-file'), 'x');
     await writeFile(join(root, 'df-fresh-file'), 'x');
     await writeFile(join(root, 'worktree-data'), 'precious');
-    for (const [name, days] of [['df-old-dir', 30], ['df-old-file', 30], ['df-fresh-file', 1], ['worktree-data', 365]]) {
+    await mkdir(join(root, 'pytest-of-tester', 'pytest-3'), { recursive: true });
+    await writeFile(join(root, 'pytest-of-tester', 'pytest-3', 'oldrun'), 'x');
+    await mkdir(join(root, 'pytest-of-fresh'), { recursive: true });
+    for (const [name, days] of [['df-old-dir', 30], ['df-old-file', 30], ['df-fresh-file', 1], ['worktree-data', 365],
+      ['pytest-of-tester', 30], ['pytest-of-fresh', 1]]) {
       await age(join(root, name), days);
     }
     const events = [];
@@ -105,9 +118,10 @@ test('pruneExpiredTmp deletes only expired df-*, keeps everything else (real fs)
       tmpRoot: root, cutoffMs: Date.now() - 7 * DAY_MS,
       journal: async e => events.push(e), fsImpl: await import('node:fs/promises'),
     });
-    assert.equal(result.deleted, 2);
+    assert.equal(result.deleted, 3);
     assert.equal(result.refused, 0);
-    assert.deepEqual(await readdir(root).then(n => n.sort()), ['df-fresh-file', 'worktree-data']);
+    assert.deepEqual(await readdir(root).then(n => n.sort()), ['df-fresh-file', 'pytest-of-fresh', 'worktree-data']);
+    assert.ok(events.some(e => e.event === 'tmp_delete' && e.path === join(root, 'pytest-of-tester')));
     assert.ok(events.some(e => e.event === 'tmp_delete' && e.path === join(root, 'df-old-dir')));
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -487,6 +501,30 @@ test('RAM below 1.5 GiB: stops only clean idle threads, protects active/pinned/s
   }
 });
 
+test('bb thread stop with non-zero exit code is an error, not a counted stop', async () => {
+  const root = await sandbox('ramcode');
+  try {
+    const summary = await runSteward({
+      mounts: ['/data'], statfsImpl: mountStat(bytesGiB(9n)),
+      memInfoImpl: async () => bytesGiB(1n),
+      tmpRoot: join(root, 'tmp'), cacheRoots: [], journalPath: join(root, 'j.jsonl'),
+      execDocker: async () => ({ code: 0, stdout: '', stderr: '' }),
+      execBb: async args => {
+        if (args[1] === 'stop') return { code: 3, stdout: '', stderr: `cannot stop ${args[2]}` };
+        return { code: 0, stdout: JSON.stringify([thread('thr_idle01'), thread('thr_idle02')]), stderr: '' };
+      },
+    });
+    assert.equal(summary.ram.stopped, 0);
+    assert.equal(summary.ram.errors, 2);
+    assert.ok(summary.errors.some(e => /stop thr_idle01: cannot stop thr_idle01/.test(e)));
+    const events = (await readFile(join(root, 'j.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.ok(events.some(e => e.event === 'ram_stop_error' && e.threadId === 'thr_idle01' && e.code === 3));
+    assert.ok(!events.some(e => e.event === 'ram_stop'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('RAM stop failure is journaled and the tick continues with other threads', async () => {
   const root = await sandbox('ramerr');
   try {
@@ -570,7 +608,7 @@ test('dry-run lists planned thread stops without stopping anything', async () =>
       execBb: async args => { bbCalls.push(args); return { code: 0, stdout: JSON.stringify([thread('thr_idle01'), thread('thr_busy01', { status: 'active' })]), stderr: '' }; },
     });
     assert.deepEqual(summary.ram.plannedStops, ['thr_idle01']);
-    assert.deepEqual(bbCalls.filter(a => a[0] === 'stop'), []);
+    assert.deepEqual(bbCalls.filter(a => a[1] === 'stop'), []); // stop в dry-run не выполняется
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -696,6 +734,47 @@ test('parseArgv: flags, mounts and unknown flag rejection', () => {
   assert.throws(() => parseArgv(['--bogus']), /unknown flag/);
   assert.throws(() => parseArgv(['--journal']), /missing value/);
   assert.equal(Number.isNaN(parseArgv(['--tmp-days', 'abc']).tmpDays), true); // отбракует runSteward
+});
+
+test('escalation hook drains stderr (no pipe stall) and reports it in detail', async () => {
+  const dir = await sandbox('hook');
+  const hookPath = join(dir, 'hook.sh');
+  try {
+    // 200 KB в stderr — больше буфера pipe: без дренирования хук завис бы.
+    await writeFile(hookPath, '#!/bin/sh\nyes hook-diag | head -c 200000 >&2\nexit 7\n', { mode: 0o700 });
+    const outcome = await escalateViaCommand(hookPath, 15_000)({ reason: 'test' });
+    assert.equal(outcome.code, 7);
+    assert.ok(outcome.detail.includes('hook-diag'));
+    assert.ok(outcome.detail.length <= 500); // диагностика обрезана до хвоста
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI without --journal writes the journal under XDG_STATE_HOME (real spawn)', async t => {
+  // Тихий CLI-тик без эффектов: монт с запасом места (> 5 GiB), docker выключен,
+  // bb подменён на /bin/false, журнал — в песочнице XDG_STATE_HOME.
+  let free = 0n;
+  try { free = await measureMount('/media/mydum/Data'); } catch { /* нет монта */ }
+  if (free < bytesGiB(6n)) return t.skip('нет здорового монта для тихого CLI-тика');
+  const work = await mkdtemp(join('/media/mydum/Data', 'rsteward-cli-'));
+  const stateDir = join(work, 'state');
+  try {
+    const child = spawn(process.execPath, [
+      join(import.meta.dirname, 'resource-steward.mjs'),
+      '--no-docker', '--mount', work, '--bb', '/bin/false',
+    ], { env: { ...process.env, XDG_STATE_HOME: stateDir }, stdio: 'ignore' });
+    const [code] = await once(child, 'close');
+    assert.equal(code, 0);
+    const journalFile = join(stateDir, 'resource-steward', 'journal.jsonl');
+    // Права 0600 проверены в тестах журнала на tmpdir; на FUSE-монте
+    // /media/mydum/Data chmod — no-op (файлы видны как 0755), здесь не проверяем.
+    const events = (await readFile(journalFile, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(events[events.length - 1].event, 'tick_end');
+    assert.ok(events.every(e => e.event !== 'tier1_start')); // /tmp не тронут
+  } finally {
+    await rm(work, { recursive: true, force: true });
+  }
 });
 
 test('default journal path lives outside the repository under XDG state', () => {

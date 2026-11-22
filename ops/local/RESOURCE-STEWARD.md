@@ -14,7 +14,7 @@
 2. **Уборка Тира 1** — только если где-то **< 5 GiB**. Строго фиксированный allowlist:
    - Docker build cache: `docker builder prune -f`;
    - висячие образы: `docker image prune -f` (только dangling, ни `-a`, ни volumes);
-   - просроченные записи `/tmp/df-*` старше N дней (`--tmp-days`, дефолт 7);
+   - просроченные `/tmp/df-*` и каталоги `/tmp/pytest-of-*` старше N дней (`--tmp-days`, дефолт 7);
    - содержимое кэшей pip (`$XDG_CACHE_HOME/pip`), uv (`$XDG_CACHE_HOME/uv`),
      npm (`~/.npm/_cacache`) — пофайлово старше N дней (`--cache-days`, дефолт 7).
 3. **Повторное измерение.** Если после Тира 1 **< 2 GiB** → событие `alarm` в журнале и
