@@ -14,7 +14,6 @@ export const TELEMETRY_SCHEMA = 1;
 // гейты (L1 local, tamper, L3 visual), L2 critic, арбитр и total. Замер других
 // фаз (например worker_feedback) попадает в журнал, но не в компактную сводку.
 export const TELEMETRY_PHASES = ['spawn', 'worker', 'l1_local', 'tamper', 'l3_visual', 'l2_critic', 'arbiter', 'total'];
-const VERIFY_PHASES = new Set(['l1_local', 'tamper', 'l3_visual', 'l2_critic']);
 const ROLES = ['worker', 'critic', 'arbiter'];
 const NOTE_LIMIT = 16;
 // Лимит компактной квитанции Board.complete — строка телеметрии влезает
@@ -34,21 +33,36 @@ const pick = (raw, keys) => {
 
 // Нормализация usage провайдера в { input, output, cached }: agy/anthropic
 // (input_tokens, cache_read_input_tokens), openai (prompt_tokens,
-// completion_tokens, cached_tokens) и camelCase-варианты (bb/pi).
+// completion_tokens, cached_tokens, вложенный prompt_tokens_details) и
+// camelCase/pi-варианты (input, output, cacheRead).
 export function normalizeUsage(raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const input = pick(raw, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens', 'input']);
   const output = pick(raw, ['output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens', 'output']);
   const cached = pick(raw, ['cache_read_input_tokens', 'cacheReadInputTokens', 'cached_tokens',
-    'cachedTokens', 'cache_read_tokens', 'cached']);
+    'cachedTokens', 'cache_read_tokens', 'cached', 'cacheRead']) ??
+    pick(raw?.prompt_tokens_details, ['cached_tokens']);
   if (input === null && output === null && cached === null) return null;
   return { input, output, cached };
 }
 
-// usage из потока agy: result.usage проходит валидацию agy-stream.cjs
-// (RESULT_FIELDS) и доходит сюда транзитом.
-export function agyStreamUsage(raw) {
-  return normalizeUsage(raw);
+// Суммирование токенов: null остаётся null, пока не появится число; числа
+// разных раундов/ходов складываются.
+const sumTokens = (a, b) => a === null && b === null ? null : (a ?? 0) + (b ?? 0);
+const mergeTokens = (prev, usage) => ({ input: sumTokens(prev?.input, usage.input),
+  output: sumTokens(prev?.output, usage.output), cached: sumTokens(prev?.cached, usage.cached) });
+
+// Суммарный usage нескольких ходов/раундов (pi-транскрипт, повторные вызовы);
+// ни одного числового значения — null.
+export function sumUsages(raws) {
+  if (!Array.isArray(raws)) return null;
+  let totals = null;
+  for (const raw of raws) {
+    const usage = normalizeUsage(raw);
+    if (!usage) continue;
+    totals = mergeTokens(totals ?? { input: null, output: null, cached: null }, usage);
+  }
+  return totals;
 }
 
 // usage из снимков bb/pi: защита от неизвестных форм — ищем usage в известных
@@ -107,6 +121,7 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
   let spawnSeen = false;
   let workerResumeAt = null;
   let workerMs = 0;
+  let workerSeen = false;
   let notes = [];
   const phases = new Map();
   const rounds = { total: 0, rework: 0, pass: 0, arbitration: 0, open: 0 };
@@ -172,7 +187,10 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
       guarded(() => {
         if (workerWindow && workerResumeAt !== null) {
           const at = now();
-          if (at !== null) workerMs += Math.max(0, at - workerResumeAt);
+          if (at !== null) {
+            workerMs += Math.max(0, at - workerResumeAt);
+            workerSeen = true;
+          }
           workerResumeAt = null;
         }
         if (subject !== null) observe(subject);
@@ -238,12 +256,20 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
       }, 'record_arbitration');
     },
 
-    // Токены роли: null/неизвестная форма не перетирает ранее увиденное.
+    // Токены роли: многораундовое СУММИРОВАНИЕ — числа разных раундов/ходов
+    // складываются, null остаётся null; источник — последний известный.
     recordUsage(role, raw, source = null) {
       return guarded(() => {
         if (!ROLES.includes(role)) return null;
         const usage = normalizeUsage(raw);
-        if (usage) tokens[role] = { ...usage, ...(typeof source === 'string' ? { source } : {}) };
+        if (usage) {
+          const prev = tokens[role];
+          tokens[role] = {
+            ...mergeTokens(prev, usage),
+            ...(typeof (source ?? prev?.source) === 'string'
+              ? { source: source ?? prev.source } : {}),
+          };
+        }
         return usage;
       }, 'record_usage') ?? null;
     },
@@ -256,7 +282,8 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
         const phasesMs = {};
         for (const phase of TELEMETRY_PHASES) {
           if (phase === 'total') { phasesMs.total = total; continue; }
-          if (phase === 'worker') { phasesMs.worker = workerMs; continue; }
+          // Окно воркера ни разу не закрыто — фаза не измерена, null вместо 0.
+          if (phase === 'worker') { phasesMs.worker = workerSeen ? workerMs : null; continue; }
           const measured = phases.get(phase);
           phasesMs[phase] = measured ? measured.ms : null;
         }
@@ -286,16 +313,21 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
 
     // Квитанция закрытия карточки со строкой телеметрии: детерминированное
     // ужатие — полная строка, затем краткая, затем исходная квитанция.
-    // Пустая телеметрия квитанцию не меняет.
+    // Пустая телеметрия квитанцию не меняет. На момент complete текущий раунд
+    // закрывается успехом: открытый раунд отражается как pass, а не как
+    // открытый (финальная запись журнала закрывает его тем же recordRound).
     embed(evidence) {
       try {
         if (!events || evidence === null || typeof evidence !== 'object' ||
             Array.isArray(evidence)) return evidence;
-        const full = this.summaryLine();
-        if (!full) return evidence;
         const record = this.summary() ?? {};
-        const roundsTotal = Number.isFinite(record.rounds?.total) ? record.rounds.total : 0;
-        const mini = `rounds=${roundsTotal} tok[critic]=${fmtTokens(record.tokens?.critic)}`;
+        const rounds = record.rounds ?? {};
+        const open = rounds.open ?? 0;
+        const projected = open > 0 ? { ...record, rounds: { ...rounds,
+          pass: (rounds.pass ?? 0) + open, open: 0 } } : record;
+        const full = formatTelemetrySummary(projected);
+        if (!full) return evidence;
+        const mini = `rounds=${projected.rounds?.total ?? 0} tok[critic]=${fmtTokens(projected.tokens?.critic)}`;
         for (const telemetry of [full, mini]) {
           const candidate = { ...evidence, telemetry };
           if (JSON.stringify(candidate).length <= EMBED_LIMIT) return candidate;

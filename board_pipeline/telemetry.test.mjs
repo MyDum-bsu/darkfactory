@@ -12,6 +12,7 @@ import agyStream from './agy-stream.cjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { NEON_CRITIC } from './review-policy.mjs';
+import { parseReviewTranscript } from './review-runner.mjs';
 import { commitFile, neonFixture } from './review-test-fixture.mjs';
 import { loadSdk } from './sdk.mjs';
 import { aggregateTelemetry, createTelemetryRecorder, formatTelemetryReport, formatTelemetrySummary,
@@ -41,13 +42,18 @@ function agyStreamWithUsage(cwd, usage, { reads = ['candidate/sum.js'] } = {}) {
   ].map(x => JSON.stringify(x)).join('\n');
 }
 
-test('normalizeUsage: agy/openai/camelCase формы, ноль валиден, мусор — null', () => {
+test('normalizeUsage: agy/openai/camelCase/pi формы, ноль валиден, мусор — null', () => {
   assert.deepEqual(normalizeUsage({ input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 2 }),
     { input: 10, output: 3, cached: 2 });
   assert.deepEqual(normalizeUsage({ prompt_tokens: 7, completion_tokens: 5, cached_tokens: 1 }),
     { input: 7, output: 5, cached: 1 });
   assert.deepEqual(normalizeUsage({ inputTokens: 1, outputTokens: 2, cacheReadInputTokens: 0 }),
     { input: 1, output: 2, cached: 0 });
+  // pi-форма: плоское cacheRead и вложенный prompt_tokens_details.
+  assert.deepEqual(normalizeUsage({ input: 11, output: 4, cacheRead: 6 }),
+    { input: 11, output: 4, cached: 6 });
+  assert.deepEqual(normalizeUsage({ prompt_tokens: 9, completion_tokens: 2,
+    prompt_tokens_details: { cached_tokens: 7 } }), { input: 9, output: 2, cached: 7 });
   assert.deepEqual(normalizeUsage({ input_tokens: 0 }), { input: 0, output: null, cached: null });
   assert.equal(normalizeUsage(null), null);
   assert.equal(normalizeUsage('42'), null);
@@ -190,6 +196,25 @@ test('partial: попытка, подхваченная после рестар�
   assert.equal(record.partial, true);
   assert.equal(record.open, true);
   assert.equal(record.outcome, 'uncertain');
+  // workerResume ни разу не вызывался — фаза worker null, а не ноль.
+  assert.equal(record.phases_ms.worker, null);
+});
+
+test('recordUsage: суммирует токены по раундам, null не выдумывается', async t => {
+  const journal = await mkdtemp(join(tmpdir(), 'telemetry-sum-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+  const rec = createTelemetryRecorder({ journal, clock: () => 0 });
+  rec.recordUsage('critic', { input: 100, output: 50, cacheRead: 10 }, 'pi_stream');
+  rec.recordUsage('critic', { input_tokens: 30, output_tokens: 20 }, 'agy_stream');
+  // Числа раундов сложились, cached первого раунда сохранился, источник — последний.
+  assert.deepEqual(rec.summary().tokens.critic,
+    { input: 130, output: 70, cached: 10, source: 'agy_stream' });
+  assert.deepEqual(rec.summary().tokens.worker, null);
+  // Раунд без чисел (null) не ломает накопленное и не выдумывает нули.
+  rec.recordUsage('critic', null);
+  rec.recordUsage('critic', { garbage: true });
+  assert.deepEqual(rec.summary().tokens.critic,
+    { input: 130, output: 70, cached: 10, source: 'agy_stream' });
 });
 
 test('embed: сводка в квитанции ≤1000, не влезла — квитанция без неё', async t => {
@@ -208,6 +233,13 @@ test('embed: сводка в квитанции ≤1000, не влезла — �
   assert.equal(rec.embed(big), big);
   assert.equal(rec.embed('raw'), 'raw');
   assert.equal(rec.embed(null), null);
+  // Закрываемый раунд отражается в квитанции complete как pass, без open.
+  const closing = createTelemetryRecorder({ journal, clock: () => 0 });
+  await closing.phase('l2_critic', async () => {});
+  closing.roundStart();
+  const projected = closing.embed({ v: 1 });
+  assert.match(projected.telemetry, /rounds=1 rw=0 pass=1/);
+  assert.doesNotMatch(projected.telemetry, /open=/);
 });
 
 test('aggregate + отчёт: суммы фаз/раундов/токенов, фильтры, битые строки', () => {
@@ -279,6 +311,32 @@ test('agy-stream: usage из result доходит до наблюдателя, 
   const withoutUsage = agyStream.parseAgyStream(
     agyStreamWithUsage(cwd, null), cwd, { snapshotTools: true });
   assert.equal(withoutUsage.usage, null);
+});
+
+test('parseReviewTranscript: usage ассистентских message_end суммируется', () => {
+  const piMsg = (over = {}) => JSON.stringify({ type: 'message_end', message: {
+    role: 'assistant', provider: 'openai', model: 'gpt-6.2-sol', thinkingLevel: 'medium',
+    responseId: 'resp_1', stopReason: 'stop',
+    content: [{ type: 'text', text: 'looks fine\nREVIEW_OK' }], ...over } });
+  const settledEvent = JSON.stringify({ type: 'agent_settled', aborted: false });
+  // Два хода pi: числа usage складываются, cacheRead и вложенный
+  // prompt_tokens_details.cached_tokens распознаются.
+  const parsed = parseReviewTranscript([
+    piMsg({ usage: { input: 100, output: 50, cacheRead: 10 } }),
+    piMsg({ usage: { input: 30, output: 20, prompt_tokens_details: { cached_tokens: 5 } },
+      content: [{ type: 'text', text: 'final\nREVIEW_OK' }] }),
+    settledEvent,
+  ].join('\n'));
+  assert.deepEqual(parsed.usage, { input: 130, output: 70, cached: 15 });
+  // Провайдер не отдал usage — явный null.
+  const withoutUsage = parseReviewTranscript([piMsg(), settledEvent].join('\n'));
+  assert.equal(withoutUsage.usage, null);
+  // Нечисловой usage хода не ломает разбор.
+  const garbage = parseReviewTranscript([
+    piMsg({ usage: 'bogus' }), piMsg({ usage: { input: 7 },
+      content: [{ type: 'text', text: 'final\nREVIEW_OK' }] }), settledEvent,
+  ].join('\n'));
+  assert.deepEqual(garbage.usage, { input: 7, output: null, cached: null });
 });
 
 test('neon-review: usage из потока попадает в квитанцию критика', async t => {
@@ -401,13 +459,14 @@ test('интеграция: телеметрия вокруг acceptHeld поп�
   assert.match(summary, /tok\[critic\]=-/);
   assert.match(summary, /rounds=1 rw=0 pass=1/);
 
-  // Компактная строка телеметрии дошла до карточки на Board. Квитанция
-  // complete строится внутри acceptHeld — текущий раунд ещё открыт.
+  // Компактная строка телеметрии дошла до карточки на Board. Закрываемый
+  // раунд отражён как pass (complete строится внутри acceptHeld).
   const after = await settled(handle, id);
   assert.equal(after.state, 'completed');
   assert.equal(typeof after.result.telemetry, 'string');
   assert.match(after.result.telemetry, /total=/);
-  assert.match(after.result.telemetry, /rounds=1 rw=0 pass=0 open=1/);
+  assert.match(after.result.telemetry, /rounds=1 rw=0 pass=1/);
+  assert.doesNotMatch(after.result.telemetry, /open=/);
   // В квитанции нет секретов: только тайминги, раунды и токены.
   assert.doesNotMatch(after.result.telemetry, /thr_|att-1|\/tmp|worktree/);
 });

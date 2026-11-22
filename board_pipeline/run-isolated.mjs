@@ -139,6 +139,8 @@ async function execute() {
   const telemetry = createTelemetryRecorder({ journal: root,
     models: { worker: { provider: p.bb.provider, model: p.bb.model },
       critic: reviewSetup.critic, arbiter: reviewSetup.arbiter } });
+  // Фактический источник токенов критика: поток agy (neon) или pi-транскрипт.
+  const criticSource = reviewSetup.neon ? 'agy_stream' : 'pi_stream';
   const route = { ...p.route, policyDigest: pinned.digest,
     zcodeQuota: p.zcodeQuota ?? p.bb?.zcodeQuota };
   // Queue-driven маршрут без route.taskId: карточку берёт board.claimReady по
@@ -414,7 +416,7 @@ async function execute() {
           await assertPinned();
           await beforeEffect?.();
           const receipt = await telemetry.phase('l2_critic', () => review(handoff, trusted));
-          telemetry.recordUsage('critic', receipt?.usage, 'agy_stream');
+          telemetry.recordUsage('critic', receipt?.usage, criticSource);
           return receipt;
         },
       } });
@@ -439,6 +441,7 @@ async function execute() {
       prompt: ['Use the following specification; output only an arbitration decision, not a critic verdict.',
         reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : ''].join('\n\n') });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
+    telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
     telemetry.recordArbitration();
     return decision;
   };

@@ -13,6 +13,7 @@ import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { unpackExact } from './runtime.mjs';
 import { withModelProxy } from './model-proxy.mjs';
+import { sumUsages } from './telemetry.mjs';
 
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
@@ -141,7 +142,8 @@ export function hasValidFinding(findings) {
 // Возвращает actual { provider, model, reasoningLevel } ассистентских
 // message_end (все обязаны совпадать, включая responseModel/actualModel и
 // providerThinkingLevel/reasoningEffort, когда те присутствуют), объединение
-// ВСЕХ toolsAdded по потоку и текст строго последнего хода.
+// ВСЕХ toolsAdded по потоку, суммарный usage ассистентских message_end
+// (null, если провайдер токены не отдал) и текст строго последнего хода.
 export function parseReviewTranscript(ndjson) {
   const events = [];
   for (const line of String(ndjson).split('\n')) {
@@ -159,6 +161,7 @@ export function parseReviewTranscript(ndjson) {
     }
   };
   const seen = [];
+  const usages = [];
   let hasError = false;
   let seenSettled = false;
   let aborted = null;
@@ -180,6 +183,12 @@ export function parseReviewTranscript(ndjson) {
     if (event?.type !== 'message_end') continue;
     const message = event.message ?? event.data?.message;
     if (message?.role !== 'assistant') continue;
+    // VS-3: usage хода — числовые поля суммируются позже (sumUsages);
+    // отсутствующий/нечисловой usage хода не ломает разбор.
+    if (message.usage !== null && typeof message.usage === 'object' &&
+        !Array.isArray(message.usage)) {
+      usages.push(message.usage);
+    }
     const parts = Array.isArray(message.content) ? message.content : [];
     const text = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
     seen.push({
@@ -223,6 +232,7 @@ export function parseReviewTranscript(ndjson) {
     actual: { provider: actual.provider, model: actual.model,
       reasoningLevel: actual.reasoningLevel },
     seen, toolsAdded, finalText: last.text, responseId: last.responseId, events,
+    usage: sumUsages(usages),
   };
 }
 
@@ -714,6 +724,8 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           model: parsed.actual.model,
           reasoningLevel: parsed.actual.reasoningLevel,
         },
+        // VS-3: суммарный usage ходов pi; провайдер не отдал — явный null.
+        usage: parsed.usage ?? null,
         isolation: 'docker-ro-v1',
       };
     } finally {
@@ -845,7 +857,8 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
       if (!SHA256.test(req.subject_digest ?? '') || decision.subject_digest !== req.subject_digest) {
         throw new ReviewDenied('arbiter_subject_mismatch');
       }
-      return decision;
+      // VS-3: решение арбитра с суммарным usage его ходов (null при отсутствии).
+      return { ...decision, usage: parsed.usage ?? null };
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }
