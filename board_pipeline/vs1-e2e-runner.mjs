@@ -7,7 +7,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs, promisify } from 'node:util';
 import { requireWorkspaceSpace } from '../ops/local/check-workspace-space.mjs';
@@ -83,9 +83,13 @@ async function execute() {
   console.log(JSON.stringify({ step: 'disk_preflight', ...space }));
 
   const lab = await mkdtemp(join(values['lab-parent'], 'vs1-e2e-lab-'));
-  const dirs = { state: join(lab, 'state'), stateIdle: join(lab, 'state-idle'),
-    inbox: join(lab, 'inbox'), sqlite: join(lab, 'sqlite'), gate: join(lab, 'gate'),
-    operator: join(lab, 'operator'), tmp: join(lab, 'check-tmp'),
+  // Приватные каталоги (state, inbox, операторские файлы) — на POSIX-ФС:
+  // fuseblk на /media/mydum/Data не хранит биты прав, а контроллер требует
+  // state 0700 uid=process. Тяжёлые данные (worktree, sqlite, tmp, лог) — на Data.
+  const priv = await mkdtemp(join(tmpdir(), 'vs1-e2e-state-'));
+  const dirs = { state: join(priv, 'state'), stateIdle: join(priv, 'state-idle'),
+    inbox: join(priv, 'inbox'), gate: join(priv, 'gate'), operator: join(priv, 'operator'),
+    sqlite: join(lab, 'sqlite'), tmp: join(lab, 'check-tmp'),
     worktree: join(lab, 'worktree') };
   for (const dir of [dirs.state, dirs.stateIdle, dirs.inbox, dirs.sqlite,
     dirs.gate, dirs.operator, dirs.tmp]) {
@@ -129,7 +133,7 @@ async function execute() {
   await say({ step: 'board', url: boardUrl, pid: boardProc.pid });
 
   const env = { ...process.env, XDG_CONFIG_HOME: join(dirs.gate, 'config'), TMPDIR: dirs.tmp };
-  const proof = { factorySha, lab, boardUrl, channel: 'pilot', provider: 'acp-devin',
+  const proof = { factorySha, lab, stateDir: priv, boardUrl, channel: 'pilot', provider: 'acp-devin',
     model: 'swe-2-high', permissionMode: 'full', specDigest, policyDigest,
     cards: {}, candidates: [], journal: {}, idleTickZeroCalls: false };
   const cleanup = async () => {
