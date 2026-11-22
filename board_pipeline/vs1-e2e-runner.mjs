@@ -142,12 +142,17 @@ async function execute() {
   // seal сверяет её с живой меткой карточки (policy_digest_drift при смене).
   const policyDigest = sha256Text(`vs1-bsu-e2e-1:${specDigest}`);
 
-  // Порт обязан быть свободен ДО старта: ответивший endpoint — чужая доска.
+  // Порт обязан быть свободен ДО старта: любой HTTP-ответ — чужой endpoint.
+  const probe = async () => {
+    const { stdout } = await exec('curl', ['-sS', '-o', '/dev/null', '-w', '%{http_code}',
+      '--max-time', '0.5', `http://127.0.0.1:${port}/`]);
+    return stdout.trim();
+  };
   try {
-    await exec('curl', ['-fsS', '--max-time', '0.5', `http://127.0.0.1:${port}/tasks`]);
-    throw new Error(`Port ${port} already serves an endpoint; refusing to start`);
+    if (await probe()) throw new Error(`Port ${port} already serves an endpoint; refusing to start`);
   } catch (e) {
     if (/already serves/.test(e.message)) throw e;
+    // соединение отклонено — порт свободен
   }
   // Изолированный vb serve на loopback, порт != 44100.
   const boardProc = spawn(VB, ['serve', '--port', String(port), '--dir', dirs.sqlite,
@@ -158,9 +163,12 @@ async function execute() {
   let boardReady = false;
   for (let i = 0; i < 60 && boardProc.exitCode === null; i++) {
     try {
-      await exec('curl', ['-fsS', '--max-time', '0.3', `http://127.0.0.1:${port}/tasks`]);
-      // Готовность подтверждается файлом БД, созданным именно нашим процессом.
-      if ((await readdir(dirs.sqlite)).some(f => f.endsWith('.db'))) { boardReady = true; break; }
+      // Любой HTTP-ответ (включая 401/404) означает, что listener поднялся;
+      // готовность подтверждается файлом БД, созданным нашим процессом.
+      if (await probe() &&
+          (await readdir(dirs.sqlite)).some(f => f.endsWith('.db'))) {
+        boardReady = true; break;
+      }
     } catch { /* ещё не поднялся */ }
     await new Promise(r => setTimeout(r, 300));
   }
