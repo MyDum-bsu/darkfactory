@@ -78,7 +78,14 @@ function connectUpstream(proxy, authority, client, pending, upstreamHead, track)
   };
 }
 
-export async function withModelProxy({ allow, bootstrap = [], env = process.env, hostClient = false }, run) {
+async function connectPhase(allowed, startup, authority, beforeConnect) {
+  if (!startup.has(authority) && !allowed.has(authority)) return null;
+  try { await beforeConnect?.(); } catch { return null; }
+  // Bootstrap may have been revoked while reading the operator switch.
+  return startup.has(authority) ? 'startup' : allowed.has(authority) ? 'model' : null;
+}
+
+export async function withModelProxy({ allow, bootstrap = [], env = process.env, hostClient = false, beforeConnect }, run) {
   const allowed = permit(allow);
   const startup = bootstrap.length ? permit(bootstrap) : new Set();
   if ([...startup].some(host => allowed.has(host))) throw new Error('model_proxy_phase_overlap');
@@ -105,7 +112,7 @@ export async function withModelProxy({ allow, bootstrap = [], env = process.env,
     (_, res) => { res.writeHead(405, { Connection: 'close' }); res.end(); });
   server.maxConnections = LIMIT;
   server.on('connection', track);
-  server.on('connect', (request, client, head) => {
+  server.on('connect', async (request, client, head) => {
     if (auth) {
       const proposed = Buffer.from(request.headers['proxy-authorization'] ?? '');
       if (proposed.length !== auth.length || !timingSafeEqual(auth, proposed)) {
@@ -113,10 +120,10 @@ export async function withModelProxy({ allow, bootstrap = [], env = process.env,
         return;
       }
     }
-    const isStartup = startup.has(request.url);
-    if (!isStartup && !allowed.has(request.url)) { deny(client, 403, 'Model Destination Denied'); return; }
+    const phase = await connectPhase(allowed, startup, request.url, beforeConnect);
+    if (phase === null || client.destroyed) { deny(client, 403, 'Model Destination Denied'); return; }
     const close = connectUpstream(proxy, request.url, client, pending, head, track);
-    if (isStartup) {
+    if (phase === 'startup') {
       startups.add(close);
       client.once('close', () => startups.delete(close));
     }

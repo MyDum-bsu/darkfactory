@@ -83,7 +83,7 @@ function neonBody({ task_id, candidate_sha, subject_digest }, prompt, diff, file
 }
 
 export function isolatedNeonReviewRunner({ journal, prompt = '', timeoutMs = 480_000,
-  sandbox = runInReadOnlySandbox, transport = hostAgyTransport }) {
+  sandbox = runInReadOnlySandbox, transport = hostAgyTransport, beforeEffect }) {
   if (!isAbsolute(journal ?? '')) throw new ReviewDenied('review_runner_misconfigured');
   return async (binding, profile) => {
     if (!isNeonReview(profile?.review)) throw new ReviewDenied('review_profile_not_approved');
@@ -105,11 +105,11 @@ export function isolatedNeonReviewRunner({ journal, prompt = '', timeoutMs = 480
         '--no-textconv', '--no-ext-diff', '--no-color', binding.base_sha, binding.candidate_sha, '--'],
       { timeout: 30_000, maxBuffer: INPUT_LIMIT });
       const run = await sandbox({ snapshot: source,
-        argv: ['node', '-e', collectSnapshot, String(INPUT_LIMIT)], timeoutMs: 30_000 });
+        argv: ['node', '-e', collectSnapshot, String(INPUT_LIMIT)], timeoutMs: 30_000, beforeEffect });
       if (run.code !== 0) throw new ReviewDenied(run.code === 3 ? 'review_neon_context_too_large' : 'review_neon_snapshot_failed');
       const body = neonBody(binding, prompt, diff, JSON.parse(run.stdout));
       if (Buffer.byteLength(body) > INPUT_LIMIT) throw new ReviewDenied('review_neon_context_too_large');
-      const live = await transport({ prompt: body, timeoutMs });
+      const live = await transport({ prompt: body, timeoutMs, beforeEffect });
       if (live.code !== 0) {
         const reason = (live.stderr ?? '').split('\n').find(line => /^(?:agy_[a-z_]+|review_tool_use_forbidden)$/.test(line));
         throw new ReviewDenied(reason ?? 'agy_transport_failed');

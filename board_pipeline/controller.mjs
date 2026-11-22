@@ -258,6 +258,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         await save({ phase: 'lease_lost', reason: 'lease_lost_before_spawn' });
         return visible();
       }
+      await board.project?.(record.taskId, claim.epoch, 'claimed');
       let launched;
       let workerTrail = null;
       if (workerSelector) {
@@ -296,7 +297,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     } catch (e) {
       // Обрыв в любой точке claim/launch не повторяет эффект: та же сверка,
       // что и при рестарте процесса с записью IN_FLIGHT.
-      process.stderr.write(`claim/launch error: ${e?.stack ?? e}\n`);
+      process.stderr.write(board.project ? 'pilot claim/launch stopped; see private state\n' : `claim/launch error: ${e?.stack ?? e}\n`);
       return reconcileInFlight();
     }
     return visible();
@@ -346,7 +347,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     return visible();
   }
   const stopWith = async (reason, extraState = null, detail = '') => {
-    const blockText = `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}.${detail ? ` ${detail}` : ''} Проверьте ход; повтор не отправлен.`;
+    const privateText = `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}.${detail ? ` ${detail}` : ''} Проверьте ход; повтор не отправлен.`;
+    const blockText = board.blockText?.(attempt.epoch, privateText) ?? privateText;
     await save({ phase: 'blocking', turnSeq,
       intent: { kind: 'block', attemptId: record.attemptId, epoch: attempt.epoch,
         turnSeq, reason, blockText: blockText.slice(0, 1000) },
@@ -569,4 +571,18 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     await save({ phase: result.outcome === 'uncertain' ? 'uncertain' : 'hold', reason: result.reason ?? 'unverified' });
   }
   return visible();
+}
+
+export async function advanceWithProjection(options) {
+  const result = await advance(options);
+  const { board, state, route } = options;
+  if (!board.project || !['done', 'hold'].includes(result.phase)) return result;
+  const record = await state.load();
+  const taskId = record?.taskId ?? route.taskId;
+  if (!taskId || !record?.epoch) return result;
+  // A display write belongs outside the native claim/effect try blocks. If
+  // it fails, the durable and native settlement are not rolled back or retried.
+  if (result.phase === 'done') await board.project(taskId, record.epoch, 'completed', record.sha);
+  else if ((await board.lookup(taskId)).state === 'blocked') await board.project(taskId, record.epoch, 'blocked');
+  return result;
 }

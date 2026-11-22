@@ -1011,7 +1011,12 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     } } : {}),
   });
 
-  const intent = async (phase) => append({ kind: 'intent', phase });
+  const phases = new Map([['local', 'L1'], ['visual', 'L3'], ['review', 'L2']]);
+  const project = phase => ports.board.project?.(attempt.task_id, attempt.epoch, phase, binding.candidate_sha);
+  const intent = async phase => {
+    await append({ kind: 'intent', phase });
+    if (phases.has(phase)) await project(phases.get(phase));
+  };
   const step = async (phase, ok, detail) => append({ kind: 'result', phase, ok, detail });
 
   // tree_sha из реальной инспекции снимка (не из слов воркера и не только из
@@ -1201,6 +1206,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     subjectDigest: () => digest,
     journal });
   if (verdict.status === 'lost') return settle('denied', { reason: verdict.reason });
+  if (verdict.status === 'verified') await project('L2_PASS');
+  if (verdict.status === 'rework' && verdict.review?.verdict === REVIEW_BLOCKED) await project('L2_REWORK');
 
   // GUARD:NoBlindRoundClose — возврат на доработку никогда не превращается в
   // complete без свежего verified-вердикта на тот же кандидат.

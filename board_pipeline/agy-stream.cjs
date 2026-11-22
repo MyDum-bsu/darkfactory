@@ -124,12 +124,13 @@ async function superviseAgy(child, settled, { cwd, onInit, emit, kill = () => ch
   }
 }
 
-async function runAgy({ binary, cwd, env, prompt, timeoutMs, sealBootstrap }) {
+async function runAgy({ binary, cwd, env, prompt, timeoutMs, sealBootstrap, beforeEffect }) {
   let version;
   try {
     version = await promisify(execFile)(binary, ['--version'], { cwd, env, timeout: 5000, maxBuffer: 4096 });
   } catch { throw error('agy_version_unattested'); }
   if (version.stdout.trim() !== '1.5.14') throw error('agy_version_unattested');
+  await beforeEffect?.();
   const child = spawn(binary, ['--print', '', '--model', MODEL, '--effort', EFFORT,
     '--mode', 'plan', '--disable-slash-commands', '--settings', SETTINGS,
     '--input-format', 'stream-json', '--output-format', 'stream-json', '--print-timeout', '180s'],
@@ -152,6 +153,7 @@ async function runAgy({ binary, cwd, env, prompt, timeoutMs, sealBootstrap }) {
       onInit: async () => {
         // Withhold every candidate byte until the startup-only tunnels are revoked.
         await sealBootstrap();
+        await beforeEffect?.();
         child.stdin.end(`${JSON.stringify({ event: 'user', message: { content: prompt } })}\n`);
       } });
     return { code: 0, stdout, cwd };

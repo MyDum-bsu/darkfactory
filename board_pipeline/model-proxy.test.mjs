@@ -110,3 +110,20 @@ test('host Agy broker requires its per-run proxy credential and does not forward
   });
   assert.deepEqual(observed, [undefined, undefined]);
 });
+
+test('pilot closure stops even an enrolled model CONNECT before going upstream', async t => {
+  let outbound = 0;
+  let open = true;
+  const upstream = createServer();
+  upstream.on('connect', (_, socket) => { outbound++; socket.end('HTTP/1.1 200 Connection Established\r\n\r\n'); });
+  upstream.listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  t.after(() => new Promise(resolve => upstream.close(resolve)));
+  await withModelProxy({ allow: ['chatgpt.com:443'], env: { HTTPS_PROXY: `http://127.0.0.1:${upstream.address().port}` },
+    beforeConnect: async () => { if (!open) throw new Error('pilot_stopped'); } }, async path => {
+    assert.match(await exchange(path, tunnel('chatgpt.com:443')), /^HTTP\/1\.1 200 /);
+    open = false;
+    assert.match(await exchange(path, tunnel('chatgpt.com:443')), /^HTTP\/1\.1 403 /);
+  });
+  assert.equal(outbound, 1);
+});

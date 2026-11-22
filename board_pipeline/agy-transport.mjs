@@ -77,7 +77,7 @@ async function withAgyKeyring({ address, path, item }, run) {
 // Host model transport only. All source material comes from an offline pack;
 // the child gets neither worktree/state paths nor inherited ambient env.
 export async function hostAgyTransport({ prompt, timeoutMs = 210_000, env = process.env,
-  launch = agyStream.runAgy }) {
+  launch = agyStream.runAgy, beforeEffect }) {
   const binary = await ownedFile(env.DF_AGY_BINARY ?? join(homedir(), '.local', 'opt', 'antigravity-cli', 'agy'),
     'agy_binary_not_enrolled');
   const scope = await ownedFile(env.DF_AGY_SCOPE_FILE ?? join(homedir(), '.config', 'antigravity', 'credential-user-scope'),
@@ -96,8 +96,9 @@ export async function hostAgyTransport({ prompt, timeoutMs = 210_000, env = proc
     const username = userInfo().username;
     const proxyEnv = env.DF_AGY_HTTPS_PROXY ? { HTTPS_PROXY: env.DF_AGY_HTTPS_PROXY } : env;
     const result = await withAgyKeyring({ address: env.DBUS_SESSION_BUS_ADDRESS, path: keyring, item: env.DF_AGY_KEYRING_ITEM },
-      revokeKeyring => withModelProxy({ allow: EGRESS, bootstrap: BOOTSTRAP, env: proxyEnv, hostClient: true },
-        (proxy, sealModelBootstrap) => launch({ binary, cwd: empty, prompt, timeoutMs,
+      revokeKeyring => withModelProxy({ allow: EGRESS, bootstrap: BOOTSTRAP, env: proxyEnv,
+        hostClient: true, beforeConnect: beforeEffect },
+        (proxy, sealModelBootstrap) => launch({ binary, cwd: empty, prompt, timeoutMs, beforeEffect,
           sealBootstrap: () => { sealModelBootstrap(); return revokeKeyring(); },
           env: { PATH: '/usr/bin:/bin', HOME: home, XDG_CONFIG_HOME: config, XDG_RUNTIME_DIR: runtime,
             USER: username, LOGNAME: username, LANG: 'C.UTF-8',

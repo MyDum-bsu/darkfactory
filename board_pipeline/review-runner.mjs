@@ -448,7 +448,7 @@ export function assertToolsAllowed(toolsAdded) {
 
 // Both snapshot tools and model clients have an isolated network namespace.
 export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAGE,
-  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate' }) {
+  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate', beforeEffect }) {
   if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length) {
     throw new ReviewDenied('sandbox_request_invalid');
   }
@@ -479,6 +479,7 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   let code = 0;
   let stdout = '';
   let stderr = '';
+  await beforeEffect?.();
   try {
     const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
     stdout = run.stdout;
@@ -502,7 +503,7 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
 function runModelInReadOnlySandbox({ allow, argv, env = {}, mounts = [], ...options }) {
   const { NODE_OPTIONS, ...bootEnv } = env;
   if (NODE_OPTIONS) bootEnv.DF_CHILD_NODE_OPTIONS = NODE_OPTIONS;
-  return withModelProxy({ allow }, socket => runInReadOnlySandbox({ ...options,
+  return withModelProxy({ allow, beforeConnect: options.beforeEffect }, socket => runInReadOnlySandbox({ ...options,
     argv: ['node', '/model-proxy/client.cjs', ...argv], env: bootEnv,
     mounts: [...mounts, { src: PROXY_BOOTSTRAP, dst: '/model-proxy/client.cjs' },
       { src: socket, dst: '/model-proxy/upstream.sock' }] }));
@@ -512,7 +513,7 @@ function piSandbox(opts) {
   return runModelInReadOnlySandbox(opts);
 }
 
-async function sandboxPiCredential(piRoot, provider, kind) {
+async function sandboxPiCredential(piRoot, provider, kind, beforeEffect) {
   const load = async () => JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'))?.[provider];
   let auth = await load();
   if (auth == null) throw new ReviewDenied(`${kind}_auth_missing`);
@@ -520,6 +521,7 @@ async function sandboxPiCredential(piRoot, provider, kind) {
   // Refresh is a host-side operation: a rotated refresh token must survive
   // the sandbox, and the long-lived credential must never be copied into it.
   if (typeof auth.expires === 'number' && auth.expires <= Date.now() + 10 * 60 * 1000) {
+    await beforeEffect?.();
     try {
       await exec(join(piRoot, 'bin', 'pi'), ['auth', 'print-bearer-token', '--provider', provider,
         '--min-expiry', '10m'], { timeout: 60_000, maxBuffer: 1024 * 1024 });
@@ -536,7 +538,7 @@ async function sandboxPiCredential(piRoot, provider, kind) {
 
 // Legacy Pi/Sol ReviewPort on the hardened snapshot; VS-2 uses the Neon adapter.
 export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
-  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox }) {
+  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect }) {
   if (!isAbsolute(journal ?? '') || !isAbsolute(piRoot ?? '')) {
     throw new ReviewDenied('review_runner_misconfigured');
   }
@@ -584,7 +586,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // одного провайдера критика и уничтожается pi-guard после первого чтения.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
-      const credential = await sandboxPiCredential(piRoot, critic.provider, 'review');
+      const credential = await sandboxPiCredential(piRoot, critic.provider, 'review', beforeEffect);
       await writeFile(join(cfgDir, 'auth.json'),
         JSON.stringify({ [critic.provider]: credential }), { mode: 0o600 });
       for (const file of PI_CONFIG_FILES) {
@@ -650,7 +652,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         '--no-approve', '--tools', READ_ONLY_TOOLS.join(','),
         '--session-dir', '/tmp/session', instruction];
 
-      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs });
+      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs, beforeEffect });
       if (run.code !== 0) {
         // Сырой вывод — только в приватный журнал (0600), не в причину Board.
         try {
@@ -746,7 +748,7 @@ function parseArbiterDecision(text) {
 // арбитр судит по сериализованному спору (trigger + evidence + спека), а не
 // по дереву — дерево и worktree в контейнер не монтируются вообще.
 export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
-  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox }) {
+  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect }) {
   if (!isAbsolute(piRoot ?? '')) {
     throw new ReviewDenied('arbiter_runner_misconfigured');
   }
@@ -762,7 +764,7 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
       // auth только одного провайдера арбитра — как у критика, копией в tmpfs.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
-      const credential = await sandboxPiCredential(piRoot, arbiter.provider, 'arbiter');
+      const credential = await sandboxPiCredential(piRoot, arbiter.provider, 'arbiter', beforeEffect);
       await writeFile(join(cfgDir, 'auth.json'),
         JSON.stringify({ [arbiter.provider]: credential }), { mode: 0o600 });
       for (const file of PI_CONFIG_FILES) {
@@ -822,7 +824,7 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
 
       const snapshot = join(scratch, 'empty');
       await mkdir(snapshot);
-      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, allow, timeoutMs });
+      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, allow, timeoutMs, beforeEffect });
       if (run.code !== 0) {
         throw new ReviewDenied(`arbiter_runner_exit:${run.code ?? 'timeout'}`);
       }

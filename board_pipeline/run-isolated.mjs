@@ -7,7 +7,7 @@ import { parseArgs, promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { acceptHeld } from './acceptance.mjs';
 import { reserveWorktree, saveState } from './slot.mjs';
-import { advance } from './controller.mjs';
+import { advanceWithProjection } from './controller.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
@@ -18,6 +18,7 @@ import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter } from 
 import { MAX_QUESTION_TTL_MS, readSignedAnswer, signedAnswerVerifier } from './question-gate.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 import { reconcileFeedbackFromBb, reconcileSpawnFromBb } from './bb-reconcile.mjs';
+import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -69,13 +70,12 @@ async function ownerAnswerSource(cfg, principal, tree, inbox) {
 async function execute() {
   const { values } = parseArgs({ options: { execute: { type: 'boolean' }, policy: { type: 'string' },
     state: { type: 'string' }, 'recheck-rejected-handoff': { type: 'boolean' },
-    'stop-on-idle': { type: 'boolean' } } });
+    'stop-on-idle': { type: 'boolean' }, 'allow-live-pilot': { type: 'boolean' } } });
   if (!values.execute || !values.policy || !values.state) throw new Error('Use --execute --policy FILE --state DIR');
   const policyFile = await realpath(values.policy);
   const policyBytes = await readFile(policyFile);
   const p = JSON.parse(policyBytes);
-  if (p.scope !== 'isolated' || !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/api\/board$/.test(p.boardUrl ?? '') ||
-      new URL(p.boardUrl).port === '44100' || p.channel !== 'pilot') throw new Error('Only a separate isolated pilot Board is supported');
+  const activation = boardActivation(p, { allowLive: values['allow-live-pilot'] });
   if (!p.bb || !approved.has(p.bb.provider) || approved.get(p.bb.provider) !== p.bb.model ||
       (p.bb.provider === 'acp-zcode-start' && p.bb.effort !== 'max') || !/^proj_[a-z0-9]+$/.test(p.bb.project ?? '')) {
     throw new Error('Implementation preset is not approved');
@@ -94,6 +94,10 @@ async function execute() {
   if (inside(root, inbox) || inside(inbox, root) || inside(tree, inbox)) throw new Error('Handoff inbox must be separate');
   const st = await lstat(root);
   if (!st.isDirectory() || st.uid !== process.getuid() || st.mode & 0o077) throw new Error('State must be private');
+  const switchOpen = activation && await createPilotSwitch(activation.killSwitch, {
+    permitDirectory: dir => [tree, inbox, root].every(path => !inside(path, dir) && !inside(dir, path)),
+  });
+  await switchOpen?.();
   const brief = await realpath(p.brief);
   const reviewPrompt = await realpath(p.reviewPrompt);
   const reviewGate = await realpath(p.reviewGate);
@@ -131,7 +135,9 @@ async function execute() {
   process.env.DF_REVIEW_ROUTES = reviewRoutes;
   const { board } = loadSdk();
   const ownerAnswers = await ownerAnswerSource(p.questionGate, p.owner, tree, inbox);
-  const port = nativeBoardPort(board(), { channel: p.channel, isolatedQuestionOwner: Boolean(ownerAnswers) });
+  const assertOpen = activation && (async () => { await assertPinned(); await switchOpen(); });
+  const port = nativeBoardPort(board(), { channel: p.channel, isolatedQuestionOwner: Boolean(ownerAnswers),
+    pilot: activation && { scope: activation.scope, assertOpen } });
   const record = join(root, 'attempt.json');
   const git = async (...args) =>
     (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
@@ -173,6 +179,7 @@ async function execute() {
     },
     async spawn(attempt) {
       await assertPinned();
+      await port.guardTask?.(attempt.task_id, attempt.epoch);
       // Фактический исполнитель выбран workerSelector (включая согласованный
       // резерв при подтверждённом отказе первичного провайдера).
       const execSpec = attempt.executor ?? p.bb;
@@ -195,6 +202,7 @@ async function execute() {
       if (effort) argv.push('--reasoning-level', effort);
       const live = await port.verifyHeld(attempt.task_id, attempt.epoch);
       if (live.epoch !== attempt.epoch) throw new Error('lease_lost_before_bb_call');
+      await port.guardTask?.(attempt.task_id, attempt.epoch);
       try {
         const { stdout } = await exec('bb', argv, { timeout: 60_000 });
         return { threadId: JSON.parse(stdout).id };
@@ -229,6 +237,7 @@ async function execute() {
         threadId: threadId ?? attempt?.bb_thread_id, feedbackId, afterSeq });
     },
     async feedback(packet) {
+      await port.guardTask?.(packet.attempt.task_id, packet.attempt.epoch);
       // Уникальное имя файла сообщения: тот же SHA может получить замечание
       // повторно (rejected→recheck или новый раунд), 'wx' не должен падать.
       const message = join(root, `feedback-${packet.sha}-${randomUUID()}.md`);
@@ -271,6 +280,7 @@ async function execute() {
       }
       const live = await port.verifyHeld(packet.attempt.task_id, packet.attempt.epoch);
       if (live.epoch !== packet.attempt.epoch) throw new Error('lease_lost_before_bb_feedback');
+      await port.guardTask?.(packet.attempt.task_id, packet.attempt.epoch);
       const { stdout } = await exec('bb', ['thread', 'tell', packet.attempt.bb_thread_id, '--mode', 'queue',
         '--permission-mode', permissionMode, '--message-file', message, '--json'], { timeout: 50_000 });
       return { confirmed: ['sent', 'queued'].includes(JSON.parse(stdout).delivery) };
@@ -329,11 +339,12 @@ async function execute() {
     },
   };
   const reviewRunner = reviewSetup.neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner;
-  const review = reviewRunner({ journal: root, prompt: reviewText });
   const verify = async (attempt, submission) => {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
+    const beforeEffect = activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
+    const review = reviewRunner({ journal: root, prompt: reviewText, beforeEffect });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
     // сверяется с доверенным значением, а не сам с собой.
@@ -351,14 +362,15 @@ async function execute() {
     }, 20_000);
     try {
       return await acceptHeld({ attempt, submission, policy, journal: root, ports: {
-        board: port, inspect: worktreeInspector(policy), local: offlineProfileRunner(root),
-        tamper: tamperGate, visual: offlineVisualRunner(root),
+        board: port, inspect: worktreeInspector(policy), local: offlineProfileRunner(root, { beforeEffect }),
+        tamper: tamperGate, visual: offlineVisualRunner(root, { beforeEffect }),
         // Смена брифа/файлов политики во время проверок останавливает кандидата до complete.
         verifyPinned: assertPinned,
         review: async (handoff, trusted) => {
           await renewal;
           if (lost) throw new Error('Lease lost');
           await assertPinned();
+          await beforeEffect?.();
           return review(handoff, trusted);
         },
       } });
@@ -374,9 +386,10 @@ async function execute() {
   // Порт арбитра: реальный изолированный раннер третьего семейства в том же
   // rootless Docker read-only контуре, что и критик. Создаётся лениво —
   // только когда арбитраж действительно запрошен.
-  let arbiterRunner = null;
   const arbitrate = async (req) => {
-    arbiterRunner ??= isolatedArbiterRunner({ journal: root,
+    const beforeEffect = activation && (() => port.guardTask(req.task_id, req.epoch));
+    await beforeEffect?.();
+    const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
       prompt: ['Use the following specification; output only an arbitration decision, not a critic verdict.',
         reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : ''].join('\n\n') });
     return arbiterRunner(req);
@@ -385,8 +398,9 @@ async function execute() {
     const deadline = Date.now() + p.waitMs;
     let previous;
     let recheck = values['recheck-rejected-handoff'];
+    const tick = guardedEffect(assertOpen, advanceWithProjection);
     while (Date.now() <= deadline) {
-      const result = await advance({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
+      const result = await tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
         recheckRejectedHandoff: recheck,
         // Фактические критик/арбитр из профиля проверки и политики; порт
         // арбитра подключается из конфига, когда задан.
@@ -395,7 +409,7 @@ async function execute() {
           arbiter: reviewSetup.arbiter,
           arbitrate } });
       recheck = false;
-      const line = JSON.stringify(result);
+      const line = JSON.stringify(activation && result.reason ? { ...result, reason: 'see_private_attempt' } : result);
       if (line !== previous) console.log(line);
       previous = line;
       if (result.phase === 'release_ready') return;

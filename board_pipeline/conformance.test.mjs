@@ -16,7 +16,8 @@ import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { acceptHeld } from './acceptance.mjs';
-import { advance } from './controller.mjs';
+import { advanceWithProjection } from './controller.mjs';
+import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { reserveWorktree, saveState } from './slot.mjs';
 import { answerBytes, signedAnswerVerifier } from './question-gate.mjs';
@@ -78,15 +79,43 @@ async function startBoard(cli, t) {
   return { url, dir };
 }
 
+async function enrollPilotFixture({ root, handle, url, channel, owner, pilotScope, finish, effects }) {
+  const projections = [];
+  let afterRead;
+  const settings = join(root, 'operator');
+  await mkdir(settings, { mode: 0o700 });
+  const switchFile = join(settings, 'switch');
+  await writeFile(switchFile, 'run\n', { mode: 0o600 });
+  const activation = boardActivation({ scope: 'pilot', boardUrl: url, channel,
+    owner: pilotScope.owner ?? owner, label: { key: 'queue', value: 'vs1' },
+    route: { repoId: pilotScope.repoId ?? REPO, checkProfile: pilotScope.profileId ?? 'pilot', finish },
+    pilot: { enabled: true, killSwitch: switchFile } });
+  const admission = { scope: activation.scope, assertOpen: await createPilotSwitch(switchFile) };
+  effects.nativeClaims = 0;
+  const portHandle = { ...handle,
+    tasks: { ...handle.tasks, claim: async (...args) => { effects.nativeClaims++; return handle.tasks.claim(...args); } },
+    async thread(...args) { const snapshot = await handle.thread(...args); await afterRead?.(snapshot.message); return snapshot; },
+    async label(id, change) {
+      const applied = await handle.label(id, change);
+      projections.push((await handle.thread(id, { limit: 1 })).message.labels);
+      return applied;
+    },
+  };
+  return { admission, portHandle, controls: { projections,
+    setSwitch: value => writeFile(switchFile, value), afterRead: hook => { afterRead = hook; } } };
+}
+
 // Полный лабораторный стенд: живая Board, git worktree, слот-бронь, порты со
 // счётчиками и хранилище записи попытки — всё как в run-isolated, но под тестом.
-async function lab(t, { finish = 'verified', lease = 900, mutants, questions = false } = {}) {
+async function lab(t, { finish = 'verified', lease = 900, mutants, questions = false,
+  pilot = false, pilotScope = {}, hasUi = false } = {}) {
   const { url, dir } = await startBoard(boardCli(), t);
+  const channel = pilot ? 'bgu-cabinet' : 'pilot';
   process.env.BOARD_URL = url;
   const { board } = loadSdk();
   const handle = board();
   for (let attempt = 1; attempt <= 5; attempt++) {
-    try { await handle.createChannel('pilot'); break; }
+    try { await handle.createChannel(channel); break; }
     catch (error) {
       if (attempt === 5) throw error;
       await delay(300);
@@ -109,15 +138,17 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
   commit(tree, 'Synthetic candidate');
   const candidate = git(tree, 'rev-parse', 'HEAD');
 
-  const { task } = await handle.tasks.create('pilot', { text: 'Synthetic conformance',
-    noSync: true, labels: { ...LABELS, finish } });
+  const { task } = await handle.tasks.create(channel, { text: 'Synthetic conformance',
+    noSync: true, labels: { ...LABELS, finish, ...(hasUi ? { has_ui: 'true' } : {}) } });
   const owner = (await handle.thread(task.id, { limit: 1 })).message.task.owner;
   const card = async () => (await handle.thread(task.id, { limit: 1 })).message.task;
 
   // Счётчики эффектов на стороне портов — внешний факт, не журнал контроллера.
   const effects = { spawnCalls: 0, feedbackCalls: 0, completeCalls: 0, blockCalls: 0,
     verifyCalls: 0, localCalls: 0, reviewCalls: 0, arbiterCalls: 0, delivered: [] };
-  const port = nativeBoardPort(handle, { channel: 'pilot', lease, isolatedQuestionOwner: questions });
+  const { admission, portHandle = handle, controls } = pilot
+    ? await enrollPilotFixture({ root, handle, url, channel, owner, pilotScope, finish, effects }) : {};
+  const port = nativeBoardPort(portHandle, { channel, lease, isolatedQuestionOwner: questions, pilot: admission });
   const realComplete = port.complete.bind(port);
   const realBlock = port.block.bind(port);
   port.complete = async (...args) => { effects.completeCalls++; return realComplete(...args); };
@@ -132,6 +163,7 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
     reconcileSpawnResult: { status: 'empty' },
     reconcileFeedbackResult: { status: 'empty' },
     async spawn(envelope) {
+      await port.guardTask?.(envelope.task_id, envelope.epoch);
       effects.spawnCalls++;
       const threadId = bb.fixedThread ?? `thr_wire${effects.spawnCalls}`;
       bb.spawnRegistry.push(threadId);
@@ -139,6 +171,7 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
       return { threadId };
     },
     async feedback(packet) {
+      await port.guardTask?.(packet.attempt.task_id, packet.attempt.epoch);
       effects.feedbackCalls++;
       bb.delivered.push(packet.feedbackId);
       if (bb.feedbackOutcome === 'lost_ack') throw new Error('lost transport response');
@@ -182,11 +215,11 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
     return acceptHeld({ attempt, submission, policy, journal, ports: {
       board: port,
       inspect: worktreeInspector(policy),
-      local: async binding => { effects.localCalls++;
+      local: async binding => { await port.guardTask?.(attempt.task_id, attempt.epoch); effects.localCalls++;
         return { sha: binding.candidate_sha, ok: true,
           evidence: [{ file: 'checks-vs1.log', sha256: 'f'.repeat(64), exit: 0 }] }; },
       tamper: tamperGate,
-      review: async binding => { effects.reviewCalls++;
+      review: async binding => { await port.guardTask?.(attempt.task_id, attempt.epoch); effects.reviewCalls++;
         return { task: binding.task_id, sha: binding.candidate_sha,
           actual: REVIEW, verdict: 'REVIEW_OK', checkpoint: 'feed80ab' }; },
       ...(typeof unsafePorts === 'function' ? unsafePorts(journal) : unsafePorts),
@@ -199,23 +232,25 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
     save: async value => { stored = structuredClone(value); },
   };
   const cfg = {
-    route: { allowlist: { owner, label: { key: 'queue', value: 'vs1' } }, base,
-      policyVersion: 'vs1-5', checkProfile: 'pilot', worktree: tree, finish },
+    route: { allowlist: { owner: admission?.scope.owner ?? owner, label: { key: 'queue', value: 'vs1' },
+      ...(admission ? { repoId: admission.scope.repoId } : {}) }, base,
+      policyVersion: 'vs1-5', checkProfile: admission?.scope.profileId ?? 'pilot', worktree: tree, finish },
     authorize: async () => true,
     state, board: port, bb, submissions, verify,
     ...(mutants ? { mutants } : {}),
   };
   const releaseSlot = await reserveWorktree(registry, tree, stateDir);
   t.after(() => releaseSlot());
+  const tick = guardedEffect(admission?.assertOpen, advanceWithProjection);
   return {
-    handle, port, bb, effects, cfg, card, tree, root, registry, stateDir, dir,
+    handle, port, bb, effects, cfg, card, tree, root, registry, stateDir, dir, channel, ...controls,
     taskId: task.id, base, candidate, stored: () => stored,
     submit: (sha, seq, extra = {}) => { turns.push({ seq, sha, ...extra }); },
     pushTurn: entry => { turns.push(entry); },
     setScript: map => { scripted = map; },
     setUnsafePorts: p => { unsafePorts = p; },
     releaseSlot,
-    tick: () => advance(cfg),
+    tick: () => tick(cfg),
     workerSelector: over => { cfg.workerSelector = { ...ws, critic: REVIEW,
       // This conformance fixture intentionally uses the legacy Pi/Sol critic.
       arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' },
@@ -744,4 +779,201 @@ test('VS-2 replacement hold, expiry and ambiguous unblock never unlock another q
     assert.equal(x.effects.spawnCalls, 1);
     assert.equal(x.effects.feedbackCalls, 0);
   }
+});
+
+test('VS-2 pilot projects claimed, L1/L3/L2, a real REWORK/PASS and completion on the card', async t => {
+  const x = await lab(t, { pilot: true, hasUi: true });
+  x.setUnsafePorts(journal => ({
+    visual: async binding => ({ ok: true, status: 'pass', sha: binding.candidate_sha,
+      artifacts: [{ name: 'page.png', sha256: 'd'.repeat(64), bytes: 5 }],
+      evidence: { file: 'visual.log', sha256: 'e'.repeat(64), exit: 0 } }),
+    review: async binding => {
+      const transcript = 'synthetic transcript';
+      const name = 'pilot-review.json';
+      await writeFile(join(journal, name), transcript, { mode: 0o600 });
+      const rework = binding.candidate_sha === x.candidate;
+      return { task: binding.task_id, sha: binding.candidate_sha, actual: REVIEW,
+        verdict: rework ? 'REVIEW_BLOCKED' : 'REVIEW_OK', checkpoint: 'feed80ab',
+        isolation: 'docker-ro-v1', transcript_file: name, subject_digest: binding.subject_digest,
+        transcript_sha256: createHash('sha256').update(transcript).digest('hex'),
+        ...(rework ? { findings: [{ file: 'check.mjs', expected: 'correct', actual: 'SYNTHETIC_STDERR_NEVER_PUBLIC' }] } : {}) };
+    },
+  }));
+  const started = await x.tick();
+  assert.equal(started.phase, 'working');
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(x.effects.feedbackCalls, 1);
+  await writeFile(join(x.tree, 'check.mjs'), 'console.log("second candidate"); process.exit(0);\n');
+  git(x.tree, 'add', 'check.mjs');
+  commit(x.tree, 'Fix synthetic rework');
+  const fixed = git(x.tree, 'rev-parse', 'HEAD');
+  x.submit(fixed, 20);
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal((await x.card()).state, 'completed');
+  assert.deepEqual(x.projections.map(labels => labels['factory.phase']),
+    ['claimed', 'L1', 'L3', 'L2', 'L2_REWORK', 'L1', 'L3', 'L2', 'L2_PASS', 'completed']);
+  assert.equal(x.projections[4]['factory.next'], 'revise_candidate');
+  assert.equal(x.projections[4]['factory.sha'], x.candidate);
+  assert.equal(x.projections.at(-1)['factory.sha'], fixed);
+  assert.equal(x.projections.at(-1)['factory.epoch'], String(started.epoch));
+  assert.equal(x.projections.some(labels => JSON.stringify(labels).includes('SYNTHETIC_STDERR_NEVER_PUBLIC')), false);
+  await x.tick();
+  assert.equal(x.projections.length, 10, 'replayed terminal tick is a label no-op');
+});
+
+test('VS-2 pilot projects native blocked without making private diagnostics public', async t => {
+  const x = await lab(t, { pilot: true });
+  x.setUnsafePorts({ review: async () => { throw new Error('SYNTHETIC_STDERR_NEVER_PUBLIC'); } });
+  await x.tick();
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'hold');
+  const task = await x.card();
+  assert.equal(task.state, 'blocked');
+  assert.equal(task.blocked.reason.includes('SYNTHETIC_STDERR_NEVER_PUBLIC'), false);
+  assert.equal(x.projections.at(-1)['factory.phase'], 'blocked');
+  assert.equal(x.projections.at(-1)['factory.next'], 'operator_review');
+  assert.equal(x.projections.some(labels => JSON.stringify(labels).includes('SYNTHETIC_STDERR_NEVER_PUBLIC')), false);
+});
+
+test('VS-2 pilot has no native claims on foreign tuple, idle switch or switch closure after read', async t => {
+  for (const tuple of [{ owner: 'local:user:foreign' }, { repoId: 'wrong-repo' }, { profileId: 'wrong-profile' }]) {
+    const x = await lab(t, { pilot: true, pilotScope: tuple });
+    assert.equal((await x.tick()).phase, 'idle');
+    assert.equal((await x.card()).epoch, 0);
+    assert.equal(x.effects.nativeClaims, 0);
+    assert.equal(x.effects.spawnCalls + x.effects.reviewCalls, 0);
+  }
+  const x = await lab(t, { pilot: true });
+  await x.setSwitch('stop\n');
+  await assert.rejects(x.tick(), { code: 'pilot_stopped' });
+  assert.equal(x.effects.nativeClaims, 0);
+  await x.setSwitch('run\n');
+  x.afterRead(async root => {
+    if (root?.id === x.taskId && root.task?.state === 'ready') await x.setSwitch('stop\n');
+  });
+  const stopped = await x.tick();
+  assert.equal(stopped.phase, 'uncertain');
+  assert.equal((await x.card()).state, 'ready');
+  assert.equal(x.effects.nativeClaims, 0);
+  assert.equal(x.effects.spawnCalls + x.effects.reviewCalls, 0);
+  assert.deepEqual(x.projections, []);
+});
+
+test('VS-2 pilot kill switch rejects writes and renewal after a verification cut', async t => {
+  const x = await lab(t, { pilot: true });
+  const { epoch } = await x.tick();
+  const complete = x.port.complete;
+  x.port.complete = async (...args) => {
+    await x.setSwitch('stop\n');
+    return complete(...args);
+  };
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'uncertain');
+  assert.equal((await x.card()).state, 'claimed');
+  assert.equal((await x.card()).result, null);
+  assert.equal(x.projections.at(-1)['factory.phase'], 'L2_PASS');
+  await assert.rejects(x.port.verifyHeld(x.taskId, epoch), { code: 'pilot_stopped' });
+  await assert.rejects(x.port.project(x.taskId, epoch, 'L2_REWORK', x.candidate), { code: 'pilot_stopped' });
+  assert.equal(x.effects.spawnCalls, 1);
+  await assert.rejects(x.tick(), { code: 'pilot_stopped' });
+  assert.equal(x.effects.feedbackCalls, 0);
+});
+
+test('VS-2 pilot refuses review when enrolled repo label changes after native claim', async t => {
+  const x = await lab(t, { pilot: true });
+  await x.tick();
+  await x.handle.label(x.taskId, { set: { repo_id: 'foreign-after-claim' } });
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'lease_lost');
+  assert.equal(x.effects.localCalls + x.effects.reviewCalls + x.effects.feedbackCalls, 0);
+  assert.deepEqual(x.projections.map(labels => labels['factory.phase']), ['claimed']);
+  assert.equal((await x.card()).state, 'claimed');
+});
+
+test('VS-2 pilot leaves other channels, deployed and waiting tasks untouched', async t => {
+  const x = await lab(t, { pilot: true });
+  await x.handle.createChannel('manual-bb');
+  const { task: foreignChannel } = await x.handle.tasks.create('manual-bb', { text: 'synthetic foreign channel', labels: LABELS });
+  const { task: deployed } = await x.handle.tasks.create(x.channel, { text: 'synthetic deployment', labels: { ...LABELS, finish: 'deployed' } });
+  const { task: blocker } = await x.handle.tasks.create(x.channel, { text: 'synthetic unenrolled dependency' });
+  await x.handle.tasks.needs(x.taskId, [blocker.id]);
+  assert.equal((await x.tick()).phase, 'idle');
+  assert.equal(x.effects.nativeClaims + x.effects.spawnCalls + x.effects.verifyCalls, 0);
+  assert.equal((await x.card()).state, 'waiting');
+  for (const task of [foreignChannel, deployed, blocker]) {
+    const native = (await x.handle.thread(task.id)).message.task;
+    assert.equal(native.state, 'ready');
+    assert.equal(native.epoch, 0);
+  }
+  assert.deepEqual(x.projections, []);
+});
+
+test('VS-2 pilot stops a queued BB spawn and a model start at their effect boundaries', async t => {
+  const spawn = await lab(t, { pilot: true });
+  const publish = spawn.port.project;
+  spawn.port.project = async (...args) => {
+    await publish(...args);
+    if (args[2] === 'claimed') await spawn.setSwitch('stop\n');
+  };
+  assert.equal((await spawn.tick()).phase, 'lease_lost');
+  assert.equal(spawn.effects.nativeClaims, 1);
+  assert.equal((await spawn.card()).state, 'claimed');
+  assert.equal(spawn.effects.spawnCalls, 0);
+
+  const model = await lab(t, { pilot: true });
+  await model.tick();
+  model.afterRead(async root => {
+    if (root?.id === model.taskId && root.labels['factory.phase'] === 'L2') await model.setSwitch('stop\n');
+  });
+  model.submit(model.candidate, 10);
+  assert.equal((await model.tick()).phase, 'uncertain');
+  assert.equal(model.effects.localCalls, 1);
+  assert.equal(model.effects.reviewCalls + model.effects.feedbackCalls, 0);
+  assert.equal((await model.card()).state, 'claimed');
+  assert.equal((await model.card()).result, null);
+});
+
+test('VS-2 pilot native label compare-and-set cannot overwrite a fresher projection', async t => {
+  const x = await lab(t, { pilot: true });
+  const { epoch } = await x.tick();
+  let introduced = false;
+  x.afterRead(async root => {
+    if (!introduced && root?.id === x.taskId) {
+      introduced = true;
+      await x.handle.label(x.taskId, { set: { 'factory.epoch': String(epoch + 1) } });
+    }
+  });
+  await assert.rejects(x.port.project(x.taskId, epoch, 'L2', x.candidate), { code: 'label_conflict' });
+  const { message } = await x.handle.thread(x.taskId);
+  assert.equal(message.labels['factory.epoch'], String(epoch + 1));
+  assert.equal(message.labels['factory.phase'], 'claimed');
+  assert.equal(message.task.epoch, epoch);
+});
+
+test('VS-2 pilot leaves native settlement authoritative if final phase publication fails', async t => {
+  const x = await lab(t, { pilot: true });
+  const publish = x.port.project;
+  x.port.project = (...args) => {
+    if (args[2] === 'completed') throw new Error('synthetic display failure');
+    return publish(...args);
+  };
+  await x.tick();
+  x.submit(x.candidate, 10);
+  await assert.rejects(x.tick(), /synthetic display failure/);
+  assert.equal(x.stored().phase, 'done');
+  assert.equal((await x.card()).state, 'completed');
+  x.port.project = publish;
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(x.effects.completeCalls, 1);
+  assert.equal(x.projections.at(-1)['factory.phase'], 'completed');
+});
+
+test('VS-2 pilot drops model prose from the native completion receipt', async t => {
+  const x = await lab(t, { pilot: true });
+  const { epoch } = await x.tick();
+  await x.port.complete(x.taskId, epoch, { sha: x.candidate,
+    arbitration: { decision: 'accept_with_notes', notes: 'SYNTHETIC_STDERR_NEVER_PUBLIC' } });
+  assert.deepEqual((await x.port.lookup(x.taskId)).result,
+    { sha: x.candidate, arbitration: { decision: 'accept_with_notes' } });
 });

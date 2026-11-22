@@ -1,5 +1,11 @@
+import { PilotDenied } from './pilot-gate.mjs';
+import { pilotProjection, pilotScopeMatches } from './pilot-projection.mjs';
+
 // The native claim token never leaves this adapter.
-export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestionOwner = false }) {
+export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestionOwner = false, pilot }) {
+  if (pilot && (pilot.scope.channel !== channel || typeof pilot.assertOpen !== 'function')) {
+    throw new PilotDenied('pilot_route_not_allowed');
+  }
   const held = new Map();
 
   async function rootOf(taskId) {
@@ -9,6 +15,27 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
     }
     return message;
   }
+
+  async function allowEffect(taskId, state, epoch, seen) {
+    if (!pilot) return;
+    const root = seen ?? await rootOf(taskId);
+    if (!pilotScopeMatches(root, pilot.scope) || root.task.state !== state ||
+        (epoch !== undefined && root.task.epoch !== epoch) ||
+        (state === 'claimed' && !(Date.parse(root.task.claim?.until) > Date.now()))) {
+      throw new PilotDenied('pilot_route_revoked');
+    }
+    await pilot.assertOpen();
+  }
+
+  async function project(taskId, epoch, phase, sha) {
+    const root = await rootOf(taskId);
+    const change = pilotProjection({ phase, epoch, sha }, root, pilot.scope);
+    if (!change) return;
+    await pilot.assertOpen();
+    await handle.label(taskId, change);
+  }
+
+  const blockText = (epoch, detail) => pilot ? `Factory paused at epoch ${epoch}; operator review.` : detail.slice(0, 1000);
 
   async function lookup(taskId) {
     const { state, epoch, claim, result, blocked } = (await rootOf(taskId)).task;
@@ -52,6 +79,7 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
     }
     let renewed;
     try {
+      await allowEffect(taskId, 'claimed', epoch);
       renewed = await claim.renew(lease);
     } catch (error) {
       held.delete(taskId);
@@ -125,7 +153,8 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
     return true;
   }
 
-  async function acquire(taskId, token) {
+  async function acquire(taskId, token, seen) {
+    await allowEffect(taskId, 'ready', undefined, seen);
     const claim = await handle.tasks.claim(taskId, token === undefined ? { lease } : { lease, token });
     held.set(taskId, claim);
     return { epoch: claim.epoch, until: claim.until };
@@ -154,11 +183,13 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
   }
 
   return {
+    ...(pilot ? { project, blockText, guardTask: (taskId, epoch) => allowEffect(taskId, 'claimed', epoch) } : {}),
     questionState,
     async unblockQuestion(question, blockText) {
       if (await questionState(question, blockText) !== 'blocked') throw new Error('Question hold changed');
       // Board 0.54.0 has no CAS on unblock. This capability is only enabled on
       // the isolated owner-exclusive queue, never on the public pilot route.
+      await allowEffect(question.task_id, 'blocked', question.epoch);
       await handle.tasks.unblock(question.task_id);
     },
     async claimForQuestion(question, { token }) {
@@ -170,7 +201,8 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
     verifyHeld,
     async matches(taskId, { owner, label, state }) {
       const root = await rootOf(taskId);
-      return root.task.state === state && root.task.owner === owner && root.labels?.[label.key] === label.value;
+      return root.task.state === state && root.task.owner === owner && root.labels?.[label.key] === label.value &&
+        (!pilot || pilotScopeMatches(root, pilot.scope));
     },
     async claim(taskId, { token } = {}) {
       return claimById(taskId, { token });
@@ -193,10 +225,8 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
           // метка, профиль и контракт проверяются на нём же, его метки и возвращаются.
           const fresh = await rootOf(listed.id);
           if (fresh.task.state !== 'ready' || !admits(trusted, fresh)) continue;
-          const claim = await handle.tasks.claim(listed.id,
-            token === undefined ? { lease } : { lease, token });
-          held.set(listed.id, claim);
-          return { taskId: listed.id, epoch: claim.epoch, until: claim.until, labels: fresh.labels };
+          const claim = await acquire(listed.id, token, fresh);
+          return { taskId: listed.id, ...claim, labels: fresh.labels };
         }
         // Сервер сообщает курсор следующей страницы; без сдвига или без карточек очередь кончилась.
         if (!page.cursor || page.cursor === after || !page.tasks?.length) return null;
@@ -215,16 +245,24 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
     },
     async complete(taskId, epoch, evidence) {
       const claim = claimFor(taskId, epoch);
-      const text = JSON.stringify(evidence);
+      let publicEvidence = evidence;
+      if (pilot && evidence?.arbitration && Object.hasOwn(evidence.arbitration, 'notes')) {
+        // Model prose belongs in the private arbitration receipt, not on a pilot card.
+        const { notes, ...arbitration } = evidence.arbitration;
+        publicEvidence = { ...evidence, arbitration };
+      }
+      const text = JSON.stringify(publicEvidence);
       if (typeof text !== 'string' || text.length > 1000) {
         throw new Error('Board result requires compact typed evidence (up to 1000 characters)');
       }
+      await allowEffect(taskId, 'claimed', epoch);
       await claim.complete(text);
       held.delete(taskId);
     },
     async block(taskId, epoch, reason) {
       const claim = claimFor(taskId, epoch);
-      await claim.block(reason.slice(0, 1000), { kind: 'needs_input' });
+      await allowEffect(taskId, 'claimed', epoch);
+      await claim.block(blockText(epoch, reason), { kind: 'needs_input' });
       held.delete(taskId);
     },
   };

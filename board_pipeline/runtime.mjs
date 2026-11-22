@@ -108,7 +108,7 @@ async function cleanupContainer(name) {
   }
 }
 
-export function offlineDockerRunner(journal) {
+export function offlineDockerRunner(journal, { beforeEffect } = {}) {
   return async (handoff, profile) => {
     const recipe = checkCommand(profile.check ?? {});
     const { image, argv, cwd, timeoutMs } = recipe;
@@ -135,6 +135,7 @@ export function offlineDockerRunner(journal) {
         '--workdir', posix.join('/candidate', cwd), image, ...argv];
       let output;
       let exit = 0;
+      await beforeEffect?.();
       try {
         const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
         output = `${run.stdout}${run.stderr}`;
@@ -196,7 +197,7 @@ export async function collectVisualArtifacts(dropped, journal, binding) {
 
 // L3 визуальный гейт: та же изоляция rootless Docker, плюс каталог артефактов,
 // смонтированный rw только для выгрузки скриншотов в приватный журнал контроллера.
-export function offlineVisualRunner(journal) {
+export function offlineVisualRunner(journal, { beforeEffect } = {}) {
   return async (binding, profile) => {
     const recipe = checkCommand(profile.visual ?? {});
     const { image, argv, cwd, timeoutMs } = recipe;
@@ -236,8 +237,10 @@ export function offlineVisualRunner(journal) {
         '/bin/sh', '-c', 'sleep 3600'];
       let output;
       let exit;
+      await beforeEffect?.();
       try {
         await exec('docker', args, { timeout: 15_000 });
+        await beforeEffect?.();
         try {
           const run = await exec('docker',
             ['exec', '--workdir', posix.join('/candidate', cwd), name, ...argv],
@@ -254,6 +257,7 @@ export function offlineVisualRunner(journal) {
         }
         // Выгрузка из tmpfs живого контейнера; сбой tar — это ошибка, не тихий pass.
         const bundle = join(scratch, 'artifacts.tar');
+        await beforeEffect?.();
         const packed = await exec('docker',
           ['exec', name, 'tar', '-C', '/artifacts', '-cf', '-', '.'],
           { timeout: 30_000, maxBuffer: ARTIFACT_MAX_TOTAL_BYTES + 2 * 1024 * 1024,
@@ -278,8 +282,8 @@ export function offlineVisualRunner(journal) {
   };
 }
 
-export function offlineProfileRunner(journal) {
-  const check = offlineDockerRunner(journal);
+export function offlineProfileRunner(journal, options) {
+  const check = offlineDockerRunner(journal, options);
   return async (handoff, profile) => {
     if (!Array.isArray(profile.checks) || !profile.checks.length) throw new Error('An approved check list is required');
     const evidence = [];

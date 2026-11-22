@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { lstat, readFile, readdir, writeFile } from 'node:fs/promises';
+import { chmod, lstat, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
@@ -9,6 +9,7 @@ import { hostAgyTransport } from './agy-transport.mjs';
 import { agyStreamFixture, commitFile, neonFixture } from './review-test-fixture.mjs';
 import agyStream from './agy-stream.cjs';
 import { NEON_ISOLATION } from './review-policy.mjs';
+import { PilotDenied } from './pilot-gate.mjs';
 
 const subject_digest = 'a'.repeat(64);
 const verdict = { verdict: 'PASS', subject_digest, summary: 'Matches the spec',
@@ -100,6 +101,24 @@ test('Agy transport launches with an empty 0500 directory and never inherits tas
     await request.sealBootstrap();
     return { code: 0, cwd: request.cwd };
   } });
+});
+
+test('Agy pilot cut after init withholds the prompt from the already-started process', async t => {
+  const { journal } = await fixture(t);
+  const binary = join(journal, 'fake-agy');
+  const received = join(journal, 'received-prompt');
+  await writeFile(binary, `#!${process.execPath}\nif (process.argv.includes('--version')) { console.log('1.5.14'); process.exit(0); }\nconsole.log(JSON.stringify({ event:'init', conversation_id:'one', init:{model:'gemini-4-neon',cwd:process.cwd(),permission_mode:'request-review',tools:[]} }));\nprocess.stdin.on('data', () => require('fs').writeFileSync(${JSON.stringify(received)}, 'received'));\n`, { mode: 0o700 });
+  await chmod(binary, 0o700);
+  let checks = 0;
+  let revoked = false;
+  const result = await agyStream.runAgy({ binary, cwd: journal, env: process.env, prompt: 'synthetic candidate',
+    timeoutMs: 3000, sealBootstrap: async () => { revoked = true; }, beforeEffect: async () => {
+      if (++checks === 2) throw new PilotDenied('pilot_stopped');
+    } });
+  assert.equal(revoked, true);
+  assert.equal(checks, 2);
+  assert.equal(result.code, 1);
+  await assert.rejects(lstat(received), { code: 'ENOENT' });
 });
 
 test('Agy watchdog SIGKILLs on a tool step before accepting later output', { timeout: 3000 }, async () => {
