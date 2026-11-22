@@ -19,11 +19,13 @@ const forbidden = () => Object.assign(new Error('review_tool_use_forbidden'), { 
 const within = (root, target) => target === root || target.startsWith(`${root}${sep}`);
 
 function checkedPath(root, request) {
-  if (typeof request !== 'string' || !request || /[\0\r\n]/.test(request)) throw forbidden();
+  if (typeof request !== 'string' || !request || request !== request.trim() || /[\0\r\n\\]/.test(request) ||
+      /^(?:[a-z][a-z0-9+.-]*:|[~-])/i.test(request) || request.split(sep).includes('..')) throw forbidden();
   const path = resolve(root, request);
-  // Check both the spelling and the actual target; neither an escaping path
-  // nor a symlink to another part of the host is a snapshot tool input.
-  if (!within(root, path) || !within(root, realpathSync(path))) throw forbidden();
+  // Check the spelling and the raw filesystem resolution separately. Do not
+  // normalize away a component before checking what the native tool opens.
+  const raw = isAbsolute(request) ? request : `${root}${sep}${request}`;
+  if (!within(root, path) || !within(root, realpathSync(raw))) throw forbidden();
   return relative(root, path) || '.';
 }
 

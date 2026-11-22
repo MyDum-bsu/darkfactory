@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -43,6 +43,25 @@ test('snapshot tool schema admits only known read/search operations with contain
     ['run_command', { CommandLine: 'true' }], ['read_url_content', { Url: 'https://example.invalid/' }],
     ['write_to_file', { TargetFile: path }], ['invoke_subagent', { Prompt: 'read' }],
   ]) assert.throws(() => tools.checkSnapshotTool(snapshot, name, args), { reason: 'review_tool_use_forbidden' });
+});
+
+test('raw traversal through an internal symlink cannot outsmart normalized path checks', async t => {
+  const { snapshot, outside } = await fixture(t);
+  await mkdir(join(snapshot, 'candidate', 'deep', 'more'), { recursive: true });
+  await symlink('../..', join(snapshot, 'candidate', 'deep', 'more', 'alias'));
+  await writeFile(join(snapshot, 'candidate', 'deep', 'outside.txt'), 'lexically resolved file');
+  const raw = 'candidate/deep/more/alias/../../outside.txt';
+  assert.equal(await realpath(`${snapshot}/${raw}`), outside);
+  assert.throws(() => tools.checkSnapshotTool(snapshot, 'read_file', { Path: raw }),
+    { reason: 'review_tool_use_forbidden' });
+});
+
+test('a URL-shaped argument is not a file path even if a matching pathname exists', async t => {
+  const { snapshot } = await fixture(t);
+  await mkdir(join(snapshot, 'https:'));
+  await writeFile(join(snapshot, 'https:', 'example.invalid'), 'local fixture');
+  assert.throws(() => tools.checkSnapshotTool(snapshot, 'read_file', { Path: 'https://example.invalid' }),
+    { reason: 'review_tool_use_forbidden' });
 });
 
 test('the trusted pre-tool hook records contained reads and denies traversal before dispatch', async t => {
