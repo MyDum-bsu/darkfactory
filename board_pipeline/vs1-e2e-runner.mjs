@@ -119,7 +119,8 @@ async function execute() {
   const branch = `feat/vs1-e2e-${randomUUID().slice(0, 8)}`;
   const bsu = await realpath(values['bsu-repo']);
   const origin = join(lab, 'bsu-origin');
-  await exec('git', ['clone', '--local', '-q', bsu, origin], { timeout: 120_000 });
+  // fuseblk не поддерживает жёсткие ссылки: --no-hardlinks копирует объекты.
+  await exec('git', ['clone', '--no-hardlinks', '-q', bsu, origin], { timeout: 180_000 });
   await exec('git', ['-C', origin, 'fetch', '-q', BUNDLE,
     'refs/tags/*:refs/tags/*'], { timeout: 60_000 });
   await exec('git', ['-C', origin, 'worktree', 'add', dirs.worktree, '-b', branch, BASE],
