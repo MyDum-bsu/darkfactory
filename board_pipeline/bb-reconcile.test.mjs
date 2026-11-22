@@ -138,5 +138,6 @@ test('reconcileFeedback: afterSeq → --after-seq; source spawn не засчи�
     feedbackId: 'f1', afterSeq: 25 });
   assert.equal(res.status, 'delivered');
   assert.ok(calls[0].includes('--after-seq') && calls[0].includes('25'));
-  assert.ok(!calls[0].includes('--all') && !calls[0].includes('--limit'));
+  assert.ok(calls[0].includes('--all'), '--after-seq без --all ограничен 100 событиями');
+  assert.ok(!calls[0].includes('--limit'));
 });

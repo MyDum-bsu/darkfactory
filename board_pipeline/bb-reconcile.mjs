@@ -70,10 +70,11 @@ export async function reconcileFeedbackFromBb({ execBb, threadId, feedbackId, af
   if (!THREAD_ID.test(threadId ?? '') || typeof feedbackId !== 'string' || !feedbackId) {
     return { status: 'ambiguous' };
   }
+  // --after-seq без --all отдаёт лишь первую страницу (100 событий по
+  // умолчанию): --all обязателен, чтобы событие 101+ после afterSeq читалось.
   const args = ['thread', 'log', threadId];
   if (Number.isSafeInteger(afterSeq) && afterSeq > 0) args.push('--after-seq', String(afterSeq));
-  else args.push('--all');
-  args.push('--json');
+  args.push('--all', '--json');
   const log = await execBb(args, { timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
   const header = `Замечание фабрики ${feedbackId}.`;
   const hits = events(log.stdout).filter(event =>

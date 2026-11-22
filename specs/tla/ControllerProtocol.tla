@@ -198,7 +198,7 @@ WorkerTurn ==
 \* Возврат на доработку: durable intent feedback, фаза returning. Как в
 \* controller.mjs, запись нового intent сбрасывает receipt и машину провода.
 FeedbackIntent ==
-    /\ ctrlPhase = "working" /\ walIntent = "none" /\ reworkRounds < 3
+    /\ ctrlPhase = "checking" /\ walIntent = "none" /\ reworkRounds < 3
     /\ walIntent' = "feedback" /\ walReceipt' = "none" /\ feedbackWire' = "idle"
     /\ ctrlPhase' = "returning"
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive,
@@ -329,15 +329,21 @@ AcceptTurn ==
     /\ \/ /\ lastTurnSeq > feedbackWatermark
           /\ acceptedTurnSeq' = lastTurnSeq
           /\ progressMade' = TRUE
+          /\ ctrlPhase' = "checking"        \* новый ход -> проверка
+          /\ UNCHANGED <<walIntent, walReceipt>>
        \/ /\ AllowStaleTurnWatermark        \* мутант 4: replay старого хода
           /\ feedbackWatermark > 0
           /\ lastTurnSeq > 0
           /\ lastTurnSeq <= feedbackWatermark
+          \* Старый ход без новой сдачи принят как ответ: нарушение протокола
+          \* хода ведёт сразу в blocking с durable intent (controller.mjs
+          \* stopWith при повторе seenShas/отсутствии нового handoff).
           /\ acceptedTurnSeq' = lastTurnSeq
+          /\ ctrlPhase' = "blocking"
+          /\ walIntent' = "block" /\ walReceipt' = "none"
           /\ UNCHANGED progressMade
-    /\ ctrlPhase' = "checking"
-    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, walIntent,
-                   walReceipt, worktreeReserved, liveWriters, spawnOnWire,
+    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive,
+                   worktreeReserved, liveWriters, spawnOnWire,
                    feedbackWire, spawnCount, candidateDigest, verifiedDigest,
                    activePolicyDigest, pinnedPolicyDigest, lastTurnSeq,
                    feedbackWatermark, commitEpoch, reworkRounds>>
@@ -354,7 +360,7 @@ CheckDone ==
 \* --- Проверка, seal и complete ------------------------------------------------
 
 Verify ==
-    /\ ctrlPhase = "working" /\ candidateDigest = "cand" /\ verifiedDigest = "none"
+    /\ ctrlPhase = "checking" /\ candidateDigest = "cand" /\ verifiedDigest = "none"
     /\ verifiedDigest' = "cand" /\ progressMade' = TRUE
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
                    walReceipt, worktreeReserved, liveWriters, spawnOnWire,
