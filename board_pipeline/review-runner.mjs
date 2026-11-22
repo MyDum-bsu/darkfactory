@@ -169,7 +169,8 @@ export function parseReviewTranscript(ndjson) {
     }
     if (event?.type === 'agent_settled') {
       seenSettled = true;
-      aborted = event.aborted === true;
+      // Строгое сравнение с false ниже: отсутствующее/null aborted не проходит.
+      aborted = event.aborted;
     }
     if (event?.type !== 'message_end') continue;
     const message = event.message ?? event.data?.message;
@@ -647,10 +648,11 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       }
       assertToolsAllowed(parsed.toolsAdded);
       const verdict = parseReviewVerdict(parsed.finalText);
-      if (binding.subject_digest != null &&
-          verdict.subject_digest !== binding.subject_digest) {
-        // При заданном binding.subject_digest вердикт обязан подтвердить тот
-        // же дайджест; отсутствие или расхождение — отказ.
+      if (binding.subject_digest != null
+          ? verdict.subject_digest !== binding.subject_digest
+          : nonEmpty(verdict.subject_digest)) {
+        // При заданном дайджесте вердикт обязан подтвердить именно его;
+        // непрошенный subject_digest без binding — тоже отказ.
         throw new ReviewDenied('review_verdict_subject_mismatch');
       }
 
@@ -670,7 +672,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         task: binding.task_id,
         sha: binding.candidate_sha,
         tree_sha: treeSha,
-        subject_digest: verdict.subject_digest ?? null,
+        subject_digest: binding.subject_digest ? verdict.subject_digest : null,
         verdict: verdict.verdict,
         status: verdict.status,
         summary: verdict.summary,

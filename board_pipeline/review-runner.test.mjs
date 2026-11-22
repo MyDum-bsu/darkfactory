@@ -179,6 +179,13 @@ test('transcript: незавершённый/пустой финальный х�
   assert.throws(() => parseReviewTranscript([
     msg(), msg({ content: [{ type: 'text', text: 'final\nREVIEW_OK' }] }),
   ].join('\n')), (e) => e.reason === 'review_incomplete_turn');
+  // agent_settled без поля aborted или с null — не валидное завершение.
+  assert.throws(() => parseReviewTranscript([
+    msg(), JSON.stringify({ type: 'agent_settled' }),
+  ].join('\n')), (e) => e.reason === 'review_incomplete_turn');
+  assert.throws(() => parseReviewTranscript([
+    msg(), JSON.stringify({ type: 'agent_settled', aborted: null }),
+  ].join('\n')), (e) => e.reason === 'review_incomplete_turn');
 });
 
 test('transcript: пустой и битый поток — отказ', () => {
@@ -417,6 +424,12 @@ test('runner: verdict без subject_digest при заданном binding — 
       sandbox: stubSandbox(stream('{"verdict":"PASS","summary":"ok"}')) });
     const receipt2 = await free({ ...binding, subject_digest: null }, profile);
     assert.equal(receipt2.subject_digest, null);
+    // Непрошенный subject_digest в вердикте при пустом binding — отказ,
+    // непроверенный дайджест не должен доходить до квитанции.
+    const rogue = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: stubSandbox(stream(`{"verdict":"PASS","subject_digest":"${digest}"}`)) });
+    await assert.rejects(rogue({ ...binding, subject_digest: null }, profile),
+      (e) => e.reason === 'review_verdict_subject_mismatch');
   } finally {
     await rm(repo, { recursive: true, force: true });
     await rm(journal, { recursive: true, force: true });
@@ -437,11 +450,12 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
     // Файла на диске уже нет; не-креденшельное чтение — EACCES.
     try { fs.readFileSync('/tmp/.pi/agent/auth.json', 'utf8'); console.log('read1:allowed'); }
     catch (e) { console.log('read1:' + e.code); }
-    // Креденшельный код pi получает байты из памяти: имя функции в стеке.
+    // Даже имя RuntimeCredentials без /pi-ro в стеке — не креденшельный код.
     class RuntimeCredentials {
       read() { return fs.readFileSync('/tmp/.pi/agent/auth.json', 'utf8'); }
     }
-    console.log('cred:' + new RuntimeCredentials().read().includes('secret-value'));
+    try { new RuntimeCredentials().read(); console.log('cred:allowed'); }
+    catch (e) { console.log('cred:' + e.code); }
     try { fs.existsSync('/tmp/.pi/agent/auth.json'); console.log('exists:allowed'); }
     catch (e) { console.log('exists:' + e.code); }
     try { fs.readFileSync('/tmp/.pi/agent/settings.json'); console.log('cfg:allowed'); }
@@ -453,14 +467,23 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
     // child_process: внешние бинарники закрыты, read-only утилиты — нет.
     const cp = require('child_process');
     // spawnSync не бросает, а возвращает result с error — как реальный сбой.
-    let r = cp.spawnSync('sh', ['-c', 'echo hi']);
-    console.log('sh:' + (r.error ? r.error.code : 'allowed:' + r.status));
-    r = cp.spawnSync('curl', ['-s', 'x'], { timeout: 3000 });
-    console.log('curl:' + (r.error ? r.error.code : 'allowed:' + r.status));
+    const probe = (label, r) =>
+      console.log(label + ':' + (r.error ? r.error.code : 'allowed:' + r.status));
+    probe('sh', cp.spawnSync('sh', ['-c', 'echo hi']));
+    probe('curl', cp.spawnSync('curl', ['-s', 'x'], { timeout: 3000 }));
+    probe('findExec', cp.spawnSync('find', ['/tmp', '-exec', 'ls', ';']));
+    probe('findOk', cp.spawnSync('find', ['/tmp/.pi', '-name', 'x*'], { timeout: 3000 }));
+    probe('shellOpt', cp.spawnSync('ls', ['/tmp'], { shell: true }));
+    probe('cwdOut', cp.spawnSync('ls', { cwd: '/etc' }));
+    probe('cwdCand', cp.spawnSync('ls', { cwd: '/candidate' }));
+    probe('candPath', cp.spawnSync('/candidate/evil.sh'));
+    probe('sysPath', cp.spawnSync('/usr/bin/ls', ['/tmp'], { timeout: 3000 }));
+    probe('tmpPath', cp.spawnSync('/tmp/ls'));
     try { cp.execFileSync('sh', ['-c', 'echo hi']); console.log('execSh:allowed'); }
     catch (e) { console.log('execSh:' + e.code); }
     try { cp.spawnSync('ls', ['/tmp'], { timeout: 3000 }); console.log('ls:allowed'); }
     catch (e) { console.log('ls:' + e.code); }
+    cp.exec('ls /tmp', (e) => console.log('exec:' + (e ? e.code : 'allowed')));
     const net = require('net');
     // Приватный endpoint отклоняется ДО allowlist — даже явно разрешённый.
     const targets = [[44100, '127.0.0.1'], [9, '127.0.0.1'], [443, '10.1.2.3']];
@@ -478,14 +501,24 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
     { timeout: 15_000, env: { ...process.env, PI_ALLOW_CONNECT: '127.0.0.1:9' } });
   const out = run.stdout;
   assert.match(out, /read1:EACCES/, `auth.json доступен обычному чтению:\n${out}`);
-  assert.match(out, /cred:true/, `креденшельный стек не получил auth из памяти:\n${out}`);
+  assert.match(out, /cred:EACCES/, `имя без /pi-ro в стеке прошло:\n${out}`);
   assert.match(out, /exists:EACCES/);
   assert.match(out, /cfg:EACCES/);
   assert.match(out, /piDir:EACCES/);
   assert.match(out, /etc:allowed/);
   assert.match(out, /sh:EACCES/, `sh внутри песочницы не заблокирован:\n${out}`);
   assert.match(out, /curl:EACCES/);
+  assert.match(out, /findExec:EACCES/, `find -exec не заблокирован:\n${out}`);
+  assert.match(out, /findOk:allowed:0/, `чистый find должен работать:\n${out}`);
+  assert.match(out, /shellOpt:EACCES/, `shell:true не заблокирован:\n${out}`);
+  assert.match(out, /cwdOut:EACCES/, `cwd вне /candidate не заблокирован:\n${out}`);
+  // cwd=/candidate разрешён гардом (ENOENT — значит гард пропустил, но каталога нет на хосте).
+  assert.match(out, /cwdCand:(allowed|ENOENT)/, `cwd=/candidate не должен быть EACCES:\n${out}`);
+  assert.match(out, /candPath:EACCES/, `бинарник из /candidate запущен:\n${out}`);
+  assert.match(out, /sysPath:allowed:0/, `системный /usr/bin/ls должен работать:\n${out}`);
+  assert.match(out, /tmpPath:EACCES/, `бинарник из /tmp запущен:\n${out}`);
   assert.match(out, /execSh:EACCES/);
+  assert.match(out, /exec:EACCES/, `exec (шелл) не заблокирован:\n${out}`);
   assert.match(out, /ls:allowed/, `read-only ls должен работать:\n${out}`);
   assert.match(out, /127\.0\.0\.1:44100=ENETUNREACH/);
   assert.match(out, /127\.0\.0\.1:9=ENETUNREACH/, 'приватный прокси прошёл allowlist');

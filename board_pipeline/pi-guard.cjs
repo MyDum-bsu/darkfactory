@@ -23,6 +23,7 @@ const origRealpathSync = fs.realpathSync.bind(fs);
 const origReadlinkSync = fs.readlinkSync.bind(fs);
 const origLstatSync = fs.lstatSync.bind(fs);
 const origStatSync = fs.statSync.bind(fs);
+const origExistsSync = fs.existsSync.bind(fs);
 
 const PI_HOME = '/tmp/.pi';
 const AUTH = '/tmp/.pi/agent/auth.json';
@@ -37,11 +38,22 @@ const SECRET_FILES = new Set(['/tmp/.pi/agent/auth.json',
 
 // Секрет уходит в память до любого кода pi: файл исчезает ещё в прелоаде.
 let authBytes = null;
-try {
+if (origExistsSync(AUTH)) {
   authBytes = origReadFileSync(AUTH);
-  origUnlinkSync(AUTH);
+  // Секрет обязан исчезнуть с диска до старта pi. Не смогли удалить —
+  // ревью небезопасно: фатально, без тихого продолжения.
+  try {
+    origUnlinkSync(AUTH);
+  } catch (e) {
+    process.stderr.write(`pi-guard: cannot remove ${AUTH}: ${e.message}\n`);
+    process.exit(1);
+  }
+  if (origExistsSync(AUTH)) {
+    process.stderr.write(`pi-guard: ${AUTH} still present after unlink\n`);
+    process.exit(1);
+  }
   try { origUnlinkSync(AUTH + '.lock'); } catch { /* lock ещё не создан */ }
-} catch { /* auth.json не был скопирован в cfg — ревью без сети всё равно упадёт */ }
+}
 
 let locked = false;
 const lock = () => { locked = true; };
@@ -66,11 +78,19 @@ function pathOf(arg) {
 // бандла. auth.json отдаётся только креденшельным функциям pi — стек
 // RuntimeCredentials/readCredential воспроизвести тулом нельзя.
 const PI_STACK = /\/pi-ro\//;
-const TOOL_STACK = /\/tools\//;
-const CRED_STACK = /RuntimeCredentials|readCredential|CredentialStore|AuthStorage/;
+const TOOL_STACK = /\/tools\/|\/candidate/;
+const CRED_STACK = /RuntimeCredentials|readCredential|CredentialStore|AuthStorage|migrateAuth/;
 const stackOf = () => new Error().stack || '';
-const piInternal = () => PI_STACK.test(stackOf()) && !TOOL_STACK.test(stackOf());
-const isCredentialRead = () => CRED_STACK.test(stackOf());
+// Вызов только из кода pi: стек обязан проходить через /pi-ro и не иметь
+// туловых/candidate-фреймов; одного совпадения имени недостаточно.
+const piInternal = () => {
+  const s = stackOf();
+  return s.includes('/pi-ro/') && !TOOL_STACK.test(s);
+};
+const isCredentialRead = () => {
+  const s = stackOf();
+  return CRED_STACK.test(s) && s.includes('/pi-ro/') && !TOOL_STACK.test(s);
+};
 
 // realpath уводит симлинки /candidate за пределы снимка (в т.ч. в /tmp/.pi) —
 // такие пути запрещены. Битая ссылка проверяется по lstat+readlink.
@@ -162,10 +182,9 @@ function guardFn(obj, key, opts = {}) {
   obj[key] = function (...args) {
     const p = pathOf(args[0]);
     if (p !== null && path.resolve(p) === AUTH) {
-      // Файла на диске нет: байты из памяти отдаём только внутреннему коду pi
-      // (стек /pi-ro без /tools/ — миграции и RuntimeCredentials); тулы и
-      // внешние вызовы получают EACCES.
-      if (authBytes !== null && (piInternal() || isCredentialRead())) {
+      // Файла на диске нет: байты из памяти отдаём только креденшельному коду
+      // pi (имя функции И строго /pi-ro в стеке, без /tools/ и /candidate).
+      if (authBytes !== null && isCredentialRead()) {
         if (key === 'existsSync') return true;
         if (key === 'exists') {
           const cb = args.at(-1);
@@ -345,12 +364,46 @@ require('tls').connect = function (...args) {
 // Только read-only поисковые утилиты: внешние сетевые/шелл-бинарники внутри
 // песочницы не поднимаются. NODE_OPTIONS наследуется — гард живёт и в детях.
 const cp = require('child_process');
+// Только имена read-only утилит либо точные системные пути: произвольный
+// путь (особенно из /candidate или /tmp) не считается доверенным.
 const CHILD_ALLOW = new Set(['rg', 'grep', 'find', 'ls']);
+const CHILD_PATHS = new Set(['/usr/bin/rg', '/usr/bin/grep', '/bin/grep',
+  '/usr/bin/find', '/bin/ls', '/usr/bin/ls']);
+// find способен исполнять внешние команды — такие флаги закрыты.
+const FIND_DENY = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete',
+  '-fls', '-fprint', '-fprint0', '-fprintf']);
+
+function fileAllowed(file) {
+  const f = String(file ?? '');
+  if (f.includes('/')) return CHILD_PATHS.has(f);
+  return CHILD_ALLOW.has(f);
+}
+
+function argsAllowed(file, rest) {
+  if (path.basename(String(file ?? '')) !== 'find') return true;
+  const argv = Array.isArray(rest[0]) ? rest[0] : [];
+  return !argv.some(a => FIND_DENY.has(String(a)));
+}
+
+function optionsAllowed(rest) {
+  const opt = rest.find(a => a !== null && typeof a === 'object' && !Array.isArray(a));
+  if (!opt) return true;
+  if (opt.shell) return false;
+  if (opt.cwd !== undefined) {
+    const cwd = path.resolve(String(opt.cwd));
+    if (cwd !== '/candidate' && !cwd.startsWith('/candidate/')) return false;
+  }
+  return true;
+}
+
 function guardChild(key, sync) {
   const orig = cp[key];
   if (typeof orig !== 'function') return;
   cp[key] = function (file, ...rest) {
-    if (!CHILD_ALLOW.has(path.basename(String(file ?? '')))) {
+    // exec() по определению идёт через шелл — запрещён целиком.
+    const blocked = key === 'exec' || !fileAllowed(file) ||
+      !argsAllowed(file, rest) || !optionsAllowed(rest);
+    if (blocked) {
       if (DEBUG) {
         process.stderr.write(`[guard] deny ${key} ${file}\n`);
       }
@@ -370,7 +423,9 @@ function guardChild(key, sync) {
       fake.stdout = new EventEmitter();
       fake.stderr = new EventEmitter();
       process.nextTick(() => {
-        fake.emit('error', err);
+        // error только при наличии слушателя: голый EventEmitter без
+        // обработчика 'error' ронял бы процесс.
+        if (key !== 'exec' && fake.listenerCount('error') > 0) fake.emit('error', err);
         fake.emit('exit', 126, null);
       });
       return fake;
