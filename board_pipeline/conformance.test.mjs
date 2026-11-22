@@ -215,6 +215,8 @@ async function lab(t, { finish = 'verified', lease = 900, mutants } = {}) {
     releaseSlot,
     tick: () => advance(cfg),
     workerSelector: over => { cfg.workerSelector = { ...ws, critic: REVIEW,
+      // This conformance fixture intentionally uses the legacy Pi/Sol critic.
+      arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' },
       arbitrate: async req => { effects.arbiterCalls++;
         return { decision: 'escalate_owner', question: 'owner?', subject_digest: 'd'.repeat(64) }; },
       ...over }; },
