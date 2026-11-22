@@ -19,8 +19,10 @@ const BASE = 'ed83f15714f6c1dd72104fa365a68b283f4d0ff7';
 // дефектом (ALLOW_INSECURE_HTTP_SCHEDULE_URL), ход 3 — чистая версия после
 // всех замечаний независимого критика. Хранятся в бандле вне дерева bsu.
 const DEFECT = '5578c155dbaf6cded5e71ae6263e11e500ec624d';
-const FINAL = '83b2def4a98668ce564c4883e30005d8c34402d9';
-const FINAL_TREE = 'a9f81c98e412bf374556a2026c915ca6b2ddd953';
+// Финал — верхушка сходимости реального критика: прошёл REVIEW_OK в живом
+// прогоне (кандидаты ниже получали REVIEW_BLOCKED по новым находкам).
+const FINAL = '2e595518b04de2bf0e807d9bc4f537392a14370a';
+const FINAL_TREE = '5bcf4417cfd10b3d86450d1ba4e2bb1612bbf21d';
 const BUNDLE = '/media/mydum/Data/board-v2-lab.dp5xC3Kj/vs1-e2e-candidates.bundle';
 const VB = join(homedir(), '.local/share/vercel-board/node_modules/.bin/vb');
 
@@ -323,7 +325,7 @@ else console.log('Onboarding controls are present');`;
     const idlePolicyFile = join(dirs.operator, 'policy-idle.json');
     await writeFile(idlePolicyFile, JSON.stringify({ ...policy, waitMs: 12_000 }), { mode: 0o600 });
     const before = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
-    const claimsBefore = (await vbCli(boardUrl, ['tasks', 'list', '--channel', 'pilot']))
+    const claimsBefore = (await vbCli(boardUrl, ['tasks', 'list', 'pilot']))
       .tasks?.filter(t => t?.message?.task?.claim != null).length ?? null;
     const threadsBefore = await bbThreadCount(env);
     const gateFilesBefore = (await readdir(dirs.state))
@@ -332,7 +334,7 @@ else console.log('Onboarding controls are present');`;
     const idle = await runController(idlePolicyFile, dirs.state, env, wlog, () => {},
       ['--stop-on-idle']);
     const after = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
-    const claimsAfter = (await vbCli(boardUrl, ['tasks', 'list', '--channel', 'pilot']))
+    const claimsAfter = (await vbCli(boardUrl, ['tasks', 'list', 'pilot']))
       .tasks?.filter(t => t?.message?.task?.claim != null).length ?? null;
     const threadsAfter = await bbThreadCount(env);
     const allIdle = idle.lines.length >= 1 && idle.lines.every(l => {
@@ -355,6 +357,10 @@ else console.log('Onboarding controls are present');`;
     await say({ step: 'done', attempt: proof.attempt, card1: final1, card2: final2,
       idleTickZeroCalls: proof.idleTickZeroCalls });
   } finally {
+    // Доказательство пишется и при частичном срыве: в нём всё наблюдавшееся.
+    try {
+      await writeFile(values.proof, JSON.stringify(proof, null, 2), { mode: 0o600 });
+    } catch { /* путь proof недоступен */ }
     await cleanup();
   }
   await writeFile(values.proof, JSON.stringify(proof, null, 2), { mode: 0o600 });
