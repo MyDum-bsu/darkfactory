@@ -474,8 +474,9 @@ export async function resolveArbitration({
   // Строгая привязка решения к манифесту приёмки для ВСЕХ решений арбитра:
   // subjectDigest манифеста обязан быть валидным 64-hex, а digest решения —
   // строго совпадать. Отсутствие манифеста или расхождение — hold.
-  const digestOk = typeof subjectDigest === 'string' && DIGEST64.test(subjectDigest) &&
-    typeof ruling?.subject_digest === 'string' && ruling.subject_digest === subjectDigest;
+  const digestOk = typeof subjectDigest === 'string' &&
+    typeof ruling?.subject_digest === 'string' && DIGEST64.test(subjectDigest) &&
+    ruling.subject_digest === subjectDigest;
   const needsDigest = ['directed_rework', 'accept_with_notes', 'escalate_owner']
     .includes(ruling?.decision);
   if (needsDigest && !digestOk) {
