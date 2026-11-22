@@ -9,6 +9,7 @@
 // второго писателя.
 
 import { executorFamily, ReviewDenied } from './review-runner.mjs';
+import { NEON_CRITIC, SOL_ARBITER } from './review-policy.mjs';
 
 // Согласованная политика исполнителей: первичный, согласованный резерв и
 // узкий резерв (только при явном allowNarrowReserve в маршруте).
@@ -24,16 +25,8 @@ export const NARROW_RESERVE_PI = Object.freeze({
 });
 
 // Дефолтный критик и арбитр третьего независимого семейства.
-export const DEFAULT_CRITIC = Object.freeze({
-  provider: 'openai',
-  model: 'gpt-6.2-sol',
-  reasoningLevel: 'medium',
-});
-export const DEFAULT_ARBITER = Object.freeze({
-  provider: 'google',
-  model: 'gemini-4-neon',
-  reasoningLevel: 'high',
-});
+export const DEFAULT_CRITIC = NEON_CRITIC;
+export const DEFAULT_ARBITER = SOL_ARBITER;
 
 const DETERMINISTIC_GATES = new Set(['l1', 'tamper', 'l3']);
 const GATE_BY_REASON = new Map([

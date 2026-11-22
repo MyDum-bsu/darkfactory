@@ -56,8 +56,8 @@ async function sandboxedPiConfig(file, src) {
 const GUARD_FILE = new URL('./pi-guard.cjs', import.meta.url).pathname;
 
 export class ReviewDenied extends Error {
-  constructor(reason) {
-    super(reason);
+  constructor(reason, options) {
+    super(reason, options);
     this.reason = reason;
   }
 }
@@ -526,8 +526,29 @@ function piSandbox(opts) {
   return sandboxExec({ ...opts, modelNetwork: true });
 }
 
-// Адаптер ReviewPort: реальный Pi/Sol в read-only rootless Docker на снимке
-// unpackExact(candidate_sha). Возвращает аттестованный ReviewReceipt.
+async function sandboxPiCredential(piRoot, provider, kind) {
+  const load = async () => JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'))?.[provider];
+  let auth = await load();
+  if (auth == null) throw new ReviewDenied(`${kind}_auth_missing`);
+  if (auth.type !== 'oauth') return auth;
+  // Refresh is a host-side operation: a rotated refresh token must survive
+  // the sandbox, and the long-lived credential must never be copied into it.
+  if (typeof auth.expires === 'number' && auth.expires <= Date.now() + 10 * 60 * 1000) {
+    try {
+      await exec(join(piRoot, 'bin', 'pi'), ['auth', 'print-bearer-token', '--provider', provider,
+        '--min-expiry', '10m'], { timeout: 60_000, maxBuffer: 1024 * 1024 });
+    } catch {
+      // A child-process error can include the bearer in stdout; don't forward it.
+      throw new ReviewDenied(`${kind}_auth_refresh_failed`);
+    }
+    auth = await load();
+  }
+  if (auth?.type !== 'oauth' || !nonEmpty(auth.access)) throw new ReviewDenied(`${kind}_auth_missing`);
+  return { type: 'oauth', access: auth.access, expires: auth.expires, refresh: 'sandbox-redacted',
+    ...(nonEmpty(auth.accountId) ? { accountId: auth.accountId } : {}) };
+}
+
+// Legacy Pi/Sol ReviewPort on the hardened snapshot; VS-2 uses the Neon adapter.
 export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
   prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox }) {
   if (!isAbsolute(journal ?? '') || !isAbsolute(piRoot ?? '')) {
@@ -577,36 +598,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // одного провайдера критика и уничтожается pi-guard после первого чтения.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
-      let fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
-      let credential = fullAuth?.[critic.provider];
-      if (credential === undefined || credential === null) {
-        throw new ReviewDenied('review_auth_missing');
-      }
-      // OAuth refresh-токен одноразовый: если контейнер рефрешит его, новая
-      // пара гибнет в tmpfs, а на хосте остаётся погашенный токен. Поэтому
-      // рефреш — только на хосте, до запуска контейнера. pi сам атомарно
-      // перезаписывает auth.json; stdout (bearer) не логируем.
-      if (credential?.type === 'oauth' && typeof credential.expires === 'number' &&
-          credential.expires <= Date.now() + 10 * 60 * 1000) {
-        try {
-          await exec(join(piRoot, 'bin', 'pi'),
-            ['auth', 'print-bearer-token', '--provider', critic.provider,
-             '--min-expiry', '10m'],
-            { timeout: 60_000, maxBuffer: 1024 * 1024 });
-        } catch {
-          throw new ReviewDenied('review_auth_refresh_failed');
-        }
-        fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
-        credential = fullAuth?.[critic.provider];
-      }
-      // В контейнер refresh-токен не передаётся вообще: внутри sandbox нет
-      // долгоживущего секрета и pi никогда не пытается OAuth-refresh.
-      const sandboxCredential = credential?.type === 'oauth'
-        ? { ...credential, refresh: 'sandbox-redacted',
-            expires: Math.max(Number(credential.expires) || 0, Date.now() + 3600_000) }
-        : credential;
+      const credential = await sandboxPiCredential(piRoot, critic.provider, 'review');
       await writeFile(join(cfgDir, 'auth.json'),
-        JSON.stringify({ [critic.provider]: sandboxCredential }));
+        JSON.stringify({ [critic.provider]: credential }), { mode: 0o600 });
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
@@ -772,26 +766,16 @@ const PROVIDER_EGRESS = new Map([
   ['cognition', ['api.cognition.ai:443']],
 ]);
 
-// Решение арбитра — ровно один JSON-объект в конце выдачи: код-блок ```json
-// или последний сбалансированный {...}. Нечитаемый ответ — null.
 function parseArbiterDecision(text) {
-  const body = String(text ?? '');
-  const fences = [...body.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
-  for (const m of fences.reverse()) {
-    try {
-      const v = JSON.parse(m[1]);
-      if (v !== null && typeof v === 'object' && !Array.isArray(v)) return v;
-    } catch { /* следующий блок */ }
+  const body = String(text ?? '').trim();
+  const json = /^```(?:json)?\s+([\s\S]*?)```$/i.exec(body)?.[1] ?? body;
+  try {
+    const decision = JSON.parse(json);
+    if (decision !== null && typeof decision === 'object' && !Array.isArray(decision)) return decision;
+  } catch (cause) {
+    throw new ReviewDenied('arbiter_response_invalid', { cause });
   }
-  const tail = body.lastIndexOf('{');
-  while (tail >= 0) {
-    try {
-      const v = JSON.parse(body.slice(tail));
-      if (v !== null && typeof v === 'object' && !Array.isArray(v)) return v;
-    } catch { /* хвост не JSON */ }
-    break;
-  }
-  return null;
+  throw new ReviewDenied('arbiter_response_invalid');
 }
 
 // Изолированный раннер арбитра третьего независимого семейства. Тот же
@@ -805,6 +789,7 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
   }
   return async (req) => {
     const arbiter = req?.arbiter;
+    const effort = arbiter?.reasoningLevel ?? 'high';
     if (arbiter === null || typeof arbiter !== 'object' || Array.isArray(arbiter) ||
         !nonEmpty(arbiter.provider) || !nonEmpty(arbiter.model)) {
       throw new ReviewDenied('arbiter_profile_not_approved');
@@ -814,13 +799,9 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
       // auth только одного провайдера арбитра — как у критика, копией в tmpfs.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
-      const fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
-      const credential = fullAuth?.[arbiter.provider];
-      if (credential === undefined || credential === null) {
-        throw new ReviewDenied('arbiter_auth_missing');
-      }
+      const credential = await sandboxPiCredential(piRoot, arbiter.provider, 'arbiter');
       await writeFile(join(cfgDir, 'auth.json'),
-        JSON.stringify({ [arbiter.provider]: credential }));
+        JSON.stringify({ [arbiter.provider]: credential }), { mode: 0o600 });
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
@@ -838,7 +819,7 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
         }
       }
       const allow = [...(PROVIDER_EGRESS.get(arbiter.provider) ?? [])];
-      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs' };
+      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1' };
       for (const key of PROXY_ENV) {
         const value = process.env[key];
         if (typeof value !== 'string' || !value) continue;
@@ -886,7 +867,7 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
         'exec /pi-ro/bin/pi "$@"', 'pi',
         '--print', '--mode', 'json',
         '--provider', arbiter.provider, '--model', arbiter.model,
-        '--thinking', arbiter.reasoningLevel ?? 'high',
+        '--thinking', effort,
         '--no-mcp', '--no-extensions', '--no-skills', '--no-context-files',
         '--no-approve', '--tools', READ_ONLY_TOOLS.join(','),
         '--session-dir', '/tmp/session', instruction];
@@ -908,10 +889,11 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
           throw new ReviewDenied(`arbiter_${key}_mismatch`);
         }
       }
+      if (parsed.actual.reasoningLevel !== effort) throw new ReviewDenied('arbiter_effort_mismatch');
       assertToolsAllowed(parsed.toolsAdded);
       const decision = parseArbiterDecision(parsed.finalText);
-      if (decision === null) {
-        throw new ReviewDenied('arbiter_response_invalid');
+      if (!SHA256.test(req.subject_digest ?? '') || decision.subject_digest !== req.subject_digest) {
+        throw new ReviewDenied('arbiter_subject_mismatch');
       }
       return decision;
     } finally {

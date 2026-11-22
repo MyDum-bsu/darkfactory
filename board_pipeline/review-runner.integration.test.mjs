@@ -8,7 +8,9 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
-import { isolatedPiReviewRunner } from './review-runner.mjs';
+import { isolatedArbiterRunner, isolatedPiReviewRunner } from './review-runner.mjs';
+import { isolatedNeonReviewRunner } from './neon-review.mjs';
+import { NEON_CRITIC, SOL_ARBITER } from './review-policy.mjs';
 
 const exec = promisify(execFile);
 const CRITIC = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
@@ -84,5 +86,71 @@ test('isolatedPiReviewRunner: живой Pi/Sol на read-only снимке', as
   } finally {
     await rm(repo, { recursive: true, force: true });
     await rm(journal, { recursive: true, force: true });
+  }
+});
+
+async function neonFixture(t) {
+  const repo = await makeRepo();
+  const journal = await mkdtemp(join(tmpdir(), 'neon-it-journal-'));
+  t.after(async () => {
+    await rm(repo, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+  });
+  await git(repo, 'commit', '--allow-empty', '-qm', 'base');
+  const base_sha = await git(repo, 'rev-parse', 'HEAD');
+  return { repo, journal, binding: { task_id: '9002', worktree: repo, base_sha,
+    executor: 'acp-devin/swe-2-high' }, profile: { review: NEON_CRITIC } };
+}
+
+test('Neon ReviewPort: real offline Docker snapshot with a simulated Google HTTP reply', async t => {
+  const { repo, journal, binding, profile } = await neonFixture(t);
+  const candidate_sha = await commitFile(repo, 'export function sum(a, b) { return a + b; }\n');
+  const subject_digest = 'a'.repeat(64);
+  const run = isolatedNeonReviewRunner({ journal, prompt: SPEC, credential: async () => 'test-credential',
+    request: async (_, options) => {
+      const requestData = JSON.parse(options.body);
+      const { files, diff } = JSON.parse(requestData.contents[0].parts[0].text);
+      assert.deepEqual(files, [{ path: 'sum.js', text: 'export function sum(a, b) { return a + b; }\n' }]);
+      assert.match(diff, /\+export function sum/);
+      return Response.json({ modelVersion: 'gemini-4-neon', responseId: 'fixture-turn',
+        candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify({
+          verdict: 'PASS', subject_digest, summary: 'Matches the spec', findings: [], checked_invariants: ['sum'],
+        }) }] } }] });
+    } });
+  const receipt = await run({ ...binding, candidate_sha, subject_digest }, profile);
+  assert.equal(receipt.verdict, 'REVIEW_OK');
+  assert.equal(receipt.isolation, 'docker-ro-v1');
+  assert.equal((await lstat(join(journal, receipt.transcript_file))).mode & 0o777, 0o600);
+});
+
+test('Sol arbiter live: isolated actual model, medium effort and exact review subject', {
+  skip: process.env.DF_SOL_ARBITER_LIVE !== '1' && 'live provider check: npm run test:sol-arbiter:live',
+}, async t => {
+  const journal = await mkdtemp(join(tmpdir(), 'sol-arbiter-it-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+  const subject_digest = 'a'.repeat(64);
+  const run = isolatedArbiterRunner({ journal, prompt: SPEC });
+  const decision = await run({ task_id: '9003', attempt_id: 'test-arbitration', epoch: 1,
+    subject_digest, arbiter: SOL_ARBITER, trigger: { trigger: 'dispute' }, evidence: {
+      findings: [{ file: 'sum.js', input: 'sum(2,2)', expected: '4', actual: '5', harm: 2 }],
+      dispute: { claim: 'Returning 5 for sum(2,2) satisfies this spec.' },
+    } });
+  assert.equal(decision.subject_digest, subject_digest);
+  assert.equal(decision.decision, 'directed_rework');
+});
+
+test('Neon live: real medium model returns bound REWORK then PASS', {
+  skip: process.env.DF_NEON_LIVE !== '1' && 'live provider check: npm run test:neon:live',
+}, async t => {
+  const { repo, journal, binding, profile } = await neonFixture(t);
+  const run = isolatedNeonReviewRunner({ journal, prompt: SPEC });
+  for (const [expression, status, digit] of [['a + b + 1', 'REWORK', 'b'], ['a + b', 'PASS', 'c']]) {
+    const candidate_sha = await commitFile(repo, `export function sum(a, b) { return ${expression}; }\n`);
+    const subject_digest = digit.repeat(64);
+    const receipt = await run({ ...binding, candidate_sha, subject_digest }, profile);
+    assert.equal(receipt.status, status);
+    assert.equal(receipt.subject_digest, subject_digest);
+    assert.deepEqual(receipt.actual, NEON_CRITIC);
+    assert.match(receipt.transcript_sha256, /^[a-f0-9]{64}$/);
   }
 });

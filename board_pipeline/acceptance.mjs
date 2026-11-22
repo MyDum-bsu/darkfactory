@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
+import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter } from './review-policy.mjs';
 import { assertTriadIndependent } from './worker-selector.mjs';
 
 const HANDOFF_KEYS = [
@@ -59,7 +60,6 @@ const REVIEW_OK = 'REVIEW_OK';
 const REVIEW_BLOCKED = 'REVIEW_BLOCKED';
 const REVIEW_ESCALATE = 'REVIEW_ESCALATE';
 const FINISH = new Set(['verified', 'deployed']);
-const REVIEW_MODELS = new Set(['gpt-6.2-sol', 'gpt-6.2-astra']);
 
 class Denied extends Error {
   constructor(reason) {
@@ -102,7 +102,7 @@ function validateHandoff(handoff) {
   if (!SHA_RE.test(handoff.base_sha)) throw new Denied('base_sha_not_full');
 }
 
-function validatePolicy(policy, checkProfile) {
+function validatePolicy(policy, checkProfile, { allowNeon = false } = {}) {
   if (policy === null || typeof policy !== 'object') throw new Denied('policy_not_object');
   if (typeof policy.version !== 'string' && typeof policy.version !== 'number') {
     throw new Denied('policy_version_missing');
@@ -114,8 +114,9 @@ function validatePolicy(policy, checkProfile) {
   if (profile === null || typeof profile !== 'object') {
     throw new Denied(`unknown_profile:${checkProfile}`);
   }
-  if (profile.review?.provider !== 'openai' || profile.review.reasoningLevel !== 'medium' ||
-      !REVIEW_MODELS.has(profile.review.model)) {
+  const legacy = isLegacyPiReview(profile.review);
+  const neon = allowNeon && isNeonReview(profile.review) && isReviewSkillList(profile.review.skills);
+  if (!legacy && !neon) {
     throw new Denied('review_profile_not_approved');
   }
   return profile;
@@ -627,7 +628,7 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   // Полный набор обязателен при любом из признаков аттестации ИЛИ когда
   // профиль требует аттестацию — независимо от наличия манифеста.
   const attestationRequired = hasAttestationFields ||
-    profile.review?.requireAttestation === true;
+    profile.review?.requireAttestation === true || isNeonReview(profile.review);
   if (attestationRequired) {
     if (rev.isolation !== 'docker-ro-v1') {
       return { status: 'hold', reason: 'review_isolation_missing' };
@@ -864,7 +865,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   try {
     validateAttempt(attempt);
     validateSubmission(submission, attempt);
-    profile = validatePolicy(policy, attempt.check_profile);
+    profile = validatePolicy(policy, attempt.check_profile, { allowNeon: true });
     validateEnrolled(attempt, profile);
     // Исполнитель из доверенной попытки (или профиля) и критик — разные семейства.
     // При настроенном арбитре проверяется вся триада: арбитр обязан быть из
@@ -872,6 +873,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     // переключения на резерв.
     const executor = attempt.executor ?? profile.executor;
     const arbiter = attempt.arbiter ?? profile.arbiter;
+    if (isNeonReview(profile.review)) {
+      if (!isSolArbiter(arbiter) || executor === undefined) throw new Denied('vs2_review_triad_not_approved');
+      if (attempt.policy_digest === undefined) throw new Denied('subject_contract_incomplete');
+    }
     try {
       if (arbiter !== undefined) {
         assertTriadIndependent({ executor, critic: profile.review, arbiter });

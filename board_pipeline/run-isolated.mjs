@@ -12,7 +12,9 @@ import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
-import { assertCrossFamily, isolatedArbiterRunner, isolatedPiReviewRunner } from './review-runner.mjs';
+import { isolatedArbiterRunner, isolatedPiReviewRunner } from './review-runner.mjs';
+import { isolatedNeonReviewRunner } from './neon-review.mjs';
+import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter } from './review-policy.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 import { reconcileFeedbackFromBb, reconcileSpawnFromBb } from './bb-reconcile.mjs';
 import * as workerSelector from './worker-selector.mjs';
@@ -24,13 +26,40 @@ const inside = (root, p) => {
 };
 const approved = new Map([['acp-devin', 'swe-2-high'], ['acp-zcode-start', 'builtin:zai-start-plan\\GLM-5.3-Flash']]);
 
+async function operatorReviewSetup(policy) {
+  const critic = policy.profiles?.[policy.route.checkProfile]?.review;
+  const arbiter = policy.arbiter ?? workerSelector.DEFAULT_ARBITER;
+  const neon = isNeonReview(critic);
+  if (!neon && !isLegacyPiReview(critic)) throw new Error('Review profile is not approved');
+  if (neon && (!isSolArbiter(arbiter) || policy.route.taskId !== undefined || policy.policyDigest !== undefined)) {
+    throw new Error('Neon requires a subject-bound queue route, fingerprinted policy and Sol arbiter');
+  }
+  const skills = critic.skills;
+  if ((neon || skills !== undefined) && !isReviewSkillList(skills)) throw new Error('Invalid review skill binding');
+  const skillPaths = await Promise.all((skills ?? []).map(skill => {
+    const path = policy.reviewSkillFiles?.[skill];
+    if (!isAbsolute(path ?? '')) throw new Error(`Missing operator review skill: ${skill}`);
+    return realpath(path);
+  }));
+  workerSelector.assertTriadIndependent({ executor: policy.bb, critic, arbiter });
+  return { critic, arbiter, neon, skills: skills ?? [], skillPaths };
+}
+
+async function readOperatorInputs(paths) {
+  const inputs = new Map(await Promise.all(paths.map(async path => [path, await readFile(path)])));
+  const digest = createHash('sha256').update(JSON.stringify(paths.map(path =>
+    createHash('sha256').update(inputs.get(path)).digest('hex')))).digest('hex');
+  return { inputs, digest };
+}
+
 async function execute() {
   const { values } = parseArgs({ options: { execute: { type: 'boolean' }, policy: { type: 'string' },
     state: { type: 'string' }, 'recheck-rejected-handoff': { type: 'boolean' },
     'stop-on-idle': { type: 'boolean' } } });
   if (!values.execute || !values.policy || !values.state) throw new Error('Use --execute --policy FILE --state DIR');
   const policyFile = await realpath(values.policy);
-  const p = await readJson(policyFile);
+  const policyBytes = await readFile(policyFile);
+  const p = JSON.parse(policyBytes);
   if (p.scope !== 'isolated' || !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/api\/board$/.test(p.boardUrl ?? '') ||
       new URL(p.boardUrl).port === '44100' || p.channel !== 'pilot') throw new Error('Only a separate isolated pilot Board is supported');
   if (!p.bb || !approved.has(p.bb.provider) || approved.get(p.bb.provider) !== p.bb.model ||
@@ -55,13 +84,20 @@ async function execute() {
   const reviewPrompt = await realpath(p.reviewPrompt);
   const reviewGate = await realpath(p.reviewGate);
   const reviewRoutes = await realpath(join(dirname(reviewGate), 'routes.json'));
-  const files = [policyFile, brief, reviewPrompt, reviewGate, reviewRoutes];
+  const reviewSetup = await operatorReviewSetup(p);
+  const files = [policyFile, brief, reviewPrompt, reviewGate, reviewRoutes, ...reviewSetup.skillPaths];
   for (const path of [root, ...files]) {
     if (inside(tree, path) || inside(inbox, path)) throw new Error('Operator files must be outside worker paths');
   }
-  const fingerprint = async () => createHash('sha256').update(JSON.stringify(await Promise.all(files.map(async path =>
-    createHash('sha256').update(await readFile(path)).digest('hex'))))).digest('hex');
-  const route = { ...p.route, policyDigest: await fingerprint(),
+  const pinned = await readOperatorInputs(files);
+  if (!pinned.inputs.get(policyFile).equals(policyBytes)) throw new Error('Operator policy changed during load');
+  const reviewSpec = pinned.inputs.get(reviewPrompt).toString('utf8');
+  const reviewText = [reviewSpec, ...reviewSetup.skills.map((skill, i) => {
+    const body = pinned.inputs.get(reviewSetup.skillPaths[i]).toString('utf8');
+    if (!body.trim()) throw new Error(`Empty operator review skill: ${skill}`);
+    return `Operator-selected review skill (${skill}):\n${body}`;
+  })].join('\n\n');
+  const route = { ...p.route, policyDigest: pinned.digest,
     zcodeQuota: p.zcodeQuota ?? p.bb?.zcodeQuota };
   // Queue-driven маршрут без route.taskId: карточку берёт board.claimReady по
   // allowlist оператора (owner + маршрутная метка + дополнительно требуемые метки).
@@ -70,22 +106,11 @@ async function execute() {
       repoId: p.route.repoId, required: p.route.required ?? [] };
   }
   const assertPinned = async () => {
-    if (await fingerprint() !== route.policyDigest) throw new Error('Operator inputs changed');
+    if ((await readOperatorInputs(files)).digest !== route.policyDigest) throw new Error('Operator inputs changed');
   };
   if (p.version !== route.policyVersion || !p.owner || !p.label?.key || !p.label?.value ||
       !p.profiles?.[route.checkProfile]?.branch) throw new Error('Incomplete enrolled policy');
   if (!Number.isSafeInteger(p.waitMs) || p.waitMs < 1) throw new Error('Configure the pilot wait time');
-  // Кросс-семейственный инвариант до claim и spawn: исполнитель и критик из
-  // закреплённой политики обязаны принадлежать разным известным семействам.
-  const assertFamilies = () => {
-    try {
-      assertCrossFamily(p.bb, p.profiles?.[route.checkProfile]?.review);
-    } catch (e) {
-      throw new Error(`review_family_check:${e.reason ?? e.message}`);
-    }
-  };
-  assertFamilies();
-
   delete process.env.BOARD_TOKEN;
   process.env.BOARD_URL = p.boardUrl;
   process.env.DF_REVIEW_BOARD_URL = p.boardUrl;
@@ -97,7 +122,6 @@ async function execute() {
     (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
   const authorize = async (state, taskId) => {
     await assertPinned();
-    assertFamilies();
     // В queue-режиме на фазе 'ready' карточки ещё нет — allowlist-допуск делает claimReady
     // адаптера; при известной карточке сверяем владельца, метку и состояние нативно.
     const cardOk = taskId === undefined ||
@@ -248,6 +272,8 @@ async function execute() {
       return { turnSeq };
     }
   } };
+  const reviewRunner = reviewSetup.neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner;
+  const review = reviewRunner({ journal: root, prompt: reviewText });
   const verify = async (attempt, submission) => {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
@@ -260,7 +286,7 @@ async function execute() {
       profiles: { [attempt.check_profile]: { ...profile, visual: profile.visual,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
-      review: { ...profile.review, requireAttestation: true } } } };
+      arbiter: reviewSetup.arbiter, review: { ...profile.review, requireAttestation: true } } } };
     let lost = false;
     let renewal = Promise.resolve();
     const timer = setInterval(() => {
@@ -268,10 +294,6 @@ async function execute() {
         .catch(() => { lost = true; });
     }, 20_000);
     try {
-      // Независимый L2-критик: реальный Pi на системно read-only снимке в
-      // rootless Docker, harness-agnostic адаптер вместо сломанного BB accept-edits.
-      const review = isolatedPiReviewRunner({ journal: root,
-        prompt: await readFile(reviewPrompt, 'utf8') });
       return await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: worktreeInspector(policy), local: offlineProfileRunner(root),
         tamper: tamperGate, visual: offlineVisualRunner(root),
@@ -299,7 +321,8 @@ async function execute() {
   let arbiterRunner = null;
   const arbitrate = async (req) => {
     arbiterRunner ??= isolatedArbiterRunner({ journal: root,
-      prompt: typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '' });
+      prompt: ['Use the following specification; output only an arbitration decision, not a critic verdict.',
+        reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : ''].join('\n\n') });
     return arbiterRunner(req);
   };
   try {
@@ -312,8 +335,8 @@ async function execute() {
         // Фактические критик/арбитр из профиля проверки и политики; порт
         // арбитра подключается из конфига, когда задан.
         workerSelector: { ...workerSelector,
-          critic: p.profiles[route.checkProfile]?.review,
-          arbiter: p.arbiter ?? workerSelector.DEFAULT_ARBITER,
+          critic: reviewSetup.critic,
+          arbiter: reviewSetup.arbiter,
           arbitrate } });
       recheck = false;
       const line = JSON.stringify(result);

@@ -9,6 +9,7 @@ import { acceptHeld } from './acceptance.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
 import { loadSdk } from './sdk.mjs';
+import { NEON_CRITIC, SOL_ARBITER } from './review-policy.mjs';
 
 const { board, local } = loadSdk();
 
@@ -544,6 +545,39 @@ test('контракт приёмки связывает subject_digest с кв�
   assert.equal(evidence.sha, CAND);
   assert.deepEqual(calls, { inspect: 2, local: 1, review: 1 });
   assert.equal(seen.claim, 1);
+});
+
+test('Neon policy requires approved skills, independent Sol and an attested bound verdict', async t => {
+  const { handle, ported } = await isolated(t);
+  const cases = [
+    { skills: undefined, reason: 'review_profile_not_approved' },
+    { skills: ['worktree/evil'], reason: 'review_profile_not_approved' },
+    { skills: ['logika'], executor: 'pi/openai/gpt-6.2-sol', reason: 'arbiter_family_not_independent' },
+    { skills: ['logika'], legacyReceipt: true, reason: 'review_isolation_missing' },
+    { skills: ['humanizer'] },
+  ];
+  for (const { skills, executor = 'acp-devin/swe-2-high', legacyReceipt, reason } of cases) {
+    const id = await contractTask(handle);
+    const { epoch, port: boardPort } = await held(ported, id);
+    const journal = await tmpJournal();
+    const review = { ...NEON_CRITIC, skills };
+    const transcript = 'private provider transcript';
+    await writeFile(path.join(journal, 'neon.json'), transcript, { mode: 0o600 });
+    let reviewed = 0;
+    const { ports } = stubs({ review: async binding => {
+      reviewed++;
+      assert.equal(binding.subject_digest, expectedDigest());
+      return { task: id, sha: CAND, actual: NEON_CRITIC, verdict: 'REVIEW_OK', checkpoint: 'feed80ab',
+        ...(!legacyReceipt && { isolation: 'docker-ro-v1', subject_digest: binding.subject_digest,
+          transcript_file: 'neon.json', transcript_sha256: createHash('sha256').update(transcript).digest('hex') }) };
+    } });
+    const result = await acceptHeld({ attempt: contractAttempt(id, epoch, { executor }),
+      submission: submission(id, epoch), policy: policy(id, { review, arbiter: SOL_ARBITER }),
+      journal, ports: { ...ports, board: boardPort } });
+    assert.equal(result.reason, reason);
+    assert.equal(reviewed, !reason || legacyReceipt ? 1 : 0);
+    assert.equal((await settled(handle, id)).state === 'completed', reason === undefined);
+  }
 });
 
 test('ручной v1 без контракта остаётся без манифеста: subject_digest равен null', async (t) => {

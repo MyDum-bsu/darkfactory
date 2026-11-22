@@ -189,7 +189,9 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     ? (workerSelector.arbiter ?? route.arbiter ?? workerSelector.DEFAULT_ARBITER) : undefined;
   const criticMismatch = Boolean(workerSelector && route.critic && workerSelector.critic &&
     (route.critic.provider !== workerSelector.critic.provider ||
-     route.critic.model !== workerSelector.critic.model));
+     route.critic.model !== workerSelector.critic.model ||
+     (route.critic.reasoningLevel !== undefined &&
+      route.critic.reasoningLevel !== workerSelector.critic.reasoningLevel)));
 
   // Recovery may only reinterpret a rejected first envelope, never create an attempt.
   const recheck = recheckRejectedHandoff && record?.phase === 'hold' &&

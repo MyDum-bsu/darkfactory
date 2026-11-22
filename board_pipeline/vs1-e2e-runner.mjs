@@ -273,6 +273,7 @@ else console.log('Onboarding controls are present');`;
     const version = 'vs1-bsu-e2e-1';
     const policy = {
       scope: 'isolated', boardUrl, channel: 'pilot', owner, policyDigest,
+      arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' },
       label: { key: 'automation', value: 'vs1-e2e' }, version, waitMs: 3_600_000,
       brief, reviewPrompt, reviewGate: join(dirs.gate, 'board-review.mjs'),
       handoffDir: dirs.inbox,

@@ -572,7 +572,7 @@ test('a substantive dispute triggers a third-family arbiter and one directed rew
   let arbitrations = 0;
   x.cfg.workerSelector = workerSelector({ arbitrate: async req => {
     arbitrations++;
-    assert.equal(req.arbiter.provider, 'google', 'арбитр из третьего семейства');
+    assert.deepEqual(req.arbiter, { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' });
     assert.equal(req.subject_digest, DIGEST);
     return { decision: 'directed_rework', directive: 'исправь только оспариваемую находку',
       subject_digest: DIGEST };
@@ -683,7 +683,7 @@ test('arbiter accept_with_notes completes the card only through a full seal', as
   assert.equal(head.result.sha, BAD2);
   const record = await x.cfg.state.load();
   assert.equal(record.arbitration.decision, 'accept_with_notes');
-  assert.equal(record.arbitration.arbiter.provider, 'google');
+  assert.deepEqual(record.arbitration.arbiter, { provider: 'openai', model: 'gpt-6.2-sol' });
 });
 
 // Пункт 1: арбитрованное принятие никогда не обходит seal — грязный worktree,
@@ -864,9 +864,8 @@ test('a route critic conflicting with the selector critic is rejected before cla
   assert.equal(x.effects.spawn, 0);
   // Совпадающий критик маршрута и селектора — маршрут допускается.
   const y = await lab(t);
-  y.cfg.route.critic = { provider: 'openai', model: 'gpt-6.2-sol' };
-  y.cfg.workerSelector = workerSelector({
-    critic: { provider: 'openai', model: 'gpt-6.2-sol' } });
+  y.cfg.route.critic = { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' };
+  y.cfg.workerSelector = workerSelector({ critic: { ...y.cfg.route.critic } });
   assert.equal((await y.tick()).phase, 'working');
 });
 
