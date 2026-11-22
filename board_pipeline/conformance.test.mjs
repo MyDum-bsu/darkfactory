@@ -259,6 +259,66 @@ test('trace1a-restart: crash after WAL intent, restart reconcile adopts the wire
   assert.equal(x.effects.spawnCalls, 1, 'reconcile не вызывает spawn');
 });
 
+// Трасса 1A-selector: workerSelector включён, bb.spawn оборвался внутри
+// attemptSpawnWithFallback → outcome 'uncertain' НЕ финален: контроллер
+// сверяет wire через reconcileSpawn, подхватывает тред и доводит до done.
+test('trace1a-selector: lost spawn ack under workerSelector — reconcile adopts, 0 re-spawn', async t => {
+  const x = await lab(t);
+  x.workerSelector();
+  x.bb.spawnOutcome = 'lost_ack';
+  x.bb.fixedThread = 'thr_lost1';
+  x.bb.reconcileSpawnResult = { status: 'matched', threadId: 'thr_lost1' };
+  const first = await x.tick();
+  assert.equal(first.phase, 'working');
+  assert.equal(first.threadId, 'thr_lost1');
+  assert.equal(x.effects.spawnCalls, 1, 'ни одного повторного bb.spawn');
+  const record = x.stored();
+  assert.equal(record.receipt.kind, 'spawn');
+  assert.equal(record.receipt.confirmed, 'reconciled');
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(x.effects.spawnCalls, 1);
+  assert.equal(x.effects.completeCalls, 1);
+});
+
+// Регрессия: рестарт в фазе blocking с записью блокировки, причина которой НЕ
+// совпадает с фактической на карточке — не подтверждённый чужой эффект, а
+// uncertain без повторного board.block.
+test('blocking reconcile: чужая причина на карточке — blocking_reason_mismatch, 0 повторных block', async t => {
+  const x = await lab(t);
+  assert.equal((await x.tick()).phase, 'working');
+  // Реальный board.block другим текстом через удерживаемую аренду.
+  await x.port.block(x.taskId, x.stored().epoch, 'external hold: чужая причина');
+  assert.equal(x.effects.blockCalls, 1);
+  const crashed = { ...x.stored(), phase: 'blocking',
+    intent: { kind: 'block', attemptId: x.stored().attemptId, epoch: x.stored().epoch,
+      turnSeq: 10, reason: 'worker_turn_finished_without_new_handoff',
+      blockText: 'worker_turn_finished_without_new_handoff: thr_wire1, BB event 10.' } };
+  await x.cfg.state.save(crashed);
+  const res = await x.tick();
+  assert.equal(res.phase, 'uncertain');
+  assert.equal(res.reason, 'blocking_reason_mismatch');
+  assert.equal(x.effects.blockCalls, 1, 'повторный board.block не отправлен');
+});
+
+// Регрессия: рестарт в фазе blocking с НАШЕЙ причиной — adopt наблюденного
+// эффекта в hold без повторного board.block.
+test('blocking reconcile: наша причина на карточке — observed block в hold, 0 повторных block', async t => {
+  const x = await lab(t);
+  assert.equal((await x.tick()).phase, 'working');
+  const blockText = 'worker_turn_finished_without_new_handoff: thr_wire1, BB event 10. Проверьте ход; повтор не отправлен.';
+  await x.port.block(x.taskId, x.stored().epoch, blockText);
+  assert.equal(x.effects.blockCalls, 1);
+  const crashed = { ...x.stored(), phase: 'blocking',
+    intent: { kind: 'block', attemptId: x.stored().attemptId, epoch: x.stored().epoch,
+      turnSeq: 10, reason: 'worker_turn_finished_without_new_handoff', blockText } };
+  await x.cfg.state.save(crashed);
+  const res = await x.tick();
+  assert.equal(res.phase, 'hold');
+  assert.equal(res.reason, 'worker_turn_finished_without_new_handoff');
+  assert.equal(x.effects.blockCalls, 1, 'повторный board.block не отправлен');
+});
+
 // Трасса 1B: эффект «на проводе», но выдача списка BB пустая — карантин,
 // ноль повторных spawn, worktree остаётся в брони.
 test('trace1b: empty BB listing after lost ack — quarantine, no re-spawn, slot kept', async t => {

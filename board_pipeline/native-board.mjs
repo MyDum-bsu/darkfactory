@@ -11,7 +11,7 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
   }
 
   async function lookup(taskId) {
-    const { state, epoch, claim, result } = (await rootOf(taskId)).task;
+    const { state, epoch, claim, result, blocked } = (await rootOf(taskId)).task;
     let decoded;
     if (typeof result === 'string') {
       try {
@@ -21,7 +21,8 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
       }
     }
     // task.claim несёт только actor/until — токен держателя остаётся внутри адаптера.
-    return { state, epoch, claim, result: decoded };
+    return { state, epoch, claim, result: decoded,
+      ...(blocked && typeof blocked === 'object' ? { blocked } : {}) };
   }
 
   // Метки корня карточки: канал контракта приёмки (spec_digest, policy_digest, repo_id, finish).

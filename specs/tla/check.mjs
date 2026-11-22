@@ -62,11 +62,15 @@ if (base.code !== 0 || !base.out.includes('No error has been found')) {
 
 for (const [cfg, invariant] of MUTANTS) {
   const res = await tlc(cfg);
-  const expected = `Invariant ${invariant} is violated.`;
-  if (res.code === 12 && res.out.includes(expected)) {
+  // Нарушен должен быть ровно один инвариант — целевой. «Любая ошибка» или
+  // пачка нарушений мутантом не считаются.
+  const violated = [...res.out.matchAll(/Invariant (\w+) is violated\./g)].map(x => x[1]);
+  const unique = [...new Set(violated)];
+  if (res.code === 12 && unique.length === 1 && unique[0] === invariant) {
     console.log(`${cfg}: OK (exit 12, ${invariant})`);
   } else {
-    failures.push(`${cfg}: exit=${res.code}, expected 12 and "${expected}"\n${res.out.slice(-2000)}`);
+    failures.push(`${cfg}: exit=${res.code}, violated=${JSON.stringify(unique)}, ` +
+      `expected exit 12 and exactly "${invariant}"\n${res.out.slice(-2000)}`);
   }
 }
 

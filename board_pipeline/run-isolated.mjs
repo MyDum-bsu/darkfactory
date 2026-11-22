@@ -14,6 +14,7 @@ import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
 import { assertCrossFamily, isolatedArbiterRunner, isolatedPiReviewRunner } from './review-runner.mjs';
 import { tamperGate } from './tamper-gate.mjs';
+import { reconcileFeedbackFromBb, reconcileSpawnFromBb } from './bb-reconcile.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -159,39 +160,18 @@ async function execute() {
         throw error;
       }
     },
-    // Сверка исхода spawn по read-only вызовам BB: ровно 1 тред в этом же
-    // environment, чей журнал несёт маркер attempt_id, — matched. Пустая выдача
-    // НЕ доказывает отсутствие эффекта — честный { status: 'empty' } ведёт в
-    // карантин, повторный spawn контроллером запрещён.
+    // Сверка исхода spawn/feedback по read-only вызовам BB (реальная схема
+    // `bb thread list/show/log --json` — см. bb-reconcile.mjs). Пустая выдача
+    // НЕ доказывает отсутствия эффекта — честный { status: 'empty' } ведёт в
+    // карантин, повторный spawn/tell контроллером запрещён.
     async reconcileSpawn(attempt) {
-      const { stdout } = await exec('bb', ['thread', 'list', '--json'], { timeout: 30_000 });
-      const threads = JSON.parse(stdout);
-      const candidates = (Array.isArray(threads) ? threads : [])
-        .filter(t => t?.environmentPath === tree && /^thr_[a-z0-9]+$/.test(t?.id ?? ''));
-      const matched = [];
-      for (const candidate of candidates) {
-        const log = await exec('bb', ['thread', 'log', candidate.id, '--limit', '40', '--json'],
-          { timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
-        if (log.stdout.includes(attempt.attempt_id)) matched.push(candidate.id);
-      }
-      if (matched.length === 1) return { status: 'matched', threadId: matched[0] };
-      return { status: matched.length === 0 ? 'empty' : 'ambiguous' };
+      return reconcileSpawnFromBb({ execBb: (args, opts) => exec('bb', args, opts),
+        project: p.bb.project, tree, attemptId: attempt.attempt_id,
+        handoffFile: handoffPath(attempt) });
     },
-    // Сверка доставки feedback: ровно 1 событие с маркером feedbackId в журнале
-    // треда — delivered; 0 — empty; >1 — ambiguous. Ни одно из показаний не
-    // повторяет bb thread tell.
     async reconcileFeedback({ attempt, feedbackId, threadId }) {
-      const target = threadId ?? attempt?.bb_thread_id;
-      if (!/^thr_[a-z0-9]+$/.test(target ?? '') || typeof feedbackId !== 'string' || !feedbackId) {
-        return { status: 'ambiguous' };
-      }
-      const { stdout } = await exec('bb', ['thread', 'log', target, '--limit', '400', '--json'],
-        { timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
-      const events = JSON.parse(stdout);
-      const hits = (Array.isArray(events) ? events : [])
-        .filter(e => e?.type === 'client/turn/requested' && JSON.stringify(e?.data ?? {}).includes(feedbackId));
-      if (hits.length === 1) return { status: 'delivered' };
-      return { status: hits.length === 0 ? 'empty' : 'ambiguous' };
+      return reconcileFeedbackFromBb({ execBb: (args, opts) => exec('bb', args, opts),
+        threadId: threadId ?? attempt?.bb_thread_id, feedbackId });
     },
     async feedback(packet) {
       const message = join(root, `feedback-${packet.sha}.md`);
