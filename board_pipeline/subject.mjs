@@ -18,11 +18,13 @@ export class SubjectDenied extends Error {
   }
 }
 
-// Единый безопасный обход массивов: без пользовательских map/iterators, без sparse.
+// Единый безопасный обход массивов: только настоящие массивы, без пользовательских
+// map/iterators и без sparse-элементов.
 function safeArray(value, reason) {
+  if (!Array.isArray(value)) throw new SubjectDenied(reason);
   const items = [];
   for (let i = 0; i < value.length; i++) {
-    if (!Object.hasOwn(value, String(i))) throw new SubjectDenied(reason);
+    if (!Object.hasOwn(value, String(i))) throw new SubjectDenied('subject_sparse_array');
     items.push(value[i]);
   }
   return items;
@@ -150,7 +152,7 @@ export function buildSubject({
       tree_sha: treeSha,
       merge_result_sha: mergeResultSha,
     },
-    artifacts: safeArray(artifacts, 'subject_sparse_array').map(artifact =>
+    artifacts: safeArray(artifacts, 'subject_artifacts_not_array').map(artifact =>
       typeof artifact === 'object' && artifact !== null && !Array.isArray(artifact)
         ? { ...artifact } : artifact),
     spec_digest: specDigest,

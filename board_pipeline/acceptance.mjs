@@ -199,14 +199,15 @@ function attemptSubject(attempt, submission, treeSha) {
   });
 }
 
-// Ключ контракта для журнала: смена spec/policy/fixtures/release при том же SHA
+// Ключ контракта для журнала: смена spec/policy/fixtures/release/tree при том же SHA
 // создаёт новый запуск вместо переиспользования старого терминального вердикта.
-// (candidate_sha уже в ключе запуска, а tree_sha однозначно выводится из него в Git.)
+// Закреплённый tree_sha входит в ключ; когда дерево берётся из снимка, в ключе null.
 function contractKey(attempt) {
   if (attempt.spec_digest === undefined) return null;
   return createHash('sha256').update(canonicalJson({
     repo_id: attempt.repo_id,
     base_sha: attempt.base_sha,
+    tree_sha: attempt.tree_sha ?? null,
     spec_digest: attempt.spec_digest,
     policy_digest: attempt.policy_digest,
     fixtures_digest: attempt.fixtures_digest ?? null,
@@ -222,6 +223,7 @@ function sameContract(runEntry, attempt) {
   const recorded = runEntry?.contract;
   if (recorded === null || typeof recorded !== 'object') return false;
   return recorded.repo_id === attempt.repo_id &&
+    (recorded.tree_sha ?? null) === (attempt.tree_sha ?? null) &&
     recorded.spec_digest === attempt.spec_digest &&
     recorded.policy_digest === attempt.policy_digest &&
     (recorded.fixtures_digest ?? null) === (attempt.fixtures_digest ?? null) &&
@@ -330,14 +332,16 @@ function compactEvidence(evidence, run) {
     },
     run,
   };
+  // Детерминированное ужатие: каждая следующая ступень вызывается и проверяется на лимит.
   const variants = [
     base,
     () => ({ ...base, checks: { ...base.checks, checks: base.checks.checks.map(({ i, ok }) => ({ i, ok })) } }),
     () => ({ ...base, checks: { ok: base.checks.ok, n: base.checks.n } }),
   ];
   for (const variant of variants) {
-    const text = JSON.stringify(variant);
-    if (typeof text === 'string' && text.length <= 1000) return variant;
+    const candidate = typeof variant === 'function' ? variant() : variant;
+    const text = JSON.stringify(candidate);
+    if (typeof text === 'string' && text.length <= 1000) return candidate;
   }
   throw new Error('Compact Board receipt cannot fit the 1000 character limit');
 }
@@ -614,7 +618,19 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     if (e.code !== 'EEXIST') throw e;
     const entries = (await readExistingRun(file)) ?? [];
     const runEntry = entries.find((entry) => entry.kind === 'run');
-    if (runEntry && !sameContract(runEntry, attempt)) {
+    // Журнал без записи run несогласован: старый исход не подтверждается ничем.
+    if (!runEntry) {
+      return {
+        outcome: 'uncertain',
+        reason: 'journal_run_entry_missing',
+        run: id,
+        repeated: true,
+        task_id: attempt.task_id,
+        attempt_id: attempt.attempt_id,
+        candidate_sha: submission.candidate_sha,
+      };
+    }
+    if (!sameContract(runEntry, attempt)) {
       return {
         outcome: 'denied',
         reason: 'journal_subject_mismatch',
@@ -661,6 +677,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     subject_digest: null,
     ...(key ? { contract: {
       repo_id: attempt.repo_id,
+      tree_sha: attempt.tree_sha ?? null,
       spec_digest: attempt.spec_digest,
       policy_digest: attempt.policy_digest,
       fixtures_digest: attempt.fixtures_digest ?? null,
@@ -786,13 +803,27 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       await step('seal', false, 'contract_labels_unavailable');
       return hold('contract_labels_unavailable');
     }
-    if (labels.spec_digest !== attempt.spec_digest) {
-      await step('seal', false, 'spec_digest_drift');
-      return hold('spec_digest_drift');
+    // Все закреплённые поля контракта сверяются с живыми метками карточки: дрейф
+    // любого из них после L2 останавливает кандидата до complete.
+    const expectedLabels = {
+      repo_id: attempt.repo_id,
+      profile_id: attempt.check_profile,
+      finish: attempt.finish,
+      spec_digest: attempt.spec_digest,
+      policy_digest: attempt.policy_digest,
+    };
+    for (const [field, expected] of Object.entries(expectedLabels)) {
+      if (labels[field] !== expected) {
+        await step('seal', false, `${field}_drift`);
+        return hold(`${field}_drift`);
+      }
     }
-    if (labels.policy_digest !== attempt.policy_digest) {
-      await step('seal', false, 'policy_digest_drift');
-      return hold('policy_digest_drift');
+    if (attempt.fixtures_digest !== undefined) {
+      const actualFixtures = typeof labels.fixtures_digest === 'string' ? labels.fixtures_digest : null;
+      if (actualFixtures !== (attempt.fixtures_digest ?? null)) {
+        await step('seal', false, 'fixtures_digest_drift');
+        return hold('fixtures_digest_drift');
+      }
     }
     if (policy.digest !== undefined && policy.digest !== attempt.policy_digest) {
       await step('seal', false, 'policy_digest_drift');

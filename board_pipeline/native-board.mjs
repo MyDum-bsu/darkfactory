@@ -11,7 +11,7 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
   }
 
   async function lookup(taskId) {
-    const { state, epoch, result } = (await rootOf(taskId)).task;
+    const { state, epoch, claim, result } = (await rootOf(taskId)).task;
     let decoded;
     if (typeof result === 'string') {
       try {
@@ -20,7 +20,8 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
         if (!(error instanceof SyntaxError)) throw error;
       }
     }
-    return { state, epoch, result: decoded };
+    // task.claim несёт только actor/until — токен держателя остаётся внутри адаптера.
+    return { state, epoch, claim, result: decoded };
   }
 
   // Метки корня карточки: канал контракта приёмки (spec_digest, policy_digest, repo_id, finish).
@@ -67,7 +68,8 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
   // Фильтр должен быть явным и полным: пустой или частичный allowlist захват не делает.
   function checkFilter(filter) {
     if (filter === null || typeof filter !== 'object' || Array.isArray(filter) ||
-        typeof filter.owner !== 'string' || !filter.owner) {
+        typeof filter.owner !== 'string' || !filter.owner ||
+        typeof filter.profileId !== 'string' || !filter.profileId) {
       throw new Error('A trusted claim filter is required');
     }
     const { key, value } = filter.label ?? {};
@@ -80,13 +82,11 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
     }
     if (!Array.isArray(filter.required) ||
         !filter.required.every(item => typeof item === 'string' && item) ||
-        !CONTRACT_MIN.every(key => filter.required.includes(key)) ||
-        (filter.profileId !== undefined && (typeof filter.profileId !== 'string' || !filter.profileId))) {
+        !CONTRACT_MIN.every(key => filter.required.includes(key))) {
       throw new Error('A trusted claim filter is required');
     }
     return { owner: filter.owner, label: { key, value }, finish: filter.finish,
-      required: [...new Set(filter.required)],
-      ...(filter.profileId !== undefined ? { profileId: filter.profileId } : {}) };
+      profileId: filter.profileId, required: [...new Set(filter.required)] };
   }
 
   // Значения контрактных меток валидируются, не только presence: дайджесты — 64 hex,
@@ -108,7 +108,7 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
     if (root.task.owner !== filter.owner) return false;
     if (root.labels?.[filter.label.key] !== filter.label.value) return false;
     if (root.labels?.finish !== filter.finish) return false;
-    if (filter.profileId !== undefined && root.labels?.profile_id !== filter.profileId) return false;
+    if (root.labels?.profile_id !== filter.profileId) return false;
     const labels = root.labels;
     if (labels === null || typeof labels !== 'object' || !contractLabelsValid(labels)) return false;
     for (const key of filter.required) {
@@ -118,7 +118,14 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
   }
 
   async function claimById(taskId, { token } = {}) {
-    await lookup(taskId);
+    const root = await lookup(taskId);
+    // Захват только готовой карточки: waiting/blocked и живой чужой claim не берутся.
+    // Просроченная аренда считается готовой (нативная семантика re-claim после expiry).
+    const expiredLease = root.state === 'claimed' && typeof root.claim?.until === 'string' &&
+      Number.isFinite(Date.parse(root.claim.until)) && Date.now() >= Date.parse(root.claim.until);
+    if (root.state !== 'ready' && !expiredLease) {
+      throw new Error('Task is not ready for a native claim');
+    }
     const claim = await handle.tasks.claim(taskId, token === undefined ? { lease } : { lease, token });
     held.set(taskId, claim);
     // Токен аренды и capability остаются внутри адаптера; наружу идут только факт и срок.
@@ -150,11 +157,13 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
         for (const entry of page.tasks ?? []) {
           const listed = entry?.message;
           if (listed?.channel !== channel || !admits(trusted, listed)) continue;
-          // Перечитываем карточку непосредственно перед claim: владелец, метка и контракт
-          // могли смениться между выдачей списка и захватом.
+          // Единственный перечитанный снимок непосредственно перед SDK claim: владелец,
+          // метка, профиль и контракт проверяются на нём же, его метки и возвращаются.
           const fresh = await rootOf(listed.id);
           if (fresh.task.state !== 'ready' || !admits(trusted, fresh)) continue;
-          const claim = await claimById(listed.id, { token });
+          const claim = await handle.tasks.claim(listed.id,
+            token === undefined ? { lease } : { lease, token });
+          held.set(listed.id, claim);
           return { taskId: listed.id, epoch: claim.epoch, until: claim.until, labels: fresh.labels };
         }
         // Сервер сообщает курсор следующей страницы; без сдвига или без карточек очередь кончилась.

@@ -826,7 +826,7 @@ test('компактная квитанция укладывается в 1000 �
 
 test('sameContract отличает смену контракта и ручной v1', async (t) => {
   const { _internals: { sameContract } } = await import('./acceptance.mjs');
-  const run = { contract: { repo_id: REPO, spec_digest: SPEC, policy_digest: POL,
+  const run = { contract: { repo_id: REPO, tree_sha: TREE, spec_digest: SPEC, policy_digest: POL,
     fixtures_digest: null, release_target: null } };
   assert.equal(sameContract(run, contractAttempt('1', 1)), true);
   assert.equal(sameContract(run, contractAttempt('1', 1, { spec_digest: OTHER_256 })), false);
@@ -834,4 +834,145 @@ test('sameContract отличает смену контракта и ручно�
   assert.equal(sameContract({ contract: null }, contractAttempt('1', 1)), false, 'запись без контракта');
   assert.equal(sameContract(run, attempt('1', 1)), true, 'ручной v1 без контракта всегда совместим');
   assert.equal(sameContract(run, contractAttempt('1', 1, { release_target: { finish: 'deployed' } })), false);
+  assert.equal(sameContract(run, contractAttempt('1', 1, { tree_sha: 'e'.repeat(40) })), false, 'другое дерево');
+});
+
+test('seal сверяет дрейф repo_id, profile_id, finish и fixtures_digest', async (t) => {
+  for (const [label, value, reason] of [
+    ['repo_id', 'other-repo', 'repo_id_drift'],
+    ['profile_id', 'other-profile', 'profile_id_drift'],
+    ['finish', 'deployed', 'finish_drift'],
+  ]) {
+    const { handle, ported } = await isolated(t);
+    const id = await contractTask(handle);
+    const { epoch, port: boardPort } = await held(ported, id);
+    await handle.label(id, { set: { [label]: value } });
+    const journal = await tmpJournal();
+    const { ports } = stubs();
+    const res = await acceptHeld({
+      attempt: contractAttempt(id, epoch),
+      submission: submission(id, epoch),
+      policy: policy(id),
+      journal,
+      ports: { ...ports, board: boardPort },
+    });
+    assert.equal(res.outcome, 'hold', label);
+    assert.equal(res.reason, reason);
+    assert.equal((await settled(handle, id)).state, 'blocked');
+  }
+  // fixtures_digest: закреплён null, метка появилась со значением — дрейф.
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  await handle.label(id, { set: { fixtures_digest: OTHER_256 } });
+  const journal = await tmpJournal();
+  const { ports } = stubs();
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(res.outcome, 'hold');
+  assert.equal(res.reason, 'fixtures_digest_drift');
+  assert.equal((await settled(handle, id)).state, 'blocked');
+});
+
+test('повтор с другим закреплённым tree_sha не переиспользует вердикт журнала', async (t) => {
+  const { handle, ported, seen } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs();
+  const redLocal = async (binding) => {
+    calls.local++;
+    return { sha: binding.candidate_sha, ok: false, evidence: 'checks.json', exit: 3 };
+  };
+  const first = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort, local: redLocal },
+  });
+  assert.equal(first.outcome, 'rework', 'первый прогон красный: аренда остаётся живой');
+  assert.equal(calls.local, 1);
+  const second = await acceptHeld({
+    attempt: contractAttempt(id, epoch, { tree_sha: 'e'.repeat(40) }),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort, local: redLocal },
+  });
+  assert.equal(second.outcome, 'rework');
+  assert.equal(second.repeated, undefined, 'вердикт для другого дерева не переиспользован');
+  assert.notEqual(second.run, first.run);
+  assert.equal(calls.local, 2, 'проверки выполнены заново для нового закреплённого дерева');
+  assert.equal(seen.claim, 1);
+});
+
+test('журнал без записи run не возвращает старый исход', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs();
+  // Готовим файл запуска с тем же ключом, но без записи run — только intent complete.
+  const probe = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(probe.outcome, 'verified');
+  const { readFile, writeFile, readdir } = await import('node:fs/promises');
+  const files = (await readdir(journal)).filter((name) => name.endsWith('.jsonl'));
+  const runFile = path.join(journal, files[0]);
+  const lines = (await readFile(runFile, 'utf8')).split('\n').filter(Boolean)
+    .filter((line) => !line.includes('"kind":"run"'));
+  await writeFile(runFile, lines.join('\n') + '\n');
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(res.outcome, 'uncertain');
+  assert.equal(res.reason, 'journal_run_entry_missing');
+  assert.equal(calls.claim ?? 0, 0);
+});
+
+test('компактная квитанция ужимается при 20 проверках с длинными именами логов', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports } = stubs();
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort, local: async (binding) => ({
+      sha: binding.candidate_sha, ok: true,
+      evidence: Array.from({ length: 20 }, (_, i) => ({
+        file: `checks-${i}-${'y'.repeat(220)}.${i}.log`, sha256: 'e'.repeat(64), exit: 0 })),
+    }) },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'completed');
+  const receipt = typeof after.result === 'string' ? JSON.parse(after.result) : after.result;
+  const text = JSON.stringify(receipt);
+  assert.equal(text.length <= 1000, true, `лимит Board.complete: ${text.length}`);
+  assert.equal(receipt.sha, CAND);
+  assert.equal(receipt.subject_digest, expectedDigest());
+  assert.equal(receipt.checks.n, 20);
+  assert.equal(receipt.checks.ok, true);
+  assert.equal(receipt.review.verdict, 'REVIEW_OK');
+  assert.equal(receipt.review.checkpoint, 'feed80ab');
+  assert.equal(receipt.run, res.run);
 });

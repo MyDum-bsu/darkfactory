@@ -24,7 +24,8 @@ test('native completion unlocks an actual dependency and records typed evidence'
   const { epoch } = await port.claim(fix.id);
   const evidence = { sha: '78'.repeat(20), verdict: 'REVIEW_OK' };
   await port.complete(fix.id, epoch, evidence);
-  assert.deepEqual(await port.lookup(fix.id), { state: 'completed', epoch, result: evidence });
+  assert.deepEqual(await port.lookup(fix.id),
+    { state: 'completed', epoch, claim: null, result: evidence });
   assert.equal((await port.lookup(after.id)).state, 'ready');
 });
 
@@ -64,6 +65,7 @@ const FILTER = {
   owner: 'board:client',
   label: { key: 'queue', value: 'vs1' },
   finish: 'verified',
+  profileId: 'pilot',
   required: ['profile_id', 'repo_id', 'spec_digest', 'policy_digest'],
 };
 
@@ -202,4 +204,57 @@ test('claim() returns only epoch and until: the lease token never leaves the ada
   assert.ok(!JSON.stringify(claimed).includes(seen.token), 'токен аренды не попадает в ответ claim');
   const picked = await port.claimReady(FILTER).catch(() => null);
   if (picked) assert.ok(!JSON.stringify(picked).includes(seen.token));
+});
+
+test('claimReady requires an explicit profileId in the filter', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  for (const bad of [
+    { ...FILTER, profileId: undefined },
+    { ...FILTER, profileId: '' },
+    { ...FILTER, profileId: 7 },
+  ]) {
+    await assert.rejects(port.claimReady(bad), /trusted claim filter/, JSON.stringify(bad));
+  }
+  assert.equal(seen.claim, 0);
+});
+
+test('claimReady returns labels of the final verified snapshot and reads the card once', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  const { task } = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  let reads = 0;
+  const original = handle.thread.bind(handle);
+  ported.thread = async (id, opts) => {
+    reads++;
+    const snap = await original(id, opts);
+    if (id === task.id) {
+      // Последний снимок перед claim отличается от выдачи списка: возвращены должны
+      // быть именно проверенные метки этого снимка.
+      return { message: { ...snap.message,
+        labels: { ...snap.message.labels, spec_digest: 'f'.repeat(64) } } };
+    }
+    return snap;
+  };
+  const picked = await port.claimReady(FILTER);
+  assert.equal(picked.taskId, task.id);
+  assert.equal(picked.labels.spec_digest, 'f'.repeat(64), 'метки последнего проверенного снимка');
+  assert.equal(seen.claim, 1);
+  assert.equal(reads, 1, 'один перечитанный снимок перед SDK claim, без лишнего lookup');
+  await port.complete(task.id, picked.epoch, { sha: 'c'.repeat(40) });
+});
+
+test('claim() refuses a card that is not ready', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  const [head, dependent] = await handle.tasks.createMany('pilot', [
+    { key: 'head', text: 'Head', noSync: true, labels: { ...CONTRACT, queue: 'vs1' } },
+    { text: 'Dependent', needs: [{ key: 'head' }], noSync: true },
+  ], { id: 'claim-not-ready' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  await assert.rejects(port.claim(dependent.id), /not ready for a native claim/);
+  const { epoch } = await port.claim(head.id);
+  await assert.rejects(port.claim(head.id), /not ready for a native claim/, 'повторный claim захваченной карточки');
+  assert.equal(seen.claim, 1, 'SDK claim сделан ровно один раз');
+  await port.complete(head.id, epoch, { sha: 'c'.repeat(40) });
 });

@@ -164,3 +164,11 @@ test('sparse-массивы отклоняются канонизацией и �
   assert.throws(() => validateSubject(subject({ artifacts: Array(1) })), /subject_sparse_array/);
   assert.throws(() => validateSubject(subject({ artifacts: [null, null] })), /subject_artifact_not_object/);
 });
+
+test('артефакты-не-массивы отклоняются как ошибка типа', () => {
+  assert.throws(() => buildSubject({ kind: 'git_tree', repoId: 'repo', baseSha: BASE, candidateSha: CAND,
+    treeSha: TREE, specDigest: SPEC, policyDigest: POLICY, artifacts: {} }), /subject_artifacts_not_array/);
+  assert.throws(() => buildSubject({ kind: 'artifact_bundle', repoId: 'repo',
+    specDigest: SPEC, policyDigest: POLICY, artifacts: 'primary' }), /subject_artifacts_not_array/);
+  assert.throws(() => validateSubject(subject({ artifacts: {} })), /subject_artifacts_not_array/);
+});
