@@ -842,3 +842,78 @@ test('acceptHeld: отсутствующий или подменённый фа�
     await rm(journal, { recursive: true, force: true });
   }
 });
+
+test('guard: /review читается критиком, запись запрещена', async () => {
+  const dir = join(tmpdir(), '.pi', 'agent');
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'auth.json'), '{"openai":{"token":"s"}}');
+  const guard = new URL('./pi-guard.cjs', import.meta.url).pathname;
+  const script = `
+    const fs = require('fs');
+    require(${JSON.stringify(guard)});
+    // Чтение /review разрешено гардом: несуществующий файл — ENOENT, не EACCES.
+    try { fs.readFileSync('/review/diff.patch'); console.log('read:allowed'); }
+    catch (e) { console.log('read:' + e.code); }
+    // Запись в /review запрещена (гардом или :ro-монтом) — никогда не «allowed».
+    try { fs.writeFileSync('/review/diff.patch', 'x'); console.log('write:allowed'); }
+    catch (e) { console.log('write:' + e.code); }
+    // Контроль: путь вне ALLOW_DIRS отклоняется самим гардом.
+    try { fs.readFileSync('/notallowed/x'); console.log('ctl:allowed'); }
+    catch (e) { console.log('ctl:' + e.code); }
+  `;
+  const { stdout } = await exec(process.execPath, ['-e', script],
+    { timeout: 15_000 });
+  const out = Object.fromEntries(stdout.trim().split('\n')
+    .map((l) => l.split(':')));
+  assert.equal(out.read, 'ENOENT', `гард запретил чтение /review: ${stdout}`);
+  assert.notEqual(out.write, 'allowed', `запись в /review не отклонена: ${stdout}`);
+  assert.equal(out.ctl, 'EACCES', `контрольный путь не отклонён: ${stdout}`);
+});
+
+test('runner: в контейнер уходит кред без refresh и без auth.openai.com', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'runner-repo-'));
+  const journal = await mkdtemp(join(tmpdir(), 'runner-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'runner-pi-'));
+  try {
+    const git = async (...args) =>
+      (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
+    await git('init', '-q', '-b', 'pilot');
+    await git('config', 'user.email', 't@l');
+    await git('config', 'user.name', 't');
+    await writeFile(join(repo, 'a.txt'), 'x\n');
+    await git('add', 'a.txt');
+    await git('commit', '-qm', 'cand');
+    const sha = await git('rev-parse', 'HEAD');
+    // OAuth-кред с длинным сроком: хостовый refresh не понадобится.
+    const oauth = { type: 'oauth', access: 'acc-token', refresh: 'rt-real',
+      expires: Date.now() + 3600_000, clientId: 'cid' };
+    await writeFile(join(piRoot, 'auth.json'), JSON.stringify({ openai: oauth }));
+
+    let seen = null;
+    let cred = null;
+    const stream = [
+      msg({ content: [{ type: 'text', text: '{"verdict":"PASS","summary":"ok"}' }] }),
+      settled,
+    ].join('\n');
+    const runner = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async (opts) => {
+        seen = opts;
+        // scratch живёт только внутри вызова — читаем кред на месте.
+        const cfg = opts.mounts.find((m) => m.dst === '/pi-cfg');
+        const { readFile } = await import('node:fs/promises');
+        cred = JSON.parse(await readFile(join(cfg.src, 'auth.json'), 'utf8')).openai;
+        return { code: 0, stdout: stream, stderr: '' };
+      } });
+    await runner({ task_id: '1', candidate_sha: sha, worktree: repo,
+      executor: 'acp-devin/swe-2-high' }, { review: CRITIC });
+
+    assert.equal(cred.refresh, 'sandbox-redacted');
+    assert.equal(cred.access, 'acc-token');
+    assert.ok(!String(seen.env.PI_ALLOW_CONNECT).includes('auth.openai.com'),
+      `в allow попал auth.openai.com: ${seen.env.PI_ALLOW_CONNECT}`);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+  }
+});

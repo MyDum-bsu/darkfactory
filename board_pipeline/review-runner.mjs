@@ -577,13 +577,36 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // одного провайдера критика и уничтожается pi-guard после первого чтения.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
-      const fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
-      const credential = fullAuth?.[critic.provider];
+      let fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
+      let credential = fullAuth?.[critic.provider];
       if (credential === undefined || credential === null) {
         throw new ReviewDenied('review_auth_missing');
       }
+      // OAuth refresh-токен одноразовый: если контейнер рефрешит его, новая
+      // пара гибнет в tmpfs, а на хосте остаётся погашенный токен. Поэтому
+      // рефреш — только на хосте, до запуска контейнера. pi сам атомарно
+      // перезаписывает auth.json; stdout (bearer) не логируем.
+      if (credential?.type === 'oauth' && typeof credential.expires === 'number' &&
+          credential.expires <= Date.now() + 10 * 60 * 1000) {
+        try {
+          await exec(join(piRoot, 'bin', 'pi'),
+            ['auth', 'print-bearer-token', '--provider', critic.provider,
+             '--min-expiry', '10m'],
+            { timeout: 60_000, maxBuffer: 1024 * 1024 });
+        } catch {
+          throw new ReviewDenied('review_auth_refresh_failed');
+        }
+        fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
+        credential = fullAuth?.[critic.provider];
+      }
+      // В контейнер refresh-токен не передаётся вообще: внутри sandbox нет
+      // долгоживущего секрета и pi никогда не пытается OAuth-refresh.
+      const sandboxCredential = credential?.type === 'oauth'
+        ? { ...credential, refresh: 'sandbox-redacted',
+            expires: Math.max(Number(credential.expires) || 0, Date.now() + 3600_000) }
+        : credential;
       await writeFile(join(cfgDir, 'auth.json'),
-        JSON.stringify({ [critic.provider]: credential }));
+        JSON.stringify({ [critic.provider]: sandboxCredential }));
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
@@ -605,7 +628,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // Egress-allowlist для pi-guard: только адрес прокси и публичные
       // endpoint'ы модели. Прокси на :44100 запрещён до запуска; NO_PROXY
       // в контейнер не передаётся.
-      const allow = ['api.openai.com:443', 'chatgpt.com:443', 'auth.openai.com:443'];
+      const allow = ['api.openai.com:443', 'chatgpt.com:443'];
       // PI_OFFLINE: pi не скачивает внешние инструменты (fd/rg с github.com)
       // — иначе egress-allowlist роняет процесс на старте.
       const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1' };

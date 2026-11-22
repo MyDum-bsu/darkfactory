@@ -29,7 +29,7 @@ const origExistsSync = fs.existsSync.bind(fs);
 const PI_HOME = '/tmp/.pi';
 const AUTH = '/tmp/.pi/agent/auth.json';
 const ALLOW_DIRS = ['/candidate', '/pi-ro/bin', '/pi-ro/install', '/pi-ro/npm',
-  '/pi-guard', '/tmp/session', '/tmp', '/usr', '/lib', '/lib64',
+  '/pi-guard', '/review', '/tmp/session', '/tmp', '/usr', '/lib', '/lib64',
   '/etc', '/proc', '/dev', '/sys', '/run', '/.agents', '/home', '/root', '/opt'];
 // Конфиги, к которым после lock доступ имеет только внутренний код pi.
 const SECRET_FILES = new Set(['/tmp/.pi/agent/auth.json',
