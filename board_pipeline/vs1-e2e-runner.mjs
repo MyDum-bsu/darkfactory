@@ -6,7 +6,7 @@
 // Границы: никогда порт 44100, никакой живой Board/кабинета/сети кандидата.
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -81,18 +81,22 @@ async function boardEventCount(sqliteDir) {
 }
 
 // Исполняемые шимы на время пустого тика: логируют любой реальный вызов
-// bb / docker / pi до его исполнения (включая неуспешные вызовы до записи файлов).
-async function createIdleShims(shimDir, logFile, basePath) {
+// bb / docker / pi (включая абсолютный $HOME/.pi/agent/bin/pi) до исполнения.
+async function createIdleShims(shimDir, idleHome, logFile, basePath, realPi) {
   await mkdir(shimDir, { recursive: true, mode: 0o700 });
+  await mkdir(join(idleHome, '.pi', 'agent', 'bin'), { recursive: true, mode: 0o700 });
   await writeFile(logFile, '', { mode: 0o600 });
   for (const bin of ['bb', 'docker', 'pi']) {
     const p = join(shimDir, bin);
+    const execTarget = bin === 'pi' ? JSON.stringify(realPi) : bin;
     await writeFile(p, `#!/bin/sh
 printf '%s\\n' ${JSON.stringify(bin)} >> ${JSON.stringify(logFile)}
-PATH=${JSON.stringify(basePath)} exec ${bin} "$@"
+PATH=${JSON.stringify(basePath)} exec ${execTarget} "$@"
 `, { mode: 0o700 });
     await chmod(p, 0o700);
   }
+  await copyFile(join(shimDir, 'pi'), join(idleHome, '.pi', 'agent', 'bin', 'pi'));
+  await chmod(join(idleHome, '.pi', 'agent', 'bin', 'pi'), 0o700);
 }
 
 // Снимок состояния карточки для сравнения «без эффектов»: только стабильные поля.
@@ -330,16 +334,21 @@ else console.log('Onboarding controls are present');`;
     const stateFiles = await readdir(dirs.state);
     const forSha = (sha, re) => stateFiles.some(f => re.test(f) && f.includes(sha));
     const outcomes = {};
+    const journalOrder = [];
     for (const file of stateFiles.filter(f => f.startsWith('run-'))) {
-      for (const line of (await readFile(join(dirs.state, file), 'utf8')).split('\n')) {
+      const fullPath = join(dirs.state, file);
+      const { mtimeMs } = await stat(fullPath);
+      for (const line of (await readFile(fullPath, 'utf8')).split('\n')) {
         if (!line.trim()) continue;
         let rec; try { rec = JSON.parse(line); } catch { continue; }
         if (rec.kind === 'outcome' && rec.candidate_sha &&
             rec.attempt_id === attempt.attemptId && rec.epoch === attempt.epoch) {
           (outcomes[rec.candidate_sha] ??= []).push(rec);
+          journalOrder.push({ sha: rec.candidate_sha, mtimeMs });
         }
       }
     }
+    journalOrder.sort((a, b) => a.mtimeMs - b.mtimeMs);
     let final1Parsed = null;
     try { final1Parsed = JSON.parse(final1.result ?? 'null'); } catch { /* ignore */ }
     const acceptedSha = typeof final1Parsed?.sha === 'string' ? final1Parsed.sha : null;
@@ -354,9 +363,11 @@ else console.log('Onboarding controls are present');`;
       };
     });
     proof.turns = turns;
+    const journalMatchesOrder = journalOrder.length === seen.submitted.length &&
+      journalOrder.every((entry, idx) => entry.sha === seen.submitted[idx]);
     const exactOrderAndCount = turns.length >= 3 &&
       Object.keys(outcomes).length === seen.submitted.length &&
-      turns.every(t => t.count === 1);
+      turns.every(t => t.count === 1) && journalMatchesOrder;
     const turn0 = turns[0];
     const turn1 = turns[1];
     const turnLast = turns[turns.length - 1];
@@ -392,11 +403,13 @@ else console.log('Onboarding controls are present');`;
     const before = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
     const eventsBefore = await boardEventCount(dirs.sqlite);
     const idleShimsDir = join(dirs.operator, 'idle-shims');
+    const idleHome = join(dirs.operator, 'idle-home');
     const idleCallsLog = join(dirs.operator, 'idle-calls.log');
     const basePath = env.PATH ?? process.env.PATH ?? '';
-    await createIdleShims(idleShimsDir, idleCallsLog, basePath);
+    const realPi = join(homedir(), '.pi', 'agent', 'bin', 'pi');
+    await createIdleShims(idleShimsDir, idleHome, idleCallsLog, basePath, realPi);
     await rename(join(dirs.state, 'attempt.json'), join(dirs.state, 'attempt-main.json'));
-    const idleEnv = { ...env, PATH: `${idleShimsDir}:${basePath}` };
+    const idleEnv = { ...env, HOME: idleHome, PATH: `${idleShimsDir}:${basePath}` };
     const idle = await runController(idlePolicyFile, dirs.state, idleEnv, wlog, () => {},
       ['--stop-on-idle']);
     const after = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
@@ -405,8 +418,12 @@ else console.log('Onboarding controls are present');`;
     const bbCallsDelta = idleCalls.filter(c => c === 'bb').length;
     const dockerCallsDelta = idleCalls.filter(c => c === 'docker').length;
     const piCallsDelta = idleCalls.filter(c => c === 'pi').length;
-    const idleAttempt = await readFile(join(dirs.state, 'attempt.json'), 'utf8')
-      .then(s => JSON.parse(s), () => null);
+    let idleAttempt = null;
+    try {
+      idleAttempt = JSON.parse(await readFile(join(dirs.state, 'attempt.json'), 'utf8'));
+    } catch (e) {
+      if (e?.code !== 'ENOENT') throw e;
+    }
     const attemptCreated = idleAttempt !== null;
     const allIdle = idle.lines.length >= 1 && idle.lines.every(l => {
       try { return JSON.parse(l).phase === 'idle'; } catch { return false; }
