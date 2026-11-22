@@ -1,6 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createQuestion, questionBlockText } from './question-gate.mjs';
 import { advanceQuestion, QUESTION_PHASES } from './question-resume.mjs';
+import { createReleasePackage, releaseQuestionDetails, ReleaseDenied } from './release-contract.mjs';
+import { advanceRelease, RELEASE_PHASES } from './release-flow.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
@@ -79,7 +81,7 @@ function attemptOf(record, route) {
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
 export async function advance({ route, state, board, bb, submissions, verify, authorize,
-  recheckRejectedHandoff, workerSelector, mutants, questionGate }) {
+  recheckRejectedHandoff, workerSelector, mutants, questionGate, release }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const hazards = mutants ?? {};
@@ -312,6 +314,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         evidence: { questionId: question.question_id, ownerAnswer: answer },
       }), reconcileFeedback: reconcileInFlight });
   }
+  if (release && RELEASE_PHASES.has(record.phase)) {
+    if (!questionGate) throw new ReleaseDenied('release_approval_unavailable');
+    return advanceRelease({ record, save, visible, board, release, gate: questionGate, leaseAlive });
+  }
   if (record.phase === 'release_ready') {
     if (!questionGate) throw new Error('An enrolled owner answer gate is required for release');
     if (!await leaseAlive()) return lostLease();
@@ -361,7 +367,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     }
     return visible();
   };
-  const askOwner = async ({ kind, prompt, evidence, result, extraState }) => {
+  const askOwner = async ({ kind, prompt, evidence, result, extraState, releasePlan }) => {
     const sha = await questionGate.capture({ attempt, turnSeq });
     const candidateSha = result?.receipt?.evidence?.sha;
     if (!sha || (kind === 'release' && (sha !== record.sha || sha !== candidateSha ||
@@ -373,7 +379,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     try {
       question = createQuestion({ attempt, kind, prompt, evidence,
         principal: questionGate.principal, ttlMs: questionGate.ttlMs, now: questionGate.now(),
-        checkpoint: { sha, turn_seq: turnSeq, subject_digest: result?.subject_digest },
+        checkpoint: { sha, turn_seq: turnSeq, subject_digest: result?.subject_digest,
+          ...(releasePlan ? { release: releaseQuestionDetails(releasePlan) } : {}) },
       });
     } catch (error) {
       if (!(error instanceof RangeError)) throw error;
@@ -382,6 +389,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     const blockText = questionBlockText(question);
     await save({ phase: 'blocking', turnSeq, question, ownerAnswer: null, ...(extraState ?? {}),
       releaseVerification: kind === 'release' ? result.receipt : null,
+      releasePlan: releasePlan ?? null,
       intent: { kind: 'block', reason: 'owner_answer_required', questionId: question.question_id,
         attemptId: attempt.attempt_id, epoch: attempt.epoch, blockText } });
     try { await board.block(attempt.task_id, attempt.epoch, blockText); }
@@ -389,9 +397,14 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     await save({ phase: 'awaiting_answer', reason: 'owner_answer_required', receipt: { kind: 'block' } });
     return visible();
   };
+  let prepared;
   const askRelease = result => askOwner({ kind: 'release', result,
-    prompt: 'Передать проверенный кандидат в стадию допуска к выпуску?',
-    evidence: 'Проверки и seal пройдены. Ответ не запускает выпуск.' });
+    ...(prepared ? {
+      releasePlan: createReleasePackage({ ...prepared, source: attempt, subject_digest: result.subject_digest }),
+      prompt: 'Разрешить изолированный выпуск?',
+      evidence: 'Проверки и seal пройдены.',
+    } : { prompt: 'Передать проверенный кандидат в стадию допуска к выпуску?',
+      evidence: 'Проверки и seal пройдены. Ответ не запускает выпуск.' }) });
   if (!submission) return stopWith(after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
   const taskId = Number.isSafeInteger(submission.task_id) ? String(submission.task_id) : submission.task_id;
   if (taskId !== attempt.task_id || submission.epoch !== attempt.epoch ||
@@ -413,7 +426,13 @@ export async function advance({ route, state, board, bb, submissions, verify, au
 
   await save({ phase: 'checking', reason: undefined, sha: submission.candidate_sha, turnSeq,
     seenShas: [...record.seenShas, submission.candidate_sha] });
-  const result = await verify(attempt, { ...submission, task_id: taskId });
+  if (release && route.finish === 'deployed') {
+    try { prepared = await release.prepare(submission.candidate_sha); }
+    catch (cause) { return stopWith(cause instanceof ReleaseDenied ? cause.code : 'release_prepare_failed'); }
+  }
+  const verification = prepared ? { ...attempt, release_target: { finish: 'deployed', target_id: prepared.target,
+    release_channel: 'isolated-static', previous_live_digest: prepared.previous.digest } } : attempt;
+  const result = await verify(verification, { ...submission, task_id: taskId });
   if (result.outcome === 'rework') {
     let roundsHistory;
     let arbitrationUsed = record.arbitrationUsed ?? 0;

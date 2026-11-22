@@ -26,8 +26,12 @@ export function createQuestion({ attempt, kind, principal, ttlMs, now, checkpoin
   const question = { schema: QUESTION, question_id: randomUUID(), task_id, epoch, attempt_id, kind,
     respondent: principal, created_at: now, expires_at: now + ttlMs, prompt: prompt.trim(), evidence,
     decisions: [kind === 'product' ? 'resolve' : 'approve', 'decline'], recommend: 'decline',
+    ...(kind === 'release' && checkpoint.release ? {
+      consequence: 'Deploy; restore previous on red smoke.',
+    } : {}),
     checkpoint: { sha: checkpoint.sha, turn_seq: checkpoint.turn_seq,
-      ...(kind === 'release' ? { subject_digest: checkpoint.subject_digest } : {}) } };
+      ...(kind === 'release' ? { subject_digest: checkpoint.subject_digest,
+        ...(checkpoint.release ? { release: checkpoint.release } : {}) } : {}) } };
   questionBlockText(question);
   return question;
 }

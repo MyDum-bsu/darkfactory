@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { execFile, execFileSync, spawn as spawnProcess } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +18,9 @@ import { test } from 'node:test';
 import { acceptHeld } from './acceptance.mjs';
 import { advanceWithProjection } from './controller.mjs';
 import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.mjs';
+import { localReleasePort } from './local-release.mjs';
+import { digestBytes, enrollLocalTarget, makeReleaseRecord, readTargetRecord, serveLocalTarget } from './release-target.mjs';
+import { buildSubject, subjectDigest } from './subject.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { reserveWorktree, saveState } from './slot.mjs';
 import { answerBytes, signedAnswerVerifier } from './question-gate.mjs';
@@ -976,4 +979,224 @@ test('VS-2 pilot drops model prose from the native completion receipt', async t 
     arbitration: { decision: 'accept_with_notes', notes: 'SYNTHETIC_STDERR_NEVER_PUBLIC' } });
   assert.deepEqual((await x.port.lookup(x.taskId)).result,
     { sha: x.candidate, arbitration: { decision: 'accept_with_notes' } });
+});
+
+const LIVE_TARGET = 'isolated-t4';
+const INITIAL_TEXT = 'READY\nprevious isolated artifact\n';
+async function releaseLab(t, text = 'READY\nnew isolated artifact\n') {
+  const x = await lab(t, { questions: true, finish: 'deployed' });
+  await writeFile(join(x.tree, 'release.txt'), text, { mode: 0o644 });
+  git(x.tree, 'add', 'release.txt');
+  commit(x.tree, 'Add isolated release artifact');
+  x.candidate = git(x.tree, 'rev-parse', 'HEAD');
+  const directory = join(x.root, 'release-target');
+  await mkdir(directory, { mode: 0o700 });
+  await enrollLocalTarget(directory, { target: LIVE_TARGET, repo: REPO, initialSha: x.base,
+    initialBytes: Buffer.from(INITIAL_TEXT) });
+  const site = await serveLocalTarget({ root: directory, target: LIVE_TARGET, repo: REPO });
+  t.after(() => site.close());
+  const openPort = () => localReleasePort({ root: directory, target: LIVE_TARGET, repo: REPO, url: site.url,
+    worktree: x.tree, artifact: 'release.txt', smokePrefix: 'READY\n' });
+  const release = await openPort();
+  let promotions = 0;
+  let rollbacks = 0;
+  const measured = port => ({ ...port,
+    async promote(...args) { promotions++; return port.promote(...args); },
+    async rollback(...args) { rollbacks++; return port.rollback(...args); },
+  });
+  x.cfg.release = measured(release);
+  const owner = ownerAnswers(x);
+  const started = await x.tick();
+  assert.equal(started.phase, 'working');
+  x.submit(x.candidate, 10);
+  const waiting = await x.tick();
+  assert.equal(waiting.phase, 'awaiting_answer', waiting.reason);
+  const question = JSON.parse((await x.card()).blocked.reason);
+  return { x, owner, question, started, release, site, directory, text,
+    counts: () => ({ promotions, rollbacks }), reopen: async () => { x.cfg.release = measured(await openPort()); },
+    async approve() {
+      owner.submit(question, 'approve', '');
+      assert.equal((await x.tick()).phase, 'resume_pending');
+      const resumed = await x.tick();
+      assert.equal(resumed.phase, 'release_ready');
+      assert.equal(resumed.epoch, started.epoch + 1);
+    },
+  };
+}
+
+async function readPublicArtifact(site) {
+  const response = await fetch(`${site.url}/artifact`, { redirect: 'error' });
+  assert.equal(response.status, 200);
+  return response.text();
+}
+
+test('VS-2 release: exact signed package, one real publication, version/smoke and native deployed receipt', async t => {
+  const f = await releaseLab(t);
+  const { x, owner, question } = f;
+  assert.equal(question.checkpoint.release.target, LIVE_TARGET);
+  assert.equal(question.checkpoint.release.digest, digestBytes(Buffer.from(f.text)));
+  assert.equal(question.checkpoint.release.previous.digest, digestBytes(Buffer.from(INITIAL_TEXT)));
+  assert.match(question.consequence, /restore/);
+  const expectedSubject = subjectDigest(buildSubject({ kind: 'git_tree', repoId: REPO,
+    baseSha: x.base, candidateSha: x.candidate, treeSha: git(x.tree, 'rev-parse', 'HEAD^{tree}'),
+    specDigest: SPEC, policyDigest: POLICY_DIGEST, releaseTarget: { finish: 'deployed', targetId: LIVE_TARGET,
+      releaseChannel: 'isolated-static', previousLiveDigest: question.checkpoint.release.previous.digest } }));
+  assert.equal(question.checkpoint.subject_digest, expectedSubject);
+  assert.equal((await x.tick()).phase, 'awaiting_answer');
+  owner.submit(question, 'approve', '', true);
+  assert.equal((await x.tick()).phase, 'awaiting_answer');
+  assert.deepEqual(f.counts(), { promotions: 0, rollbacks: 0 });
+  assert.equal(await readPublicArtifact(f.site), INITIAL_TEXT);
+  assert.deepEqual((await readdir(f.directory)).filter(name => name.startsWith('promotion-')), []);
+  await f.approve();
+  assert.equal((await x.tick()).phase, 'release_smoke');
+  assert.equal(await readPublicArtifact(f.site), f.text);
+  assert.equal((await x.tick()).phase, 'done');
+  const { result } = await x.port.lookup(x.taskId);
+  assert.equal(result.schema, 'darkfactory.release-receipt.v1');
+  assert.equal(result.task_id, x.taskId);
+  assert.equal(result.epoch, f.started.epoch + 1);
+  assert.equal(result.attempt_id, owner.load().attemptId);
+  assert.equal(result.finish, 'deployed');
+  assert.equal(result.sha, x.candidate);
+  assert.equal(result.subject_digest, expectedSubject);
+  assert.equal(result.readback, result.digest);
+  assert.equal(result.smoke, 'pass');
+  assert.equal(owner.load().releaseApproval.harm, 10);
+  assert.equal((await x.tick()).phase, 'done');
+  assert.deepEqual(f.counts(), { promotions: 1, rollbacks: 0 });
+  assert.equal(x.effects.spawnCalls, 1);
+  assert.equal(x.effects.feedbackCalls, 0);
+  assert.equal(x.effects.completeCalls, 1);
+});
+
+test('VS-2 release: red smoke restores actual previous artifact and never closes as deployed', async t => {
+  const f = await releaseLab(t, 'BROKEN\nnew isolated artifact\n');
+  const { x, owner } = f;
+  await f.approve();
+  assert.equal((await x.tick()).phase, 'release_smoke');
+  assert.equal(await readPublicArtifact(f.site), f.text);
+  const rollback = x.cfg.release.rollback;
+  x.cfg.release.rollback = async (...args) => { await rollback(...args); throw new Error('lost rollback response'); };
+  assert.equal((await x.tick()).reason, 'release_rolled_back');
+  assert.equal(await readPublicArtifact(f.site), INITIAL_TEXT);
+  assert.equal((await x.card()).state, 'blocked');
+  assert.equal((await x.card()).result, null);
+  assert.equal(owner.load().receipt.kind, 'rolled_back');
+  await x.tick();
+  assert.deepEqual(f.counts(), { promotions: 1, rollbacks: 1 });
+  assert.equal(x.effects.completeCalls, 0);
+  assert.equal(x.effects.spawnCalls, 1);
+  // Even an accidental second port call cannot use the same effect key.
+  await assert.rejects(f.release.promote(owner.load().releasePlan, async () => {}), { code: 'EEXIST' });
+  assert.equal(await readPublicArtifact(f.site), INITIAL_TEXT);
+});
+
+test('VS-2 release reconciles a lost publication response and restart by exact operation, without rerunning', async t => {
+  const f = await releaseLab(t);
+  const { x, owner } = f;
+  await f.approve();
+  const store = x.cfg.state.save;
+  x.cfg.state.save = async state => {
+    if (state.phase === 'release_smoke') throw new Error('power lost after publication before receipt');
+    return store(state);
+  };
+  const promote = x.cfg.release.promote;
+  x.cfg.release.promote = async (...args) => { await promote(...args); throw new Error('lost publish response'); };
+  await assert.rejects(x.tick(), /power lost/);
+  assert.equal(owner.load().phase, 'release_promoting');
+  assert.equal(await readPublicArtifact(f.site), f.text);
+  x.cfg.state.save = store;
+  await f.reopen();
+  assert.equal((await x.tick()).phase, 'release_smoke');
+  const nativeComplete = x.port.complete;
+  x.port.complete = async (...args) => { await nativeComplete(...args); throw new Error('lost native complete response'); };
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal((await x.card()).state, 'completed');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.deepEqual(f.counts(), { promotions: 1, rollbacks: 0 });
+  assert.equal(x.effects.completeCalls, 1);
+});
+
+test('VS-2 release rejects expired consent, target drift and stale epoch without touching live bytes', async t => {
+  for (const scenario of ['expired', 'late_expiry', 'missing_seal', 'target_drift', 'stale_epoch']) {
+    const f = await releaseLab(t);
+    const { x, owner } = f;
+    await f.approve();
+    let expected = INITIAL_TEXT;
+    if (scenario === 'expired') owner.expire();
+    if (scenario === 'missing_seal') await x.cfg.state.save({ ...owner.load(), releaseVerification: null });
+    if (scenario === 'late_expiry') {
+      const promote = x.cfg.release.promote;
+      x.cfg.release.promote = (plan, authorize) => promote(plan, async () => {
+        owner.expire();
+        await authorize();
+      });
+    }
+    if (scenario === 'target_drift') {
+      expected = 'READY\nindependent fixture operator drift\n';
+      await saveState(join(f.directory, 'live.json'), makeReleaseRecord(LIVE_TARGET, x.base, Buffer.from(expected)));
+    }
+    if (scenario === 'stale_epoch') {
+      const held = owner.load();
+      await x.handle.tasks.held(x.taskId, { epoch: held.epoch, token: held.token }).release();
+      await x.handle.tasks.claim(x.taskId);
+    }
+    const out = await x.tick();
+    assert.ok(['hold', 'uncertain'].includes(out.phase));
+    assert.equal(await readPublicArtifact(f.site), expected);
+    assert.equal((await x.card()).result, null);
+    assert.equal(x.effects.completeCalls, 0);
+    assert.equal(x.effects.spawnCalls, 1);
+    assert.equal(x.effects.feedbackCalls, 0);
+    assert.deepEqual((await readdir(f.directory)).filter(name => name.startsWith('promotion-')), []);
+    const attempts = f.counts().promotions;
+    await x.tick();
+    assert.equal(f.counts().promotions, attempts);
+    if (!['target_drift', 'late_expiry'].includes(scenario)) assert.equal(attempts, 0);
+  }
+});
+
+test('VS-2 release quarantines an unconfirmed publication, with no second dispatch', async t => {
+  const f = await releaseLab(t);
+  await f.approve();
+  const promote = f.x.cfg.release.promote;
+  let unknownCalls = 0;
+  f.x.cfg.release.promote = async () => { unknownCalls++; throw new Error('publication outcome unavailable'); };
+  assert.equal((await f.x.tick()).reason, 'release_promotion_unconfirmed');
+  f.x.cfg.release.promote = promote;
+  assert.equal((await f.x.tick()).phase, 'uncertain');
+  assert.equal(unknownCalls, 1);
+  assert.deepEqual(f.counts(), { promotions: 0, rollbacks: 0 });
+  assert.equal(await readPublicArtifact(f.site), INITIAL_TEXT);
+  assert.equal(f.x.effects.completeCalls, 0);
+});
+
+test('VS-2 release never treats a missing HTTP smoke as a red proof or a deployed result', async t => {
+  const f = await releaseLab(t);
+  await f.approve();
+  assert.equal((await f.x.tick()).phase, 'release_smoke');
+  await f.site.close();
+  assert.equal((await f.x.tick()).phase, 'uncertain');
+  const retained = await readTargetRecord(join(f.directory, 'live.json'));
+  assert.equal(retained.sha, f.x.candidate);
+  assert.deepEqual(f.counts(), { promotions: 1, rollbacks: 0 });
+  assert.equal((await f.x.card()).result, null);
+  assert.equal(f.x.effects.completeCalls, 0);
+});
+
+test('VS-2 release never rolls back over an independently changed current version', async t => {
+  const f = await releaseLab(t, 'BROKEN\nnew isolated artifact\n');
+  await f.approve();
+  assert.equal((await f.x.tick()).phase, 'release_smoke');
+  const intruder = 'READY\nindependent fixture operator version\n';
+  const rollback = f.x.cfg.release.rollback;
+  f.x.cfg.release.rollback = async (...args) => {
+    await saveState(join(f.directory, 'live.json'), makeReleaseRecord(LIVE_TARGET, f.x.base, Buffer.from(intruder)));
+    await rollback(...args);
+  };
+  assert.equal((await f.x.tick()).reason, 'release_rollback_unconfirmed');
+  assert.equal(await readPublicArtifact(f.site), intruder);
+  assert.equal(f.x.effects.completeCalls, 0);
+  assert.equal((await f.x.card()).result, null);
 });

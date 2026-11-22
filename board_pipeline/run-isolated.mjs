@@ -19,6 +19,8 @@ import { MAX_QUESTION_TTL_MS, readSignedAnswer, signedAnswerVerifier } from './q
 import { tamperGate } from './tamper-gate.mjs';
 import { reconcileFeedbackFromBb, reconcileSpawnFromBb } from './bb-reconcile.mjs';
 import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.mjs';
+import { localReleasePort } from './local-release.mjs';
+import { ReleaseDenied } from './release-contract.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -65,6 +67,21 @@ async function ownerAnswerSource(cfg, principal, tree, inbox) {
       !(await lstat(dir)).isDirectory()) throw new Error('Owner answer inbox must be separate');
   return { principal, ttlMs: cfg.ttlMs, now: Date.now, read: id => readSignedAnswer(dir, id),
     verify: signedAnswerVerifier({ principal, publicKey: cfg.publicKey }) };
+}
+
+async function releaseSetup(policy, { tree, inbox, root }) {
+  const config = policy.release;
+  if (config === undefined) return undefined;
+  if (config?.enabled !== true || policy.scope !== 'isolated' || policy.route.finish !== 'deployed' ||
+      policy.route.taskId !== undefined || policy.policyDigest !== undefined || !policy.route.repoId ||
+      !policy.questionGate || !isAbsolute(config.directory ?? '') ||
+      config.url === new URL(policy.boardUrl).origin) throw new ReleaseDenied('release_policy_invalid');
+  const target = await realpath(config.directory);
+  if (target !== config.directory || [tree, inbox, root].some(path => inside(path, target) || inside(target, path))) {
+    throw new ReleaseDenied('release_directory_invalid');
+  }
+  return localReleasePort({ root: target, target: config.target, repo: policy.route.repoId,
+    url: config.url, worktree: tree, artifact: config.artifact, smokePrefix: config.smokePrefix });
 }
 
 async function execute() {
@@ -135,6 +152,7 @@ async function execute() {
   process.env.DF_REVIEW_ROUTES = reviewRoutes;
   const { board } = loadSdk();
   const ownerAnswers = await ownerAnswerSource(p.questionGate, p.owner, tree, inbox);
+  const releasePort = await releaseSetup(p, { tree, inbox, root });
   const assertOpen = activation && (async () => { await assertPinned(); await switchOpen(); });
   const port = nativeBoardPort(board(), { channel: p.channel, isolatedQuestionOwner: Boolean(ownerAnswers),
     pilot: activation && { scope: activation.scope, assertOpen } });
@@ -400,7 +418,7 @@ async function execute() {
     let recheck = values['recheck-rejected-handoff'];
     const tick = guardedEffect(assertOpen, advanceWithProjection);
     while (Date.now() <= deadline) {
-      const result = await tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
+      const result = await tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate, release: releasePort,
         recheckRejectedHandoff: recheck,
         // Фактические критик/арбитр из профиля проверки и политики; порт
         // арбитра подключается из конфига, когда задан.
@@ -412,7 +430,7 @@ async function execute() {
       const line = JSON.stringify(activation && result.reason ? { ...result, reason: 'see_private_attempt' } : result);
       if (line !== previous) console.log(line);
       previous = line;
-      if (result.phase === 'release_ready') return;
+      if (result.phase === 'release_ready' && !releasePort) return;
       if (['done', 'hold', 'uncertain', 'lease_lost'].includes(result.phase)) {
         if (result.phase !== 'done') process.exitCode = 1;
         return;
