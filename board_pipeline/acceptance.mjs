@@ -388,6 +388,21 @@ function compactVisual(visual) {
 
 function compactEvidence(evidence, run) {
   const review = evidence.review ?? {};
+  // Квитанция арбитра входит в тот же компактный конверт: notes ужимается
+  // ступенями вместе с остальными полями до гарантированного лимита 1000.
+  const arbitration = evidence.arbitration !== null &&
+    typeof evidence.arbitration === 'object'
+    ? {
+        decision: evidence.arbitration.decision,
+        subject_digest: evidence.arbitration.subject_digest,
+        arbiter: typeof evidence.arbitration.arbiter === 'object'
+          ? { provider: evidence.arbitration.arbiter.provider,
+              model: evidence.arbitration.arbiter.model }
+          : undefined,
+        notes: typeof evidence.arbitration.notes === 'string'
+          ? evidence.arbitration.notes : undefined,
+      }
+    : undefined;
   const base = {
     v: 1,
     sha: evidence.sha,
@@ -405,14 +420,29 @@ function compactEvidence(evidence, run) {
     },
     run,
   };
+  const withArbitration = (notesBudget) => {
+    if (arbitration === undefined) return base;
+    const arb = { ...arbitration };
+    if (notesBudget !== null && typeof arb.notes === 'string') {
+      arb.notes = arb.notes.slice(0, notesBudget);
+      arb.notes_sha256 = createHash('sha256')
+        .update(arbitration.notes ?? '').digest('hex').slice(0, 16);
+    }
+    if (notesBudget === 0) delete arb.notes;
+    return { ...base, arbitration: arb };
+  };
   // Детерминированное ужатие: каждая следующая ступень вызывается и проверяется на лимит.
   const variants = [
-    base,
-    () => ({ ...base, checks: { ...base.checks, checks: base.checks.checks.map(({ i, ok }) => ({ i, ok })) } }),
-    () => ({ ...base, checks: { ok: base.checks.ok, n: base.checks.n } }),
+    () => withArbitration(null),
+    () => withArbitration(400),
+    () => withArbitration(120),
+    () => ({ ...withArbitration(120), checks: { ...base.checks,
+      checks: base.checks.checks.map(({ i, ok }) => ({ i, ok })) } }),
+    () => ({ ...withArbitration(120), checks: { ok: base.checks.ok, n: base.checks.n } }),
+    () => ({ ...withArbitration(0), checks: { ok: base.checks.ok, n: base.checks.n } }),
   ];
   for (const variant of variants) {
-    const candidate = typeof variant === 'function' ? variant() : variant;
+    const candidate = variant();
     const text = JSON.stringify(candidate);
     if (typeof text === 'string' && text.length <= 1000) return candidate;
   }
@@ -975,6 +1005,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   const intent = async (phase) => append({ kind: 'intent', phase });
   const step = async (phase, ok, detail) => append({ kind: 'result', phase, ok, detail });
 
+  // tree_sha из реальной инспекции снимка (не из слов воркера и не только из
+  // манифеста): фиксируется сразу после успешного ports.inspect.
+  let inspectedTreeSha = attempt.tree_sha ?? null;
+
   const settle = async (outcome, extra = {}) => {
     const { receipt: receiptExtra, ...rest } = extra;
     const record = {
@@ -985,8 +1019,9 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       candidate_sha: submission.candidate_sha,
       run: id,
       subject_digest: digest,
-      tree_sha: subject?.source?.tree_sha ?? null,
+      tree_sha: inspectedTreeSha,
       receipt: {
+        tree_sha: inspectedTreeSha,
         task_id: attempt.task_id,
         attempt_id: attempt.attempt_id,
         epoch: attempt.epoch,
@@ -1137,7 +1172,12 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
 
   const verdict = await runVerification({ binding, profile, ports, intent, step,
     beforeReview: () => ports.board.verifyHeld(attempt.task_id, attempt.epoch),
-    onSnapshot: finalizeSubject,
+    onSnapshot: async (ins) => {
+      if (ins !== null && typeof ins === 'object') {
+        inspectedTreeSha = ins.tree_sha ?? ins.tree ?? inspectedTreeSha;
+      }
+      return finalizeSubject(ins);
+    },
     subjectDigest: () => digest,
     journal });
   if (verdict.status === 'lost') return settle('denied', { reason: verdict.reason });
@@ -1152,7 +1192,32 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     // Арбитрованное принятие (accept_with_notes) обязано пройти тот же полный
     // seal перед complete: контроллер вызывает sealAndComplete с квитанцией
     // арбитра — прямого board.complete в обход seal не существует.
-    record.sealAndComplete = async (arbitrationReceipt) => {
+    // Callback выдаётся только для L2-возврата ревью при готовом манифесте:
+    // детерминированные гейты (local_checks/tamper/visual) и отсутствие
+    // манифеста арбитражом не принимаются никогда.
+    if (subject !== null && String(verdict.reason).startsWith('review_verdict:')) {
+      record.sealAndComplete = async (arbitrationReceipt) => {
+      // Строгая валидация квитанции арбитра ДО seal: любой пропуск —
+      // hold без complete.
+      let receiptOk = arbitrationReceipt !== null &&
+        typeof arbitrationReceipt === 'object' && !Array.isArray(arbitrationReceipt) &&
+        arbitrationReceipt.decision === 'accept_with_notes' &&
+        typeof arbitrationReceipt.notes === 'string' && arbitrationReceipt.notes.trim().length > 0 &&
+        Number.isFinite(arbitrationReceipt.max_harm) && arbitrationReceipt.max_harm < 10 &&
+        arbitrationReceipt.dod_violation !== true &&
+        arbitrationReceipt.subject_digest === digest;
+      if (receiptOk) {
+        try {
+          assertTriadIndependent({
+            executor: attempt.executor ?? profile.executor,
+            critic: profile.review,
+            arbiter: arbitrationReceipt.arbiter,
+          });
+        } catch {
+          receiptOk = false;
+        }
+      }
+      if (!receiptOk) return hold('invalid_arbitration_receipt');
       const sealed = await doSeal();
       if (sealed.denied) return settle('denied', { reason: sealed.denied });
       if (sealed.fail) return hold(sealed.fail);
@@ -1167,6 +1232,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         tamper: verdict.tamper ? 'pass' : 'na',
         visual: verdict.visual,
         review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
+        arbitration: arbitrationReceipt,
       }, id);
       const gateReceipts = {
         tamper: verdict.tamper ? { ok: verdict.tamper.ok === true, sha: verdict.tamper.sha,
@@ -1179,13 +1245,12 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         return settle('verified', {
           evidence: verdict.loc?.evidence,
           receipt: { settle: 'deferred', until: sealLive.until, evidence,
-            arbitration: arbitrationReceipt, ...gateReceipts },
+            ...gateReceipts },
         });
       }
       await intent('complete');
       try {
-        await ports.board.complete(attempt.task_id, attempt.epoch,
-          { ...evidence, arbitration: arbitrationReceipt });
+        await ports.board.complete(attempt.task_id, attempt.epoch, evidence);
         await step('complete', true, { epoch: attempt.epoch });
       } catch (e) {
         await step('complete', false, messageOf(e));
@@ -1198,14 +1263,15 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         return settle('uncertain', {
           reason: `complete_failed:${messageOf(e)}`,
           board_state: state,
-          receipt: { settle: 'unknown', evidence, arbitration: arbitrationReceipt, ...gateReceipts },
+          receipt: { settle: 'unknown', evidence, ...gateReceipts },
         });
       }
       return settle('verified', {
         evidence: verdict.loc?.evidence,
-        receipt: { settle: 'completed', evidence, arbitration: arbitrationReceipt, ...gateReceipts },
+        receipt: { settle: 'completed', evidence, ...gateReceipts },
       });
-    };
+      };
+    }
     return record;
   }
   if (verdict.status === 'hold') {

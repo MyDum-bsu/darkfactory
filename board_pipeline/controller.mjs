@@ -83,6 +83,16 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   const visible = () => ({ phase: record.phase, attemptId: record.attemptId,
     epoch: record.epoch, threadId: record.threadId, reason: record.reason, sha: record.sha });
 
+  // Единый фактический критик/арбитр для триады: настроенный селектор важнее
+  // маршрутного; расхождение route.critic с фактическим — отказ до claim.
+  const selCritic = workerSelector
+    ? (workerSelector.critic ?? route.critic ?? workerSelector.DEFAULT_CRITIC) : undefined;
+  const selArbiter = workerSelector
+    ? (workerSelector.arbiter ?? route.arbiter ?? workerSelector.DEFAULT_ARBITER) : undefined;
+  const criticMismatch = Boolean(workerSelector && route.critic && workerSelector.critic &&
+    (route.critic.provider !== workerSelector.critic.provider ||
+     route.critic.model !== workerSelector.critic.model));
+
   // Recovery may only reinterpret a rejected first envelope, never create an attempt.
   const recheck = recheckRejectedHandoff && record?.phase === 'hold' &&
     record.reason === 'invalid_or_stale_submission' && !record.turnSeq && record.seenShas.length === 0;
@@ -91,11 +101,13 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     // Кросс-семейственная триада отвергает маршрут до claim — для ВСЕХ
     // кандидатов цепочки: нарушивший независимость резерв блокирует маршрут.
     if (workerSelector) {
+      if (criticMismatch) {
+        await save({ binding, phase: 'hold', reason: 'review_profile_mismatch', seenShas: [] });
+        return visible();
+      }
       try {
-        const critic = route.critic ?? workerSelector.DEFAULT_CRITIC;
-        const arbiter = route.arbiter ?? workerSelector.DEFAULT_ARBITER;
         for (const candidate of workerSelector.selectWorker({ route, zcodeQuota: route.zcodeQuota })) {
-          workerSelector.assertTriadIndependent({ executor: candidate, critic, arbiter });
+          workerSelector.assertTriadIndependent({ executor: candidate, critic: selCritic, arbiter: selArbiter });
         }
       } catch (e) {
         await save({ binding, phase: 'hold',
@@ -147,8 +159,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         const selection = await workerSelector.attemptSpawnWithFallback({
           route, attempt: attemptOf(record, route),
           zcodeQuota: route.zcodeQuota,
-          critic: route.critic ?? workerSelector.DEFAULT_CRITIC,
-          arbiter: route.arbiter ?? workerSelector.DEFAULT_ARBITER,
+          critic: selCritic,
+          arbiter: selArbiter,
           probe: typeof bb.probeAvailability === 'function' ? w => bb.probeAvailability(w) : undefined,
           spawn: envelope => bb.spawn(envelope),
           inspectWorktree: typeof bb.inspectWorktree === 'function'
@@ -258,13 +270,20 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       }
       if (progress.trigger) {
         const subjectDigest = result.subject_digest ?? result.receipt?.subject_digest ?? null;
+        // Спор/принятие оценивается по объединённым замечаниям: текущий раунд
+        // плюс все предыдущие L2-раунды — harm=10 или DoD из прошлого раунда
+        // не исчезает при новой находке.
+        const priorL2Findings = roundsHistory.slice(0, -1)
+          .filter(r => r.gate === 'l2')
+          .flatMap(r => Array.isArray(r.findings) ? r.findings : []);
+        const allFindings = [...priorL2Findings, ...roundFindings];
         const ruling = await workerSelector.resolveArbitration({
           attempt, trigger: progress, arbitrationUsed,
-          arbiter: route.arbiter ?? workerSelector.DEFAULT_ARBITER,
-          critic: route.critic ?? workerSelector.DEFAULT_CRITIC,
-          maxHarm: workerSelector.maxHarmOf(result.feedback?.findings),
+          arbiter: selArbiter,
+          critic: selCritic,
+          maxHarm: workerSelector.maxHarmOf(allFindings),
           subjectDigest,
-          dodViolation: workerSelector.hasDodViolation?.(result.feedback?.findings) === true,
+          dodViolation: workerSelector.hasDodViolation?.(allFindings) === true,
           verifyHeld: (id, ep) => board.verifyHeld(id, ep),
           arbitrate: workerSelector.arbitrate,
         });

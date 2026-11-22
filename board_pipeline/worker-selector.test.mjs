@@ -368,13 +368,29 @@ test('пункт 7: dispute по несуществующей ссылке — �
     l2Round({ dispute: { finding_ref: 'a.js', justification: 'j', spec_evidence: 's' } }),
   ] });
   assert.equal(noPrev.trigger, null);
-  // checkpoint прошлого L2 — тоже допустимая ссылка.
+  // Checkpoint прошлого L2 — НЕ допустимая ссылка (п.12: только реальные
+  // findings; к тому же у прошлого раунда findings пусты).
   const viaCheckpoint = evaluateReworkProgress({ roundsHistory: [
     l2Round({ checkpoint: 'abc123' }),
     l2Round({ findings: [{ file: 'b.js' }], signature: 's2',
       dispute: { finding_ref: 'abc123', justification: 'j', spec_evidence: 's' } }),
   ] });
-  assert.equal(viaCheckpoint.trigger, 'substantive_dispute');
+  assert.equal(viaCheckpoint.trigger, null);
+  // И при непустых findings ссылка на checkpoint всё равно не считается:
+  // finding_ref обязан совпасть с элементом findings (id, file, file:line).
+  const checkpointWithFindings = evaluateReworkProgress({ roundsHistory: [
+    l2Round({ checkpoint: 'abc123', findings: [{ file: 'a.js', expected: 'e', actual: 'x' }] }),
+    l2Round({ findings: [{ file: 'b.js' }], signature: 's2',
+      dispute: { finding_ref: 'abc123', justification: 'j', spec_evidence: 's' } }),
+  ] });
+  assert.equal(checkpointWithFindings.trigger, null);
+  // Пустой массив findings у прошлого раунда — спор не признаётся вообще.
+  const emptyPrev = evaluateReworkProgress({ roundsHistory: [
+    l2Round({ findings: [] }),
+    l2Round({ findings: [{ file: 'b.js' }], signature: 's2',
+      dispute: { finding_ref: 'a.js', justification: 'j', spec_evidence: 's' } }),
+  ] });
+  assert.equal(emptyPrev.trigger, null);
 });
 
 // Пункт 7: взаимоисключающие требования L2 по одному месту — substantive_dispute.
@@ -540,14 +556,126 @@ test('пункт 8: maxHarmOf fail-closed на невалидном harm и DoD-
 
 test('resolveArbitration: escalate_owner с вопросом и потеря аренды до вызова', async () => {
   const r = await resolveArbitration({
-    attempt: arbAttempt, trigger: disputeTrigger, verifyHeld: liveHeld,
-    arbitrate: async () => ({ decision: 'escalate_owner', question: 'Какое поведение верно по §3?' }),
+    attempt: arbAttempt, trigger: disputeTrigger, subjectDigest: DIGEST, verifyHeld: liveHeld,
+    arbitrate: async () => ({ decision: 'escalate_owner', question: 'Какое поведение верно по §3?',
+      subject_digest: DIGEST }),
   });
   assert.equal(r.decision, 'escalate_owner');
   const noLease = await resolveArbitration({
-    attempt: arbAttempt, trigger: disputeTrigger,
+    attempt: arbAttempt, trigger: disputeTrigger, subjectDigest: DIGEST,
     verifyHeld: async () => ({ epoch: 99 }),
-    arbitrate: async () => ({ decision: 'escalate_owner', question: 'q' }),
+    arbitrate: async () => ({ decision: 'escalate_owner', question: 'q', subject_digest: DIGEST }),
   });
   assert.equal(noLease.decision, 'lease_lost');
+});
+
+// Пункт 5: subject_digest обязателен для ВСЕХ решений арбитра, включая
+// escalate_owner. Отсутствие манифеста, невалидный или чужой digest — hold.
+test('пункт 5: escalate_owner тоже привязан к subject_digest', async () => {
+  for (const [subjectDigest, ruling] of [
+    [DIGEST, { decision: 'escalate_owner', question: 'q' }],
+    [DIGEST, { decision: 'escalate_owner', question: 'q', subject_digest: 'f'.repeat(64) }],
+    [DIGEST, { decision: 'escalate_owner', question: 'q', subject_digest: 'junk' }],
+    [null, { decision: 'escalate_owner', question: 'q', subject_digest: DIGEST }],
+    ['not-hex', { decision: 'escalate_owner', question: 'q', subject_digest: 'not-hex' }],
+  ]) {
+    const r = await resolveArbitration({
+      attempt: arbAttempt, trigger: disputeTrigger, subjectDigest,
+      verifyHeld: liveHeld, arbitrate: async () => ruling,
+    });
+    assert.equal(r.decision, 'hold', JSON.stringify([subjectDigest, ruling]));
+    assert.equal(r.reason, 'arbiter_subject_mismatch');
+  }
+});
+
+// Пункт 9: pi-харнесс с моделью 'opencode-go/deepseek-v4.1-flash' — одна
+// таблица семейств и в селекторе, и в acceptHeld.
+test('пункт 9: pi/opencode-go/deepseek-v4.1-flash распознаётся как deepseek', () => {
+  assert.equal(workerFamily({ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' }), 'deepseek');
+  assert.equal(workerFamily(NARROW_RESERVE_PI), 'deepseek');
+  // Триада pi-executor / openai-критик / google-арбитр — полностью независима.
+  const triad = assertTriadIndependent({
+    executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
+    critic: DEFAULT_CRITIC, arbiter: DEFAULT_ARBITER });
+  assert.equal(triad.executor, 'deepseek');
+  // Критик того же семейства deepseek отклоняется и для pi-исполнителя.
+  assert.throws(() => assertTriadIndependent({
+    executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
+    critic: { provider: 'opencode-go', model: 'deepseek-v4' },
+    arbiter: DEFAULT_ARBITER }), /same_family/);
+});
+
+// Пункт 10: имя файла лога (candidate_sha + UUID) не входит в сигнатуру L1 —
+// два побайтово одинаковых падения дают одну сигнатуру.
+test('пункт 10: сигнатура L1 игнорирует случайное имя файла лога', () => {
+  const mk = file => ({
+    outcome: 'rework', reason: 'local_checks_failed',
+    feedback: { reason: 'local_checks_failed', evidence: [
+      { file, exit: 1, sha256: 'f'.repeat(64) }] },
+  });
+  const sigA = roundSignature(mk('checks-7-aaa-uuid1.log'));
+  const sigB = roundSignature(mk('checks-7-bbb-uuid2.log'));
+  assert.equal(sigA, sigB, 'одинаковый лог — одна сигнатура');
+  const p = evaluateReworkProgress({ roundsHistory: [
+    { gate: 'l1', signature: sigA, blocking: null, findings: [], excerpt: null,
+      checkpoint: null, dispute: null, contradictory: false },
+    { gate: 'l1', signature: sigB, blocking: null, findings: [], excerpt: null,
+      checkpoint: null, dispute: null, contradictory: false },
+  ] });
+  assert.equal(p.kind, 'repeated_deterministic_failure');
+  // А разный sha256 при одинаковом имени файла — разные сигнатуры.
+  const other = { outcome: 'rework', reason: 'local_checks_failed',
+    feedback: { reason: 'local_checks_failed', evidence: [
+      { file: 'checks-7-aaa-uuid1.log', exit: 1, sha256: 'e'.repeat(64) }] } };
+  assert.notEqual(roundSignature(other), sigA);
+});
+
+// Пункт 11: ключ finding через JSON.stringify — склейка разделителем не
+// склеивает разные находки в одну.
+test('пункт 11: findingKey не допускает коллизий через разделитель', () => {
+  const f1 = { file: 'a', line: 1, expected: 'A|B', actual: 'C' };
+  const f2 = { file: 'a', line: 1, expected: 'A', actual: 'B|C' };
+  const p = evaluateReworkProgress({ roundsHistory: [
+    l2Round({ findings: [f1], signature: 's1', blocking: 1 }),
+    l2Round({ findings: [f2], signature: 's2', blocking: 1 }),
+  ] });
+  assert.equal(p.trigger, null, 'разные findings не склеиваются в одну строку');
+});
+
+// Пункт 12: взаимоисключающие требования фиксируются только при обоих
+// направлениях (&&): одностороннее совпадение — не противоречие.
+test('пункт 12: одностороннее совпадение expected/actual — не противоречие', () => {
+  // Только pe === ca: новая находка лишь подтверждает старую — уточнение.
+  const oneWay = evaluateReworkProgress({ roundsHistory: [
+    l2Round({ signature: 's1', findings: [{ file: 'x.js', line: 5, expected: 'A', actual: 'B' }] }),
+    l2Round({ signature: 's2', findings: [{ file: 'x.js', line: 5, expected: 'X', actual: 'A' }] }),
+  ] });
+  assert.equal(oneWay.trigger, null);
+  // prev.expected === prev.actual (вырожденная пара) — тоже не противоречие.
+  const degenerate = evaluateReworkProgress({ roundsHistory: [
+    l2Round({ signature: 's1', findings: [{ file: 'x.js', line: 5, expected: 'A', actual: 'A' }] }),
+    l2Round({ signature: 's2', findings: [{ file: 'x.js', line: 5, expected: 'A', actual: 'A' }] }),
+  ] });
+  assert.notEqual(degenerate.kind, 'contradictory_l2_findings');
+});
+
+// Пункт 13: заданный (в т.ч. null/undefined/отрицательный) harm не в
+// диапазоне 0<=harm<10 — fail-closed 10.
+test('пункт 13: maxHarmOf — собственный ключ harm вне диапазона даёт 10', () => {
+  for (const f of [{ harm: null }, { harm: undefined }, { harm: -1 }, { harm: '3' }]) {
+    assert.equal(maxHarmOf([f]), 10, JSON.stringify(f));
+  }
+  // Отсутствие ключа harm — не нарушение.
+  assert.equal(maxHarmOf([{ file: 'a' }]), 0);
+});
+
+// Пункт 13: receipt арбитражного принятия несёт max_harm для валидации в seal.
+test('пункт 13: accept_with_notes receipt содержит max_harm', async () => {
+  const r = await resolveArbitration({
+    attempt: arbAttempt, trigger: disputeTrigger, subjectDigest: DIGEST,
+    verifyHeld: liveHeld, maxHarm: 4,
+    arbitrate: async () => ({ decision: 'accept_with_notes', notes: 'n', subject_digest: DIGEST }),
+  });
+  assert.equal(r.receipt.max_harm, 4);
+  assert.equal(r.receipt.dod_violation, false);
 });

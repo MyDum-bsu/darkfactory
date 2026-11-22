@@ -63,6 +63,8 @@ const PROVIDER_FAMILY = new Map([
   ['google', 'google'],
   ['acp-antigravity-acp', 'google'],
 ]);
+// Провайдеры-харнессы: сами семейства не несут, семейство берётся из модели.
+const HARNESS_PROVIDERS = new Set(['pi']);
 const MODEL_FAMILY = new Map([
   ['swe-2-high', 'cognition'],
   ['swe-2-medium', 'cognition'],
@@ -107,6 +109,13 @@ export function executorFamily(spec) {
     ? PROVIDER_FAMILY.get(provider.toLowerCase()) : undefined;
   const mf = typeof model === 'string' && model !== ''
     ? MODEL_FAMILY.get(model.toLowerCase()) : undefined;
+  // Харнессы-запускатели (pi): семейство определяет вложенная модель вида
+  // 'provider/model' — та же строгая таблица применяется рекурсивно.
+  if (pf === undefined && typeof provider === 'string' &&
+      HARNESS_PROVIDERS.has(provider.toLowerCase()) &&
+      typeof model === 'string' && model.includes('/')) {
+    return executorFamily(model);
+  }
   // Оба поля обязательны и обязаны указывать на одно семейство.
   return pf !== undefined && pf === mf ? pf : null;
 }

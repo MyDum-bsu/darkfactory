@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 
 import { acceptHeld } from './acceptance.mjs';
@@ -1623,4 +1624,214 @@ test('числовая и строковая policy.version — разные з�
   const second = await run('1');
   assert.equal(second.outcome, 'verified');
   assert.notEqual(second.run, first.run);
+});
+
+// --- Арбитрованное принятие: sealAndComplete выдаётся только для L2-ревью
+// при готовом манифесте и требует строго валидную квитанцию арбитра ---
+
+// Аттестованный L2-возврат: как только квитанция несёт subject_digest/findings,
+// требуется полный набор — изоляция docker-ro-v1 и реальный транскрипт в журнале.
+const l2Blocked = (journal, over = {}) => async (binding) => {
+  const transcript = JSON.stringify({ verdict: 'REVIEW_BLOCKED', sha: binding.candidate_sha });
+  await writeFile(path.join(journal, 'l2-transcript.json'), transcript, { mode: 0o600 });
+  return {
+    task: binding.task_id,
+    sha: binding.candidate_sha,
+    actual: { ...REVIEW_ROUTE },
+    verdict: 'REVIEW_BLOCKED',
+    status: 'REWORK',
+    checkpoint: 'deadbeef',
+    subject_digest: expectedDigest(),
+    isolation: 'docker-ro-v1',
+    transcript_file: 'l2-transcript.json',
+    transcript_sha256: createHash('sha256').update(transcript).digest('hex'),
+    findings: [{ file: 'a.js', line: 3, expected: 'spec', actual: 'impl', freq: 1 }],
+    ...over,
+  };
+};
+
+const arbReceipt = (digest, over = {}) => ({
+  kind: 'arbitration', decision: 'accept_with_notes', notes: 'minor note',
+  subject_digest: digest, max_harm: 3, dod_violation: false,
+  arbiter: { provider: 'google', model: 'gemini-4-neon' },
+  ...over,
+});
+
+test('пункт 1: sealAndComplete только при review_verdict + манифест; валидная квитанция закрывает карточку', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports } = stubs({ review: l2Blocked(journal) });
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(res.outcome, 'rework');
+  assert.equal(typeof res.sealAndComplete, 'function');
+  assert.equal(res.tree_sha, TREE);
+  const sealed = await res.sealAndComplete(arbReceipt(expectedDigest()));
+  assert.equal(sealed.outcome, 'verified');
+  assert.equal(sealed.receipt.settle, 'completed');
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'completed');
+  const evidence = typeof after.result === 'string' ? JSON.parse(after.result) : after.result;
+  assert.equal(evidence.arbitration.decision, 'accept_with_notes');
+});
+
+test('пункт 1: sealAndComplete не выдаётся на детерминированных гейтах и без манифеста', async (t) => {
+  // L1: local_checks_failed при контракте — rework без sealAndComplete.
+  const a = await isolated(t);
+  const idA = await contractTask(a.handle);
+  const { epoch: eA, port: pA } = await held(a.ported, idA);
+  const jA = await tmpJournal();
+  const l1 = stubs({ local: async (binding) => {
+    l1.calls.local++;
+    return { sha: binding.candidate_sha, ok: false, evidence: 'checks.json', exit: 3 };
+  } });
+  const resA = await acceptHeld({
+    attempt: contractAttempt(idA, eA), submission: submission(idA, eA),
+    policy: policy(idA), journal: jA, ports: { ...l1.ports, board: pA },
+  });
+  assert.equal(resA.outcome, 'rework');
+  assert.equal(resA.sealAndComplete, undefined, 'local_checks_failed не арбитрируется');
+  // tamper_gate_failed — тоже без sealAndComplete.
+  const b = await isolated(t);
+  const idB = await contractTask(b.handle);
+  const { epoch: eB, port: pB } = await held(b.ported, idB);
+  const jB = await tmpJournal();
+  const tp = stubs({ tamper: async (binding) => ({
+    ok: false, sha: binding.candidate_sha, base_sha: binding.base_sha,
+    violations: ['unexpected write'], digest: 't'.repeat(64) }) });
+  const resB = await acceptHeld({
+    attempt: contractAttempt(idB, eB), submission: submission(idB, eB),
+    policy: policy(idB), journal: jB, ports: { ...tp.ports, board: pB },
+  });
+  assert.equal(resB.outcome, 'rework');
+  assert.equal(resB.sealAndComplete, undefined, 'tamper_gate_failed не арбитрируется');
+  // REVIEW_BLOCKED без манифеста (ручной v1) — callback не выдаётся.
+  const c = await isolated(t);
+  const idC = await task(c.handle);
+  const { epoch: eC, port: pC } = await held(c.ported, idC);
+  const jC = await tmpJournal();
+  const rv = stubs({ review: l2Blocked(jC, { subject_digest: null }) });
+  const resC = await acceptHeld({
+    attempt: attempt(idC, eC), submission: submission(idC, eC),
+    policy: policy(idC), journal: jC, ports: { ...rv.ports, board: pC },
+  });
+  assert.equal(resC.outcome, 'rework');
+  assert.equal(resC.sealAndComplete, undefined, 'без манифеста арбитрованного принятия нет');
+});
+
+test('пункт 1: невалидная arbitration квитанция — hold без complete', async (t) => {
+  const digest = expectedDigest();
+  const cases = [
+    ['без квитанции', undefined],
+    ['не объект', 'text'],
+    ['другое решение', arbReceipt(digest, { decision: 'directed_rework' })],
+    ['пустые notes', arbReceipt(digest, { notes: ' ' })],
+    ['harm>=10', arbReceipt(digest, { max_harm: 10 })],
+    ['harm не число', arbReceipt(digest, { max_harm: 'high' })],
+    ['dod_violation', arbReceipt(digest, { dod_violation: true })],
+    ['чужой digest', arbReceipt('f'.repeat(64))],
+    ['арбитр того же семейства', arbReceipt(digest, { arbiter: REVIEW_ROUTE })],
+    ['неизвестный арбитр', arbReceipt(digest, { arbiter: { provider: 'x', model: 'y' } })],
+  ];
+  for (const [label, receipt] of cases) {
+    const { handle, ported } = await isolated(t);
+    const id = await contractTask(handle);
+    const { epoch, port: boardPort } = await held(ported, id);
+    const journal = await tmpJournal();
+    const { ports } = stubs({ review: l2Blocked(journal) });
+    const res = await acceptHeld({
+      attempt: contractAttempt(id, epoch), submission: submission(id, epoch),
+      policy: policy(id), journal, ports: { ...ports, board: boardPort },
+    });
+    const sealed = await res.sealAndComplete(receipt);
+    assert.equal(sealed.outcome, 'hold', label);
+    assert.equal(sealed.reason, 'invalid_arbitration_receipt', label);
+    assert.equal((await settled(handle, id)).state, 'blocked', label);
+  }
+});
+
+// Пункт 3: arbitration внутри compactEvidence — длинные notes ужимаются,
+// итог гарантированно <= 1000 символов.
+test('пункт 3: arbitration с notes 2000 символов укладывается в лимит квитанции', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports } = stubs({ review: l2Blocked(journal) });
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch), submission: submission(id, epoch),
+    policy: policy(id), journal, ports: { ...ports, board: boardPort },
+  });
+  const sealed = await res.sealAndComplete(arbReceipt(expectedDigest(), {
+    notes: 'n'.repeat(2000) }));
+  assert.equal(sealed.outcome, 'verified');
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'completed');
+  const evidence = typeof after.result === 'string' ? JSON.parse(after.result) : after.result;
+  assert.ok(JSON.stringify(evidence).length <= 1000, 'компактная квитанция <= 1000');
+  assert.ok(evidence.arbitration.notes === undefined ||
+    evidence.arbitration.notes.length < 2000, 'notes ужаты');
+});
+
+// Пункт 4: tree_sha из реальной инспекции на верхнем уровне и в квитанции —
+// и с манифестом, и без него.
+test('пункт 4: tree_sha из инспекции снимка в результате и квитанции', async (t) => {
+  const INSPECTED = 'e'.repeat(40);
+  const withTree = { head: CAND, clean: true, baseAncestor: true, tree_sha: INSPECTED, tree: INSPECTED };
+  // С манифестом: закреплённое дерево совпадает со снимком.
+  const a = await isolated(t);
+  const idA = await contractTask(a.handle);
+  const { epoch: eA, port: pA } = await held(a.ported, idA);
+  const jA = await tmpJournal();
+  const sA = stubs({ inspect: async () => withTree });
+  const resA = await acceptHeld({
+    attempt: contractAttempt(idA, eA, { tree_sha: INSPECTED }),
+    submission: submission(idA, eA), policy: policy(idA), journal: jA,
+    ports: { ...sA.ports, board: pA },
+  });
+  assert.equal(resA.outcome, 'verified');
+  assert.equal(resA.tree_sha, INSPECTED);
+  assert.equal(resA.receipt.tree_sha, INSPECTED);
+  // Без манифеста (маршрут по taskId): tree_sha всё равно фиксируется.
+  const b = await isolated(t);
+  const idB = await task(b.handle);
+  const { epoch: eB, port: pB } = await held(b.ported, idB);
+  const jB = await tmpJournal();
+  const sB = stubs({ inspect: async () => withTree });
+  const resB = await acceptHeld({
+    attempt: attempt(idB, eB), submission: submission(idB, eB),
+    policy: policy(idB), journal: jB, ports: { ...sB.ports, board: pB },
+  });
+  assert.equal(resB.outcome, 'verified');
+  assert.equal(resB.tree_sha, INSPECTED);
+  assert.equal(resB.receipt.tree_sha, INSPECTED);
+  assert.equal(resB.subject_digest, null);
+});
+
+// Пункт 9: исполнитель pi/opencode-go/deepseek-v4.1-flash проходит acceptHeld —
+// единая таблица семейств, триада независима.
+test('пункт 9: pi/deepseek-исполнитель проходит приёмку с независимой триадой', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports } = stubs();
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, {
+      executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
+      arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' },
+    }),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
 });

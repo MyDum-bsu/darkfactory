@@ -732,7 +732,8 @@ test('accept_with_notes with a foreign subject_digest never reaches the seal', a
 test('arbiter escalate_owner puts one concrete needs_input question on the card', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector({ arbitrate: async () => ({
-    decision: 'escalate_owner', question: 'Какое поведение верно по spec §3?' }) });
+    decision: 'escalate_owner', question: 'Какое поведение верно по spec §3?',
+    subject_digest: DIGEST }) });
   await x.tick();
   scriptedVerify(x, {
     [BAD1]: L2_REWORK([FINDING]),
@@ -834,4 +835,78 @@ test('two identical deterministic failures hold without calling the arbiter', as
   assert.equal(arbitrations, 0, 'красный детерминированный гейт не арбитрируется');
   assert.equal((await x.inspect()).state, 'blocked');
   assert.equal(x.effects.feedback.length, 1);
+});
+
+// Пункт 8: расхождение route.critic с фактическим критиком селектора —
+// отказ маршрута до claim (review_profile_mismatch).
+test('a route critic conflicting with the selector critic is rejected before claim', async t => {
+  const x = await lab(t);
+  x.cfg.route.critic = { provider: 'openai', model: 'gpt-6.1-sol' };
+  x.cfg.workerSelector = workerSelector({
+    critic: { provider: 'openai', model: 'gpt-6.2-sol' },
+    arbitrate: async () => { throw new Error('unreachable'); } });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'review_profile_mismatch');
+  assert.equal((await x.inspect()).state, 'ready', 'карточка не заявлена');
+  assert.equal(x.effects.spawn, 0);
+  // Совпадающий критик маршрута и селектора — маршрут допускается.
+  const y = await lab(t);
+  y.cfg.route.critic = { provider: 'openai', model: 'gpt-6.2-sol' };
+  y.cfg.workerSelector = workerSelector({
+    critic: { provider: 'openai', model: 'gpt-6.2-sol' } });
+  assert.equal((await y.tick()).phase, 'working');
+});
+
+// Пункт 13: harm=10 или DoD-нарушение в ПРОШЛОМ L2-раунде учитывается при
+// арбитраже спора текущего раунда — accept_with_notes невозможен.
+test('a dispute is judged by combined findings: prior-round harm10 blocks acceptance', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => {
+    arbitrations++;
+    return { decision: 'accept_with_notes', notes: 'n', subject_digest: DIGEST };
+  } });
+  await x.tick();
+  scriptedVerify(x, {
+    // Первый раунд: находка с harm=10.
+    [BAD1]: L2_REWORK([{ ...FINDING, harm: 10 }]),
+    // Второй: новая находка + спор по находке первого раунда.
+    [BAD2]: L2_REWORK([{ file: 'b.js', expected: 'e2', actual: 'x2' }]),
+  });
+  withDispute(x, BAD2, 'a.js');
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'harm10_requires_owner');
+  assert.equal(arbitrations, 0, 'арбитр не вызывается при harm=10 в истории');
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('a dispute is judged by combined findings: prior-round DoD violation blocks acceptance', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => {
+    arbitrations++;
+    return { decision: 'accept_with_notes', notes: 'n', subject_digest: DIGEST };
+  } });
+  await x.tick();
+  scriptedVerify(x, {
+    // Первый раунд: DoD-нарушение без harm.
+    [BAD1]: L2_REWORK([{ ...FINDING, dod_violation: true }]),
+    // Второй: спор по той находке.
+    [BAD2]: L2_REWORK([{ file: 'b.js', expected: 'e2', actual: 'x2' }]),
+  });
+  withDispute(x, BAD2, 'a.js');
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  // DoD-флаг в прошлом раунде — fail-closed harm 10: стоп до вызова арбитра.
+  assert.equal(out.reason, 'harm10_requires_owner');
+  assert.equal(arbitrations, 0);
+  assert.equal((await x.inspect()).state, 'blocked');
 });

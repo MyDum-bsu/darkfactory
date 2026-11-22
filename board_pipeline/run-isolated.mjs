@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { parseArgs, promisify } from 'node:util';
@@ -121,8 +121,10 @@ async function execute() {
       // Фактический исполнитель выбран workerSelector (включая согласованный
       // резерв при подтверждённом отказе первичного провайдера).
       const execSpec = attempt.executor ?? p.bb;
-      await mkdir(dirname(handoffPath(attempt)), { mode: 0o700 });
-      const initial = join(root, `worker-${attempt.attempt_id}.md`);
+      await mkdir(dirname(handoffPath(attempt)), { recursive: true, mode: 0o700 });
+      // Уникальное имя промпта на каждый запуск: повторный вход spawn для
+      // резервного провайдера не падает с EEXIST.
+      const initial = join(root, `worker-${attempt.attempt_id}-${randomUUID()}.md`);
       const text = await readFile(brief, 'utf8');
       const example = JSON.stringify({ task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
         worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' });
@@ -151,12 +153,9 @@ async function execute() {
         const safeCode = /^[a-z][a-z_0-9]{0,63}$/.test(diagnostic?.code ?? '') ? diagnostic.code : null;
         console.error(`BB spawn failed (${http ? `HTTP ${http[1]}` : safeCode ?? error.code ?? 'invalid response'}); ` +
           `diagnostic categories: ${matched.join(', ') || 'none'}; no automatic retry`);
-        // Подтверждённый отказ провайдера (недоступность/неподдерживаемая модель
-        // или провайдер) — единственное основание для согласованного резерва;
-        // транспортная неясность по-прежнему выбрасывается как uncertain.
-        if (/not available|unavailable|unsupported|unknown (provider|model)|denied/i.test(message)) {
-          return { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
-        }
+        // Обрыв bb thread spawn без подтверждённого threadId — неизвестный
+        // исход: возможен живой писатель, никакого второго запуска. Переход к
+        // резерву допустим только по подтверждённому probe ДО вызова spawn.
         throw error;
       }
     },
@@ -243,7 +242,13 @@ async function execute() {
     let recheck = values['recheck-rejected-handoff'];
     while (Date.now() <= deadline) {
       const result = await advance({ route, state, board: port, bb, submissions, verify, authorize,
-        recheckRejectedHandoff: recheck, workerSelector });
+        recheckRejectedHandoff: recheck,
+        // Фактические критик/арбитр из профиля проверки и политики; порт
+        // арбитра подключается из конфига, когда задан.
+        workerSelector: { ...workerSelector,
+          critic: p.profiles[route.checkProfile]?.review,
+          arbiter: p.arbiter ?? workerSelector.DEFAULT_ARBITER,
+          arbitrate: typeof p.arbitrate === 'function' ? p.arbitrate : undefined } });
       recheck = false;
       const line = JSON.stringify(result);
       if (line !== previous) console.log(line);

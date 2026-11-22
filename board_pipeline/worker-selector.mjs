@@ -47,13 +47,7 @@ const DIGEST64 = /^[0-9a-f]{64}$/;
 // (provider 'pi') семейство определяет модель вида 'provider/model' —
 // иначе пара provider+model обязана быть из одного семейства.
 export function workerFamily(worker) {
-  const direct = executorFamily(worker);
-  if (direct !== null) return direct;
-  if (worker !== null && typeof worker === 'object' &&
-      typeof worker.model === 'string' && worker.model.includes('/')) {
-    return executorFamily(worker.model);
-  }
-  return null;
+  return executorFamily(worker);
 }
 
 // Упорядоченный план исполнителей маршрута. Резерв ZCode входит в план
@@ -246,8 +240,10 @@ export function roundGate(result) {
   return 'l1';
 }
 
+// Ключ finding через JSON.stringify: склейка строк не допускает коллизий
+// вида expected='A|B',actual='C' против expected='A',actual='B|C'.
 export const findingKey = f =>
-  `${f?.file ?? ''}|${f?.line ?? ''}|${f?.expected ?? ''}|${f?.actual ?? ''}`;
+  JSON.stringify([f?.file ?? '', f?.line ?? null, f?.expected ?? '', f?.actual ?? '']);
 
 // Сигнатура детерминированного отказа из ФАКТИЧЕСКИХ данных провалившейся
 // проверки: упавший тест A (лог sha256_A) и починенный A + упавший B
@@ -259,7 +255,15 @@ function deterministicDetail(feedback) {
     const failing = evidence.filter(e => e !== null && typeof e === 'object' &&
       (e.exit !== 0 && e.exit !== undefined || e.ok === false));
     const list = failing.length ? failing : evidence;
-    return list.map(e => `${e?.file ?? ''}:${e?.sha256 ?? e?.exit ?? ''}`).join(';;');
+    // file в сигнатуру не входит: имя лога содержит candidate_sha и случайный
+    // UUID — два побайтово одинаковых падения обязаны давать одну сигнатуру.
+    return list.map(e => JSON.stringify({
+      exit: e?.exit ?? null,
+      sha256: e?.sha256 ?? null,
+      summary: e?.summary ?? null,
+      status: e?.status ?? null,
+      violations: e?.violations ?? null,
+    })).join(';;');
   }
   if (Array.isArray(feedback.violations) && feedback.violations.length) {
     return `violations:${JSON.stringify(feedback.violations)}`;
@@ -298,6 +302,9 @@ export function validDispute(dispute) {
 
 // Допустимые ссылки на замечания прошлого L2-раунда: file, file:line, id
 // находки и checkpoint ревью. Спор по несуществующей ссылке не признаётся.
+// Спор допустим только по реальным findings прошлого L2-раунда: id, file или
+// file:line конкретного замечания. Checkpoint и пустой массив findings —
+// не основание для арбитража.
 function findingRefsOf(round) {
   const refs = new Set();
   for (const f of round?.findings ?? []) {
@@ -307,7 +314,6 @@ function findingRefsOf(round) {
     }
     if (typeof f?.id === 'string' && f.id) refs.add(f.id);
   }
-  if (typeof round?.checkpoint === 'string' && round.checkpoint) refs.add(round.checkpoint);
   return refs;
 }
 
@@ -319,8 +325,10 @@ function contradicting(prev, latest) {
       if (typeof pf?.file !== 'string' || !pf.file || pf.file !== cf?.file) continue;
       if ((pf.line ?? null) !== (cf.line ?? null)) continue;
       const pe = pf.expected, pa = pf.actual, ce = cf.expected, ca = cf.actual;
-      if ((typeof pe === 'string' && pe && pe === ca) ||
-          (typeof pa === 'string' && pa && pa === ce)) return true;
+      // Взаимоисключающие требования: оба направления развернуты одновременно
+      // и требование реально отличается от факта (иначе это уточнение, не спор).
+      if (typeof pe === 'string' && pe && typeof pa === 'string' && pa &&
+          pe === ca && pa === ce && pe !== pa) return true;
     }
   }
   return false;
@@ -338,6 +346,7 @@ export function evaluateReworkProgress({ roundsHistory = [] } = {}) {
   // с реальным замечанием ПРОШЛОГО L2 (file, file:line, id или checkpoint).
   // Спор по несуществующей ссылке арбитраж не запускает.
   if (latest.gate === 'l2' && validDispute(latest.dispute) && prev?.gate === 'l2' &&
+      Array.isArray(prev.findings) && prev.findings.length > 0 &&
       findingRefsOf(prev).has(latest.dispute.finding_ref)) {
     return { trigger: 'substantive_dispute', kind: 'worker_dispute', evidence: latest.dispute };
   }
@@ -394,10 +403,13 @@ export function maxHarmOf(findings) {
   let max = 0;
   for (const f of findings) {
     if (f?.dod_violation === true || f?.violates_dod === true) return 10;
-    const h = f?.harm;
-    if (h === undefined || h === null) continue;
-    if (typeof h !== 'number' || !Number.isFinite(h) || h >= 10) return 10;
-    if (h > max) max = h;
+    // Заданный (даже null/undefined) harm обязан быть конечным числом
+    // 0 <= harm < 10; иначе fail-closed 10.
+    if (f !== null && typeof f === 'object' && Object.hasOwn(f, 'harm')) {
+      const h = f.harm;
+      if (typeof h !== 'number' || !Number.isFinite(h) || h < 0 || h >= 10) return 10;
+      if (h > max) max = h;
+    }
   }
   return max;
 }
@@ -454,14 +466,18 @@ export async function resolveArbitration({
     trigger: { trigger: trigger?.trigger, kind: trigger?.kind },
     evidence,
   });
-  // Строгая привязка решения к манифесту приёмки: для directed_rework и
-  // accept_with_notes обязателен валидный 64-hex subject_digest; при наличии
-  // манифеста digest обязан совпасть.
-  const digestOk = DIGEST64.test(ruling?.subject_digest ?? '') &&
-    (subjectDigest === null || ruling.subject_digest === subjectDigest);
+  // Строгая привязка решения к манифесту приёмки для ВСЕХ решений арбитра:
+  // subjectDigest манифеста обязан быть валидным 64-hex, а digest решения —
+  // строго совпадать. Отсутствие манифеста или расхождение — hold.
+  const digestOk = DIGEST64.test(subjectDigest ?? '') &&
+    ruling?.subject_digest === subjectDigest;
+  const needsDigest = ['directed_rework', 'accept_with_notes', 'escalate_owner']
+    .includes(ruling?.decision);
+  if (needsDigest && !digestOk) {
+    return { decision: 'hold', reason: 'arbiter_subject_mismatch', evidence };
+  }
   switch (ruling?.decision) {
     case 'directed_rework': {
-      if (!digestOk) return { decision: 'hold', reason: 'arbiter_subject_mismatch', evidence };
       const hasDirective = typeof ruling.directive === 'string' && ruling.directive.trim().length > 0;
       const hasFindings = Array.isArray(ruling.findings) && ruling.findings.length > 0;
       if (!hasDirective && !hasFindings) {
@@ -471,12 +487,6 @@ export async function resolveArbitration({
         findings: ruling.findings ?? [], arbitrationUsed: 1, evidence };
     }
     case 'accept_with_notes': {
-      // Принятие возможно только на известном манифесте: digest обязан быть
-      // и строго совпадать с subject_digest текущего кандидата.
-      if (subjectDigest === null || ruling.subject_digest !== subjectDigest ||
-          !DIGEST64.test(ruling.subject_digest ?? '')) {
-        return { decision: 'hold', reason: 'arbiter_subject_mismatch', evidence };
-      }
       const dodBreach = dodViolation === true ||
         hasDodViolation(trigger?.evidence?.findings) ||
         ruling.dod_satisfied === false || ruling.violates_dod === true;
@@ -492,6 +502,7 @@ export async function resolveArbitration({
           attempt_id: attempt.attempt_id, subject_digest: subjectDigest,
           arbiter: { provider: arbiter.provider, model: arbiter.model },
           decision: 'accept_with_notes', notes: ruling.notes,
+          max_harm: maxHarm, dod_violation: false,
         },
         evidence };
     }
