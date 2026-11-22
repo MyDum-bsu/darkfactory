@@ -6,7 +6,7 @@
   "engines": { "node": ">=22.18" },
   "scripts": {
     "doctor": "node ops/check-host.mjs",
-    "test": "node --test board_pipeline/acceptance.test.mjs board_pipeline/accept-held.test.mjs board_pipeline/native-board.test.mjs board_pipeline/controller.test.mjs board_pipeline/slot.test.mjs ops/local/*.test.mjs",
-    "test:integration": "node --test board_pipeline/pipeline.test.mjs"
+    "test": "node --test board_pipeline/acceptance.test.mjs board_pipeline/accept-held.test.mjs board_pipeline/native-board.test.mjs board_pipeline/controller.test.mjs board_pipeline/subject.test.mjs board_pipeline/slot.test.mjs ops/local/*.test.mjs",
+    "test:integration": "node --test board_pipeline/pipeline.test.mjs board_pipeline/subject-flow.test.mjs"
   }
 }

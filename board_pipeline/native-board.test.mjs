@@ -56,3 +56,85 @@ test('expired lease cannot complete an attempt after a newer claim', async t => 
   await newer.complete(task.id, second.epoch, { sha: '1'.repeat(40) });
   assert.equal((await newer.lookup(task.id)).result.sha, '1'.repeat(40));
 });
+
+// claimReady: allowlist-допуск и честный ноль эффектов на чужих, неполных и waiting-карточках.
+const CONTRACT = { spec_digest: 'a'.repeat(64), policy_digest: 'b'.repeat(64), repo_id: 'fixture-repo',
+  profile_id: 'pilot', finish: 'verified', queue: 'vs1' };
+const FILTER = {
+  owner: 'board:client',
+  label: { key: 'queue', value: 'vs1' },
+  finish: 'verified',
+  required: ['spec_digest', 'policy_digest', 'repo_id'],
+};
+
+async function claimedBoard(t) {
+  const backend = local({ memory: true });
+  t.after(() => backend.close());
+  const handle = board({ backend });
+  await handle.createChannel('pilot');
+  const seen = { claim: 0 };
+  const ported = {
+    ...handle,
+    tasks: {
+      ...handle.tasks,
+      claim: async (...args) => {
+        seen.claim++;
+        return handle.tasks.claim(...args);
+      },
+    },
+  };
+  return { handle, ported, seen };
+}
+
+function contractTask(handle, labels, over = {}) {
+  return handle.tasks.create('pilot', { text: 'Synthetic claimReady', noSync: true, labels, ...over });
+}
+
+test('claimReady takes the oldest admitted ready card and returns its contract labels', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  const plain = await contractTask(handle, { queue: 'vs1', finish: 'verified' });
+  const admitted = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  const picked = await port.claimReady(FILTER);
+  assert.equal(picked.taskId, admitted.task.id);
+  assert.equal(picked.labels.spec_digest, CONTRACT.spec_digest);
+  assert.notEqual(picked.taskId, plain.task.id);
+  assert.equal(seen.claim, 1, 'ровно один native claim — только допущенная карточка');
+  const held = await port.verifyHeld(picked.taskId, picked.epoch);
+  assert.equal(held.epoch, picked.epoch);
+  const labels = await port.labels(admitted.task.id);
+  assert.equal(labels.spec_digest, CONTRACT.spec_digest);
+  assert.equal(labels.queue, 'vs1');
+  assert.equal(await port.claimReady(FILTER), null, 'захваченная карточка больше не ready');
+});
+
+test('claimReady does not claim on an empty, foreign, mislabeled or incomplete queue', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  assert.equal(await port.claimReady({ ...FILTER, owner: 'board:other' }), null);
+  assert.equal(await port.claimReady({ ...FILTER, label: { key: 'queue', value: 'other' } }), null);
+  assert.equal(await port.claimReady({ ...FILTER, finish: 'deployed' }), null);
+  assert.equal(await port.claimReady({ ...FILTER, required: ['spec_digest', 'fixtures_digest'] }), null);
+  assert.equal(seen.claim, 0, 'ни один нативный claim не сделан');
+  await assert.rejects(port.claimReady({ owner: '' }), /trusted claim filter/);
+  await assert.rejects(port.claimReady({ label: { key: 'queue' } }), /trusted claim filter/);
+  await assert.rejects(port.claimReady({ required: 'spec_digest' }), /trusted claim filter/);
+});
+
+test('claimReady never touches a waiting card and unlocks it only after native completion', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  const [head, dependent] = await handle.tasks.createMany('pilot', [
+    { key: 'head', text: 'Head', noSync: true, labels: { ...CONTRACT, queue: 'vs1' } },
+    { text: 'Dependent', needs: [{ key: 'head' }], noSync: true, labels: { ...CONTRACT, queue: 'vs1' } },
+  ], { id: 'claim-ready-unlock' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  const first = await port.claimReady(FILTER);
+  assert.equal(first.taskId, head.id);
+  assert.equal((await port.lookup(dependent.id)).state, 'waiting');
+  await port.complete(head.id, first.epoch, { sha: 'c'.repeat(40) });
+  const second = await port.claimReady(FILTER);
+  assert.equal(second.taskId, dependent.id);
+  assert.equal(seen.claim, 2);
+});
+

@@ -6,6 +6,7 @@ import { test } from 'node:test';
 
 import { acceptHeld } from './acceptance.mjs';
 import { nativeBoardPort } from './native-board.mjs';
+import { buildSubject, subjectDigest } from './subject.mjs';
 import { loadSdk } from './sdk.mjs';
 
 const { board, local } = loadSdk();
@@ -476,4 +477,161 @@ test('ручной submit v1 остаётся совместимым', async (t)
   const after = await settled(handle, id);
   assert.equal(after.state, 'completed');
   assert.equal(after.result.sha, CAND);
+});
+
+// --- Связка CandidateSubject и дрейф контракта ---
+
+const REPO = 'darkfactory-vs1-fixture';
+const TREE = 'c'.repeat(40);
+const SPEC = 'a'.repeat(64);
+const POL = 'b'.repeat(64);
+const OTHER_256 = 'f'.repeat(64);
+
+function contractAttempt(taskId, epoch, over = {}) {
+  return attempt(taskId, epoch, {
+    repo_id: REPO,
+    tree_sha: TREE,
+    spec_digest: SPEC,
+    policy_digest: POL,
+    fixtures_digest: null,
+    ...over,
+  });
+}
+
+function contractTask(handle, text = 'Synthetic subject acceptance') {
+  return handle.tasks.create('pilot', { text, noSync: true, labels: {
+    spec_digest: SPEC, policy_digest: POL, repo_id: REPO, profile_id: 'pilot', finish: 'verified',
+  } }).then(({ task }) => task.id);
+}
+
+function expectedDigest() {
+  return subjectDigest(buildSubject({
+    kind: 'git_tree', repoId: REPO, baseSha: BASE, candidateSha: CAND, treeSha: TREE,
+    specDigest: SPEC, policyDigest: POL, fixturesDigest: null, releaseTarget: { finish: 'verified' },
+  }));
+}
+
+test('контракт приёмки связывает subject_digest с квитанцией, журналом и карточкой', async (t) => {
+  const { handle, ported, seen } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs();
+
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+
+  const digest = expectedDigest();
+  assert.equal(res.outcome, 'verified');
+  assert.equal(res.receipt.subject_digest, digest, 'квитанция привязана к манифесту приёмки');
+  const text = await journalText(journal);
+  assert.ok(text.includes(`"subject_digest":"${digest}"`), 'журнал несёт subject_digest');
+  assert.ok(!text.includes(seen.token), 'токен аренды по-прежнему не покидает адаптер');
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'completed');
+  const evidence = typeof after.result === 'string' ? JSON.parse(after.result) : after.result;
+  assert.equal(evidence.subject_digest, digest, 'компактная квитанция Board.complete несёт subject_digest');
+  assert.equal(evidence.sha, CAND);
+  assert.deepEqual(calls, { inspect: 2, local: 1, review: 1 });
+  assert.equal(seen.claim, 1);
+});
+
+test('ручной v1 без контракта остаётся без манифеста: subject_digest равен null', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports } = stubs();
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(res.outcome, 'verified');
+  assert.equal(res.receipt.subject_digest, null);
+});
+
+test('дрейф spec_digest на карточке до seal отвергает кандидата без complete', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs();
+  // Спека изменилась после claim: метка карточки больше не совпадает с закреплённым контрактом.
+  await handle.label(id, { set: { spec_digest: OTHER_256 } });
+
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+
+  assert.equal(res.outcome, 'hold');
+  assert.equal(res.reason, 'spec_digest_drift');
+  assert.equal(calls.review, 1, 'проверки шли до seal, ревью уже выполнено');
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'blocked', 'карточка видимо остановлена, не закрыта');
+  assert.equal(after.result, null);
+});
+
+test('дрейф policy_digest на карточке и в политике останавливает до complete', async (t) => {
+  for (const [name, prepare] of [
+    ['policy_digest_drift', async () => ({ policy: { ...policy('x'), digest: OTHER_256 } })],
+    ['policy_digest_drift', async (handle, id) => {
+      await handle.label(id, { set: { policy_digest: OTHER_256 } });
+      return { policy: policy('x') };
+    }],
+  ]) {
+    const { handle, ported } = await isolated(t);
+    const id = await contractTask(handle);
+    const { epoch, port: boardPort } = await held(ported, id);
+    const { policy: prepared } = await prepare(handle, id);
+    const journal = await tmpJournal();
+    const { ports } = stubs();
+    const res = await acceptHeld({
+      attempt: contractAttempt(id, epoch),
+      submission: submission(id, epoch),
+      policy: { ...prepared, profiles: policy(id).profiles },
+      journal,
+      ports: { ...ports, board: boardPort },
+    });
+    assert.equal(res.outcome, 'hold', name);
+    assert.equal(res.reason, name);
+    assert.equal((await settled(handle, id)).state, 'blocked');
+  }
+});
+
+test('неполный контракт попытки отклоняется до любых эффектов', async (t) => {
+  const { handle, ported, seen } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs();
+
+  for (const over of [{ tree_sha: undefined }, { policy_digest: undefined }, { repo_id: undefined },
+    { repo_id: REPO, tree_sha: TREE, spec_digest: SPEC, policy_digest: POL, fixtures_digest: OTHER_256 }]) {
+    const bad = contractAttempt(id, epoch, over);
+    if (over.fixtures_digest === OTHER_256) delete bad.spec_digest;
+    const res = await acceptHeld({
+      attempt: bad,
+      submission: submission(id, epoch),
+      policy: policy(id),
+      journal: await tmpJournal(),
+      ports: { ...ports, board: boardPort },
+    });
+    assert.equal(res.outcome, 'denied', `контракт ${JSON.stringify(over)}`);
+    assert.equal(res.reason, 'subject_contract_incomplete');
+    assert.deepEqual(calls, { inspect: 0, local: 0, review: 0 });
+  }
+  assert.equal((await settled(handle, id)).state, 'claimed');
+  assert.equal(seen.claim, 1);
 });

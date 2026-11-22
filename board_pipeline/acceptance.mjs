@@ -3,6 +3,7 @@
 
 import { open, readFile, appendFile, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { buildSubject, subjectDigest } from './subject.mjs';
 
 const HANDOFF_KEYS = [
   'task_id',
@@ -25,10 +26,25 @@ const ATTEMPT_KEYS = [
   'finish',
 ];
 
+// Контракт приёмки, закреплённый контроллером при claim (метки карточки): необязателен
+// для ручного v1, но обязателен целиком, когда задан хоть один его обязательный член.
+const ATTEMPT_OPTIONAL = [
+  'repo_id',
+  'tree_sha',
+  'spec_digest',
+  'policy_digest',
+  'fixtures_digest',
+  'release_target',
+];
+const CONTRACT_REQUIRED = ['repo_id', 'tree_sha', 'spec_digest', 'policy_digest'];
+const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
+
 // Сдача воркера: типизированный результат, без worktree/профиля/команд/токена.
 const SUBMISSION_KEYS = ['task_id', 'epoch', 'attempt_id', 'worker_thread_id', 'candidate_sha'];
 
 const SHA_RE = /^[0-9a-f]{40}$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 const ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 const REVIEW_OK = 'REVIEW_OK';
 const REVIEW_BLOCKED = 'REVIEW_BLOCKED';
@@ -88,12 +104,12 @@ function validatePolicy(policy, checkProfile) {
   return profile;
 }
 
-function strictKeys(record, allowed) {
+function strictKeys(record, allowed, optional = []) {
   if (record === null || typeof record !== 'object' || Array.isArray(record)) {
     throw new Denied('record_not_object');
   }
   for (const key of Object.keys(record)) {
-    if (!allowed.includes(key)) throw new Denied(`unexpected_field:${key}`);
+    if (!allowed.includes(key) && !optional.includes(key)) throw new Denied(`unexpected_field:${key}`);
   }
   for (const key of allowed) {
     if (typeof record[key] === 'string' && record[key].length > 0) continue;
@@ -102,8 +118,50 @@ function strictKeys(record, allowed) {
   }
 }
 
+// Контракт либо отсутствует целиком (ручной v1 без манифеста), либо закреплён полностью.
+function validateContract(attempt) {
+  const pinned = CONTRACT_REQUIRED.some(key => attempt[key] !== undefined);
+  if (!pinned) {
+    if (attempt.fixtures_digest !== undefined || attempt.release_target !== undefined) {
+      throw new Denied('subject_contract_incomplete');
+    }
+    return;
+  }
+  for (const key of CONTRACT_REQUIRED) {
+    if (attempt[key] === undefined) throw new Denied('subject_contract_incomplete');
+  }
+  if (typeof attempt.repo_id !== 'string' || !REPO_ID_RE.test(attempt.repo_id)) {
+    throw new Denied('invalid_repo_id');
+  }
+  if (!SHA_RE.test(attempt.tree_sha)) throw new Denied('tree_sha_not_full');
+  for (const key of ['spec_digest', 'policy_digest']) {
+    if (!SHA256_RE.test(attempt[key])) throw new Denied(`invalid_${key}`);
+  }
+  if (attempt.fixtures_digest !== undefined) {
+    if (attempt.fixtures_digest !== null && !SHA256_RE.test(attempt.fixtures_digest)) {
+      throw new Denied('invalid_fixtures_digest');
+    }
+  }
+  const target = attempt.release_target;
+  if (target !== undefined) {
+    if (target === null || typeof target !== 'object' || Array.isArray(target)) {
+      throw new Denied('invalid_release_target');
+    }
+    for (const key of Object.keys(target)) {
+      if (!RELEASE_TARGET_KEYS.includes(key)) throw new Denied(`unexpected_field:${key}`);
+    }
+    if (!FINISH.has(target.finish)) throw new Denied('invalid_release_target');
+    for (const key of ['target_id', 'release_channel', 'previous_live_digest']) {
+      const value = target[key];
+      if (value !== undefined && value !== null && (typeof value !== 'string' || !value)) {
+        throw new Denied('invalid_release_target');
+      }
+    }
+  }
+}
+
 function validateAttempt(attempt) {
-  strictKeys(attempt, ATTEMPT_KEYS);
+  strictKeys(attempt, ATTEMPT_KEYS, ATTEMPT_OPTIONAL);
   if (!/^[1-9][0-9]{0,14}$/.test(attempt.task_id)) throw new Denied('invalid_task_id');
   if (!Number.isSafeInteger(attempt.epoch) || attempt.epoch <= 0) throw new Denied('invalid_epoch');
   if (!ID_RE.test(attempt.attempt_id)) throw new Denied('invalid_attempt_id');
@@ -111,6 +169,29 @@ function validateAttempt(attempt) {
   if (!path.isAbsolute(attempt.worktree)) throw new Denied('worktree_not_absolute');
   if (!SHA_RE.test(attempt.base_sha)) throw new Denied('base_sha_not_full');
   if (!FINISH.has(attempt.finish)) throw new Denied('invalid_finish');
+  validateContract(attempt);
+}
+
+// Манифест приёмки этой попытки; null для ручного v1 без закреплённого контракта.
+function attemptSubject(attempt, submission) {
+  if (attempt.spec_digest === undefined) return null;
+  const target = attempt.release_target;
+  return buildSubject({
+    kind: 'git_tree',
+    repoId: attempt.repo_id,
+    baseSha: attempt.base_sha,
+    candidateSha: submission.candidate_sha,
+    treeSha: attempt.tree_sha,
+    specDigest: attempt.spec_digest,
+    policyDigest: attempt.policy_digest,
+    fixturesDigest: attempt.fixtures_digest ?? null,
+    releaseTarget: target ? {
+      finish: target.finish,
+      targetId: target.target_id ?? null,
+      releaseChannel: target.release_channel ?? null,
+      previousLiveDigest: target.previous_live_digest ?? null,
+    } : { finish: attempt.finish },
+  });
 }
 
 // Сверка сдачи с доверенной попыткой. Любое расхождение — отказ до эффекта.
@@ -402,11 +483,13 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   }
 
   let profile;
+  let subject;
   try {
     validateAttempt(attempt);
     validateSubmission(submission, attempt);
     profile = validatePolicy(policy, attempt.check_profile);
     validateEnrolled(attempt, profile);
+    subject = attemptSubject(attempt, submission);
   } catch (e) {
     if (e instanceof Denied) {
       return {
@@ -418,6 +501,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     }
     throw e;
   }
+  // Единая привязка всех квитанций этой попытки; null для ручного v1 без контракта.
+  const digest = subject === null ? null : subjectDigest(subject);
 
   const binding = {
     task_id: attempt.task_id,
@@ -472,6 +557,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     candidate_sha: submission.candidate_sha,
     policy_version: policy.version,
     finish: attempt.finish,
+    subject_digest: digest,
   });
 
   const intent = async (phase) => append({ kind: 'intent', phase });
@@ -493,6 +579,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         candidate_sha: submission.candidate_sha,
         policy_version: policy.version,
         finish: attempt.finish,
+        subject_digest: digest,
         outcome,
         ...receiptExtra,
       },
@@ -544,8 +631,34 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
 
   const { loc, review: rev, actual } = verdict;
 
-  // Печать: снимок не сдвинулся и аренда всё ещё наша перед любым settle.
+  // Печать: контракт не дрейфовал, снимок не сдвинулся и аренда всё ещё наша перед любым settle.
   await intent('seal');
+  if (subject !== null) {
+    let labels = null;
+    try {
+      labels = await ports.board.labels?.(attempt.task_id);
+    } catch (e) {
+      await step('seal', false, messageOf(e));
+      return hold(`seal_failed:${messageOf(e)}`);
+    }
+    if (labels === null || typeof labels !== 'object') {
+      await step('seal', false, 'contract_labels_unavailable');
+      return hold('contract_labels_unavailable');
+    }
+    if (labels.spec_digest !== attempt.spec_digest) {
+      await step('seal', false, 'spec_digest_drift');
+      return hold('spec_digest_drift');
+    }
+    if (labels.policy_digest !== attempt.policy_digest) {
+      await step('seal', false, 'policy_digest_drift');
+      return hold('policy_digest_drift');
+    }
+    if (policy.digest !== undefined && policy.digest !== attempt.policy_digest) {
+      await step('seal', false, 'policy_digest_drift');
+      return hold('policy_digest_drift');
+    }
+    await step('seal', true, 'contract_pinned');
+  }
   let changed;
   try {
     changed = inspectionProblem(await ports.inspect(binding), binding.candidate_sha);
@@ -567,6 +680,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
 
   const evidence = {
     sha: binding.candidate_sha,
+    subject_digest: digest,
     worker: attempt.bb_thread_id,
     checks: loc.evidence,
     review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
@@ -611,5 +725,7 @@ export const _internals = {
   validatePolicy,
   validateAttempt,
   validateSubmission,
+  validateContract,
+  attemptSubject,
   runVerification,
 };
