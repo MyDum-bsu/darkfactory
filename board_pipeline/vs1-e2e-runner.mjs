@@ -6,7 +6,7 @@
 // Границы: никогда порт 44100, никакой живой Board/кабинета/сети кандидата.
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs, promisify } from 'node:util';
@@ -87,11 +87,11 @@ async function execute() {
   // fuseblk на /media/mydum/Data не хранит биты прав, а контроллер требует
   // state 0700 uid=process. Тяжёлые данные (worktree, sqlite, tmp, лог) — на Data.
   const priv = await mkdtemp(join(tmpdir(), 'vs1-e2e-state-'));
-  const dirs = { state: join(priv, 'state'), stateIdle: join(priv, 'state-idle'),
+  const dirs = { state: join(priv, 'state'),
     inbox: join(priv, 'inbox'), gate: join(priv, 'gate'), operator: join(priv, 'operator'),
     sqlite: join(lab, 'sqlite'), tmp: join(lab, 'check-tmp'),
     worktree: join(lab, 'worktree') };
-  for (const dir of [dirs.state, dirs.stateIdle, dirs.inbox, dirs.sqlite,
+  for (const dir of [dirs.state, dirs.inbox, dirs.sqlite,
     dirs.gate, dirs.operator, dirs.tmp]) {
     await mkdir(dir, { recursive: true, mode: 0o700 });
   }
@@ -184,6 +184,9 @@ else console.log('Onboarding controls are present');`;
       bb: { project: 'proj_xdrdfgw7hs', provider: 'acp-devin', model: 'swe-2-high',
         permissionMode: 'full' },
       profiles: { bsu: { branch,
+        // Закреплённый кандидат легитимно правит test_login_browser.py (diff
+        // ревьювался выше по цепочке); операторский допуск tamper-гейта.
+        allowTestDeletion: true,
         review: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' },
         checks: [
           { image: nodeImage, argv: ['node', '-e', inspect], cwd: 'bsu-cabinet', timeoutMs: 45_000 },
@@ -230,20 +233,26 @@ else console.log('Onboarding controls are present');`;
       }
     }
 
-    // === Пустой тик: worktree обратно на базу, свежее состояние, короткий wait ===
+    // === Пустой тик: worktree обратно на базу, тот же state dir (броня слота
+    // привязана к паре worktree+state), attempt.json отложен — свежий тик.
     await exec('git', ['-C', dirs.worktree, 'reset', '--hard', BASE], { timeout: 20_000 });
     await exec('git', ['-C', dirs.worktree, 'clean', '-fd'], { timeout: 20_000 });
     const idlePolicyFile = join(dirs.operator, 'policy-idle.json');
     await writeFile(idlePolicyFile, JSON.stringify({ ...policy, waitMs: 12_000 }), { mode: 0o600 });
     const before = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
-    const idle = await runController(idlePolicyFile, dirs.stateIdle, env, wlog, () => {});
+    await rename(join(dirs.state, 'attempt.json'), join(dirs.state, 'attempt-main.json'));
+    const idle = await runController(idlePolicyFile, dirs.state, env, wlog, () => {});
     const after = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
     const allIdle = idle.lines.length >= 2 && idle.lines.every(l => {
       try { return JSON.parse(l).phase === 'idle'; } catch { return false; }
     });
     const untouched = JSON.stringify(before) === JSON.stringify(after);
-    const noGateFiles = (await readdir(dirs.stateIdle))
-      .every(f => !/^(checks|visual|review)-/.test(f));
+    // Ноль новых квитанций гейтов за пустой тик: число файлов проверок
+    // не выросло относительно журнала основного прогона.
+    const gateFilesBefore = Object.keys(proof.journal)
+      .filter(k => /^(checks|visual|review)-/.test(k)).length;
+    const noGateFiles = (await readdir(dirs.state))
+      .filter(f => /^(checks|visual|review)-/.test(f)).length === gateFilesBefore;
     proof.idleTick = { lines: idle.lines, exitCode: idle.code, card2Unchanged: untouched };
     proof.idleTickZeroCalls = allIdle && untouched && noGateFiles;
 
