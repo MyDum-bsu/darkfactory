@@ -7,6 +7,8 @@ import {
   DEFAULT_MIN_OBSERVATIONS,
   formatScorecardReport,
   modelKey,
+  normalizeDomain,
+  normalizeSize,
   rankCandidates,
   SEED_PROFILE,
 } from './model-scorecard.mjs';
@@ -153,6 +155,47 @@ test('отчёт таблицей для владельца/CTO', () => {
   assert.match(report, /Model scorecard: 1 attempts/);
   assert.match(report, /acp-devin\/swe-2-high \| worker \| backend \| S/);
   assert.match(report, /first_pass/);
+});
+
+test('tokensPerRound: input и output оба null — метрика null, а не 0', () => {
+  const lines = [
+    workerAttempt(DEVIN, { labels: { size: 'S', domain: 'backend' },
+      tokens: { worker: { input: null, output: null, cached: 500 } } }),
+    workerAttempt(DEVIN, { labels: { size: 'S', domain: 'backend' },
+      tokens: { worker: { input: null, output: null, cached: null } } }),
+  ];
+  const sc = aggregateScorecard(lines, { seed: [] });
+  const cell = sc.cells[bucketKey(DEVIN, 'worker', 'backend', 'S')];
+  assert.equal(cell.token_efficiency, null);
+});
+
+test('открытые попытки полностью исключены из first_pass_rate', () => {
+  const lines = [
+    workerAttempt(DEVIN, { labels: { size: 'S', domain: 'backend' } }), // closed first-pass
+    workerAttempt(DEVIN, { labels: { size: 'S', domain: 'backend' },
+      open: true, outcome: null }), // открытая — исход неизвестен
+  ];
+  const sc = aggregateScorecard(lines, { seed: [] });
+  const cell = sc.cells[bucketKey(DEVIN, 'worker', 'backend', 'S')];
+  assert.equal(cell.observations, 2); // в n попытка есть
+  assert.equal(cell.first_pass_rate, 1); // но знаменатель — только закрытая
+});
+
+test('нормализация size/domain: запрос и каноны', () => {
+  assert.equal(normalizeSize('s'), 'S');
+  assert.equal(normalizeSize(' M '), 'M');
+  assert.equal(normalizeSize('XL'), 'unknown');
+  assert.equal(normalizeSize(null), 'unknown');
+  assert.equal(normalizeDomain('Backend'), 'backend');
+  assert.equal(normalizeDomain('UI'), 'ui');
+  assert.equal(normalizeDomain('qa'), 'unknown');
+  assert.equal(normalizeDomain(undefined), 'unknown');
+  // rankCandidates принимает «сырые» метки: 's'/'Backend' находят клетку 'S'/'backend'.
+  const lines = Array.from({ length: 5 }, () =>
+    workerAttempt(DEVIN, { labels: { size: 'S', domain: 'backend' } }));
+  const sc = aggregateScorecard(lines, { seed: [] });
+  const ranked = rankCandidates(sc, { role: 'worker', domain: 'Backend', size: 's' });
+  assert.equal(ranked.length, 1);
 });
 
 test('seed по умолчанию — подтверждённый профиль', () => {

@@ -11,6 +11,8 @@ import { readTelemetryLines } from './telemetry.mjs';
 import {
   aggregateScorecard,
   formatScorecardReport,
+  normalizeDomain,
+  normalizeSize,
   rankCandidates,
   DEFAULT_MIN_OBSERVATIONS,
 } from './model-scorecard.mjs';
@@ -49,13 +51,15 @@ if (!positionals.length) {
     console.log(formatScorecardReport(scorecard));
     if (typeof values.role === 'string' && values.role) {
       const min = Number.parseInt(values['min-observations'] ?? '', 10);
+      const normDomain = normalizeDomain(values.domain);
+      const normSize = normalizeSize(values.size);
       const ranked = rankCandidates(scorecard, {
         role: values.role,
-        domain: values.domain ?? 'unknown',
-        size: typeof values.size === 'string' ? values.size.toUpperCase() : 'unknown',
+        domain: normDomain,
+        size: normSize,
         minObservations: Number.isSafeInteger(min) && min >= 1 ? min : DEFAULT_MIN_OBSERVATIONS,
       });
-      console.log(`Ranked ${values.role}:`,
+      console.log(`Ranked ${values.role} (${normDomain}/${normSize}):`,
         ranked.length ? ranked.map(c => `${c.model.provider}/${c.model.model}`).join(', ')
           : 'no proven candidates');
     }

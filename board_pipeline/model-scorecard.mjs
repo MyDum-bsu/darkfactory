@@ -51,19 +51,21 @@ export const SEED_PROFILE = Object.freeze([
   },
 ]);
 
-// Метка разреза из записи журнала: labels {size, domain} либо верхнеуровневые
-// поля; валидные значения приводятся к канону, остальное — 'unknown'.
-function sizeOf(entry) {
-  const raw = entry?.labels?.size ?? entry?.size;
+// Канонизация меток разреза — единая для журнала, роутинга и CLI:
+// 's' → 'S', 'Backend' → 'backend'; невалидные/отсутствующие — 'unknown'.
+export function normalizeSize(raw) {
   const size = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
   return SCORE_SIZES.includes(size) ? size : UNKNOWN;
 }
 
-function domainOf(entry) {
-  const raw = entry?.labels?.domain ?? entry?.domain;
+export function normalizeDomain(raw) {
   const domain = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
   return SCORE_DOMAINS.includes(domain) ? domain : UNKNOWN;
 }
+
+// Метка разреза из записи журнала: labels {size, domain} либо верхнеуровневые поля.
+const sizeOf = entry => normalizeSize(entry?.labels?.size ?? entry?.size);
+const domainOf = entry => normalizeDomain(entry?.labels?.domain ?? entry?.domain);
 
 export const modelKey = model =>
   typeof model?.provider === 'string' && typeof model?.model === 'string' &&
@@ -73,8 +75,10 @@ export const bucketKey = (model, role, domain, size) =>
   `${modelKey(model)}|${role}|${domain}|${size}`;
 
 // Исход «с первого раза»: закрытая успешная попытка без раундов rework.
-// Открытые и неуспешные попытки first-pass не засчитывают, но в знаменатель
-// входят — скрытая недооценка хуже честной оценки.
+// Открытые попытки из first_pass_rate исключаются ПОЛНОСТЬЮ (и из
+// знаменателя pass_n, см. aggregateScorecard): исход ещё не известен,
+// засчитывать их неудачей было бы ложным искажением. Закрытые неуспешные
+// попытки честно входят в знаменатель.
 function firstPassOf(entry) {
   return entry.open !== true && entry.outcome === PASS_OUTCOME &&
     (entry.rounds?.rework ?? 0) === 0;
@@ -91,6 +95,8 @@ function tokensPerRound(entry, role) {
   const rounds = entry.rounds?.total;
   if (usage === null || typeof usage !== 'object' ||
       !Number.isFinite(rounds) || rounds < 1) return null;
+  // Оба потока токенов не измерены — метрика не определена, а не ноль.
+  if (usage.input == null && usage.output == null) return null;
   const sum = (usage.input ?? 0) + (usage.output ?? 0);
   return Number.isFinite(sum) ? sum / rounds : null;
 }
@@ -185,7 +191,9 @@ function applySeed(buckets, seed) {
 }
 
 // Пересчёт скоркарда по строкам журнала. Чужие/битые строки — в corrupt.
-// Открытые попытки входят в знаменатели, first-pass им не засчитывается.
+// Открытые попытки учитываются в n и временных метриках, но из
+// first_pass_rate исключаются полностью (firstPass: null → pass_n не растёт):
+// исход ещё не известен, засчитывать их было бы ложным искажением.
 export function aggregateScorecard(lines, { seed = SEED_PROFILE } = {}) {
   const buckets = new Map();
   applySeed(buckets, seed);
@@ -264,13 +272,16 @@ const cmpScore = (a, b) => {
 export function rankCandidates(scorecard, { role, domain = UNKNOWN, size = UNKNOWN,
   minObservations = DEFAULT_MIN_OBSERVATIONS, models = null } = {}) {
   if (!SCORE_ROLES.includes(role)) return [];
+  // Метки запроса приводятся к тому же канону, что и метки журнала.
+  const wantDomain = normalizeDomain(domain);
+  const wantSize = normalizeSize(size);
   const wanted = Array.isArray(models)
     ? new Set(models.map(modelKey).filter(k => k !== null)) : null;
   const out = [];
   for (const [id, cell] of Object.entries(scorecard?.cells ?? {})) {
     const [key, r, d, s] = id.split('|');
     if (r !== role) continue;
-    if (d !== domain || s !== size) continue;
+    if (d !== wantDomain || s !== wantSize) continue;
     if (wanted !== null && !wanted.has(key)) continue;
     if (!cellProven(cell, minObservations)) continue;
     const [provider, ...rest] = key.split('/');

@@ -185,6 +185,96 @@ test('routeTriad shadow: выборы неизменны, рекомендаци
   assert.equal(modelKey(res.steps.worker.recommended), modelKey(GLM));
 });
 
+test('availability/квота: недоступная и исчерпавшая квоту модель пропускается', () => {
+  // GLM сильнее DEVIN, но квота исчерпана; DEEPSEEK недоступен.
+  const lines = [...journal(GLM, 6), ...journal(DEVIN, 6, { failEvery: 2 }),
+    ...journal(DEEPSEEK, 6)];
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  const allow = { worker: [DEVIN, GLM, DEEPSEEK], critic: [NEON], arbiter: [SOL] };
+  const availability = {
+    [modelKey(GLM)]: 'quota_exhausted',
+    [modelKey(DEEPSEEK)]: 'unavailable',
+    [modelKey(DEVIN)]: 'available',
+  };
+  const active = routeRole({
+    role: 'worker', size: 'S', domain: 'backend',
+    policy: policy('active', allow), scorecard, base: DEVIN,
+    others: { critic: NEON, arbiter: SOL }, availability,
+  });
+  assert.equal(active.outcome, 'routed');
+  assert.equal(modelKey(active.selected), modelKey(DEVIN)); // единственный доступный
+  const reasons = active.skipped.map(s => s.reason).sort();
+  assert.deepEqual(reasons, ['quota_exhausted', 'unavailable']);
+  // В shadow недоступная модель не рекомендуется.
+  const shadow = routeRole({
+    role: 'worker', size: 'S', domain: 'backend',
+    policy: policy('shadow', allow), scorecard, base: DEVIN,
+    others: { critic: NEON, arbiter: SOL }, availability,
+  });
+  assert.equal(shadow.outcome, 'shadow');
+  assert.equal(modelKey(shadow.recommended), modelKey(DEVIN));
+  // Предикат-форма availability и неизвестный статус — тоже отказ.
+  const pred = routeRole({
+    role: 'worker', size: 'S', domain: 'backend',
+    policy: policy('active', allow), scorecard, base: DEVIN,
+    others: { critic: NEON, arbiter: SOL },
+    availability: spec => spec.provider === 'acp-devin' ? 'weird' : 'available',
+  });
+  // DEVIN помечен неизвестным статусом → 'unavailable'; GLM/DEEPSEEK available
+  // → лучший из них выбирается.
+  assert.equal(pred.outcome, 'routed');
+  assert.notEqual(modelKey(pred.selected), modelKey(DEVIN));
+});
+
+test('триада для base: невалидный по семействам base — отказ и в shadow', () => {
+  const googleWorker = { provider: 'google', model: 'gemini-4-neon' }; // семейство критика
+  const scorecard = aggregateScorecard(journal(DEVIN, 6), { seed: [] });
+  for (const mode of ['shadow', 'active']) {
+    const step = routeRole({
+      role: 'worker', size: 'S', domain: 'backend',
+      policy: policy(mode, {
+        worker: [DEVIN, googleWorker], critic: [NEON], arbiter: [SOL] }),
+      scorecard, base: googleWorker, // base в allowlist, но ломает триаду
+      others: { critic: NEON, arbiter: SOL },
+    });
+    assert.equal(step.outcome, 'rejected', `mode=${mode}`);
+    assert.equal(step.reason, 'route_base_triad_violation');
+    assert.equal(step.selected, null);
+  }
+});
+
+test('routeTriad: worker-шаг видит переданные base.critic/base.arbiter', () => {
+  // Кастомный base.critic — glm-семейство: кандидат-executor GLM легален
+  // против дефолтного NEON (google), но ломает триаду против этого base.
+  const glmCritic = { provider: 'acp-zcode-start',
+    model: 'builtin:zai-start-plan\\GLM-5.3-Flash', effort: 'max' };
+  const scorecard = aggregateScorecard(journal(GLM, 6), { seed: [] });
+  const res = routeTriad({
+    size: 'S', domain: 'backend',
+    policy: policy('active', {
+      worker: [DEVIN, GLM], critic: [glmCritic], arbiter: [SOL] }),
+    scorecard,
+    base: { worker: DEVIN, critic: glmCritic, arbiter: SOL },
+  });
+  assert.equal(res.outcome, 'rejected');
+  assert.equal(res.role, 'worker');
+  assert.equal(res.reason, 'route_triad_violation');
+  assert.equal(res.steps.worker.skipped[0].reason, 'triad_violation');
+});
+
+test('routeRole нормализует метки: size=\'s\', domain=\'Backend\' находят клетку', () => {
+  const scorecard = aggregateScorecard(journal(GLM, 6), { seed: [] });
+  const step = routeRole({
+    role: 'worker', size: 's', domain: 'Backend',
+    policy: policy('active', { worker: [DEVIN, GLM], critic: [NEON], arbiter: [SOL] }),
+    scorecard, base: DEVIN, others: { critic: NEON, arbiter: SOL },
+  });
+  assert.equal(step.outcome, 'routed');
+  assert.equal(modelKey(step.selected), modelKey(GLM));
+  assert.equal(step.note.size, 'S');
+  assert.equal(step.note.domain, 'backend');
+});
+
 test('end-to-end: реальный журнал на диске → отчёт и роутинг', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'scorecard-'));
   try {

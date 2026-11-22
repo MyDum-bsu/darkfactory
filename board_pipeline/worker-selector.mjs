@@ -13,6 +13,8 @@ import { NEON_CRITIC, SOL_ARBITER } from './review-policy.mjs';
 import {
   DEFAULT_MIN_OBSERVATIONS,
   modelKey,
+  normalizeDomain,
+  normalizeSize,
   rankCandidates,
 } from './model-scorecard.mjs';
 
@@ -556,27 +558,43 @@ export function normalizeRoutingPolicy(policy) {
 const inAllowlist = (spec, list) =>
   list.some(entry => entry.provider === spec?.provider && entry.model === spec?.model);
 
+// Доступность/квота модели: функция (spec) => status либо карта
+// 'provider/model' => status. Незаданный availability — 'available' для всех;
+// карта без ключа модели — 'unavailable' (явная карта авторитетна).
+// Неизвестный статус трактуется как 'unavailable' (fail-closed).
+function availabilityOf(spec, availability) {
+  if (availability === undefined || availability === null) return 'available';
+  const status = typeof availability === 'function'
+    ? availability(spec)
+    : availability[modelKey(spec)];
+  return ['available', 'unavailable', 'quota_exhausted'].includes(status)
+    ? status : 'unavailable';
+}
+
 // Один шаг динамического роутинга роли.
-// role: 'worker' | 'critic' | 'arbiter'; size/domain — метки карточки;
-// policy — policy.json (routing-секция); scorecard — aggregateScorecard;
-// base — действующий выбор по умолчанию; others — зафиксированные роли
-// триады ({executor, critic, arbiter} без текущей роли).
+// role: 'worker' | 'critic' | 'arbiter'; size/domain — метки карточки
+// (нормализуются к канону скоркарда); policy — policy.json (routing-секция);
+// scorecard — aggregateScorecard; base — действующий выбор по умолчанию;
+// others — зафиксированные роли триады ({executor, critic, arbiter} без
+// текущей роли); availability — доступность/квота (карта или предикат,
+// 'available' | 'unavailable' | 'quota_exhausted').
 // Возврат: { outcome, mode, selected, recommended, ranked, skipped } —
-// в shadow selected === base; в active — лучший доказанный кандидат allowlist.
+// в shadow selected === base; в active — лучший доказанный и доступный
+// кандидат allowlist.
 export function routeRole({ role, size, domain, policy, scorecard,
-  base, others = {}, log = null } = {}) {
+  base, others = {}, availability = null, log = null } = {}) {
   // Триада оценивается против действующих ролей: незаданные — дефолтные.
   const fixed = { critic: DEFAULT_CRITIC, arbiter: DEFAULT_ARBITER, ...others };
   const routing = normalizeRoutingPolicy(policy);
   const list = routing.allowlist[role] ?? [];
+  const normSize = normalizeSize(size);
+  const normDomain = normalizeDomain(domain);
+  const reject = reason => ({ outcome: 'rejected', reason, mode: routing.mode,
+    selected: null, recommended: null, ranked: [], skipped: [] });
   // Действующий выбор обязан быть в allowlist — иначе политика противоречива.
   if (base !== undefined && base !== null && !inAllowlist(base, list)) {
-    return { outcome: 'rejected', reason: 'route_base_not_in_allowlist',
-      mode: routing.mode, selected: null, recommended: null, ranked: [], skipped: [] };
+    return reject('route_base_not_in_allowlist');
   }
-  const ranked = rankCandidates(scorecard, {
-    role, domain, size, minObservations: routing.minObservations, models: list,
-  });
   const skipped = [];
   const triadOk = candidate => {
     const families = { ...fixed };
@@ -592,6 +610,15 @@ export function routeRole({ role, size, domain, policy, scorecard,
       return false;
     }
   };
+  // Инвариант триады проверяется и для base: невалидный по семействам
+  // действующий выбор — отказ в обоих режимах, не тихий selected.
+  if (base !== undefined && base !== null && !triadOk(base)) {
+    return reject('route_base_triad_violation');
+  }
+  const ranked = rankCandidates(scorecard, {
+    role, domain: normDomain, size: normSize,
+    minObservations: routing.minObservations, models: list,
+  });
   let recommended = null;
   for (const candidate of ranked) {
     // Выбор — объект из allowlist со всеми полями (effort, reasoningLevel),
@@ -599,6 +626,11 @@ export function routeRole({ role, size, domain, policy, scorecard,
     const spec = list.find(entry => entry.provider === candidate.model?.provider &&
       entry.model === candidate.model?.model);
     if (spec === undefined) continue; // страховка, rankCandidates уже фильтрует
+    const status = availabilityOf(spec, availability);
+    if (status !== 'available') {
+      skipped.push({ model: spec, reason: status });
+      continue;
+    }
     if (!triadOk(spec)) {
       skipped.push({ model: spec, reason: 'triad_violation' });
       continue;
@@ -607,7 +639,7 @@ export function routeRole({ role, size, domain, policy, scorecard,
     break;
   }
   const note = {
-    kind: 'route_recommendation', role, domain: domain ?? 'unknown', size: size ?? 'unknown',
+    kind: 'route_recommendation', role, domain: normDomain, size: normSize,
     mode: routing.mode, recommended: recommended?.model ?? null,
     score: recommended?.cell ?? null, skipped,
   };
@@ -622,7 +654,8 @@ export function routeRole({ role, size, domain, policy, scorecard,
   // ни одного валидного — жёсткий отказ (не тихий возврат к базе).
   if (recommended === null) {
     // Доказанные кандидаты есть, но все ломают триаду — отдельная причина.
-    const reason = ranked.length > 0 && skipped.length === ranked.length
+    const reason = ranked.length > 0 && skipped.length === ranked.length &&
+      skipped.every(s => s.reason === 'triad_violation')
       ? 'route_triad_violation' : 'route_no_proven_candidate';
     return { outcome: 'rejected', reason,
       mode: 'active', selected: null, recommended: null, ranked, skipped, note };
@@ -632,11 +665,13 @@ export function routeRole({ role, size, domain, policy, scorecard,
 }
 
 // Роутинг всей триады последовательно: worker → critic → arbiter, каждая
-// следующая роль видит уже выбранные семейства. Первый жёсткий отказ
-// останавливает маршрут — частичная триада не применяется.
+// следующая роль видит уже выбранные семейства; на шаге worker триада
+// оценивается против переданных base.critic/base.arbiter, а не только
+// дефолтных. Первый жёсткий отказ останавливает маршрут — частичная
+// триада не применяется.
 export function routeTriad({ size, domain, policy, scorecard,
   base = { worker: PRIMARY_WORKER, critic: DEFAULT_CRITIC, arbiter: DEFAULT_ARBITER },
-  log = null } = {}) {
+  availability = null, log = null } = {}) {
   const selected = {};
   const steps = {};
   for (const role of ['worker', 'critic', 'arbiter']) {
@@ -644,8 +679,13 @@ export function routeTriad({ size, domain, policy, scorecard,
     if (selected.worker !== undefined) others.executor = selected.worker;
     if (selected.critic !== undefined) others.critic = selected.critic;
     if (selected.arbiter !== undefined) others.arbiter = selected.arbiter;
+    // Невыбранные роли триады — из переданного base, если заданы.
+    if (others.critic === undefined && base.critic !== undefined &&
+        role !== 'critic') others.critic = base.critic;
+    if (others.arbiter === undefined && base.arbiter !== undefined &&
+        role !== 'arbiter') others.arbiter = base.arbiter;
     const step = routeRole({ role, size, domain, policy, scorecard,
-      base: base[role], others, log });
+      base: base[role], others, availability, log });
     steps[role] = step;
     if (step.outcome === 'rejected') {
       return { outcome: 'rejected', reason: step.reason, role, steps };
