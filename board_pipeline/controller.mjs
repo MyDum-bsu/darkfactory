@@ -88,15 +88,15 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     record.reason === 'invalid_or_stale_submission' && !record.turnSeq && record.seenShas.length === 0;
   if (recheckRejectedHandoff && !recheck) return { phase: 'hold', reason: 'no_rejected_handoff_to_recheck' };
   if (!record) {
-    // Кросс-семейственная триада отвергает маршрут до claim: исполнитель,
-    // критик и арбитр обязаны быть из известных различных семейств.
+    // Кросс-семейственная триада отвергает маршрут до claim — для ВСЕХ
+    // кандидатов цепочки: нарушивший независимость резерв блокирует маршрут.
     if (workerSelector) {
       try {
-        workerSelector.assertTriadIndependent({
-          executor: workerSelector.selectWorker({ route })[0],
-          critic: route.critic ?? workerSelector.DEFAULT_CRITIC,
-          arbiter: route.arbiter ?? workerSelector.DEFAULT_ARBITER,
-        });
+        const critic = route.critic ?? workerSelector.DEFAULT_CRITIC;
+        const arbiter = route.arbiter ?? workerSelector.DEFAULT_ARBITER;
+        for (const candidate of workerSelector.selectWorker({ route, zcodeQuota: route.zcodeQuota })) {
+          workerSelector.assertTriadIndependent({ executor: candidate, critic, arbiter });
+        }
       } catch (e) {
         await save({ binding, phase: 'hold',
           reason: `route_triad_violation:${e.reason ?? e.message}`, seenShas: [] });
@@ -146,8 +146,13 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         // отказе, неизвестный исход — карантин без второго писателя.
         const selection = await workerSelector.attemptSpawnWithFallback({
           route, attempt: attemptOf(record, route),
+          zcodeQuota: route.zcodeQuota,
+          critic: route.critic ?? workerSelector.DEFAULT_CRITIC,
+          arbiter: route.arbiter ?? workerSelector.DEFAULT_ARBITER,
           probe: typeof bb.probeAvailability === 'function' ? w => bb.probeAvailability(w) : undefined,
           spawn: envelope => bb.spawn(envelope),
+          inspectWorktree: typeof bb.inspectWorktree === 'function'
+            ? att => bb.inspectWorktree(att) : undefined,
         });
         if (selection.outcome === 'uncertain') {
           await save({ phase: 'uncertain', reason: 'worker_launch_outcome_unknown',
@@ -228,13 +233,19 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     let feedbackSuffix = '';
     if (workerSelector) {
       // Раунд фиксируется в истории попытки; сходящаяся починка не ограничена
-      // счётчиком кругов — триггеры только содержательные.
+      // счётчиком кругов — триггеры только содержательные. tree_sha берётся из
+      // реальной инспекции снимка (result.tree_sha), не из слов воркера.
+      const roundFindings = Array.isArray(result.feedback?.findings)
+        ? result.feedback.findings : [];
       const round = {
         sha: submission.candidate_sha,
-        tree_sha: submission.tree_sha ?? null,
+        tree_sha: result.tree_sha ?? result.receipt?.tree_sha ?? null,
         gate: workerSelector.roundGate(result),
         signature: workerSelector.roundSignature(result),
-        blocking: Array.isArray(result.feedback?.findings) ? result.feedback.findings.length : null,
+        blocking: roundFindings.length ? roundFindings.length : null,
+        findings: roundFindings,
+        excerpt: result.feedback?.excerpt ?? null,
+        checkpoint: result.feedback?.checkpoint ?? result.checkpoint ?? null,
         dispute: submission.dispute ?? null,
         contradictory: result.contradictory === true,
       };
@@ -246,12 +257,14 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           JSON.stringify(progress.evidence ?? {}));
       }
       if (progress.trigger) {
+        const subjectDigest = result.subject_digest ?? result.receipt?.subject_digest ?? null;
         const ruling = await workerSelector.resolveArbitration({
           attempt, trigger: progress, arbitrationUsed,
           arbiter: route.arbiter ?? workerSelector.DEFAULT_ARBITER,
           critic: route.critic ?? workerSelector.DEFAULT_CRITIC,
           maxHarm: workerSelector.maxHarmOf(result.feedback?.findings),
-          subjectDigest: result.subject_digest ?? null,
+          subjectDigest,
+          dodViolation: workerSelector.hasDodViolation?.(result.feedback?.findings) === true,
           verifyHeld: (id, ep) => board.verifyHeld(id, ep),
           arbitrate: workerSelector.arbitrate,
         });
@@ -266,16 +279,18 @@ export async function advance({ route, state, board, bb, submissions, verify, au
             trigger: progress.kind };
           feedbackSuffix = ':arb';
         } else if (ruling.decision === 'accept_with_notes') {
+          // Принятие арбитра никогда не обходит печать: перед complete
+          // выполняется полный seal (inspect, закреплённые входы, живые метки
+          // карточки, verifyHeld) на стороне приёмки.
+          if (typeof result.sealAndComplete !== 'function') {
+            return stopWith('seal_port_missing', { roundsHistory });
+          }
           await save({ phase: 'checking', roundsHistory, arbitrationUsed: 1,
             arbitration: ruling.receipt });
-          if (route.finish === 'verified') {
-            try {
-              await board.complete(attempt.task_id, attempt.epoch,
-                { sha: submission.candidate_sha, arbitration: ruling.receipt });
-            } catch {
-              await save({ phase: 'uncertain', reason: 'arbitrated_complete_unconfirmed' });
-              return visible();
-            }
+          const sealed = await result.sealAndComplete(ruling.receipt)
+            .catch(e => ({ outcome: 'uncertain', reason: `seal_failed:${e?.message ?? e}` }));
+          if (sealed.outcome === 'verified' && sealed.receipt?.settle === 'completed' &&
+              route.finish === 'verified') {
             const settled = await board.lookup(attempt.task_id).catch(() => null);
             if (settled?.state !== 'completed' || settled.result?.sha !== submission.candidate_sha) {
               await save({ phase: 'uncertain', reason: 'completed_sha_not_confirmed' });
@@ -284,10 +299,23 @@ export async function advance({ route, state, board, bb, submissions, verify, au
             }
             return visible();
           }
-          await save({ phase: 'blocking' });
-          await board.block(attempt.task_id, attempt.epoch,
-            `Выпуск не разрешён этим контуром. Проверен SHA ${record.sha}`);
-          await save({ phase: 'hold', reason: 'release_not_authorized' });
+          if (sealed.outcome === 'verified' && sealed.receipt?.settle === 'deferred') {
+            await save({ phase: 'blocking' });
+            await board.block(attempt.task_id, attempt.epoch,
+              `Выпуск не разрешён этим контуром. Проверен SHA ${record.sha}`);
+            await save({ phase: 'hold', reason: 'release_not_authorized' });
+            return visible();
+          }
+          if (sealed.outcome === 'denied' && /claim_not_held/.test(sealed.reason ?? '')) {
+            await save({ phase: 'lease_lost', reason: sealed.reason });
+            return visible();
+          }
+          if (sealed.outcome === 'uncertain') {
+            await save({ phase: 'uncertain', reason: sealed.reason ?? 'arbitrated_seal_unconfirmed' });
+            return visible();
+          }
+          // hold из приёмки: карточка уже заблокирована с причиной.
+          await save({ phase: 'hold', reason: sealed.reason ?? 'arbitrated_seal_failed' });
           return visible();
         } else if (ruling.decision === 'escalate_owner') {
           return stopWith('arbiter_escalated_to_owner', { roundsHistory }, ruling.question);

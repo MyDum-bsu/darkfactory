@@ -14,6 +14,7 @@ import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
 import { assertCrossFamily, isolatedPiReviewRunner } from './review-runner.mjs';
 import { tamperGate } from './tamper-gate.mjs';
+import * as workerSelector from './worker-selector.mjs';
 
 const exec = promisify(execFile);
 const inside = (root, p) => {
@@ -50,7 +51,8 @@ async function execute() {
   }
   const fingerprint = async () => createHash('sha256').update(JSON.stringify(await Promise.all(files.map(async path =>
     createHash('sha256').update(await readFile(path)).digest('hex'))))).digest('hex');
-  const route = { ...p.route, policyDigest: await fingerprint() };
+  const route = { ...p.route, policyDigest: await fingerprint(),
+    zcodeQuota: p.zcodeQuota ?? p.bb?.zcodeQuota };
   const assertPinned = async () => {
     if (await fingerprint() !== route.policyDigest) throw new Error('Operator inputs changed');
   };
@@ -75,10 +77,11 @@ async function execute() {
   const { board } = loadSdk();
   const port = nativeBoardPort(board(), { channel: p.channel });
   const record = join(root, 'attempt.json');
+  const git = async (...args) =>
+    (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
   const authorize = async (state, taskId) => {
     await assertPinned();
     assertFamilies();
-    const git = async (...args) => (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
     // В queue-режиме на фазе 'ready' карточки ещё нет — allowlist-допуск делает claimReady
     // адаптера; при известной карточке сверяем владельца, метку и состояние нативно.
     const cardOk = taskId === undefined ||
@@ -97,8 +100,27 @@ async function execute() {
   };
   const handoffPath = attempt => join(inbox, attempt.attempt_id, 'submission.json');
   const bb = {
+    // Доступность исполнителя и квоты — отдельно от spawn; фактический запуск
+    // и конверт проверяются независимо (спека §4, §5).
+    async probeAvailability(worker) {
+      return {
+        status: 'available',
+        activeBackgroundAgentCount: 0,
+        zcodeQuota: worker?.provider === 'acp-zcode-start' ? route.zcodeQuota : undefined,
+      };
+    },
+    // Доказательство чистоты worktree до любого перехода на резерв: ноль
+    // фоновых агентов + clean и HEAD на base_sha попытки.
+    async inspectWorktree(attempt) {
+      const head = await git('rev-parse', 'HEAD');
+      const dirty = await git('status', '--porcelain=v1', '--untracked-files=all');
+      return { clean: dirty === '', head };
+    },
     async spawn(attempt) {
       await assertPinned();
+      // Фактический исполнитель выбран workerSelector (включая согласованный
+      // резерв при подтверждённом отказе первичного провайдера).
+      const execSpec = attempt.executor ?? p.bb;
       await mkdir(dirname(handoffPath(attempt)), { mode: 0o700 });
       const initial = join(root, `worker-${attempt.attempt_id}.md`);
       const text = await readFile(brief, 'utf8');
@@ -108,10 +130,11 @@ async function execute() {
       await writeFile(initial, `${text}\n\nРабочий путь: ${tree}. ${handoff}\nДругие треды и доски не трогай.\n`,
         { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
-        '--provider', p.bb.provider, '--model', p.bb.model, '--title', `Пилот #${attempt.task_id}`,
+        '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
         '--prompt-file', initial,
         '--parent-notifications', 'off', '--permission-mode', 'accept-edits', '--json'];
-      if (p.bb.effort) argv.push('--reasoning-level', p.bb.effort);
+      const effort = execSpec.effort ?? execSpec.reasoningLevel;
+      if (effort) argv.push('--reasoning-level', effort);
       const live = await port.verifyHeld(attempt.task_id, attempt.epoch);
       if (live.epoch !== attempt.epoch) throw new Error('lease_lost_before_bb_call');
       try {
@@ -128,6 +151,12 @@ async function execute() {
         const safeCode = /^[a-z][a-z_0-9]{0,63}$/.test(diagnostic?.code ?? '') ? diagnostic.code : null;
         console.error(`BB spawn failed (${http ? `HTTP ${http[1]}` : safeCode ?? error.code ?? 'invalid response'}); ` +
           `diagnostic categories: ${matched.join(', ') || 'none'}; no automatic retry`);
+        // Подтверждённый отказ провайдера (недоступность/неподдерживаемая модель
+        // или провайдер) — единственное основание для согласованного резерва;
+        // транспортная неясность по-прежнему выбрасывается как uncertain.
+        if (/not available|unavailable|unsupported|unknown (provider|model)|denied/i.test(message)) {
+          return { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
+        }
         throw error;
       }
     },
@@ -176,7 +205,7 @@ async function execute() {
     if (!profile) throw new Error('Missing approved checks');
     const policy = { version: p.version, digest: await fingerprint(), profiles: { [attempt.check_profile]: { ...profile,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
-      executor: { provider: p.bb.provider, model: p.bb.model },
+      executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
       review: { ...profile.review, requireAttestation: true } } } };
     let lost = false;
     let renewal = Promise.resolve();
@@ -214,7 +243,7 @@ async function execute() {
     let recheck = values['recheck-rejected-handoff'];
     while (Date.now() <= deadline) {
       const result = await advance({ route, state, board: port, bb, submissions, verify, authorize,
-        recheckRejectedHandoff: recheck });
+        recheckRejectedHandoff: recheck, workerSelector });
       recheck = false;
       const line = JSON.stringify(result);
       if (line !== previous) console.log(line);

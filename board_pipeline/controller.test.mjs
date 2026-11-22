@@ -370,9 +370,11 @@ test('queue mode does not admit a card whose profile_id differs from the route p
 test('worker selector spawns the agreed fallback only on a confirmed refusal and records the trail', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector();
+  x.cfg.route.zcodeQuota = 'available';
   x.cfg.bb.probeAvailability = async w => w.provider === 'acp-devin'
-    ? { status: 'confirmed_refusal' }
-    : { status: 'available', zcodeQuota: 'available' };
+    ? { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 }
+    : { status: 'available', activeBackgroundAgentCount: 0, zcodeQuota: 'available' };
+  x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
   x.cfg.bb.spawn = async env => {
     x.effects.spawn++;
     assert.equal(env.executor.provider, 'acp-zcode-start');
@@ -404,10 +406,37 @@ test('worker selector quarantines an unknown launch outcome without a second wri
   assert.equal(record.attemptedWorkers[0].verdict, 'unknown_outcome');
 });
 
+// Пункт 3: отказ первичного при грязном worktree — карантин без второго писателя.
+test('worker selector quarantines a confirmed refusal on a dirty worktree', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector();
+  x.cfg.route.zcodeQuota = 'available';
+  x.cfg.bb.probeAvailability = async () =>
+    ({ status: 'confirmed_refusal', activeBackgroundAgentCount: 0 });
+  x.cfg.bb.inspectWorktree = async () => ({ clean: false, head: 'a'.repeat(40) });
+  x.cfg.bb.spawn = async () => { x.effects.spawn++; return { threadId: 'thr_never' }; };
+  assert.equal((await x.tick()).phase, 'uncertain');
+  assert.equal((await x.tick()).reason, 'worker_launch_outcome_unknown');
+  assert.equal(x.effects.spawn, 0);
+});
+
 test('a triad violation rejects the route before any claim or spawn', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector();
   x.cfg.route.critic = { provider: 'acp-devin', model: 'swe-2-medium' };
+  assert.equal((await x.tick()).reason, 'route_triad_violation:review_same_family');
+  assert.equal((await x.inspect()).state, 'ready');
+  assert.equal(x.effects.spawn, 0);
+});
+
+// Пункт 4: триада проверяется для ВСЕХ кандидатов — резерв ZCode семейства glm
+// конфликтует с критиком glm, маршрут отклоняется до claim.
+test('a fallback violating the triad rejects the route before claim', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector();
+  x.cfg.route.zcodeQuota = 'available';
+  x.cfg.route.critic = { provider: 'acp-zcode-start',
+    model: 'builtin:zai-start-plan\\GLM-5.3-Flash' };
   assert.equal((await x.tick()).reason, 'route_triad_violation:review_same_family');
   assert.equal((await x.inspect()).state, 'ready');
   assert.equal(x.effects.spawn, 0);
@@ -420,7 +449,8 @@ test('three converging rework rounds complete without a round cap', async t => {
   await x.tick();
   const bad = {
     ['b' + '1'.repeat(39)]: { outcome: 'rework', reason: 'local_checks_failed',
-      signature: 'npm:test', feedback: { reason: 'local_checks_failed' } },
+      feedback: { reason: 'local_checks_failed', evidence: [
+        { file: 'checks-a.log', exit: 1, sha256: 'a'.repeat(64) }] } },
     ['b' + '2'.repeat(39)]: { outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
       feedback: { reason: 'review_verdict:REVIEW_BLOCKED',
         findings: [{ file: 'a.js', expected: 'e1', actual: 'x1' },
@@ -448,25 +478,54 @@ test('three converging rework rounds complete without a round cap', async t => {
   assert.equal(record.roundsHistory.length, 3);
 });
 
-// Сдача со структурированным спором против замечания L2.
-function withDispute(x) {
+// Пункт 6: L1 починил тест A, упал тест B — разные сигнатуры, починка сходится.
+test('different failing checks in L1 converge instead of stalling', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => { arbitrations++; } });
+  await x.tick();
+  scriptedVerify(x, {
+    [BAD1]: { outcome: 'rework', reason: 'local_checks_failed',
+      feedback: { reason: 'local_checks_failed', evidence: [
+        { file: 'checks-a.log', exit: 1, sha256: 'a'.repeat(64) },
+        { file: 'checks-b.log', exit: 0, sha256: 'b'.repeat(64) }] } },
+    [BAD2]: { outcome: 'rework', reason: 'local_checks_failed',
+      feedback: { reason: 'local_checks_failed', evidence: [
+        { file: 'checks-a.log', exit: 0, sha256: 'c'.repeat(64) },
+        { file: 'checks-b.log', exit: 1, sha256: 'd'.repeat(64) }] } },
+  });
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(GOOD);
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(arbitrations, 0);
+});
+
+// Сдача со структурированным спором: dispute привязывается к конкретной сдаче
+// и ссылке на реальное замечание прошлого L2.
+function withDispute(x, sha, findingRef) {
   const inner = x.cfg.submissions.read;
   x.cfg.submissions.read = async (attempt, after) => {
     const obs = await inner(attempt, after);
-    if (obs?.submission) {
+    if (obs?.submission && obs.submission.candidate_sha === sha) {
       obs.submission = { ...obs.submission, dispute: {
-        finding_ref: 'f1', justification: 'по спеке это корректно', spec_evidence: 'spec.md §2' } };
+        finding_ref: findingRef, justification: 'по спеке это корректно',
+        spec_evidence: 'spec.md §2' } };
     }
     return obs;
   };
 }
 
+const DIGEST = 'd'.repeat(64);
 const L2_REWORK = (findings, extra = {}) => ({
-  outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+  outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED', subject_digest: DIGEST,
   feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings }, ...extra });
 
 const BAD1 = 'b' + '1'.repeat(39);
 const BAD2 = 'b' + '2'.repeat(39);
+const BAD3 = 'b' + '3'.repeat(39);
 const GOOD = 'c'.repeat(40);
 const FINDING = { file: 'a.js', expected: 'spec behaviour', actual: 'other behaviour' };
 
@@ -476,10 +535,24 @@ function scriptedVerify(x, bad) {
   x.cfg.verify = async (attempt, submission) => {
     x.effects.verify++;
     const scripted = bad[submission.candidate_sha];
-    if (scripted) return typeof scripted === 'function' ? scripted() : scripted;
+    if (scripted) return typeof scripted === 'function' ? scripted(attempt, submission) : scripted;
     await x.cfg.board.complete(attempt.task_id, attempt.epoch, { sha: submission.candidate_sha });
     return { outcome: 'verified', receipt: { settle: 'completed' } };
   };
+}
+
+// Заглушка полного seal на стороне приёмки: для 'completed' проходит seal и
+// вызывает реальный board.complete — для регрессий seal возвращает исход.
+function sealStub(x, outcome) {
+  return (attempt, submission) => ({
+    ...L2_REWORK([{ file: 'b.js' }]),
+    sealAndComplete: async arbitrationReceipt => {
+      if (outcome !== 'completed') return outcome;
+      await x.cfg.board.complete(attempt.task_id, attempt.epoch,
+        { sha: submission.candidate_sha, arbitration: arbitrationReceipt });
+      return { outcome: 'verified', receipt: { settle: 'completed' } };
+    },
+  });
 }
 
 test('a substantive dispute triggers a third-family arbiter and one directed rework round', async t => {
@@ -488,13 +561,19 @@ test('a substantive dispute triggers a third-family arbiter and one directed rew
   x.cfg.workerSelector = workerSelector({ arbitrate: async req => {
     arbitrations++;
     assert.equal(req.arbiter.provider, 'google', 'арбитр из третьего семейства');
-    assert.equal(req.task_id, x.cfg.route.taskId);
-    return { decision: 'directed_rework', directive: 'исправь только оспариваемую находку' };
+    assert.equal(req.subject_digest, DIGEST);
+    return { decision: 'directed_rework', directive: 'исправь только оспариваемую находку',
+      subject_digest: DIGEST };
   } });
   await x.tick();
-  withDispute(x);
-  scriptedVerify(x, { [BAD1]: L2_REWORK([FINDING]) });
+  scriptedVerify(x, {
+    [BAD1]: L2_REWORK([FINDING]),
+    [BAD2]: L2_REWORK([{ file: 'b.js', expected: 'e2', actual: 'x2' }]),
+  });
+  withDispute(x, BAD2, 'a.js');
   x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
   assert.equal((await x.tick()).phase, 'working');
   assert.equal(arbitrations, 1);
   const last = x.effects.feedback.at(-1);
@@ -507,21 +586,147 @@ test('a substantive dispute triggers a third-family arbiter and one directed rew
   assert.equal((await x.tick()).phase, 'done');
 });
 
-test('arbiter accept_with_notes completes the card and pins the arbitration receipt', async t => {
+// Пункт 7: спор по несуществующей ссылке арбитраж не запускает.
+test('a dispute against a nonexistent finding ref is not arbitrated', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => { arbitrations++; } });
+  await x.tick();
+  scriptedVerify(x, {
+    [BAD1]: L2_REWORK([FINDING]),
+    [BAD2]: L2_REWORK([{ file: 'b.js', expected: 'e2', actual: 'x2' }]),
+  });
+  withDispute(x, BAD2, 'ghost.js');
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(arbitrations, 0, 'фейковый dispute не запускает арбитраж');
+  assert.equal(x.effects.feedback.length, 2);
+});
+
+// Пункт 7: одинаковый tree_sha разных коммитов — отсутствие прогресса.
+test('a new commit with a repeated tree_sha triggers no_progress arbitration', async t => {
+  const x = await lab(t);
+  const seen = [];
+  x.cfg.workerSelector = workerSelector({ arbitrate: async req => {
+    seen.push(req);
+    return { decision: 'directed_rework', directive: 'change the tree',
+      subject_digest: DIGEST };
+  } });
+  await x.tick();
+  const TREE = 'f'.repeat(40);
+  scriptedVerify(x, {
+    [BAD1]: { ...L2_REWORK([FINDING]), tree_sha: TREE },
+    [BAD2]: { ...L2_REWORK([{ file: 'b.js' }]), tree_sha: TREE },
+  });
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].trigger.kind, 'duplicate_tree_sha');
+});
+
+// Пункт 7: взаимоисключающие требования L2 по одному месту — substantive_dispute.
+test('contradictory L2 requirements on the same spot trigger arbitration', async t => {
+  const x = await lab(t);
+  const seen = [];
+  x.cfg.workerSelector = workerSelector({ arbitrate: async req => {
+    seen.push(req);
+    return { decision: 'directed_rework', directive: 'resolve the contradiction',
+      subject_digest: DIGEST };
+  } });
+  await x.tick();
+  scriptedVerify(x, {
+    [BAD1]: L2_REWORK([{ file: 'x.js', line: 5, expected: 'A', actual: 'B' }]),
+    [BAD2]: L2_REWORK([{ file: 'x.js', line: 5, expected: 'B', actual: 'A' }]),
+  });
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].trigger.kind, 'contradictory_l2_findings');
+  x.submit(GOOD);
+  assert.equal((await x.tick()).phase, 'done');
+});
+
+test('arbiter accept_with_notes completes the card only through a full seal', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector({ arbitrate: async () => ({
-    decision: 'accept_with_notes', notes: 'cosmetic finding only' }) });
+    decision: 'accept_with_notes', notes: 'cosmetic finding only', subject_digest: DIGEST }) });
   await x.tick();
-  withDispute(x);
-  scriptedVerify(x, { [BAD1]: L2_REWORK([FINDING]) });
+  scriptedVerify(x, {
+    [BAD1]: L2_REWORK([FINDING]),
+    [BAD2]: sealStub(x, 'completed'),
+  });
+  withDispute(x, BAD2, 'a.js');
   x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
   assert.equal((await x.tick()).phase, 'done');
   const head = await x.inspect();
   assert.equal(head.state, 'completed');
-  assert.equal(head.result.sha, BAD1);
+  assert.equal(head.result.sha, BAD2);
   const record = await x.cfg.state.load();
   assert.equal(record.arbitration.decision, 'accept_with_notes');
   assert.equal(record.arbitration.arbiter.provider, 'google');
+});
+
+// Пункт 1: арбитрованное принятие никогда не обходит seal — грязный worktree,
+// дрейф живой метки finish/spec_digest или потеря аренды на seal отменяют complete.
+test('accept_with_notes never bypasses the seal: drift or lost lease blocks complete', async t => {
+  for (const [sealed, phase, reason] of [
+    [{ outcome: 'hold', reason: 'dirty_worktree' }, 'hold', 'dirty_worktree'],
+    [{ outcome: 'hold', reason: 'finish_drift' }, 'hold', 'finish_drift'],
+    [{ outcome: 'hold', reason: 'spec_digest_drift' }, 'hold', 'spec_digest_drift'],
+    [{ outcome: 'denied', reason: 'claim_not_held:409' }, 'lease_lost', 'claim_not_held:409'],
+    [{ outcome: 'uncertain', reason: 'complete_failed:lost' }, 'uncertain', 'complete_failed:lost'],
+  ]) {
+    const x = await lab(t);
+    let completes = 0;
+    const origComplete = x.cfg.board.complete.bind(x.cfg.board);
+    x.cfg.board.complete = async (...args) => { completes++; return origComplete(...args); };
+    x.cfg.workerSelector = workerSelector({ arbitrate: async () => ({
+      decision: 'accept_with_notes', notes: 'n', subject_digest: DIGEST }) });
+    await x.tick();
+    scriptedVerify(x, {
+      [BAD1]: L2_REWORK([FINDING]),
+      [BAD2]: sealStub(x, sealed),
+    });
+    withDispute(x, BAD2, 'a.js');
+    x.submit(BAD1);
+    assert.equal((await x.tick()).phase, 'working');
+    x.submit(BAD2);
+    const out = await x.tick();
+    assert.equal(out.phase, phase, sealed.reason);
+    assert.equal(out.reason, reason, sealed.reason);
+    assert.equal(completes, 0, `complete не вызван при ${sealed.reason}`);
+  }
+});
+
+// Пункт 2: accept_with_notes с чужим subject_digest отклоняется до seal.
+test('accept_with_notes with a foreign subject_digest never reaches the seal', async t => {
+  const x = await lab(t);
+  let sealCalls = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => ({
+    decision: 'accept_with_notes', notes: 'n', subject_digest: 'f'.repeat(64) }) });
+  await x.tick();
+  scriptedVerify(x, {
+    [BAD1]: L2_REWORK([FINDING]),
+    [BAD2]: () => ({ ...L2_REWORK([{ file: 'b.js' }]),
+      sealAndComplete: async () => { sealCalls++; } }),
+  });
+  // Заглушка верификатора несёт манифест; чужой digest арбитра — mismatch.
+  withDispute(x, BAD2, 'a.js');
+  x.submit(BAD1);
+  await x.tick();
+  x.submit(BAD2);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'arbiter_subject_mismatch');
+  assert.equal(sealCalls, 0);
 });
 
 test('arbiter escalate_owner puts one concrete needs_input question on the card', async t => {
@@ -529,8 +734,11 @@ test('arbiter escalate_owner puts one concrete needs_input question on the card'
   x.cfg.workerSelector = workerSelector({ arbitrate: async () => ({
     decision: 'escalate_owner', question: 'Какое поведение верно по spec §3?' }) });
   await x.tick();
-  withDispute(x);
-  scriptedVerify(x, { [BAD1]: L2_REWORK([FINDING]) });
+  scriptedVerify(x, {
+    [BAD1]: L2_REWORK([FINDING]),
+    [BAD2]: L2_REWORK([{ file: 'b.js' }]),
+  });
+  withDispute(x, BAD2, 'a.js');
   let blockedMessage = '';
   const origBlock = x.cfg.board.block.bind(x.cfg.board);
   x.cfg.board.block = async (id, epoch, message) => {
@@ -538,6 +746,8 @@ test('arbiter escalate_owner puts one concrete needs_input question on the card'
     return origBlock(id, epoch, message);
   };
   x.submit(BAD1);
+  await x.tick();
+  x.submit(BAD2);
   const out = await x.tick();
   assert.equal(out.phase, 'hold');
   assert.equal(out.reason, 'arbiter_escalated_to_owner');
@@ -550,18 +760,32 @@ test('a second dispute after a directed rework exhausts arbitration into needs_i
   let calls = 0;
   x.cfg.workerSelector = workerSelector({ arbitrate: async () => {
     calls++;
-    return { decision: 'directed_rework', directive: `fix ${calls}` };
+    return { decision: 'directed_rework', directive: `fix ${calls}`, subject_digest: DIGEST };
   } });
   await x.tick();
-  withDispute(x);
   scriptedVerify(x, {
     [BAD1]: L2_REWORK([FINDING]),
-    [BAD2]: L2_REWORK([{ ...FINDING, file: 'b.js' }]),
+    [BAD2]: L2_REWORK([{ file: 'b.js', expected: 'e2', actual: 'x2' }]),
+    [BAD3]: L2_REWORK([{ file: 'c.js', expected: 'e3', actual: 'x3' }]),
   });
+  // Спор второго раунда ссылается на находку первого (a.js), третьего — второго (b.js).
+  const inner = x.cfg.submissions.read;
+  x.cfg.submissions.read = async (attempt, after) => {
+    const obs = await inner(attempt, after);
+    const refs = { [BAD2]: 'a.js', [BAD3]: 'b.js' };
+    if (obs?.submission && refs[obs.submission.candidate_sha]) {
+      obs.submission = { ...obs.submission, dispute: {
+        finding_ref: refs[obs.submission.candidate_sha],
+        justification: 'j', spec_evidence: 's' } };
+    }
+    return obs;
+  };
   x.submit(BAD1);
   assert.equal((await x.tick()).phase, 'working');
-  assert.equal(calls, 1);
   x.submit(BAD2);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(calls, 1);
+  x.submit(BAD3);
   const out = await x.tick();
   assert.equal(out.phase, 'hold');
   assert.equal(out.reason, 'arbitration_exhausted');
@@ -574,12 +798,17 @@ test('a harm=10 finding goes straight to the owner, never to arbiter acceptance'
   let arbitrations = 0;
   x.cfg.workerSelector = workerSelector({ arbitrate: async () => {
     arbitrations++;
-    return { decision: 'accept_with_notes', notes: 'n' };
+    return { decision: 'accept_with_notes', notes: 'n', subject_digest: DIGEST };
   } });
   await x.tick();
-  withDispute(x);
-  scriptedVerify(x, { [BAD1]: L2_REWORK([{ ...FINDING, harm: 10 }]) });
+  scriptedVerify(x, {
+    [BAD1]: L2_REWORK([FINDING]),
+    // Тот же finding повторяется с harm=10: триггер repeated_l2_finding.
+    [BAD2]: L2_REWORK([{ ...FINDING, harm: 10 }]),
+  });
   x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
   const out = await x.tick();
   assert.equal(out.phase, 'hold');
   assert.equal(out.reason, 'harm10_requires_owner');
@@ -592,8 +821,9 @@ test('two identical deterministic failures hold without calling the arbiter', as
   let arbitrations = 0;
   x.cfg.workerSelector = workerSelector({ arbitrate: async () => { arbitrations++; } });
   await x.tick();
-  const l1 = { outcome: 'rework', reason: 'local_checks_failed', signature: 'npm:test',
-    feedback: { reason: 'local_checks_failed' } };
+  const l1 = { outcome: 'rework', reason: 'local_checks_failed',
+    feedback: { reason: 'local_checks_failed', evidence: [
+      { file: 'checks-a.log', exit: 1, sha256: 'a'.repeat(64) }] } };
   scriptedVerify(x, { [BAD1]: l1, [BAD2]: l1 });
   x.submit(BAD1);
   assert.equal((await x.tick()).phase, 'working');

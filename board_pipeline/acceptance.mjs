@@ -456,6 +456,7 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
       status: 'rework',
       reason: 'local_checks_failed',
       feedback: { reason: 'local_checks_failed', evidence: loc.evidence, exit: loc.exit },
+      loc,
     };
   }
   if (loc.evidence === undefined || loc.evidence === null || loc.evidence === '') {
@@ -488,6 +489,7 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
         reason: 'tamper_gate_failed',
         feedback: { reason: 'tamper_gate_failed', violations: tamper?.violations ?? [],
           digest: tamper?.digest ?? null },
+        loc, tamper,
       };
     }
   }
@@ -518,7 +520,7 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
         reason: 'visual_gate_failed',
         feedback: { reason: 'visual_gate_failed', status: vis?.status ?? 'fail',
           artifacts: vis?.artifacts ?? [], evidence: vis?.evidence ?? null },
-        visual: vis,
+        loc, tamper, visual: vis,
       };
     }
     // Зелёный L3 должен быть аттестованной квитанцией: тот же SHA, статус pass,
@@ -646,6 +648,7 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
       feedback: { reason: `review_verdict:${rev.verdict}`, verdict: rev.verdict, checkpoint: rev.checkpoint,
         threadId: rev.threadId, excerpt: rev.excerpt, findings: rev.findings,
         summary: rev.summary },
+      loc, tamper, visual, review: rev, actual,
     };
   }
 
@@ -981,6 +984,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       epoch: attempt.epoch,
       candidate_sha: submission.candidate_sha,
       run: id,
+      subject_digest: digest,
+      tree_sha: subject?.source?.tree_sha ?? null,
       receipt: {
         task_id: attempt.task_id,
         attempt_id: attempt.attempt_id,
@@ -1047,6 +1052,89 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     return settle('denied', { reason: `claim_not_held:${messageOf(e)}` });
   }
 
+  // Печать: операторские входы, контракт карточки и снимок перепроверяются после L2
+  // и до complete — смена брифа, политики или спеки во время проверок останавливает
+  // кандидата, а не закрывает карточку устаревшим вердиктом. Тот же полный seal
+  // обязателен и для арбитрованного accept_with_notes.
+  const doSeal = async () => {
+    await intent('seal');
+    if (typeof ports.verifyPinned === 'function') {
+      try {
+        await ports.verifyPinned();
+        await step('seal', true, 'operator_inputs_pinned');
+      } catch (e) {
+        await step('seal', false, messageOf(e));
+        return { fail: 'policy_digest_drift' };
+      }
+    }
+    if (subject !== null) {
+      let labels = null;
+      try {
+        labels = await ports.board.labels?.(attempt.task_id);
+      } catch (e) {
+        await step('seal', false, messageOf(e));
+        return { fail: `seal_failed:${messageOf(e)}` };
+      }
+      if (labels === null || typeof labels !== 'object') {
+        await step('seal', false, 'contract_labels_unavailable');
+        return { fail: 'contract_labels_unavailable' };
+      }
+      // Все закреплённые поля контракта сверяются с живыми метками карточки: дрейф
+      // любого из них после L2 останавливает кандидата до complete.
+      const expectedLabels = {
+        repo_id: attempt.repo_id,
+        profile_id: attempt.check_profile,
+        finish: attempt.finish,
+        spec_digest: attempt.spec_digest,
+        policy_digest: attempt.policy_digest,
+      };
+      for (const [field, expected] of Object.entries(expectedLabels)) {
+        if (labels[field] !== expected) {
+          await step('seal', false, `${field}_drift`);
+          return { fail: `${field}_drift` };
+        }
+      }
+      // fixtures_digest сверяется всегда и нормализуется как в манифесте: отсутствие
+      // значения в контракте и на карточке — null, появление метки во время L2 — дрейф.
+      const expectedFixtures = attempt.fixtures_digest ?? null;
+      const liveFixtures = typeof labels.fixtures_digest === 'string' ? labels.fixtures_digest : null;
+      if (liveFixtures !== expectedFixtures) {
+        await step('seal', false, 'fixtures_digest_drift');
+        return { fail: 'fixtures_digest_drift' };
+      }
+      if (policy.digest !== undefined && policy.digest !== attempt.policy_digest) {
+        await step('seal', false, 'policy_digest_drift');
+        return { fail: 'policy_digest_drift' };
+      }
+      await step('seal', true, 'contract_pinned');
+    }
+    let ins;
+    try {
+      ins = await ports.inspect(binding);
+    } catch (e) {
+      await step('seal', false, messageOf(e));
+      return { fail: `seal_failed:${messageOf(e)}` };
+    }
+    const changed = inspectionProblem(ins, binding.candidate_sha);
+    if (changed) {
+      await step('seal', false, changed);
+      return { fail: changed };
+    }
+    // tree_sha снимка не должен сдвинуться с момента инспекции манифеста.
+    if (subject?.source?.tree_sha && ins?.tree && ins.tree !== subject.source.tree_sha) {
+      await step('seal', false, 'tree_sha_drift');
+      return { fail: 'tree_sha_drift' };
+    }
+    try {
+      const proof = await ports.board.verifyHeld(attempt.task_id, attempt.epoch);
+      await step('seal', true, { epoch: proof.epoch, until: proof.until });
+      return { ok: true, live: proof };
+    } catch (e) {
+      await step('seal', false, `claim_lost:${messageOf(e)}`);
+      return { denied: `claim_not_held:${messageOf(e)}` };
+    }
+  };
+
   const verdict = await runVerification({ binding, profile, ports, intent, step,
     beforeReview: () => ports.board.verifyHeld(attempt.task_id, attempt.epoch),
     onSnapshot: finalizeSubject,
@@ -1056,11 +1144,69 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
 
   if (verdict.status === 'rework') {
     // Исправимый дефект: та же аренда остаётся живой, никаких settle-эффектов.
-    return settle('rework', {
+    const record = await settle('rework', {
       reason: verdict.reason,
       feedback: verdict.feedback,
       receipt: { settle: 'deferred', reason: verdict.reason, until: live.until },
     });
+    // Арбитрованное принятие (accept_with_notes) обязано пройти тот же полный
+    // seal перед complete: контроллер вызывает sealAndComplete с квитанцией
+    // арбитра — прямого board.complete в обход seal не существует.
+    record.sealAndComplete = async (arbitrationReceipt) => {
+      const sealed = await doSeal();
+      if (sealed.denied) return settle('denied', { reason: sealed.denied });
+      if (sealed.fail) return hold(sealed.fail);
+      const sealLive = sealed.live;
+      const rev = verdict.review ?? {};
+      const actual = verdict.actual ?? {};
+      const evidence = compactEvidence({
+        sha: binding.candidate_sha,
+        subject_digest: digest,
+        worker: attempt.bb_thread_id,
+        checks: verdict.loc?.evidence ?? [],
+        tamper: verdict.tamper ? 'pass' : 'na',
+        visual: verdict.visual,
+        review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
+      }, id);
+      const gateReceipts = {
+        tamper: verdict.tamper ? { ok: verdict.tamper.ok === true, sha: verdict.tamper.sha,
+          base_sha: verdict.tamper.base_sha, digest: verdict.tamper.digest,
+          violations: verdict.tamper.violations ?? [] } : null,
+        visual: !verdict.visual || verdict.visual.status === 'not_applicable'
+          ? { status: 'not_applicable' } : verdict.visual,
+      };
+      if (attempt.finish !== 'verified') {
+        return settle('verified', {
+          evidence: verdict.loc?.evidence,
+          receipt: { settle: 'deferred', until: sealLive.until, evidence,
+            arbitration: arbitrationReceipt, ...gateReceipts },
+        });
+      }
+      await intent('complete');
+      try {
+        await ports.board.complete(attempt.task_id, attempt.epoch,
+          { ...evidence, arbitration: arbitrationReceipt });
+        await step('complete', true, { epoch: attempt.epoch });
+      } catch (e) {
+        await step('complete', false, messageOf(e));
+        let state = null;
+        try {
+          state = (await ports.board.lookup(attempt.task_id))?.state ?? null;
+        } catch {
+          state = null;
+        }
+        return settle('uncertain', {
+          reason: `complete_failed:${messageOf(e)}`,
+          board_state: state,
+          receipt: { settle: 'unknown', evidence, arbitration: arbitrationReceipt, ...gateReceipts },
+        });
+      }
+      return settle('verified', {
+        evidence: verdict.loc?.evidence,
+        receipt: { settle: 'completed', evidence, arbitration: arbitrationReceipt, ...gateReceipts },
+      });
+    };
+    return record;
   }
   if (verdict.status === 'hold') {
     return hold(verdict.reason);
@@ -1068,78 +1214,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
 
   const { loc, review: rev, actual, tamper, visual } = verdict;
 
-  // Печать: операторские входы, контракт карточки и снимок перепроверяются после L2
-  // и до complete — смена брифа, политики или спеки во время проверок останавливает
-  // кандидата, а не закрывает карточку устаревшим вердиктом.
-  await intent('seal');
-  if (typeof ports.verifyPinned === 'function') {
-    try {
-      await ports.verifyPinned();
-      await step('seal', true, 'operator_inputs_pinned');
-    } catch (e) {
-      await step('seal', false, messageOf(e));
-      return hold('policy_digest_drift');
-    }
-  }
-  if (subject !== null) {
-    let labels = null;
-    try {
-      labels = await ports.board.labels?.(attempt.task_id);
-    } catch (e) {
-      await step('seal', false, messageOf(e));
-      return hold(`seal_failed:${messageOf(e)}`);
-    }
-    if (labels === null || typeof labels !== 'object') {
-      await step('seal', false, 'contract_labels_unavailable');
-      return hold('contract_labels_unavailable');
-    }
-    // Все закреплённые поля контракта сверяются с живыми метками карточки: дрейф
-    // любого из них после L2 останавливает кандидата до complete.
-    const expectedLabels = {
-      repo_id: attempt.repo_id,
-      profile_id: attempt.check_profile,
-      finish: attempt.finish,
-      spec_digest: attempt.spec_digest,
-      policy_digest: attempt.policy_digest,
-    };
-    for (const [field, expected] of Object.entries(expectedLabels)) {
-      if (labels[field] !== expected) {
-        await step('seal', false, `${field}_drift`);
-        return hold(`${field}_drift`);
-      }
-    }
-    // fixtures_digest сверяется всегда и нормализуется как в манифесте: отсутствие
-    // значения в контракте и на карточке — null, появление метки во время L2 — дрейф.
-    const expectedFixtures = attempt.fixtures_digest ?? null;
-    const liveFixtures = typeof labels.fixtures_digest === 'string' ? labels.fixtures_digest : null;
-    if (liveFixtures !== expectedFixtures) {
-      await step('seal', false, 'fixtures_digest_drift');
-      return hold('fixtures_digest_drift');
-    }
-    if (policy.digest !== undefined && policy.digest !== attempt.policy_digest) {
-      await step('seal', false, 'policy_digest_drift');
-      return hold('policy_digest_drift');
-    }
-    await step('seal', true, 'contract_pinned');
-  }
-  let changed;
-  try {
-    changed = inspectionProblem(await ports.inspect(binding), binding.candidate_sha);
-  } catch (e) {
-    await step('seal', false, messageOf(e));
-    return hold(`seal_failed:${messageOf(e)}`);
-  }
-  if (changed) {
-    await step('seal', false, changed);
-    return hold(changed);
-  }
-  try {
-    live = await ports.board.verifyHeld(attempt.task_id, attempt.epoch);
-    await step('seal', true, { epoch: live.epoch, until: live.until });
-  } catch (e) {
-    await step('seal', false, `claim_lost:${messageOf(e)}`);
-    return settle('denied', { reason: `claim_not_held:${messageOf(e)}` });
-  }
+  const sealed = await doSeal();
+  if (sealed.denied) return settle('denied', { reason: sealed.denied });
+  if (sealed.fail) return hold(sealed.fail);
+  live = sealed.live;
 
   const evidence = compactEvidence({
     sha: binding.candidate_sha,

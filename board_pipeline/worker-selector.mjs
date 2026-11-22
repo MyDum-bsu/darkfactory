@@ -3,9 +3,10 @@
 // закрыть»: нормальная сходящаяся починка не обрывается по счётчику кругов.
 //
 // Переключение на резерв допускается ТОЛЬКО при подтверждённом отказе
-// (confirmed_refusal) первичного провайдера до любых правок worktree.
-// Неизвестный исход (потерянный ответ, транспортный таймаут, пустая/неоднозначная
-// выдача BB, фоновые агенты, грязный worktree) — uncertain без второго писателя.
+// (confirmed_refusal) первичного провайдера до любых правок worktree: после
+// любого отказа (probe или spawn) обязательно доказаны ноль фоновых агентов,
+// чистый worktree и HEAD === base_sha. Неизвестный исход — uncertain без
+// второго писателя.
 
 import { executorFamily, ReviewDenied } from './review-runner.mjs';
 
@@ -40,6 +41,7 @@ const GATE_BY_REASON = new Map([
   ['tamper_gate_failed', 'tamper'],
   ['visual_gate_failed', 'l3'],
 ]);
+const DIGEST64 = /^[0-9a-f]{64}$/;
 
 // Семейство по строгой таблице review-runner. У harness-исполнителей
 // (provider 'pi') семейство определяет модель вида 'provider/model' —
@@ -54,10 +56,12 @@ export function workerFamily(worker) {
   return null;
 }
 
-// Упорядоченный план исполнителей маршрута. Узкий резерв входит в план
-// только при явном допуске в маршруте — не как общий автозаменитель.
-export function selectWorker({ route } = {}) {
-  const plan = [PRIMARY_WORKER, FALLBACK_ZCODE];
+// Упорядоченный план исполнителей маршрута. Резерв ZCode входит в план
+// ТОЛЬКО при явном opts.zcodeQuota === 'available'; узкий резерв — только
+// при явном допуске в маршруте, не как общий автозаменитель.
+export function selectWorker({ route, zcodeQuota } = {}) {
+  const plan = [PRIMARY_WORKER];
+  if (zcodeQuota === 'available') plan.push(FALLBACK_ZCODE);
   if (route?.allowNarrowReserve === true) plan.push(NARROW_RESERVE_PI);
   return plan;
 }
@@ -93,23 +97,51 @@ function probeStatus(probeResult) {
     ? probeResult.status : 'unknown_outcome';
 }
 
-// Явный подтверждённый отказ первого хода: провайдер отказал при нуле
-// фоновых агентов и чистом неизменном worktree на base_sha.
-function isConfirmedSpawnRefusal(launched) {
-  return launched !== null && typeof launched === 'object' &&
-    launched.status === 'confirmed_refusal' &&
-    launched.activeBackgroundAgentCount === 0 && launched.worktreeClean === true;
+// После ЛЮБОГО подтверждённого отказа (probe или spawn) переход к резерву
+// допустим только при доказанном отсутствии правок: ноль фоновых агентов у
+// отказавшего источника и inspectWorktree подтвердил clean && head === base_sha.
+// Что-либо недоказано — false → uncertain без второго писателя.
+async function cleanAfterRefusal(source, attempt, inspectWorktree) {
+  if (source?.activeBackgroundAgentCount !== 0) return false;
+  if (typeof inspectWorktree !== 'function') return false;
+  let ins = null;
+  try {
+    ins = await inspectWorktree(attempt);
+  } catch {
+    ins = null;
+  }
+  return ins !== null && typeof ins === 'object' &&
+    ins.clean === true && ins.head === attempt?.base_sha;
 }
 
 // Последовательный запуск по плану с честным различением исходов.
-// probe(worker) → 'available' | 'confirmed_refusal' | { status, zcodeQuota };
-// spawn(attempt) → { threadId } либо конверт подтверждённого отказа.
-export async function attemptSpawnWithFallback({ route, attempt, probe, spawn, plan }) {
-  const order = plan ?? selectWorker({ route });
+// probe(worker) → 'available' | 'confirmed_refusal' | { status, zcodeQuota,
+// activeBackgroundAgentCount }; spawn(attempt) → { threadId } либо конверт
+// подтверждённого отказа { status: 'confirmed_refusal',
+// activeBackgroundAgentCount: 0 }. inspectWorktree(attempt) →
+// { clean, head } — обязателен для любого перехода на резерв.
+export async function attemptSpawnWithFallback({
+  route, attempt, probe, spawn, plan, zcodeQuota, inspectWorktree,
+  critic = DEFAULT_CRITIC, arbiter = DEFAULT_ARBITER,
+}) {
+  const order = plan ?? selectWorker({ route, zcodeQuota });
+  // Кросс-семейственная триада проверяется для ВСЕХ кандидатов цепочки:
+  // нарушивший независимость резерв отклоняет маршрут, а не пропускается тихо.
+  for (const worker of order) {
+    try {
+      assertTriadIndependent({ executor: worker, critic, arbiter });
+    } catch (e) {
+      return {
+        outcome: 'rejected',
+        reason: `route_triad_violation:${e.reason ?? e.message}`,
+        attemptedWorkers: [],
+      };
+    }
+  }
   const attemptedWorkers = [];
   let lastRefusal = null;
   for (const worker of order) {
-    let probed = { status: 'available' };
+    let probed = { status: 'available', activeBackgroundAgentCount: 0 };
     if (typeof probe === 'function') {
       try {
         probed = await probe(worker);
@@ -128,14 +160,29 @@ export async function attemptSpawnWithFallback({ route, attempt, probe, spawn, p
       };
     }
     if (status === 'confirmed_refusal') {
+      if (!await cleanAfterRefusal(probed, attempt, inspectWorktree)) {
+        return {
+          outcome: 'uncertain',
+          reason: 'worker_launch_outcome_unknown',
+          attemptedWorkers: [...attemptedWorkers,
+            { ...worker, family: workerFamily(worker), verdict: 'unknown_outcome' }],
+        };
+      }
       const reason = `confirmed_refusal:${worker.provider}`;
       attemptedWorkers.push({ ...worker, family: workerFamily(worker), verdict: 'confirmed_refusal', reason });
       lastRefusal = reason;
       continue;
     }
     // Согласованный резерв ZCode — только при подтверждённой доступности/квоте.
-    if (worker === FALLBACK_ZCODE && probed?.zcodeQuota !== undefined &&
-        probed.zcodeQuota !== 'available') {
+    if (worker === FALLBACK_ZCODE && probed?.zcodeQuota !== 'available') {
+      if (!await cleanAfterRefusal(probed, attempt, inspectWorktree)) {
+        return {
+          outcome: 'uncertain',
+          reason: 'worker_launch_outcome_unknown',
+          attemptedWorkers: [...attemptedWorkers,
+            { ...worker, family: workerFamily(worker), verdict: 'unknown_outcome' }],
+        };
+      }
       const reason = 'zcode_quota_unavailable';
       attemptedWorkers.push({ ...worker, family: workerFamily(worker), verdict: 'confirmed_refusal', reason });
       lastRefusal = reason;
@@ -151,7 +198,15 @@ export async function attemptSpawnWithFallback({ route, attempt, probe, spawn, p
         attemptedWorkers,
       };
     }
-    if (isConfirmedSpawnRefusal(launched)) {
+    if (launched?.status === 'confirmed_refusal') {
+      if (!await cleanAfterRefusal(launched, attempt, inspectWorktree)) {
+        return {
+          outcome: 'uncertain',
+          reason: 'worker_launch_outcome_unknown',
+          attemptedWorkers: [...attemptedWorkers,
+            { ...worker, family: workerFamily(worker), verdict: 'unknown_outcome' }],
+        };
+      }
       const reason = `confirmed_refusal:${worker.provider}`;
       attemptedWorkers.push({ ...worker, family: workerFamily(worker), verdict: 'confirmed_refusal', reason });
       lastRefusal = reason;
@@ -191,16 +246,46 @@ export function roundGate(result) {
   return 'l1';
 }
 
-// Сигнатура отказа раунда: для детерминированных гейтов — причина и явная
-// сигнатура проверки; для L2 — канонические поля blocking-findings.
-export function roundSignature(result) {
-  const explicit = result?.signature ?? result?.feedback?.signature;
-  if (typeof explicit === 'string' && explicit) return `${result?.reason ?? ''}|${explicit}`;
-  const findings = result?.feedback?.findings;
-  if (Array.isArray(findings) && findings.length) {
-    return findings.map(f => `${f?.file ?? ''}|${f?.expected ?? ''}|${f?.actual ?? ''}`).join(';;');
+export const findingKey = f =>
+  `${f?.file ?? ''}|${f?.line ?? ''}|${f?.expected ?? ''}|${f?.actual ?? ''}`;
+
+// Сигнатура детерминированного отказа из ФАКТИЧЕСКИХ данных провалившейся
+// проверки: упавший тест A (лог sha256_A) и починенный A + упавший B
+// (sha256_B) — разные сигнатуры, починка сходится.
+function deterministicDetail(feedback) {
+  if (feedback === null || typeof feedback !== 'object') return '';
+  const evidence = feedback.evidence;
+  if (Array.isArray(evidence) && evidence.length) {
+    const failing = evidence.filter(e => e !== null && typeof e === 'object' &&
+      (e.exit !== 0 && e.exit !== undefined || e.ok === false));
+    const list = failing.length ? failing : evidence;
+    return list.map(e => `${e?.file ?? ''}:${e?.sha256 ?? e?.exit ?? ''}`).join(';;');
   }
-  return result?.reason ?? '';
+  if (Array.isArray(feedback.violations) && feedback.violations.length) {
+    return `violations:${JSON.stringify(feedback.violations)}`;
+  }
+  if (Array.isArray(feedback.artifacts) && feedback.artifacts.length) {
+    return `artifacts:${feedback.artifacts.map(a => a?.sha256 ?? a?.name ?? '').join(',')}`;
+  }
+  for (const key of ['summary', 'excerpt', 'status', 'evidence']) {
+    if (typeof feedback[key] === 'string' && feedback[key]) return `${key}:${feedback[key]}`;
+  }
+  return '';
+}
+
+// Сигнатура отказа раунда: для детерминированных гейтов — причина и фактическая
+// сигнатура провалившейся проверки; для L2 — канонические ключи findings.
+export function roundSignature(result) {
+  const reason = result?.reason ?? '';
+  const feedback = result?.feedback ?? {};
+  const explicit = result?.signature ?? feedback.signature;
+  if (typeof explicit === 'string' && explicit) return `${reason}|${explicit}`;
+  const findings = feedback.findings;
+  if (Array.isArray(findings) && findings.length) {
+    return `${reason}|${findings.map(findingKey).join(';;')}`;
+  }
+  const detail = deterministicDetail(feedback);
+  return detail ? `${reason}|${detail}` : reason;
 }
 
 // Структурированный спор воркера: ссылка на замечание, аргументация и опора
@@ -211,19 +296,55 @@ export function validDispute(dispute) {
       k => typeof dispute[k] === 'string' && dispute[k].trim().length > 0);
 }
 
+// Допустимые ссылки на замечания прошлого L2-раунда: file, file:line, id
+// находки и checkpoint ревью. Спор по несуществующей ссылке не признаётся.
+function findingRefsOf(round) {
+  const refs = new Set();
+  for (const f of round?.findings ?? []) {
+    if (typeof f?.file === 'string' && f.file) {
+      refs.add(f.file);
+      if (f.line !== undefined && f.line !== null) refs.add(`${f.file}:${f.line}`);
+    }
+    if (typeof f?.id === 'string' && f.id) refs.add(f.id);
+  }
+  if (typeof round?.checkpoint === 'string' && round.checkpoint) refs.add(round.checkpoint);
+  return refs;
+}
+
+// Два L2-раунда противоречат друг другу по одному месту, если на одном
+// file+line ожидание одного стало фактом другого (и наоборот).
+function contradicting(prev, latest) {
+  for (const pf of prev?.findings ?? []) {
+    for (const cf of latest?.findings ?? []) {
+      if (typeof pf?.file !== 'string' || !pf.file || pf.file !== cf?.file) continue;
+      if ((pf.line ?? null) !== (cf.line ?? null)) continue;
+      const pe = pf.expected, pa = pf.actual, ce = cf.expected, ca = cf.actual;
+      if ((typeof pe === 'string' && pe && pe === ca) ||
+          (typeof pa === 'string' && pa && pa === ce)) return true;
+    }
+  }
+  return false;
+}
+
 // Детектор отсутствия прогресса и содержательного спора. roundsHistory —
-// включая последний раунд (поля: gate, signature, blocking, tree_sha, dispute,
-// contradictory). Сходящаяся починка любой длины триггеров не даёт.
+// включая последний раунд (поля: gate, signature, blocking, findings, excerpt,
+// checkpoint, tree_sha, dispute, contradictory). Сходящаяся починка любой
+// длины триггеров не даёт.
 export function evaluateReworkProgress({ roundsHistory = [] } = {}) {
   const latest = roundsHistory.at(-1);
   if (!latest) return { trigger: null };
-  // Содержательный спор допустим только против замечания L2: детерминированные
-  // гейты при этом заведомо зелёные (до ревью кандидат не доходил бы).
-  if (latest.gate === 'l2' && validDispute(latest.dispute)) {
+  const prev = roundsHistory.at(-2);
+  // Содержательный спор: валидный dispute в L2-раунде И finding_ref совпадает
+  // с реальным замечанием ПРОШЛОГО L2 (file, file:line, id или checkpoint).
+  // Спор по несуществующей ссылке арбитраж не запускает.
+  if (latest.gate === 'l2' && validDispute(latest.dispute) && prev?.gate === 'l2' &&
+      findingRefsOf(prev).has(latest.dispute.finding_ref)) {
     return { trigger: 'substantive_dispute', kind: 'worker_dispute', evidence: latest.dispute };
   }
-  if (latest.gate === 'l2' && latest.contradictory === true) {
-    return { trigger: 'substantive_dispute', kind: 'contradictory_l2_requirements',
+  // Противоречащие друг другу требования L2 по одному и тому же месту.
+  if (latest.gate === 'l2' && prev?.gate === 'l2' &&
+      (latest.contradictory === true || contradicting(prev, latest))) {
+    return { trigger: 'substantive_dispute', kind: 'contradictory_l2_findings',
       evidence: latest };
   }
   // Повторный tree_sha уже встречался в этой попытке — прогресса нет.
@@ -232,7 +353,6 @@ export function evaluateReworkProgress({ roundsHistory = [] } = {}) {
     return { trigger: 'no_progress', kind: 'duplicate_tree_sha',
       deterministicGate: DETERMINISTIC_GATES.has(latest.gate), evidence: latest };
   }
-  const prev = roundsHistory.at(-2);
   if (!prev) return { trigger: null };
   // Два раза подряд красный детерминированный гейт с той же сигнатурой отказа.
   if (DETERMINISTIC_GATES.has(latest.gate) && prev.gate === latest.gate &&
@@ -240,31 +360,58 @@ export function evaluateReworkProgress({ roundsHistory = [] } = {}) {
     return { trigger: 'no_progress', kind: 'repeated_deterministic_failure',
       deterministicGate: true, evidence: latest };
   }
-  // Два раза подряд L2 REWORK: тот же дефект или число блокирующих не сократилось.
-  if (latest.gate === 'l2' && prev.gate === 'l2' &&
-      ((latest.signature && prev.signature === latest.signature) ||
-        (Number.isSafeInteger(latest.blocking) && Number.isSafeInteger(prev.blocking) &&
-          latest.blocking >= prev.blocking))) {
-    return { trigger: 'no_progress', kind: 'repeated_l2_finding',
-      deterministicGate: false, evidence: latest };
+  // Два раза подряд L2 REWORK: повторился ТОТ ЖЕ finding (file+line+expected+
+  // actual), та же сигнатура, либо совпал excerpt при пустых findings.
+  if (latest.gate === 'l2' && prev.gate === 'l2') {
+    const prevKeys = new Set((prev.findings ?? []).map(findingKey));
+    const latestKeys = new Set((latest.findings ?? []).map(findingKey));
+    const shared = [...latestKeys].some(k => prevKeys.has(k));
+    const sameExcerpt = prevKeys.size === 0 && latestKeys.size === 0 &&
+      typeof prev.excerpt === 'string' && prev.excerpt && prev.excerpt === latest.excerpt;
+    const stuckWithoutFindings = prevKeys.size === 0 && latestKeys.size === 0 &&
+      Number.isSafeInteger(latest.blocking) && Number.isSafeInteger(prev.blocking) &&
+      latest.blocking >= prev.blocking;
+    if (shared || sameExcerpt || stuckWithoutFindings ||
+        (latest.signature && prev.signature === latest.signature)) {
+      return { trigger: 'no_progress', kind: 'repeated_l2_finding',
+        deterministicGate: false, evidence: latest };
+    }
   }
   return { trigger: null };
 }
 
-// Максимальный harm среди findings вердикта: 10 — деньги/данные/секреты/выкладка,
+// Нарушение DoD в findings — дисквалифицирующий признак для арбитража.
+export function hasDodViolation(findings) {
+  return Array.isArray(findings) && findings.some(
+    f => f?.dod_violation === true || f?.violates_dod === true);
+}
+
+// Максимальный harm среди findings — fail-closed: заданный, но невалидный
+// или >=10 harm (10.5, 'high', NaN, Infinity) и любой флаг DoD дают 10 —
 // только владелец.
 export function maxHarmOf(findings) {
   if (!Array.isArray(findings)) return 0;
-  return findings.reduce((m, f) => Math.max(m, Number.isSafeInteger(f?.harm) ? f.harm : 0), 0);
+  let max = 0;
+  for (const f of findings) {
+    if (f?.dod_violation === true || f?.violates_dod === true) return 10;
+    const h = f?.harm;
+    if (h === undefined || h === null) continue;
+    if (typeof h !== 'number' || !Number.isFinite(h) || h >= 10) return 10;
+    if (h > max) max = h;
+  }
+  return max;
 }
 
 // Содержательный арбитраж. Арбитр никогда не обходит красный L1/tamper/L3,
-// не ослабляет спеку и не принимает harm=10. Не более одного вызова на попытку.
-// arbitrate({ arbiter, task_id, epoch, attempt_id, subject_digest, trigger, evidence })
-// — порт к модели арбитра; ответ обязан быть строго типизированным решением.
+// не ослабляет спеку/DoD и не принимает harm=10. Не более одного вызова на
+// попытку. Решения directed_rework и accept_with_notes обязаны нести валидный
+// subject_digest; accept_with_notes дополнительно обязан совпасть с digest
+// текущего манифеста и не нарушать DoD.
+// arbitrate({ arbiter, task_id, epoch, attempt_id, subject_digest, trigger,
+// evidence }) — порт к модели арбитра; ответ — строго типизированное решение.
 export async function resolveArbitration({
   attempt, trigger, arbitrationUsed = 0, arbiter = DEFAULT_ARBITER, critic = DEFAULT_CRITIC,
-  maxHarm = 0, subjectDigest = null, verifyHeld, arbitrate,
+  maxHarm = 0, subjectDigest = null, dodViolation = false, verifyHeld, arbitrate,
 } = {}) {
   const evidence = trigger?.evidence ?? null;
   // Красный детерминированный гейт не арбитрируется: прямой hold владельцу.
@@ -307,11 +454,14 @@ export async function resolveArbitration({
     trigger: { trigger: trigger?.trigger, kind: trigger?.kind },
     evidence,
   });
-  const digestBound = ruling?.subject_digest === undefined || ruling?.subject_digest === null ||
-    subjectDigest === null || ruling.subject_digest === subjectDigest;
-  if (!digestBound) return { decision: 'hold', reason: 'arbiter_response_invalid', evidence };
+  // Строгая привязка решения к манифесту приёмки: для directed_rework и
+  // accept_with_notes обязателен валидный 64-hex subject_digest; при наличии
+  // манифеста digest обязан совпасть.
+  const digestOk = DIGEST64.test(ruling?.subject_digest ?? '') &&
+    (subjectDigest === null || ruling.subject_digest === subjectDigest);
   switch (ruling?.decision) {
     case 'directed_rework': {
+      if (!digestOk) return { decision: 'hold', reason: 'arbiter_subject_mismatch', evidence };
       const hasDirective = typeof ruling.directive === 'string' && ruling.directive.trim().length > 0;
       const hasFindings = Array.isArray(ruling.findings) && ruling.findings.length > 0;
       if (!hasDirective && !hasFindings) {
@@ -320,7 +470,19 @@ export async function resolveArbitration({
       return { decision: 'directed_rework', directive: ruling.directive ?? null,
         findings: ruling.findings ?? [], arbitrationUsed: 1, evidence };
     }
-    case 'accept_with_notes':
+    case 'accept_with_notes': {
+      // Принятие возможно только на известном манифесте: digest обязан быть
+      // и строго совпадать с subject_digest текущего кандидата.
+      if (subjectDigest === null || ruling.subject_digest !== subjectDigest ||
+          !DIGEST64.test(ruling.subject_digest ?? '')) {
+        return { decision: 'hold', reason: 'arbiter_subject_mismatch', evidence };
+      }
+      const dodBreach = dodViolation === true ||
+        hasDodViolation(trigger?.evidence?.findings) ||
+        ruling.dod_satisfied === false || ruling.violates_dod === true;
+      if (dodBreach || maxHarm >= 10) {
+        return { decision: 'hold', reason: 'dod_or_harm10_violation', evidence };
+      }
       if (typeof ruling.notes !== 'string' || !ruling.notes.trim()) {
         return { decision: 'hold', reason: 'arbiter_response_invalid', evidence };
       }
@@ -332,6 +494,7 @@ export async function resolveArbitration({
           decision: 'accept_with_notes', notes: ruling.notes,
         },
         evidence };
+    }
     case 'escalate_owner':
       if (typeof ruling.question !== 'string' || !ruling.question.trim()) {
         return { decision: 'hold', reason: 'arbiter_response_invalid', evidence };
