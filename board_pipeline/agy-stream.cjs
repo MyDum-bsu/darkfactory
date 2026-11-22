@@ -11,7 +11,7 @@ const EFFORT = 'medium';
 const LIMIT = 2 * 1024 * 1024;
 const STEP_FIELDS = new Set(['conversation_id', 'step_index', 'state', 'step_type',
   'text_delta', 'duration_seconds', 'usage', 'tool_name', 'tool_info']);
-const SAFE_STEPS = new Set(['user_input', 'agent_response', 'checkpoint']);
+const SAFE_STEPS = new Set(['user_input', 'agent_response', 'checkpoint', 'system_message']);
 const INIT_FIELDS = new Set(['model', 'cwd', 'tools', 'permission_mode', 'agent', 'json_schema']);
 const RESULT_FIELDS = new Set(['conversation_id', 'status', 'response', 'duration_seconds', 'num_turns', 'usage',
   'error', 'finished_reason', 'structured_output', 'json_schema']);
