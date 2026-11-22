@@ -334,7 +334,7 @@ else console.log('Onboarding controls are present');`;
     const idlePolicyFile = join(dirs.operator, 'policy-idle.json');
     await writeFile(idlePolicyFile, JSON.stringify({ ...policy, waitMs: 12_000 }), { mode: 0o600 });
     const before = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
-    const claimsBefore = (await vbCli(boardUrl, ['tasks', 'list', 'pilot']))
+    const claimsBefore = (await vbCli(boardUrl, ['tasks', 'pilot', '--state', 'all']))
       .tasks?.filter(t => t?.message?.task?.claim != null).length ?? null;
     const threadsBefore = await bbThreadCount(env);
     const gateFilesBefore = (await readdir(dirs.state))
@@ -343,7 +343,7 @@ else console.log('Onboarding controls are present');`;
     const idle = await runController(idlePolicyFile, dirs.state, env, wlog, () => {},
       ['--stop-on-idle']);
     const after = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
-    const claimsAfter = (await vbCli(boardUrl, ['tasks', 'list', 'pilot']))
+    const claimsAfter = (await vbCli(boardUrl, ['tasks', 'pilot', '--state', 'all']))
       .tasks?.filter(t => t?.message?.task?.claim != null).length ?? null;
     const threadsAfter = await bbThreadCount(env);
     const allIdle = idle.lines.length >= 1 && idle.lines.every(l => {
