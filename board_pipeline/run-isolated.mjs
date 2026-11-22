@@ -169,9 +169,9 @@ async function execute() {
         project: p.bb.project, tree, attemptId: attempt.attempt_id,
         handoffFile: handoffPath(attempt) });
     },
-    async reconcileFeedback({ attempt, feedbackId, threadId }) {
+    async reconcileFeedback({ attempt, feedbackId, threadId, afterSeq }) {
       return reconcileFeedbackFromBb({ execBb: (args, opts) => exec('bb', args, opts),
-        threadId: threadId ?? attempt?.bb_thread_id, feedbackId });
+        threadId: threadId ?? attempt?.bb_thread_id, feedbackId, afterSeq });
     },
     async feedback(packet) {
       const message = join(root, `feedback-${packet.sha}.md`);

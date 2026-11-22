@@ -114,9 +114,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       // либо точный текст эффекта, либо префикс `${intent.reason}:`.
       const looked = await board.lookup(taskId).catch(() => null);
       const cardReason = looked?.blocked?.reason ?? looked?.reason;
-      const reasonMatches = typeof intent.blockText === 'string' && intent.blockText &&
-        typeof cardReason === 'string' &&
-        (cardReason === intent.blockText || cardReason.startsWith(`${intent.reason}:`));
+      // Только строгое равенство записанного текста эффекта: совпадение
+      // префикса при другом содержимом (например, чужой `BB event N`) — не
+      // наша блокировка.
+      const reasonMatches = typeof intent.blockText === 'string' && intent.blockText.length > 0 &&
+        cardReason === intent.blockText;
       if (looked?.state === 'blocked' &&
           (looked.epoch === undefined || looked.epoch === intent.epoch) && reasonMatches) {
         await save({ phase: 'hold', reason: intent.reason ?? 'blocked',
@@ -161,6 +163,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         attempt: attemptOf(record, route),
         feedbackId: intent.feedbackId ?? record.feedbackId,
         threadId: record.threadId,
+        afterSeq: intent.turnSeq,
       }).catch(() => null);
       if (res?.status !== 'delivered') return uncertain('feedback_delivery_unconfirmed');
       if (!await leaseAlive()) return lostLease();

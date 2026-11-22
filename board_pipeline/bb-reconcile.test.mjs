@@ -1,6 +1,9 @@
 // Юнит-тесты bb-reconcile на реальном формате JSON `bb thread list/show/log`:
 // элемент списка может нести environmentPath, иначе путь — в show.environment.path;
 // событие хода — client/turn/requested с e.data.input[{type:'text',text}].
+// spawn засчитывает ТОЛЬКО стартовое событие (seq 1, source spawn); feedback —
+// только tell-события, журнал читается --after-seq или --all (никакого --limit 200
+// с начала треда).
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -10,9 +13,9 @@ const TREE = '/repo/worktree';
 const ATTEMPT = 'att-42';
 const HANDOFF = '/repo/inbox/att-42/submission.json';
 
-const turnEvent = (text, seq = 1) => ({
+const turnEvent = (text, seq = 1, source = 'spawn') => ({
   type: 'client/turn/requested', seq, threadId: 'thr_abc1',
-  data: { direction: 'outbound', source: 'spawn',
+  data: { direction: 'outbound', source,
     input: [{ type: 'text', text }] },
 });
 const otherEvent = { type: 'turn/completed', seq: 2, data: { status: 'completed' } };
@@ -45,7 +48,6 @@ test('reconcileSpawn: list item без environmentPath — путь берётс
   const res = await reconcileSpawnFromBb({ execBb, project: 'proj_x1', tree: TREE,
     attemptId: ATTEMPT, handoffFile: HANDOFF });
   assert.deepEqual(res, { status: 'matched', threadId: 'thr_abc1' });
-  // show вызван только для кандидатов без environmentPath; log — только для подходящего.
   assert.ok(calls.some(a => a[1] === 'show' && a[2] === 'thr_abc1'));
   assert.ok(calls.some(a => a[1] === 'log' && a[2] === 'thr_abc1'));
   assert.ok(!calls.some(a => a[1] === 'log' && a[2] === 'thr_xyz9'));
@@ -70,10 +72,19 @@ test('reconcileSpawn: {threads:[...]} обёртка и empty/ambiguous', async 
 
   const two = fakeBb({
     list: { threads: [{ id: 'thr_a1', environmentPath: TREE }, { id: 'thr_b2', environmentPath: TREE }] },
-    logs: { thr_a1: [turnEvent(spawnText)], thr_b2: [turnEvent(spawnText, 7)] },
+    logs: { thr_a1: [turnEvent(spawnText)], thr_b2: [turnEvent(spawnText)] },
   });
   assert.deepEqual(await reconcileSpawnFromBb({ execBb: two.execBb, tree: TREE,
     attemptId: ATTEMPT, handoffFile: HANDOFF }), { status: 'ambiguous' });
+});
+
+test('reconcileSpawn: поздняя цитата маркеров (seq 5, source tell) — не запуск', async () => {
+  const { execBb } = fakeBb({
+    list: [{ id: 'thr_abc1', environmentPath: TREE }],
+    logs: { thr_abc1: [turnEvent('старое задание'), turnEvent(spawnText, 5, 'tell')] },
+  });
+  assert.deepEqual(await reconcileSpawnFromBb({ execBb, tree: TREE,
+    attemptId: ATTEMPT, handoffFile: HANDOFF }), { status: 'empty' });
 });
 
 test('reconcileSpawn: чужой маркер attemptId не засчитывается', async () => {
@@ -85,17 +96,17 @@ test('reconcileSpawn: чужой маркер attemptId не засчитыва�
     attemptId: ATTEMPT, handoffFile: HANDOFF }), { status: 'empty' });
 });
 
-test('reconcileFeedback: точный заголовок в input text — delivered/empty/ambiguous', async () => {
+test('reconcileFeedback: точный заголовок в tell input text — delivered/empty/ambiguous', async () => {
   const header = fid => `Замечание фабрики ${fid}. SHA deadbeef. Причина: x.`;
-  const delivered = fakeBb({ logs: { thr_abc1: [otherEvent, turnEvent(header('f1'))] } });
+  const delivered = fakeBb({ logs: { thr_abc1: [otherEvent, turnEvent(header('f1'), 9, 'tell')] } });
   assert.deepEqual(await reconcileFeedbackFromBb({ execBb: delivered.execBb,
     threadId: 'thr_abc1', feedbackId: 'f1' }), { status: 'delivered' });
 
-  const empty = fakeBb({ logs: { thr_abc1: [turnEvent('другой текст без маркера')] } });
+  const empty = fakeBb({ logs: { thr_abc1: [turnEvent('другой текст без маркера', 9, 'tell')] } });
   assert.deepEqual(await reconcileFeedbackFromBb({ execBb: empty.execBb,
     threadId: 'thr_abc1', feedbackId: 'f1' }), { status: 'empty' });
 
-  const dup = fakeBb({ logs: { thr_abc1: [turnEvent(header('f1')), turnEvent(header('f1'), 9)] } });
+  const dup = fakeBb({ logs: { thr_abc1: [turnEvent(header('f1'), 9, 'tell'), turnEvent(header('f1'), 11, 'tell')] } });
   assert.deepEqual(await reconcileFeedbackFromBb({ execBb: dup.execBb,
     threadId: 'thr_abc1', feedbackId: 'f1' }), { status: 'ambiguous' });
 
@@ -104,4 +115,28 @@ test('reconcileFeedback: точный заголовок в input text — deliv
   assert.deepEqual(await reconcileFeedbackFromBb({ execBb: bad.execBb,
     threadId: 'not-a-thread', feedbackId: 'f1' }), { status: 'ambiguous' });
   assert.equal(bad.calls.length, 0);
+});
+
+test('reconcileFeedback: без afterSeq читает --all (feedback с seq > 200 не теряется)', async () => {
+  const header = fid => `Замечание фабрики ${fid}. SHA deadbeef.`;
+  // 250 событий журнала, feedback на seq 210 — за пределами первых 200.
+  const log = [...Array(240).keys()].map(i => otherEvent);
+  log.push(turnEvent(header('f1'), 210, 'tell'));
+  const { execBb, calls } = fakeBb({ logs: { thr_abc1: log } });
+  const res = await reconcileFeedbackFromBb({ execBb, threadId: 'thr_abc1', feedbackId: 'f1' });
+  assert.equal(res.status, 'delivered');
+  assert.ok(calls[0].includes('--all'), 'полный журнал без --limit 200');
+  assert.ok(!calls[0].includes('--limit'));
+});
+
+test('reconcileFeedback: afterSeq → --after-seq; source spawn не засчитывается', async () => {
+  const header = fid => `Замечание фабрики ${fid}.`;
+  const log = [turnEvent('старт', 1, 'spawn'), turnEvent(header('f1'), 30, 'tell'),
+    turnEvent(header('f1'), 31, 'spawn')]; // spawn-событие с тем же текстом — не tell
+  const { execBb, calls } = fakeBb({ logs: { thr_abc1: log } });
+  const res = await reconcileFeedbackFromBb({ execBb, threadId: 'thr_abc1',
+    feedbackId: 'f1', afterSeq: 25 });
+  assert.equal(res.status, 'delivered');
+  assert.ok(calls[0].includes('--after-seq') && calls[0].includes('25'));
+  assert.ok(!calls[0].includes('--all') && !calls[0].includes('--limit'));
 });

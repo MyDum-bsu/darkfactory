@@ -51,7 +51,10 @@ export async function reconcileSpawnFromBb({ execBb, project, tree, attemptId, h
     if (envPath !== tree) continue;
     const log = await execBb(['thread', 'log', item.id, '--limit', '20', '--json'],
       { timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
+    // Только стартовое событие запуска: seq 1 от source spawn. Поздняя цитата
+    // промпта с теми же маркерами в чужом/старом треде — не наш тред.
     const hit = events(log.stdout).some(event =>
+      event?.seq === 1 && (event?.data?.source === undefined || event?.data?.source === 'spawn') &&
       turnTexts(event).some(text => text.includes(attemptId) && text.includes(handoffFile)));
     if (hit) matched.push(item.id);
   }
@@ -60,15 +63,21 @@ export async function reconcileSpawnFromBb({ execBb, project, tree, attemptId, h
 }
 
 // Ровно одно сообщение `Замечание фабрики ${feedbackId}.` в журнале треда —
-// delivered; 0 → empty, >1 → ambiguous.
-export async function reconcileFeedbackFromBb({ execBb, threadId, feedbackId }) {
+// delivered; 0 → empty, >1 → ambiguous. `bb thread log --limit N` читает
+// ПЕРВЫЕ N событий — журнал после известного хода читается через --after-seq,
+// иначе целиком через --all.
+export async function reconcileFeedbackFromBb({ execBb, threadId, feedbackId, afterSeq }) {
   if (!THREAD_ID.test(threadId ?? '') || typeof feedbackId !== 'string' || !feedbackId) {
     return { status: 'ambiguous' };
   }
-  const log = await execBb(['thread', 'log', threadId, '--limit', '200', '--json'],
-    { timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
+  const args = ['thread', 'log', threadId];
+  if (Number.isSafeInteger(afterSeq) && afterSeq > 0) args.push('--after-seq', String(afterSeq));
+  else args.push('--all');
+  args.push('--json');
+  const log = await execBb(args, { timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
   const header = `Замечание фабрики ${feedbackId}.`;
   const hits = events(log.stdout).filter(event =>
+    (event?.data?.source === undefined || event?.data?.source === 'tell') &&
     turnTexts(event).some(text => text.includes(header)));
   if (hits.length === 1) return { status: 'delivered' };
   return { status: hits.length === 0 ? 'empty' : 'ambiguous' };

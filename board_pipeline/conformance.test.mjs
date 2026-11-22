@@ -301,6 +301,24 @@ test('blocking reconcile: чужая причина на карточке — bl
   assert.equal(x.effects.blockCalls, 1, 'повторный board.block не отправлен');
 });
 
+// Регрессия: тот же префикс причины, но другой номер хода — строгое равенство
+// blockText не выполняется, эффект чужой → uncertain без повторного block.
+test('blocking reconcile: тот же префикс, другой BB event — blocking_reason_mismatch', async t => {
+  const x = await lab(t);
+  assert.equal((await x.tick()).phase, 'working');
+  await x.port.block(x.taskId, x.stored().epoch,
+    'worker_turn_finished_without_new_handoff: thr_wire1, BB event 11. Проверьте ход; повтор не отправлен.');
+  const crashed = { ...x.stored(), phase: 'blocking',
+    intent: { kind: 'block', attemptId: x.stored().attemptId, epoch: x.stored().epoch,
+      turnSeq: 10, reason: 'worker_turn_finished_without_new_handoff',
+      blockText: 'worker_turn_finished_without_new_handoff: thr_wire1, BB event 10. Проверьте ход; повтор не отправлен.' } };
+  await x.cfg.state.save(crashed);
+  const res = await x.tick();
+  assert.equal(res.phase, 'uncertain');
+  assert.equal(res.reason, 'blocking_reason_mismatch');
+  assert.equal(x.effects.blockCalls, 1, 'повторный board.block не отправлен');
+});
+
 // Регрессия: рестарт в фазе blocking с НАШЕЙ причиной — adopt наблюденного
 // эффекта в hold без повторного board.block.
 test('blocking reconcile: наша причина на карточке — observed block в hold, 0 повторных block', async t => {

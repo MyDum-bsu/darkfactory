@@ -20,14 +20,15 @@ VARIABLES
     boardState,          \* "ready" | "claimed" | "blocked" | "completed"
     boardEpoch,          \* серверная эпоха аренды: 0..MaxEpoch
     leaseAlive,          \* аренда текущей эпохи жива
-    ctrlPhase,           \* "idle"|"claimed"|"launching"|"working"|"returning"|
-                         \* "blocking"|"restarting"|"uncertain"|"hold"|"done"
+    ctrlPhase,           \* "idle"|"claimed"|"launching"|"launching_retry"|"working"|
+                         \* "checking"|"returning"|"blocking"|"restarting"|
+                         \* "uncertain"|"hold"|"done"
     walIntent,           \* "none" | "spawn" | "feedback" | "block"
     walReceipt,          \* "none" | "spawn" | "feedback" | "block"
     worktreeReserved,    \* долговечная бронь worktree (slot.mjs)
     liveWriters,         \* множество РЕАЛЬНО живых писателей (эпохи)
     spawnOnWire,         \* spawn отправлен, но эффект ещё не наблюдаем/не зачислен
-    feedbackOnWire,      \* feedback отправлен, но эффект ещё не наблюдаем
+    feedbackWire,        \* "idle" | "on_wire" | "delivered" — машина доставки feedback
     spawnCount,          \* [1..MaxEpoch -> 0..2] — число вызовов spawn на эпоху
     candidateDigest,     \* "none" | "cand"
     verifiedDigest,      \* "none" | "cand"
@@ -41,14 +42,14 @@ VARIABLES
     progressMade         \* был ли зарегистрирован реальный прогресс
 
 vars == <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent, walReceipt,
-          worktreeReserved, liveWriters, spawnOnWire, feedbackOnWire, spawnCount,
+          worktreeReserved, liveWriters, spawnOnWire, feedbackWire, spawnCount,
           candidateDigest, verifiedDigest, activePolicyDigest, pinnedPolicyDigest,
           lastTurnSeq, feedbackWatermark, acceptedTurnSeq, commitEpoch,
           reworkRounds, progressMade>>
 
 ResetAttempt ==
     /\ walIntent' = "none" /\ walReceipt' = "none"
-    /\ spawnOnWire' = FALSE /\ feedbackOnWire' = FALSE
+    /\ spawnOnWire' = FALSE /\ feedbackWire' = "idle"
     /\ candidateDigest' = "none" /\ verifiedDigest' = "none"
     /\ lastTurnSeq' = 0 /\ feedbackWatermark' = 0 /\ acceptedTurnSeq' = 0
     /\ reworkRounds' = 0 /\ progressMade' = FALSE
@@ -57,7 +58,7 @@ Init ==
     /\ boardState = "ready" /\ boardEpoch = 0 /\ leaseAlive = FALSE
     /\ ctrlPhase = "idle" /\ walIntent = "none" /\ walReceipt = "none"
     /\ worktreeReserved = FALSE /\ liveWriters = {}
-    /\ spawnOnWire = FALSE /\ feedbackOnWire = FALSE
+    /\ spawnOnWire = FALSE /\ feedbackWire = "idle"
     /\ spawnCount = [e \in 1..MaxEpoch |-> 0]
     /\ candidateDigest = "none" /\ verifiedDigest = "none"
     /\ activePolicyDigest = "p1" /\ pinnedPolicyDigest = "p1"
@@ -89,7 +90,7 @@ Takeover ==
 LeaseExpires ==
     /\ leaseAlive /\ leaseAlive' = FALSE
     /\ UNCHANGED <<boardState, boardEpoch, ctrlPhase, walIntent, walReceipt,
-                   worktreeReserved, liveWriters, spawnOnWire, feedbackOnWire,
+                   worktreeReserved, liveWriters, spawnOnWire, feedbackWire,
                    spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
@@ -100,21 +101,26 @@ SpawnIntent ==
     /\ ctrlPhase = "claimed" /\ walIntent = "none"
     /\ walIntent' = "spawn" /\ ctrlPhase' = "launching"
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, walReceipt,
-                   worktreeReserved, liveWriters, spawnOnWire, feedbackOnWire,
+                   worktreeReserved, liveWriters, spawnOnWire, feedbackWire,
                    spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
 
-\* Вызов bb.spawn. Мутант 2 может послать второй send, пока первый ещё на
-\* проводе: guard ~spawnOnWire снимается AllowRetryOnEmptyObservation.
+\* Вызов bb.spawn. Первый send — только из "launching" с нулём уже посланных.
+\* Повторный send возможен только из "launching_retry", куда контроллер
+\* попадает исключительно через Crash -> ReconcileSpawnEmpty мутанта 2:
+\* последовательность SpawnSend -> SpawnSend без рестарта и пустой сверки
+\* в модели невозможна.
 SpawnSend ==
-    /\ ctrlPhase = "launching" /\ walIntent = "spawn"
-    /\ \/ /\ ~spawnOnWire /\ spawnCount[boardEpoch] = 0
-       \/ AllowRetryOnEmptyObservation    \* мутант 2: слепой повторный send
+    /\ walIntent = "spawn"
+    /\ \/ /\ ctrlPhase = "launching" /\ ~spawnOnWire /\ spawnCount[boardEpoch] = 0
+       \/ /\ AllowRetryOnEmptyObservation    \* мутант 2: слепой повторный send
+          /\ ctrlPhase = "launching_retry"
+    /\ ctrlPhase' = "launching"
     /\ spawnOnWire' = TRUE
     /\ spawnCount' = [spawnCount EXCEPT ![boardEpoch] = @ + 1]
-    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
-                   walReceipt, worktreeReserved, liveWriters, feedbackOnWire,
+    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, walIntent,
+                   walReceipt, worktreeReserved, liveWriters, feedbackWire,
                    candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
@@ -125,7 +131,7 @@ SpawnEffect ==
     /\ liveWriters' = liveWriters \cup {boardEpoch}
     /\ spawnOnWire' = FALSE
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
-                   walReceipt, worktreeReserved, feedbackOnWire, spawnCount,
+                   walReceipt, worktreeReserved, feedbackWire, spawnCount,
                    candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
@@ -136,7 +142,7 @@ SpawnReceipt ==
     /\ ~spawnOnWire /\ boardEpoch \in liveWriters
     /\ walReceipt' = "spawn" /\ walIntent' = "none" /\ ctrlPhase' = "working"
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, worktreeReserved,
-                   liveWriters, spawnOnWire, feedbackOnWire, spawnCount,
+                   liveWriters, spawnOnWire, feedbackWire, spawnCount,
                    candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
@@ -144,10 +150,10 @@ SpawnReceipt ==
 \* Обрыв процесса в любой IN_FLIGHT/рабочей фазе: запросы могут остаться на
 \* проводе ненаблюдаемыми; WAL intent/receipt переживает крах.
 Crash ==
-    /\ ctrlPhase \in {"claimed", "launching", "working", "returning", "blocking"}
+    /\ ctrlPhase \in {"claimed", "launching", "launching_retry", "working", "checking", "returning", "blocking"}
     /\ ctrlPhase' = "restarting"
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, walIntent, walReceipt,
-                   worktreeReserved, liveWriters, spawnOnWire, feedbackOnWire,
+                   worktreeReserved, liveWriters, spawnOnWire, feedbackWire,
                    spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
@@ -166,12 +172,12 @@ ReconcileSpawn ==
                  /\ walIntent' = "none"
                  /\ UNCHANGED <<liveWriters>>
             ELSE IF AllowRetryOnEmptyObservation    \* мутант 2
-                THEN /\ ctrlPhase' = "launching"    \* обратно к LaunchSpawn
+                THEN /\ ctrlPhase' = "launching_retry"    \* обратно к LaunchSpawn
                      /\ UNCHANGED <<walIntent, walReceipt, liveWriters>>
                 ELSE /\ ctrlPhase' = "uncertain"
                      /\ UNCHANGED <<walIntent, walReceipt, liveWriters>>
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, worktreeReserved,
-                   spawnOnWire, feedbackOnWire, spawnCount, candidateDigest,
+                   spawnOnWire, feedbackWire, spawnCount, candidateDigest,
                    verifiedDigest, activePolicyDigest, pinnedPolicyDigest,
                    lastTurnSeq, feedbackWatermark, acceptedTurnSeq, commitEpoch,
                    reworkRounds, progressMade>>
@@ -185,23 +191,25 @@ WorkerTurn ==
        \/ /\ UNCHANGED candidateDigest
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
                    walReceipt, worktreeReserved, liveWriters, spawnOnWire,
-                   feedbackOnWire, spawnCount, verifiedDigest, activePolicyDigest,
+                   feedbackWire, spawnCount, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, feedbackWatermark, acceptedTurnSeq,
                    commitEpoch, reworkRounds, progressMade>>
 
-\* Возврат на доработку: durable intent feedback, фаза returning.
+\* Возврат на доработку: durable intent feedback, фаза returning. Как в
+\* controller.mjs, запись нового intent сбрасывает receipt и машину провода.
 FeedbackIntent ==
     /\ ctrlPhase = "working" /\ walIntent = "none" /\ reworkRounds < 3
-    /\ walIntent' = "feedback" /\ ctrlPhase' = "returning"
-    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, walReceipt,
-                   worktreeReserved, liveWriters, spawnOnWire, feedbackOnWire,
+    /\ walIntent' = "feedback" /\ walReceipt' = "none" /\ feedbackWire' = "idle"
+    /\ ctrlPhase' = "returning"
+    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive,
+                   worktreeReserved, liveWriters, spawnOnWire,
                    spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
 
 FeedbackSend ==
-    /\ ctrlPhase = "returning" /\ walIntent = "feedback" /\ ~feedbackOnWire
-    /\ feedbackOnWire' = TRUE
+    /\ ctrlPhase = "returning" /\ walIntent = "feedback" /\ feedbackWire = "idle"
+    /\ feedbackWire' = "on_wire"
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
                    walReceipt, worktreeReserved, liveWriters, spawnOnWire,
                    spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
@@ -209,9 +217,10 @@ FeedbackSend ==
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
 
 \* Внешний эффект: замечание доставлено — watermark сдвинулся в мире.
+\* "delivered" терминален для провода: повторный FeedbackSend невозможен.
 FeedbackDelivered ==
-    /\ ctrlPhase = "returning" /\ feedbackOnWire
-    /\ feedbackOnWire' = FALSE /\ feedbackWatermark' = lastTurnSeq
+    /\ ctrlPhase = "returning" /\ feedbackWire = "on_wire"
+    /\ feedbackWire' = "delivered" /\ feedbackWatermark' = lastTurnSeq
     /\ acceptedTurnSeq' = 0    \* израсходованный ответ не считается новым ходом
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
                    walReceipt, worktreeReserved, liveWriters, spawnOnWire,
@@ -220,46 +229,58 @@ FeedbackDelivered ==
                    reworkRounds, progressMade>>
 
 \* Ack получен: receipt, возврат в working; прежний ответ израсходован.
+\* Разрешён только при подтверждённой доставке (feedbackWire = "delivered").
 FeedbackReceipt ==
     /\ ctrlPhase = "returning" /\ walIntent = "feedback"
-    /\ ~feedbackOnWire /\ feedbackWatermark = lastTurnSeq
+    /\ feedbackWire = "delivered" /\ feedbackWatermark = lastTurnSeq
     /\ walReceipt' = "feedback" /\ walIntent' = "none"
     /\ reworkRounds' = reworkRounds + 1 /\ acceptedTurnSeq' = 0
     /\ ctrlPhase' = "working"
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, worktreeReserved,
-                   liveWriters, spawnOnWire, feedbackOnWire, spawnCount,
+                   liveWriters, spawnOnWire, feedbackWire, spawnCount,
                    candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    commitEpoch, progressMade>>
 
 \* Потерянный ack feedback: read-only сверка журнала треда. Ровно одно
-\* подтверждённое сообщение (watermark сдвинут эффектом) при живой аренде ->
-\* adopt в working; 0/несколько/ошибка сверки -> uncertain без повторного tell.
-ReconcileFeedback ==
+\* подтверждённое сообщение (эффект доставлен, watermark сдвинут) при живой
+\* аренде -> adopt в working без повторного tell.
+ReconcileFeedbackDelivered ==
     /\ ctrlPhase = "restarting" /\ walIntent = "feedback" /\ walReceipt = "none"
-    /\ IF ~leaseAlive
-        THEN /\ ctrlPhase' = "uncertain"
-             /\ UNCHANGED <<walIntent, walReceipt, acceptedTurnSeq, reworkRounds>>
-        ELSE IF ~feedbackOnWire /\ feedbackWatermark = lastTurnSeq /\ lastTurnSeq > 0
-            THEN /\ walReceipt' = "feedback" /\ walIntent' = "none"
-                 /\ reworkRounds' = reworkRounds + 1 /\ acceptedTurnSeq' = 0
-                 /\ ctrlPhase' = "working"
-            ELSE /\ ctrlPhase' = "uncertain"
-                 /\ UNCHANGED <<walIntent, walReceipt, acceptedTurnSeq, reworkRounds>>
+    /\ leaseAlive /\ feedbackWire = "delivered"
+    /\ feedbackWatermark = lastTurnSeq /\ lastTurnSeq > 0
+    /\ walReceipt' = "feedback" /\ walIntent' = "none"
+    /\ reworkRounds' = reworkRounds + 1 /\ acceptedTurnSeq' = 0
+    /\ ctrlPhase' = "working"
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, worktreeReserved,
-                   liveWriters, spawnOnWire, feedbackOnWire, spawnCount,
+                   liveWriters, spawnOnWire, feedbackWire, spawnCount,
                    candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    commitEpoch, progressMade>>
 
+\* Пустая/неоднозначная выдача (эффект не отправлен или ещё на проводе) или
+\* потерянная аренда -> uncertain без повторного tell.
+ReconcileFeedbackEmpty ==
+    /\ ctrlPhase = "restarting" /\ walIntent = "feedback" /\ walReceipt = "none"
+    /\ \/ ~leaseAlive
+       \/ feedbackWire \in {"idle", "on_wire"}
+       \/ feedbackWatermark # lastTurnSeq
+    /\ ctrlPhase' = "uncertain"
+    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, walIntent, walReceipt,
+                   worktreeReserved, liveWriters, spawnOnWire, feedbackWire,
+                   spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
+                   pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
+                   acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
+
 \* --- Блокировка: intent -> эффект на карточке -> receipt -> reconcile --------
 
 \* Нарушение протокола хода/политики: durable intent block, фаза blocking.
+\* Запись нового intent сбрасывает receipt (как save() в controller.mjs).
 BlockIntent ==
     /\ ctrlPhase = "working" /\ walIntent = "none"
-    /\ walIntent' = "block" /\ ctrlPhase' = "blocking"
-    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, walReceipt,
-                   worktreeReserved, liveWriters, spawnOnWire, feedbackOnWire,
+    /\ walIntent' = "block" /\ walReceipt' = "none" /\ ctrlPhase' = "blocking"
+    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive,
+                   worktreeReserved, liveWriters, spawnOnWire, feedbackWire,
                    spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
@@ -269,7 +290,7 @@ BlockDelivered ==
     /\ ctrlPhase = "blocking" /\ walIntent = "block" /\ boardState = "claimed"
     /\ boardState' = "blocked"
     /\ UNCHANGED <<boardEpoch, leaseAlive, ctrlPhase, walIntent, walReceipt,
-                   worktreeReserved, liveWriters, spawnOnWire, feedbackOnWire,
+                   worktreeReserved, liveWriters, spawnOnWire, feedbackWire,
                    spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
@@ -279,7 +300,7 @@ BlockReceipt ==
     /\ ctrlPhase = "blocking" /\ walIntent = "block" /\ boardState = "blocked"
     /\ walReceipt' = "block" /\ walIntent' = "none" /\ ctrlPhase' = "hold"
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, worktreeReserved,
-                   liveWriters, spawnOnWire, feedbackOnWire, spawnCount,
+                   liveWriters, spawnOnWire, feedbackWire, spawnCount,
                    candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
@@ -294,12 +315,15 @@ ReconcileBlock ==
         ELSE /\ ctrlPhase' = "uncertain"
              /\ UNCHANGED <<walIntent, walReceipt>>
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, worktreeReserved,
-                   liveWriters, spawnOnWire, feedbackOnWire, spawnCount,
+                   liveWriters, spawnOnWire, feedbackWire, spawnCount,
                    candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
 
-\* Ход засчитывается ответом на feedback только если он строго новее watermark.
+\* Наблюдение хода воркера: контроллер покидает "working" в "checking".
+\* База игнорирует ход не новее watermark; мутант 4 принимает replay
+\* lastTurnSeq <= feedbackWatermark как ответ и уходит на проверку —
+\* NoWatermarkRegression нарушается на самом переходе.
 AcceptTurn ==
     /\ ctrlPhase = "working"
     /\ \/ /\ lastTurnSeq > feedbackWatermark
@@ -311,11 +335,21 @@ AcceptTurn ==
           /\ lastTurnSeq <= feedbackWatermark
           /\ acceptedTurnSeq' = lastTurnSeq
           /\ UNCHANGED progressMade
-    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
+    /\ ctrlPhase' = "checking"
+    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, walIntent,
                    walReceipt, worktreeReserved, liveWriters, spawnOnWire,
-                   feedbackOnWire, spawnCount, candidateDigest, verifiedDigest,
+                   feedbackWire, spawnCount, candidateDigest, verifiedDigest,
                    activePolicyDigest, pinnedPolicyDigest, lastTurnSeq,
                    feedbackWatermark, commitEpoch, reworkRounds>>
+
+\* Проверка хода завершена — контроллер снова ждёт следующий ход.
+CheckDone ==
+    /\ ctrlPhase = "checking" /\ ctrlPhase' = "working"
+    /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, walIntent, walReceipt,
+                   worktreeReserved, liveWriters, spawnOnWire, feedbackWire,
+                   spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
+                   pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
+                   acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
 
 \* --- Проверка, seal и complete ------------------------------------------------
 
@@ -324,7 +358,7 @@ Verify ==
     /\ verifiedDigest' = "cand" /\ progressMade' = TRUE
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
                    walReceipt, worktreeReserved, liveWriters, spawnOnWire,
-                   feedbackOnWire, spawnCount, candidateDigest, activePolicyDigest,
+                   feedbackWire, spawnCount, candidateDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds>>
 
@@ -332,7 +366,7 @@ ChangePolicy ==
     /\ boardState = "claimed" /\ activePolicyDigest = "p1" /\ activePolicyDigest' = "p2"
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
                    walReceipt, worktreeReserved, liveWriters, spawnOnWire,
-                   feedbackOnWire, spawnCount, candidateDigest, verifiedDigest,
+                   feedbackWire, spawnCount, candidateDigest, verifiedDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
 
@@ -349,7 +383,7 @@ Complete ==
     /\ boardState' = "completed" /\ commitEpoch' = boardEpoch
     /\ ctrlPhase' = "done"
     /\ UNCHANGED <<boardEpoch, leaseAlive, walIntent, walReceipt,
-                   worktreeReserved, liveWriters, spawnOnWire, feedbackOnWire,
+                   worktreeReserved, liveWriters, spawnOnWire, feedbackWire,
                    spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, reworkRounds, progressMade>>
@@ -358,7 +392,7 @@ Complete ==
 WriterDies(e) ==
     /\ e \in liveWriters /\ liveWriters' = liveWriters \ {e}
     /\ UNCHANGED <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent,
-                   walReceipt, worktreeReserved, spawnOnWire, feedbackOnWire,
+                   walReceipt, worktreeReserved, spawnOnWire, feedbackWire,
                    spawnCount, candidateDigest, verifiedDigest, activePolicyDigest,
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
@@ -366,10 +400,10 @@ WriterDies(e) ==
 Next ==
     \/ Claim \/ Takeover \/ LeaseExpires
     \/ SpawnIntent \/ SpawnSend \/ SpawnEffect \/ SpawnReceipt
-    \/ Crash \/ ReconcileSpawn \/ ReconcileFeedback \/ ReconcileBlock
+    \/ Crash \/ ReconcileSpawn \/ ReconcileFeedbackDelivered \/ ReconcileFeedbackEmpty \/ ReconcileBlock
     \/ WorkerTurn \/ FeedbackIntent \/ FeedbackSend \/ FeedbackDelivered \/ FeedbackReceipt
     \/ BlockIntent \/ BlockDelivered \/ BlockReceipt
-    \/ AcceptTurn \/ Verify \/ ChangePolicy \/ Complete
+    \/ AcceptTurn \/ CheckDone \/ Verify \/ ChangePolicy \/ Complete
     \/ \E e \in 1..MaxEpoch : WriterDies(e)
 
 Spec == Init /\ [][Next]_vars

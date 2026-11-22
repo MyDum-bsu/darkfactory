@@ -44,6 +44,15 @@ const READ_ONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
 // Монтируются только каталоги кода; конфиги идут через /pi-cfg копией в tmpfs.
 const PI_MOUNT_DIRS = ['bin', 'install', 'npm'];
 const PI_CONFIG_FILES = ['settings.json', 'models.json', 'models-store.json'];
+// Хостовый httpProxy (обычно loopback-relay) в изолированном песочнике
+// недостижим и не нужен: egress уже ограничен PI_ALLOW_CONNECT и pi-guard.
+async function sandboxedPiConfig(file, src) {
+  const body = await readFile(src);
+  if (file !== 'settings.json') return body;
+  const cfg = JSON.parse(body.toString('utf8'));
+  delete cfg.httpProxy;
+  return JSON.stringify(cfg);
+}
 const GUARD_FILE = new URL('./pi-guard.cjs', import.meta.url).pathname;
 
 export class ReviewDenied extends Error {
@@ -567,7 +576,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
-          await writeFile(join(cfgDir, file), await readFile(src));
+          await writeFile(join(cfgDir, file), await sandboxedPiConfig(file, src));
         }
       }
       const mounts = [
@@ -765,7 +774,7 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
-          await writeFile(join(cfgDir, file), await readFile(src));
+          await writeFile(join(cfgDir, file), await sandboxedPiConfig(file, src));
         }
       }
       const mounts = [
