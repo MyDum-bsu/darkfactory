@@ -64,7 +64,7 @@ const FILTER = {
   owner: 'board:client',
   label: { key: 'queue', value: 'vs1' },
   finish: 'verified',
-  required: ['spec_digest', 'policy_digest', 'repo_id'],
+  required: ['profile_id', 'repo_id', 'spec_digest', 'policy_digest'],
 };
 
 async function claimedBoard(t) {
@@ -79,7 +79,9 @@ async function claimedBoard(t) {
       ...handle.tasks,
       claim: async (...args) => {
         seen.claim++;
-        return handle.tasks.claim(...args);
+        const claimed = await handle.tasks.claim(...args);
+        seen.token = claimed.token;
+        return claimed;
       },
     },
   };
@@ -115,7 +117,7 @@ test('claimReady does not claim on an empty, foreign, mislabeled or incomplete q
   assert.equal(await port.claimReady({ ...FILTER, owner: 'board:other' }), null);
   assert.equal(await port.claimReady({ ...FILTER, label: { key: 'queue', value: 'other' } }), null);
   assert.equal(await port.claimReady({ ...FILTER, finish: 'deployed' }), null);
-  assert.equal(await port.claimReady({ ...FILTER, required: ['spec_digest', 'fixtures_digest'] }), null);
+  assert.equal(await port.claimReady({ ...FILTER, required: [...FILTER.required, 'fixtures_digest'] }), null);
   assert.equal(seen.claim, 0, 'ни один нативный claim не сделан');
   await assert.rejects(port.claimReady({ owner: '' }), /trusted claim filter/);
   await assert.rejects(port.claimReady({ label: { key: 'queue' } }), /trusted claim filter/);
@@ -138,3 +140,66 @@ test('claimReady never touches a waiting card and unlocks it only after native c
   assert.equal(seen.claim, 2);
 });
 
+
+test('claimReady rejects empty or partial filters outright', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  for (const bad of [
+    undefined,
+    {},
+    { owner: 'board:client' },
+    { owner: 'board:client', label: { key: 'queue', value: 'vs1' } },
+    { owner: 'board:client', label: { key: 'queue', value: 'vs1' }, finish: 'verified' },
+    { owner: 'board:client', label: { key: 'queue', value: 'vs1' }, finish: 'verified',
+      required: ['spec_digest', 'policy_digest'] },
+    { owner: 'board:client', label: { key: 'queue', value: 'vs1' }, finish: 'shipped',
+      required: ['profile_id', 'repo_id', 'spec_digest', 'policy_digest'] },
+  ]) {
+    await assert.rejects(port.claimReady(bad), /trusted claim filter/, JSON.stringify(bad ?? null));
+  }
+  assert.equal(seen.claim, 0);
+});
+
+test('claimReady validates contract label values, not just their presence', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  await contractTask(handle, { ...CONTRACT, queue: 'vs1', spec_digest: 'not-hex-at-all' });
+  await contractTask(handle, { ...CONTRACT, queue: 'vs1', policy_digest: 'a'.repeat(63) });
+  await contractTask(handle, { ...CONTRACT, queue: 'vs1', repo_id: '-bad-repo' });
+  await contractTask(handle, { ...CONTRACT, queue: 'vs1', finish: 'shipped' });
+  await contractTask(handle, { ...CONTRACT, queue: 'vs1', profile_id: 'other-profile' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  assert.equal(await port.claimReady({ ...FILTER, profileId: 'pilot' }), null);
+  assert.equal(await port.claimReady({ ...FILTER, profileId: 'fixture' }), null,
+    'чужой профиль маршрута не допускается');
+  assert.equal(seen.claim, 0, 'ни одна карточка с невалидным контрактом не захвачена');
+});
+
+test('claimReady re-reads the card before the claim and skips a card that changed', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  const { task } = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  // Первое чтение (перечитывание перед claim) возвращает чужого владельца: захват не делается.
+  const original = handle.thread.bind(handle);
+  ported.thread = async (id, opts) => {
+    const snap = await original(id, opts);
+    if (id === task.id) {
+      return { message: { ...snap.message, task: { ...snap.message.task, owner: 'board:other' } } };
+    }
+    return snap;
+  };
+  assert.equal(await port.claimReady(FILTER), null);
+  assert.equal(seen.claim, 0);
+});
+
+test('claim() returns only epoch and until: the lease token never leaves the adapter', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  const { task } = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  const claimed = await port.claim(task.id);
+  assert.deepEqual(Object.keys(claimed).sort(), ['epoch', 'until']);
+  assert.ok(seen.token);
+  assert.ok(!JSON.stringify(claimed).includes(seen.token), 'токен аренды не попадает в ответ claim');
+  const picked = await port.claimReady(FILTER).catch(() => null);
+  if (picked) assert.ok(!JSON.stringify(picked).includes(seen.token));
+});

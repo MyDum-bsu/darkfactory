@@ -134,9 +134,8 @@ test('две связанные карточки на реальном vb serve:
             task: attempt.task_id, worker: attempt.bb_thread_id, worktree: tree, branch: 'pilot',
             base: attempt.base_sha, finish: attempt.finish, review: REVIEW } } };
           const journal = await mkdtemp(join(dir, 'journal-'));
-          const result = await acceptHeld({
-            attempt: { ...attempt, tree_sha: treeSha },
-            submission,
+          // tree_sha не закрепляется вручную: он приходит из работы worktreeInspector.
+          const result = await acceptHeld({ attempt, submission,
             policy,
             journal,
             ports: {

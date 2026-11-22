@@ -59,44 +59,60 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
     return { epoch: claim.epoch, until: claim.until };
   }
 
+  // Минимальный набор контрактных меток, без которых карточка не допускается к захвату.
+  const CONTRACT_MIN = ['profile_id', 'repo_id', 'spec_digest', 'policy_digest'];
+  const REPO_LABEL = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
+  const HEX64 = /^[0-9a-f]{64}$/;
+
+  // Фильтр должен быть явным и полным: пустой или частичный allowlist захват не делает.
   function checkFilter(filter) {
-    if (filter === null || typeof filter !== 'object' || Array.isArray(filter)) {
+    if (filter === null || typeof filter !== 'object' || Array.isArray(filter) ||
+        typeof filter.owner !== 'string' || !filter.owner) {
       throw new Error('A trusted claim filter is required');
     }
-    const trusted = {};
-    if (filter.owner !== undefined) {
-      if (typeof filter.owner !== 'string' || !filter.owner) throw new Error('A trusted claim filter is required');
-      trusted.owner = filter.owner;
+    const { key, value } = filter.label ?? {};
+    if (typeof key !== 'string' || !key || typeof value !== 'string' || !value) {
+      throw new Error('A trusted claim filter is required');
     }
-    if (filter.label !== undefined) {
-      const { key, value } = filter.label ?? {};
-      if (typeof key !== 'string' || !key || typeof value !== 'string' || !value) {
-        throw new Error('A trusted claim filter is required');
-      }
-      trusted.label = { key, value };
+    if (typeof filter.finish !== 'string' || !filter.finish ||
+        (filter.finish !== 'verified' && filter.finish !== 'deployed')) {
+      throw new Error('A trusted claim filter is required');
     }
-    if (filter.finish !== undefined) {
-      if (typeof filter.finish !== 'string' || !filter.finish) throw new Error('A trusted claim filter is required');
-      trusted.finish = filter.finish;
+    if (!Array.isArray(filter.required) ||
+        !filter.required.every(item => typeof item === 'string' && item) ||
+        !CONTRACT_MIN.every(key => filter.required.includes(key)) ||
+        (filter.profileId !== undefined && (typeof filter.profileId !== 'string' || !filter.profileId))) {
+      throw new Error('A trusted claim filter is required');
     }
-    if (filter.required !== undefined) {
-      if (!Array.isArray(filter.required) || !filter.required.every(key => typeof key === 'string' && key)) {
-        throw new Error('A trusted claim filter is required');
-      }
-      trusted.required = filter.required;
-    }
-    return trusted;
+    return { owner: filter.owner, label: { key, value }, finish: filter.finish,
+      required: [...new Set(filter.required)],
+      ...(filter.profileId !== undefined ? { profileId: filter.profileId } : {}) };
   }
 
-  // Авторизация карточки по allowlist оператора: владелец, маршрутная метка, целевой finish
-  // и presence обязательных полей контракта. Метка маршрутизирует, но не выдаёт полномочий.
+  // Значения контрактных меток валидируются, не только presence: дайджесты — 64 hex,
+  // repo_id — канонический идентификатор, finish — целевой статус выпуска.
+  function contractLabelsValid(labels) {
+    if (typeof labels.profile_id !== 'string' || !labels.profile_id) return false;
+    if (typeof labels.repo_id !== 'string' || !REPO_LABEL.test(labels.repo_id)) return false;
+    if (!HEX64.test(labels.spec_digest) || !HEX64.test(labels.policy_digest)) return false;
+    if (labels.finish !== 'verified' && labels.finish !== 'deployed') return false;
+    if (labels.fixtures_digest !== undefined &&
+        (typeof labels.fixtures_digest !== 'string' || !HEX64.test(labels.fixtures_digest))) return false;
+    return true;
+  }
+
+  // Авторизация карточки по allowlist оператора: владелец, маршрутная метка, целевой finish,
+  // разрешённый профиль и полный валидный контракт. Метка маршрутизирует, но не выдаёт полномочий.
   function admits(filter, root) {
     if (root.task?.state !== 'ready') return false;
-    if (filter.owner !== undefined && root.task.owner !== filter.owner) return false;
-    if (filter.label !== undefined && root.labels?.[filter.label.key] !== filter.label.value) return false;
-    if (filter.finish !== undefined && root.labels?.finish !== filter.finish) return false;
-    for (const key of filter.required ?? []) {
-      if (typeof root.labels?.[key] !== 'string' || !root.labels[key]) return false;
+    if (root.task.owner !== filter.owner) return false;
+    if (root.labels?.[filter.label.key] !== filter.label.value) return false;
+    if (root.labels?.finish !== filter.finish) return false;
+    if (filter.profileId !== undefined && root.labels?.profile_id !== filter.profileId) return false;
+    const labels = root.labels;
+    if (labels === null || typeof labels !== 'object' || !contractLabelsValid(labels)) return false;
+    for (const key of filter.required) {
+      if (typeof labels[key] !== 'string' || !labels[key]) return false;
     }
     return true;
   }
@@ -105,7 +121,8 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
     await lookup(taskId);
     const claim = await handle.tasks.claim(taskId, token === undefined ? { lease } : { lease, token });
     held.set(taskId, claim);
-    return claim;
+    // Токен аренды и capability остаются внутри адаптера; наружу идут только факт и срок.
+    return { epoch: claim.epoch, until: claim.until };
   }
 
   return {
@@ -123,21 +140,22 @@ export function nativeBoardPort(handle, { channel, lease = 1800 }) {
     // незакрытыми needs и неавторизованные карточки не трогаются: эффектов нет, возврат null.
     async claimReady(filter, { token } = {}) {
       const trusted = checkFilter(filter);
-      const query = { channel, state: 'ready', limit: 200 };
-      if (trusted.owner !== undefined) query.owner = trusted.owner;
-      const serverLabels = [];
-      if (trusted.label !== undefined) serverLabels.push(`${trusted.label.key}=${trusted.label.value}`);
-      if (trusted.finish !== undefined) serverLabels.push(`finish=${trusted.finish}`);
-      for (const key of trusted.required ?? []) serverLabels.push(key);
-      if (serverLabels.length) query.label = serverLabels;
+      const query = { channel, state: 'ready', limit: 200, owner: trusted.owner };
+      const serverLabels = [`${trusted.label.key}=${trusted.label.value}`, `finish=${trusted.finish}`];
+      for (const key of trusted.required) serverLabels.push(key);
+      query.label = serverLabels;
       let after;
       for (;;) {
         const page = await handle.tasks.list({ ...query, ...(after ? { after } : {}) });
         for (const entry of page.tasks ?? []) {
-          const root = entry?.message;
-          if (root?.channel !== channel || !admits(trusted, root)) continue;
-          const claim = await claimById(root.id, { token });
-          return { taskId: root.id, epoch: claim.epoch, until: claim.until, labels: root.labels };
+          const listed = entry?.message;
+          if (listed?.channel !== channel || !admits(trusted, listed)) continue;
+          // Перечитываем карточку непосредственно перед claim: владелец, метка и контракт
+          // могли смениться между выдачей списка и захватом.
+          const fresh = await rootOf(listed.id);
+          if (fresh.task.state !== 'ready' || !admits(trusted, fresh)) continue;
+          const claim = await claimById(listed.id, { token });
+          return { taskId: listed.id, epoch: claim.epoch, until: claim.until, labels: fresh.labels };
         }
         // Сервер сообщает курсор следующей страницы; без сдвига или без карточек очередь кончилась.
         if (!page.cursor || page.cursor === after || !page.tasks?.length) return null;

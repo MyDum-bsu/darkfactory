@@ -5,8 +5,8 @@ const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'bl
 const shaRE = /^[a-f0-9]{40}$/;
 
 // Контракт приёмки, который карточка обязана нести в метках для захвата из очереди:
-// identity репозитория и хэши спеки/политики; profile_id и finish проверяет allowlist.
-const CONTRACT_LABELS = ['repo_id', 'spec_digest', 'policy_digest'];
+// разрешённый профиль, identity репозитория и валидные хэши спеки/политики.
+const CONTRACT_LABELS = ['profile_id', 'repo_id', 'spec_digest', 'policy_digest'];
 
 function isAllowlist(a) {
   if (!a || typeof a !== 'object' || Array.isArray(a)) return false;
@@ -31,12 +31,14 @@ function checkRoute(r) {
 }
 
 // Фильтр claimReady: канал закреплён адаптером, остальное — allowlist маршрута.
-// Контрактные метки обязательны всегда: неполный контракт не даёт 0-эффектного захвата.
+// Контрактные метки обязательны всегда, профиль карточки сверяется с профилем маршрута:
+// неполный или чужой контракт даёт 0-эффектный захват (null).
 function queueFilter(route) {
   return {
     owner: route.allowlist.owner,
     label: route.allowlist.label,
     finish: route.finish,
+    profileId: route.checkProfile,
     required: [...new Set([...CONTRACT_LABELS, ...(route.allowlist.required ?? [])])],
   };
 }
@@ -86,7 +88,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     if (route.taskId) {
       if ((await board.lookup(route.taskId)).state !== 'ready') return { phase: 'idle' };
     }
-    if (!await authorize('ready')) return { phase: 'hold', reason: 'route_not_authorized' };
+    // В queue-режиме у authorize ещё нет карточки — allowlist допуска делает claimReady;
+    // вторым аргументом контроллер всегда сообщает известный taskId (в legacy — маршрутный).
+    if (!await authorize('ready', route.taskId)) {
+      return { phase: 'hold', reason: 'route_not_authorized' };
+    }
     await save({ binding, phase: 'claiming', attemptId: randomUUID(),
       token: randomBytes(32).toString('base64url'), seenShas: [] });
     try {
@@ -106,7 +112,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       if (!Number.isSafeInteger(claim.epoch) || claim.epoch < 1) throw new Error('No native claim epoch');
       await save({ phase: 'launching', taskId: claim.taskId ?? route.taskId, epoch: claim.epoch,
         until: claim.until, ...(contract ? { contract } : {}) });
-      if (!await authorize('claimed')) {
+      if (!await authorize('claimed', record.taskId)) {
         await save({ phase: 'hold', reason: 'route_changed_before_spawn' });
         return visible();
       }

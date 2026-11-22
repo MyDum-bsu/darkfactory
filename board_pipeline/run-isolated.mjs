@@ -62,10 +62,14 @@ async function execute() {
   const { board } = loadSdk();
   const port = nativeBoardPort(board(), { channel: p.channel });
   const record = join(root, 'attempt.json');
-  const authorize = async state => {
+  const authorize = async (state, taskId) => {
     await assertPinned();
     const git = async (...args) => (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
-    return await port.matches(route.taskId, { owner: p.owner, label: p.label, state }) &&
+    // В queue-режиме на фазе 'ready' карточки ещё нет — allowlist-допуск делает claimReady
+    // адаптера; при известной карточке сверяем владельца, метку и состояние нативно.
+    const cardOk = taskId === undefined ||
+      await port.matches(taskId, { owner: p.owner, label: p.label, state });
+    return cardOk &&
       await git('rev-parse', '--show-toplevel') === tree &&
       await git('rev-parse', 'HEAD') === route.base &&
       await git('branch', '--show-current') === p.profiles[route.checkProfile].branch &&
@@ -90,7 +94,8 @@ async function execute() {
       await writeFile(initial, `${text}\n\nРабочий путь: ${tree}. ${handoff}\nДругие треды и доски не трогай.\n`,
         { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
-        '--provider', p.bb.provider, '--model', p.bb.model, '--title', `Пилот #${route.taskId}`, '--prompt-file', initial,
+        '--provider', p.bb.provider, '--model', p.bb.model, '--title', `Пилот #${attempt.task_id}`,
+        '--prompt-file', initial,
         '--parent-notifications', 'off', '--permission-mode', 'accept-edits', '--json'];
       if (p.bb.effort) argv.push('--reasoning-level', p.bb.effort);
       const live = await port.verifyHeld(attempt.task_id, attempt.epoch);
@@ -155,7 +160,7 @@ async function execute() {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
-    const policy = { version: p.version, profiles: { [attempt.check_profile]: { ...profile,
+    const policy = { version: p.version, digest: await fingerprint(), profiles: { [attempt.check_profile]: { ...profile,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish } } };
     let lost = false;
     let renewal = Promise.resolve();
@@ -167,6 +172,8 @@ async function execute() {
       const review = nativeReviewVerifier(reviewGate, reviewPrompt, { permissionMode: 'accept-edits' });
       return await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: worktreeInspector(policy), local: offlineProfileRunner(root),
+        // Смена брифа/файлов политики во время проверок останавливает кандидата до complete.
+        verifyPinned: assertPinned,
         review: async handoff => {
           await renewal;
           if (lost) throw new Error('Lease lost');

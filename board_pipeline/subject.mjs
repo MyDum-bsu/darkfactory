@@ -18,6 +18,16 @@ export class SubjectDenied extends Error {
   }
 }
 
+// Единый безопасный обход массивов: без пользовательских map/iterators, без sparse.
+function safeArray(value, reason) {
+  const items = [];
+  for (let i = 0; i < value.length; i++) {
+    if (!Object.hasOwn(value, String(i))) throw new SubjectDenied(reason);
+    items.push(value[i]);
+  }
+  return items;
+}
+
 // Рекурсивно отсортированные ключи: одинаковые данные дают одинаковый байтовый JSON.
 export function canonicalJson(value) {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
@@ -25,7 +35,9 @@ export function canonicalJson(value) {
     if (!Number.isFinite(value)) throw new SubjectDenied('subject_not_json');
     return JSON.stringify(value);
   }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (Array.isArray(value)) {
+    return `[${safeArray(value, 'subject_sparse_array').map(item => canonicalJson(item)).join(',')}]`;
+  }
   if (typeof value === 'object') {
     const keys = Object.keys(value).sort();
     for (const key of keys) {
@@ -92,7 +104,8 @@ export function validateSubject(subject) {
   // git_tree обычно несёт пустой список, но может дополняться артефактами (например, L3);
   // identity artifact_bundle и hybrid строится на артефактах, поэтому список не пуст.
   if (subject.kind !== 'git_tree' && !artifacts.length) throw new SubjectDenied('subject_artifacts_empty');
-  for (const artifact of artifacts) {
+  const checkedArtifacts = safeArray(artifacts, 'subject_sparse_array');
+  for (const artifact of checkedArtifacts) {
     if (artifact === null || typeof artifact !== 'object' || Array.isArray(artifact)) {
       throw new SubjectDenied('subject_artifact_not_object');
     }
@@ -137,7 +150,9 @@ export function buildSubject({
       tree_sha: treeSha,
       merge_result_sha: mergeResultSha,
     },
-    artifacts: artifacts.map(artifact => ({ ...artifact })),
+    artifacts: safeArray(artifacts, 'subject_sparse_array').map(artifact =>
+      typeof artifact === 'object' && artifact !== null && !Array.isArray(artifact)
+        ? { ...artifact } : artifact),
     spec_digest: specDigest,
     policy_digest: policyDigest,
     fixtures_digest: fixturesDigest,

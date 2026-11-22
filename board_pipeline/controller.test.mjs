@@ -76,7 +76,7 @@ async function queueLab(t, { finish = 'verified', owner = 'board:client', labels
     await handle.tasks.claim(created[0].id);
   }
   const route = { allowlist: { owner, label: { key: 'queue', value: 'vs1' } }, base: 'a'.repeat(40),
-    policyVersion: 'lab-1', checkProfile: 'fixture', worktree: '/synthetic', finish };
+    policyVersion: 'lab-1', checkProfile: 'pilot', worktree: '/synthetic', finish };
   let stored;
   let candidate;
   let wireTaskId;
@@ -331,4 +331,33 @@ test('queue mode returns rework feedback to the same worker under the same lease
   assert.equal((await x.tick()).phase, 'done');
   assert.equal(x.effects.spawn, 1);
   assert.equal(x.seen.claim, 1);
+});
+
+test('queue mode authorizes without a hardcoded card and binds the claimed card', async t => {
+  const x = await queueLab(t);
+  const calls = [];
+  x.cfg.authorize = async (state, taskId) => {
+    calls.push([state, taskId]);
+    return true;
+  };
+  await x.tick();
+  x.submit('c');
+  await x.tick();
+  // authorize('ready') без карточки (allowlist-допуск делает claimReady), затем
+  // authorize('claimed') с фактическим taskId захваченной карточки.
+  assert.deepEqual(calls, [['ready', undefined], ['claimed', x.headId()]]);
+  assert.equal(x.effects.spawn, 1);
+  assert.equal((await x.card(0)).state, 'completed');
+});
+
+test('queue mode does not admit a card whose profile_id differs from the route profile', async t => {
+  const x = await queueLab(t, {
+    labels: { spec_digest: CONTRACT.spec_digest, policy_digest: CONTRACT.policy_digest,
+      repo_id: CONTRACT.repo_id, profile_id: 'other-profile' },
+  });
+  const result = await x.tick();
+  assert.equal(result.phase, 'idle');
+  assert.equal(x.seen.claim, 0);
+  assert.equal(x.effects.spawn, 0);
+  assert.equal((await x.card(0)).state, 'ready');
 });

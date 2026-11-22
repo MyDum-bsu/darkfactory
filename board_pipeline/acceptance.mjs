@@ -2,8 +2,9 @@
 // Все внешние эффекты — только через порты. Журнал append-only: intent ДО эффекта.
 
 import { open, readFile, appendFile, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { buildSubject, subjectDigest } from './subject.mjs';
+import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 
 const HANDOFF_KEYS = [
   'task_id',
@@ -36,7 +37,7 @@ const ATTEMPT_OPTIONAL = [
   'fixtures_digest',
   'release_target',
 ];
-const CONTRACT_REQUIRED = ['repo_id', 'tree_sha', 'spec_digest', 'policy_digest'];
+const CONTRACT_REQUIRED = ['repo_id', 'spec_digest', 'policy_digest'];
 const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
 
 // Сдача воркера: типизированный результат, без worktree/профиля/команд/токена.
@@ -119,11 +120,12 @@ function strictKeys(record, allowed, optional = []) {
 }
 
 // Контракт либо отсутствует целиком (ручной v1 без манифеста), либо закреплён полностью.
+// tree_sha в попытке необязателен: он берётся из реального Git-снимка при инспекции.
 function validateContract(attempt) {
   const pinned = CONTRACT_REQUIRED.some(key => attempt[key] !== undefined);
   if (!pinned) {
-    if (attempt.fixtures_digest !== undefined || attempt.release_target !== undefined) {
-      throw new Denied('subject_contract_incomplete');
+    for (const key of ['tree_sha', 'fixtures_digest', 'release_target']) {
+      if (attempt[key] !== undefined) throw new Denied('subject_contract_incomplete');
     }
     return;
   }
@@ -133,7 +135,9 @@ function validateContract(attempt) {
   if (typeof attempt.repo_id !== 'string' || !REPO_ID_RE.test(attempt.repo_id)) {
     throw new Denied('invalid_repo_id');
   }
-  if (!SHA_RE.test(attempt.tree_sha)) throw new Denied('tree_sha_not_full');
+  if (attempt.tree_sha !== undefined && !SHA_RE.test(attempt.tree_sha)) {
+    throw new Denied('tree_sha_not_full');
+  }
   for (const key of ['spec_digest', 'policy_digest']) {
     if (!SHA256_RE.test(attempt[key])) throw new Denied(`invalid_${key}`);
   }
@@ -173,7 +177,8 @@ function validateAttempt(attempt) {
 }
 
 // Манифест приёмки этой попытки; null для ручного v1 без закреплённого контракта.
-function attemptSubject(attempt, submission) {
+// tree_sha приходит из реального Git-снимка (инспекция) или из закреплённой попытки.
+function attemptSubject(attempt, submission, treeSha) {
   if (attempt.spec_digest === undefined) return null;
   const target = attempt.release_target;
   return buildSubject({
@@ -181,7 +186,7 @@ function attemptSubject(attempt, submission) {
     repoId: attempt.repo_id,
     baseSha: attempt.base_sha,
     candidateSha: submission.candidate_sha,
-    treeSha: attempt.tree_sha,
+    treeSha,
     specDigest: attempt.spec_digest,
     policyDigest: attempt.policy_digest,
     fixturesDigest: attempt.fixtures_digest ?? null,
@@ -192,6 +197,36 @@ function attemptSubject(attempt, submission) {
       previousLiveDigest: target.previous_live_digest ?? null,
     } : { finish: attempt.finish },
   });
+}
+
+// Ключ контракта для журнала: смена spec/policy/fixtures/release при том же SHA
+// создаёт новый запуск вместо переиспользования старого терминального вердикта.
+// (candidate_sha уже в ключе запуска, а tree_sha однозначно выводится из него в Git.)
+function contractKey(attempt) {
+  if (attempt.spec_digest === undefined) return null;
+  return createHash('sha256').update(canonicalJson({
+    repo_id: attempt.repo_id,
+    base_sha: attempt.base_sha,
+    spec_digest: attempt.spec_digest,
+    policy_digest: attempt.policy_digest,
+    fixtures_digest: attempt.fixtures_digest ?? null,
+    release_target: attempt.release_target ?? null,
+    finish: attempt.finish,
+  })).digest('hex');
+}
+
+// Сверка контракта записи журнала с текущей попыткой: ключ совпал, а контракт нет —
+// журнал не может подтвердить вердикт для этого манифеста.
+function sameContract(runEntry, attempt) {
+  if (attempt.spec_digest === undefined) return true;
+  const recorded = runEntry?.contract;
+  if (recorded === null || typeof recorded !== 'object') return false;
+  return recorded.repo_id === attempt.repo_id &&
+    recorded.spec_digest === attempt.spec_digest &&
+    recorded.policy_digest === attempt.policy_digest &&
+    (recorded.fixtures_digest ?? null) === (attempt.fixtures_digest ?? null) &&
+    (JSON.stringify(recorded.release_target ?? null) ===
+      JSON.stringify(attempt.release_target ?? null));
 }
 
 // Сверка сдачи с доверенной попыткой. Любое расхождение — отказ до эффекта.
@@ -257,9 +292,59 @@ function messageOf(error) {
   return String(error?.message ?? error);
 }
 
+// Компактная квитанция для Board.complete: гарантированно <= 1000 символов и без потери
+// sha, subject_digest, статуса проверок и вердикта ревью. Полная квитанция живёт в журнале,
+// карточка ссылается на неё ключом запуска. Ужатие детерминированное: сначала ссылки на
+// логи, затем сам список проверок; не влезло — честная ошибка, а не молчаливая усечка.
+function compactChecks(checks) {
+  const items = Array.isArray(checks) ? checks : checks === undefined || checks === null ? [] : [checks];
+  const list = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (typeof item === 'string') {
+      list.push({ i, ok: true, ref: item.slice(0, 48) });
+      continue;
+    }
+    if (item === null || typeof item !== 'object') {
+      list.push({ i, ok: false });
+      continue;
+    }
+    list.push({ i, ok: item.exit === 0 || item.ok === true, ref: String(item.file ?? '').slice(0, 48) });
+  }
+  return { ok: list.length > 0 && list.every(entry => entry.ok), n: list.length, checks: list };
+}
+
+function compactEvidence(evidence, run) {
+  const review = evidence.review ?? {};
+  const base = {
+    v: 1,
+    sha: evidence.sha,
+    subject_digest: evidence.subject_digest,
+    worker: evidence.worker,
+    checks: compactChecks(evidence.checks),
+    review: {
+      verdict: review.verdict,
+      checkpoint: review.checkpoint,
+      provider: review.actual?.provider,
+      model: review.actual?.model,
+    },
+    run,
+  };
+  const variants = [
+    base,
+    () => ({ ...base, checks: { ...base.checks, checks: base.checks.checks.map(({ i, ok }) => ({ i, ok })) } }),
+    () => ({ ...base, checks: { ok: base.checks.ok, n: base.checks.n } }),
+  ];
+  for (const variant of variants) {
+    const text = JSON.stringify(variant);
+    if (typeof text === 'string' && text.length <= 1000) return variant;
+  }
+  throw new Error('Compact Board receipt cannot fit the 1000 character limit');
+}
+
 // Один общий механизм Git-снимка, проверок и ревью для ручного v1 и для приёмки по аренде.
 // Возвращает verified | rework (исправимый дефект) | hold (среда/неизвестный эффект).
-async function runVerification({ binding, profile, ports, intent, step, beforeReview }) {
+async function runVerification({ binding, profile, ports, intent, step, beforeReview, onSnapshot }) {
   await intent('inspect');
   let ins;
   try {
@@ -271,6 +356,10 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   }
   const problem = inspectionProblem(ins, binding.candidate_sha);
   if (problem) return { status: 'hold', reason: problem };
+  if (onSnapshot) {
+    const snapshotVerdict = await onSnapshot(ins);
+    if (snapshotVerdict) return snapshotVerdict;
+  }
 
   // Команды берутся из профиля, не из сдачи.
   await intent('local');
@@ -483,13 +572,14 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   }
 
   let profile;
-  let subject;
+  // Манифест достраивается после первой инспекции: tree_sha берётся из реального снимка.
+  let subject = null;
+  let digest = null;
   try {
     validateAttempt(attempt);
     validateSubmission(submission, attempt);
     profile = validatePolicy(policy, attempt.check_profile);
     validateEnrolled(attempt, profile);
-    subject = attemptSubject(attempt, submission);
   } catch (e) {
     if (e instanceof Denied) {
       return {
@@ -501,8 +591,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     }
     throw e;
   }
-  // Единая привязка всех квитанций этой попытки; null для ручного v1 без контракта.
-  const digest = subject === null ? null : subjectDigest(subject);
+  const key = contractKey(attempt);
 
   const binding = {
     task_id: attempt.task_id,
@@ -512,8 +601,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     check_profile: attempt.check_profile,
     candidate_sha: submission.candidate_sha,
   };
+  // Ключ запуска включает контракт: новый манифест при том же SHA не переиспользует
+  // терминальный вердикт старого.
   const id = runId(`${attempt.task_id}.${attempt.attempt_id}.${attempt.epoch}`,
-    submission.candidate_sha, policy.version);
+    submission.candidate_sha, policy.version) + (key ? `-s${key}` : '');
   const file = path.join(journal, `${id}.jsonl`);
 
   let fh;
@@ -522,6 +613,16 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   } catch (e) {
     if (e.code !== 'EEXIST') throw e;
     const entries = (await readExistingRun(file)) ?? [];
+    const runEntry = entries.find((entry) => entry.kind === 'run');
+    if (runEntry && !sameContract(runEntry, attempt)) {
+      return {
+        outcome: 'denied',
+        reason: 'journal_subject_mismatch',
+        task_id: attempt.task_id,
+        attempt_id: attempt.attempt_id,
+        run: id,
+      };
+    }
     const done = terminalOutcome(entries);
     if (done !== null) return { ...done, repeated: true, run: id };
     let boardState = null;
@@ -557,7 +658,14 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     candidate_sha: submission.candidate_sha,
     policy_version: policy.version,
     finish: attempt.finish,
-    subject_digest: digest,
+    subject_digest: null,
+    ...(key ? { contract: {
+      repo_id: attempt.repo_id,
+      spec_digest: attempt.spec_digest,
+      policy_digest: attempt.policy_digest,
+      fixtures_digest: attempt.fixtures_digest ?? null,
+      release_target: attempt.release_target ?? null,
+    } } : {}),
   });
 
   const intent = async (phase) => append({ kind: 'intent', phase });
@@ -602,6 +710,27 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     return settle('hold', { reason, receipt: { reason } });
   };
 
+  // Манифест достраивается на первом снимке: tree_sha из инспекции (или закреплённый),
+  // расхождение закреплённого дерева с фактическим — дрейф.
+  const finalizeSubject = async (ins) => {
+    if (subject !== null || attempt.spec_digest === undefined) return null;
+    if (attempt.tree_sha !== undefined && ins.tree !== undefined && attempt.tree_sha !== ins.tree) {
+      return { status: 'hold', reason: 'tree_sha_drift' };
+    }
+    const treeSha = attempt.tree_sha ?? ins.tree;
+    if (!treeSha) return { status: 'hold', reason: 'subject_contract_incomplete' };
+    try {
+      subject = attemptSubject(attempt, submission, treeSha);
+      digest = subjectDigest(subject);
+    } catch (e) {
+      return { status: 'hold',
+        reason: e instanceof Denied ? e.reason : `subject_failed:${messageOf(e)}` };
+    }
+    await append({ kind: 'subject', subject_digest: digest });
+    await step('subject', true, { subject_digest: digest });
+    return null;
+  };
+
   // Доказательство действующей аренды: настоящий native epoch/token, не цифра из сдачи.
   await intent('verify_claim');
   let live;
@@ -614,7 +743,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   }
 
   const verdict = await runVerification({ binding, profile, ports, intent, step,
-    beforeReview: () => ports.board.verifyHeld(attempt.task_id, attempt.epoch) });
+    beforeReview: () => ports.board.verifyHeld(attempt.task_id, attempt.epoch),
+    onSnapshot: finalizeSubject });
   if (verdict.status === 'lost') return settle('denied', { reason: verdict.reason });
 
   if (verdict.status === 'rework') {
@@ -631,8 +761,19 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
 
   const { loc, review: rev, actual } = verdict;
 
-  // Печать: контракт не дрейфовал, снимок не сдвинулся и аренда всё ещё наша перед любым settle.
+  // Печать: операторские входы, контракт карточки и снимок перепроверяются после L2
+  // и до complete — смена брифа, политики или спеки во время проверок останавливает
+  // кандидата, а не закрывает карточку устаревшим вердиктом.
   await intent('seal');
+  if (typeof ports.verifyPinned === 'function') {
+    try {
+      await ports.verifyPinned();
+      await step('seal', true, 'operator_inputs_pinned');
+    } catch (e) {
+      await step('seal', false, messageOf(e));
+      return hold('policy_digest_drift');
+    }
+  }
   if (subject !== null) {
     let labels = null;
     try {
@@ -678,13 +819,13 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     return settle('denied', { reason: `claim_not_held:${messageOf(e)}` });
   }
 
-  const evidence = {
+  const evidence = compactEvidence({
     sha: binding.candidate_sha,
     subject_digest: digest,
     worker: attempt.bb_thread_id,
     checks: loc.evidence,
     review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
-  };
+  }, id);
 
   // finish=verified закрывает карточку; finish=deployed ждёт выкладки и smoke.
   if (attempt.finish !== 'verified') {
@@ -727,5 +868,8 @@ export const _internals = {
   validateSubmission,
   validateContract,
   attemptSubject,
+  contractKey,
+  sameContract,
+  compactEvidence,
   runVerification,
 };

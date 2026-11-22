@@ -29,9 +29,11 @@ export function worktreeInspector(policy) {
       throw new Error('Enrolled feature branch changed');
     }
     const head = await git(worktree, 'rev-parse', 'HEAD');
+    // Дерево именно кандидата (не HEAD): источник tree_sha для манифеста приёмки.
+    const tree = await git(worktree, 'rev-parse', `${handoff.candidate_sha}^{tree}`);
     const clean = !(await git(worktree, 'status', '--porcelain=v1', '--untracked-files=all'));
     const baseAncestor = await git(worktree, 'merge-base', handoff.base_sha, head) === handoff.base_sha;
-    return { head, clean, baseAncestor };
+    return { head, tree, clean, baseAncestor };
   };
 }
 

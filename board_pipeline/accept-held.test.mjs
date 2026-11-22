@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -617,7 +617,7 @@ test('неполный контракт попытки отклоняется д
   const journal = await tmpJournal();
   const { ports, calls } = stubs();
 
-  for (const over of [{ tree_sha: undefined }, { policy_digest: undefined }, { repo_id: undefined },
+  for (const over of [{ policy_digest: undefined }, { repo_id: undefined },
     { repo_id: REPO, tree_sha: TREE, spec_digest: SPEC, policy_digest: POL, fixtures_digest: OTHER_256 }]) {
     const bad = contractAttempt(id, epoch, over);
     if (over.fixtures_digest === OTHER_256) delete bad.spec_digest;
@@ -634,4 +634,204 @@ test('неполный контракт попытки отклоняется д
   }
   assert.equal((await settled(handle, id)).state, 'claimed');
   assert.equal(seen.claim, 1);
+});
+
+test('tree_sha берётся из реального снимка: контракт без tree_sha проходит приёмку', async (t) => {
+  const { execFileSync } = await import('node:child_process');
+  const { worktreeInspector } = await import('./runtime.mjs');
+  const { mkdtemp } = await import('node:fs/promises');
+  const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const repo = await mkdtemp(path.join(testRoot, 'repo-'));
+  git(repo, 'init', '--initial-branch=pilot');
+  await writeFile(path.join(repo, 'check.mjs'), 'process.exit(0);\n');
+  git(repo, 'add', 'check.mjs');
+  git(repo, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=Fixture',
+    '-c', 'commit.gpgsign=false', 'commit', '-m', 'Base');
+  const base = git(repo, 'rev-parse', 'HEAD');
+  await writeFile(path.join(repo, 'check.mjs'), 'console.log("candidate"); process.exit(0);\n');
+  git(repo, 'add', 'check.mjs');
+  git(repo, '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=Fixture',
+    '-c', 'commit.gpgsign=false', 'commit', '-m', 'Candidate');
+  const candidate = git(repo, 'rev-parse', 'HEAD');
+  const realTree = git(repo, 'rev-parse', `${candidate}^{tree}`);
+
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs();
+  const policyObject = policy(id, { worktree: repo, branch: 'pilot', base });
+
+  // Инспектор возвращает дерево именно кандидата.
+  const ins = await worktreeInspector(policyObject)({
+    task_id: id, worker_thread_id: 'thr_fixture', base_sha: base, candidate_sha: candidate,
+    worktree: repo, check_profile: 'pilot' });
+  assert.equal(ins.tree, realTree);
+
+  // Контракт без tree_sha: манифест достраивается на снимке, дрейфа нет.
+  let inspected = 0;
+  const realInspect = worktreeInspector(policyObject);
+  const res = await acceptHeld({
+    attempt: { ...contractAttempt(id, epoch), base_sha: base, worktree: repo, tree_sha: undefined },
+    submission: { ...submission(id, epoch), candidate_sha: candidate },
+    policy: policyObject,
+    journal,
+    ports: { ...ports, board: boardPort, inspect: async binding => {
+      inspected++;
+      return realInspect(binding);
+    } },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+  const expected = subjectDigest(buildSubject({
+    kind: 'git_tree', repoId: REPO, baseSha: base, candidateSha: candidate, treeSha: realTree,
+    specDigest: SPEC, policyDigest: POL, fixturesDigest: null, releaseTarget: { finish: 'verified' },
+  }));
+  assert.equal(res.receipt.subject_digest, expected, 'subject_digest собран из реального дерева');
+  assert.equal((await settled(handle, id)).state, 'completed');
+  assert.deepEqual(calls, { inspect: 0, local: 1, review: 1 });
+  assert.equal(inspected, 2, 'настоящий инспектор вызван до проверок и на seal');
+});
+
+test('закреплённый tree_sha, расходящийся со снимком, останавливает кандидата', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports } = stubs();
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch, { tree_sha: 'd'.repeat(40) }),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort,
+      inspect: async () => ({ head: CAND, tree: TREE, clean: true, baseAncestor: true }) },
+  });
+  assert.equal(res.outcome, 'hold');
+  assert.equal(res.reason, 'tree_sha_drift');
+  assert.equal((await settled(handle, id)).state, 'blocked');
+});
+
+test('снимок без дерева и без закреплённого tree_sha не строит манифест', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports } = stubs();
+  const res = await acceptHeld({
+    attempt: { ...contractAttempt(id, epoch), tree_sha: undefined },
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort }, // заглушки без поля tree
+  });
+  assert.equal(res.outcome, 'hold');
+  assert.equal(res.reason, 'subject_contract_incomplete');
+  assert.equal((await settled(handle, id)).state, 'blocked');
+});
+
+test('verifyPinned: смена операторских входов во время L2 останавливает до complete', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs();
+  let pinnedCalls = 0;
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort, verifyPinned: async () => {
+      pinnedCalls++;
+      throw new Error('Operator inputs changed during L2');
+    } },
+  });
+  assert.equal(pinnedCalls, 1, 'проверка операторских входов выполнена на seal');
+  assert.equal(res.outcome, 'hold');
+  assert.equal(res.reason, 'policy_digest_drift');
+  assert.equal(calls.review, 1, 'L2 успел пройти, complete не делался');
+  assert.equal((await settled(handle, id)).state, 'blocked');
+  assert.equal((await journalText(journal)).includes('"token":'), false,
+    'токен аренды не попадает в журнал даже при стопе');
+});
+
+test('новый манифест при том же SHA не переиспользует терминальный вердикт журнала', async (t) => {
+  const { handle, ported, seen } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs({
+    local: async (binding) => {
+      calls.local++;
+      return { sha: binding.candidate_sha, ok: false, evidence: 'checks.json', exit: 3 };
+    },
+  });
+  const first = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(first.outcome, 'rework');
+  assert.equal(calls.local, 1);
+  // Тот же SHA и эпоха, но спека изменилась: новый ключ запуска, проверки идут заново.
+  const second = await acceptHeld({
+    attempt: contractAttempt(id, epoch, { spec_digest: OTHER_256 }),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  assert.equal(second.outcome, 'rework');
+  assert.equal(second.repeated, undefined, 'старый вердикт не переиспользован');
+  assert.notEqual(second.run, first.run);
+  assert.equal(calls.local, 2, 'локальные проверки выполнены заново для нового манифеста');
+  const { readdir: listDir } = await import('node:fs/promises');
+  assert.equal((await listDir(journal)).filter((name) => name.endsWith('.jsonl')).length, 2);
+  assert.equal(seen.claim, 1);
+});
+
+test('компактная квитанция укладывается в 1000 символов при любом числе проверок', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports } = stubs();
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal,
+    ports: { ...ports, board: boardPort, local: async (binding) => ({
+      sha: binding.candidate_sha, ok: true,
+      evidence: Array.from({ length: 6 }, (_, i) => ({
+        file: `checks-${i}-${'x'.repeat(200)}.log`, sha256: 'e'.repeat(64), exit: 0 })),
+    }) },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'completed');
+  const receipt = typeof after.result === 'string' ? JSON.parse(after.result) : after.result;
+  assert.equal(JSON.stringify(receipt).length <= 1000, true, 'лимит Board.complete соблюдён');
+  assert.equal(receipt.sha, CAND);
+  assert.equal(receipt.subject_digest, expectedDigest());
+  assert.equal(receipt.review.verdict, 'REVIEW_OK');
+  assert.equal(receipt.review.checkpoint, 'feed80ab');
+  assert.equal(receipt.checks.n, 6);
+  assert.equal(receipt.checks.ok, true);
+  assert.equal(receipt.run, res.run, 'карточка ссылается на полную квитанцию в журнале');
+});
+
+test('sameContract отличает смену контракта и ручной v1', async (t) => {
+  const { _internals: { sameContract } } = await import('./acceptance.mjs');
+  const run = { contract: { repo_id: REPO, spec_digest: SPEC, policy_digest: POL,
+    fixtures_digest: null, release_target: null } };
+  assert.equal(sameContract(run, contractAttempt('1', 1)), true);
+  assert.equal(sameContract(run, contractAttempt('1', 1, { spec_digest: OTHER_256 })), false);
+  assert.equal(sameContract(run, contractAttempt('1', 1, { fixtures_digest: OTHER_256 })), false);
+  assert.equal(sameContract({ contract: null }, contractAttempt('1', 1)), false, 'запись без контракта');
+  assert.equal(sameContract(run, attempt('1', 1)), true, 'ручной v1 без контракта всегда совместим');
+  assert.equal(sameContract(run, contractAttempt('1', 1, { release_target: { finish: 'deployed' } })), false);
 });

@@ -140,3 +140,27 @@ test('buildSubject defaults nullable fields and validates the result', () => {
   assert.throws(() => buildSubject({ kind: 'git_tree', repoId: 'repo', candidateSha: CAND, treeSha: TREE,
     specDigest: SPEC, policyDigest: POLICY }), /subject_base_sha_invalid/);
 });
+
+test('canonical JSON и валидация не доверяют пользовательским map/iterators', () => {
+  // Подменённый map не влияет на обход: канонизация читает реальные элементы.
+  const hostile = [1, 2, 3];
+  hostile.map = () => [9, 9, 9];
+  assert.equal(canonicalJson(hostile), '[1,2,3]');
+  assert.equal(canonicalDigest(hostile), canonicalDigest([1, 2, 3]));
+
+  // Подменённый iterator не уводит валидацию с реального списка артефактов.
+  const artifacts = [{ role: 'primary', sha256: 'f'.repeat(64), bytes: 7 }];
+  const fake = { role: 'poster', sha256: '0', bytes: -1 };
+  Object.defineProperty(artifacts, Symbol.iterator, { value: function* () { yield fake; } });
+  const withHostile = validateSubject(subject({ artifacts }));
+  assert.deepEqual(withHostile.artifacts, [{ role: 'primary', sha256: 'f'.repeat(64), bytes: 7 }]);
+  assert.equal(subjectDigest(withHostile),
+    subjectDigest(subject({ artifacts: [{ role: 'primary', sha256: 'f'.repeat(64), bytes: 7 }] })));
+});
+
+test('sparse-массивы отклоняются канонизацией и валидацией артефактов', () => {
+  assert.throws(() => canonicalJson(Array(1)), /subject_sparse_array/);
+  assert.throws(() => canonicalJson([1, , 3]), /subject_sparse_array/);
+  assert.throws(() => validateSubject(subject({ artifacts: Array(1) })), /subject_sparse_array/);
+  assert.throws(() => validateSubject(subject({ artifacts: [null, null] })), /subject_artifact_not_object/);
+});
