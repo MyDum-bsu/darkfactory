@@ -47,8 +47,9 @@ export function normalizeUsage(raw) {
 }
 
 // Суммирование токенов: null остаётся null, пока не появится число; числа
-// разных раундов/ходов складываются.
-const sumTokens = (a, b) => a === null && b === null ? null : (a ?? 0) + (b ?? 0);
+// разных раундов/ходов складываются. `== null` ловит и undefined от `prev?.`
+// при первом вызове, иначе отсутствие поля превращается в выдуманный 0.
+const sumTokens = (a, b) => a == null && b == null ? null : (a ?? 0) + (b ?? 0);
 const mergeTokens = (prev, usage) => ({ input: sumTokens(prev?.input, usage.input),
   output: sumTokens(prev?.output, usage.output), cached: sumTokens(prev?.cached, usage.cached) });
 

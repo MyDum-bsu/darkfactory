@@ -215,6 +215,10 @@ test('recordUsage: суммирует токены по раундам, null н�
   rec.recordUsage('critic', { garbage: true });
   assert.deepEqual(rec.summary().tokens.critic,
     { input: 130, output: 70, cached: 10, source: 'agy_stream' });
+  // Первый вызов без cached: null сохраняется, а не превращается в 0.
+  const first = createTelemetryRecorder({ journal, clock: () => 0 });
+  first.recordUsage('critic', { input_tokens: 10, output_tokens: 2 });
+  assert.deepEqual(first.summary().tokens.critic, { input: 10, output: 2, cached: null });
 });
 
 test('embed: сводка в квитанции ≤1000, не влезла — квитанция без неё', async t => {
