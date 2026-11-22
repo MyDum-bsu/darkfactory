@@ -161,7 +161,8 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
         if (STRONG_ASSERT.test(text)) tally.strongRemoved++;
         const tallyB = boundTally();
         tallyB.removed.push(...[...text.matchAll(CMP_BOUND)]
-          .map((m) => ({ op: m[1], num: Number(m[2]) })));
+          .map((m) => ({ expr: text.slice(0, m.index).replace(/\s+/g, ''),
+            op: m[1], num: Number(m[2]) })));
         tallyB.removedAnds += (text.match(/&&|\|\|/g) ?? []).length;
       }
       oldLine++;
@@ -185,7 +186,8 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
         if (STRONG_ASSERT.test(text)) tally.strongAdded++;
         const tallyB = boundTally();
         tallyB.added.push(...[...text.matchAll(CMP_BOUND)]
-          .map((m) => ({ op: m[1], num: Number(m[2]) })));
+          .map((m) => ({ expr: text.slice(0, m.index).replace(/\s+/g, ''),
+            op: m[1], num: Number(m[2]) })));
         tallyB.addedAnds += (text.match(/&&|\|\|/g) ?? []).length;
       }
       newLine++;
@@ -216,10 +218,15 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
     const isLower = (op) => op === '>=' || op === '>';
     const isUpper = (op) => op === '<=' || op === '<';
     const isEq = (op) => op === '===' || op === '==';
-    const weakened = tally.removed.some((r) =>
-      (isLower(r.op) && tally.added.some((a) => isLower(a.op) && a.num < r.num)) ||
-      (isUpper(r.op) && tally.added.some((a) => isUpper(a.op) && a.num > r.num)) ||
-      (isEq(r.op) && tally.added.some((a) => !isEq(a.op) && a.op !== '!=' && a.op !== '!==')));
+    // Сопоставляются только проверки одного выражения: ужесточение другого
+    // assert'а в том же файле ложным ослаблением не считается.
+    const weakened = tally.removed.some((r) => {
+      const added = tally.added.filter((a) => a.expr === r.expr);
+      return added.some((a) =>
+        (isLower(r.op) && isLower(a.op) && a.num < r.num) ||
+        (isUpper(r.op) && isUpper(a.op) && a.num > r.num) ||
+        (isEq(r.op) && !isEq(a.op) && a.op !== '!=' && a.op !== '!=='));
+    });
     const droppedConditions = tally.removedAnds > tally.addedAnds && tally.removedAnds > 0;
     if (weakened || droppedConditions) {
       violations.push({
@@ -289,6 +296,9 @@ async function packageJsonViolations(worktree, baseSha, candidateSha, path) {
   try { basePkg = JSON.parse(baseText ?? 'null'); } catch { basePkg = null; }
   try { candPkg = JSON.parse(candText ?? 'null'); } catch { candPkg = null; }
   const baseTest = basePkg?.scripts?.test;
+  const candTest0 = candPkg?.scripts?.test;
+  // Скрипт не изменился: соседние ключи (metadata.test и т.п.) — не ослабление.
+  if (candTest0 === baseTest) return [];
   if (typeof baseTest !== 'string' || !baseTest.trim()) return [];
   const push = (detail) => [{ kind: 'gate_bypass', file: path, line: 0, detail }];
   const candTest = candPkg?.scripts?.test;

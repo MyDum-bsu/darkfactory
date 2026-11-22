@@ -1555,3 +1555,72 @@ test('без манифеста: (v1, has_ui:false) и (v1-u0, без has_ui) �
   assert.equal(second.outcome, 'verified');
   assert.notEqual(second.run, first.run, 'коллизия ключа устранена хэшем кортежа');
 });
+
+test('L3 evidence: экземпляр класса и разреженный массив — hold до L2', async (t) => {
+  class Evidence {}
+  const forged = Object.assign(new Evidence(), {
+    exit: 0, file: 'v.log', sha256: 'f'.repeat(64) });
+  for (const [name, evidence] of [
+    ['экземпляр класса', forged],
+    ['sparse-массив', new Array(2)],
+  ]) {
+    const { handle, ported } = await isolated(t);
+    const id = await task(handle);
+    const { epoch, port } = await held(ported, id);
+    const { ports, calls } = stubs();
+    const res = await acceptHeld({
+      attempt: attempt(id, epoch, { has_ui: true }),
+      submission: submission(id, epoch),
+      policy: policy(id, { has_ui: true }),
+      journal: await tmpJournal(),
+      ports: { ...ports, board: port, visual: async (binding) => ({
+        ok: true, status: 'pass', sha: binding.candidate_sha,
+        artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 4 }], evidence }) },
+    });
+    assert.equal(res.outcome, 'hold', name);
+    assert.equal(res.reason, 'visual_receipt_invalid', name);
+    assert.equal(calls.review, 0, name);
+  }
+});
+
+test('evidence-массив валидных записей принимается', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports } = stubs();
+  const ev = () => ({ exit: 0, file: 'v.log', sha256: 'f'.repeat(64) });
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, { has_ui: true }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port, visual: async (binding) => ({
+      ok: true, status: 'pass', sha: binding.candidate_sha,
+      artifacts: [{ name: 'a.png', sha256: 'e'.repeat(64), bytes: 4 }],
+      evidence: [ev(), ev()] }) },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+});
+
+test('числовая и строковая policy.version — разные запуски без journal_subject_mismatch', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  await handle.label(id, { set: { finish: 'deployed' } });
+  const { epoch, port } = await held(ported, id);
+  const journal = await tmpJournal();
+  const run = (version) => {
+    const { ports } = stubs();
+    return acceptHeld({
+      attempt: attempt(id, epoch, { finish: 'deployed' }),
+      submission: submission(id, epoch),
+      policy: { ...policy(id), version },
+      journal,
+      ports: { ...ports, board: port },
+    });
+  };
+  const first = await run(1);
+  assert.equal(first.outcome, 'verified');
+  const second = await run('1');
+  assert.equal(second.outcome, 'verified');
+  assert.notEqual(second.run, first.run);
+});

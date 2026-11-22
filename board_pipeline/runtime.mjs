@@ -214,43 +214,70 @@ export function offlineVisualRunner(journal) {
       const dropped = join(scratch, 'artifacts');
       await mkdir(source);
       await chmod(source, 0o755);
-      // Каталог выгрузки на хосте: контейнер заполняет его только копированием
-      // уже ограниченных tmpfs-артефактов — прямого пути записи туда у рецепта нет.
-      await mkdir(dropped, { mode: 0o777 });
-      await chmod(dropped, 0o777);
+      await mkdir(dropped, { mode: 0o700 });
       await unpackExact(binding.worktree, binding.candidate_sha, archive, source);
       const extras = await sandboxExtras(recipe, source);
-      // Квота при записи — ядром: /artifacts это tmpfs с жёсткими size=32m и
-      // nr_inodes=66, fsize капает один файл. Хостовый диск не заполняется никогда:
-      // записываемый объём не покидает tmpfs. Данные tmpfs не переживают остановку
-      // контейнера (docker cp их не видит), поэтому внутри той же команды артефакты
-      // копируются в bind-mount /out до выхода рецепта.
-      const args = ['run', '--rm', '--name', name, '--pull=never', '--network=none', '--read-only',
+      // У контейнера нет ни одного writable-монтирования на диск хоста:
+      // только tmpfs /tmp (64m) и tmpfs /artifacts (size=32m, nr_inodes=66) —
+      // ядро ограничивает запись на лету, переполнить диск журнала нельзя.
+      // Рецепт пишет вывод в /tmp/run.log и код в /tmp/rc, затем ждёт; хост,
+      // пока контейнер жив и tmpfs смонтирован, извлекает артефакты через
+      // `docker exec tar` и снимает контейнер. docker cp tmpfs не видит.
+      const args = ['run', '-d', '--name', name, '--pull=never', '--network=none', '--read-only',
         '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
         '--ulimit', `fsize=${ARTIFACT_MAX_FILE_BYTES}:${ARTIFACT_MAX_FILE_BYTES}`,
         '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,size=64m', '-e', 'HOME=/tmp',
         '--tmpfs=/artifacts:rw,nosuid,nodev,noexec,mode=1777,' +
           `size=${ARTIFACT_MAX_TOTAL_BYTES},nr_inodes=${ARTIFACT_MAX_FILES + 2}`,
-        '--mount', `type=bind,src=${source},dst=/candidate,readonly`,
-        '--mount', `type=bind,src=${dropped},dst=/out`, ...extras,
+        '--mount', `type=bind,src=${source},dst=/candidate,readonly`, ...extras,
         '--workdir', posix.join('/candidate', cwd), image,
-        '/bin/sh', '-c', '"$@"; rc=$?; cp -r /artifacts/. /out/ 2>/dev/null; exit $rc',
+        '/bin/sh', '-c', '"$@" > /tmp/run.log 2>&1; rc=$?; echo "$rc" > /tmp/rc; sleep 3600',
         'board-visual', ...argv];
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      let exit = null;
       let output;
-      let exit = 0;
       try {
-        const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
-        output = `${run.stdout}${run.stderr}`;
-      } catch (error) {
-        exit = typeof error.code === 'number' ? error.code : null;
-        output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+        await exec('docker', args, { timeout: 15_000 });
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          const probe = await exec('docker', ['exec', name, 'cat', '/tmp/rc'],
+            { timeout: 10_000 }).then((r) => r.stdout, () => null);
+          if (probe !== null) {
+            exit = Number.parseInt(probe.trim(), 10);
+            break;
+          }
+          const running = await exec('docker',
+            ['inspect', '-f', '{{.State.Running}} {{.State.ExitCode}}', name],
+            { timeout: 10_000 }).then((r) => r.stdout.trim().split(' '), () => null);
+          if (running !== null && running[0] !== 'true') {
+            exit = Number.parseInt(running[1] ?? '', 10);
+            break;
+          }
+          await sleep(200);
+        }
+        if (exit === null || Number.isNaN(exit)) {
+          throw new Error('visual_runner_timeout');
+        }
+        // Коды 125/126/127 — проверка не состоялась: среда, не дефект кандидата.
+        if (exit === 125 || exit === 126 || exit === 127) {
+          const tail = await exec('docker', ['logs', '--tail', '20', name],
+            { timeout: 10_000 }).then((r) => `${r.stdout}${r.stderr}`, () => '');
+          throw new Error(`visual_runner_not_executed:${tail.slice(-200)}`);
+        }
+        const log = await exec('docker', ['exec', name, 'cat', '/tmp/run.log'],
+          { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 });
+        output = `${log.stdout}${log.stderr}`;
+        // Выгрузка из tmpfs живого контейнера; сбой tar — это ошибка, не тихий pass.
+        const bundle = join(scratch, 'artifacts.tar');
+        const packed = await exec('docker',
+          ['exec', name, 'tar', '-C', '/artifacts', '-cf', '-', '.'],
+          { timeout: 30_000, maxBuffer: ARTIFACT_MAX_TOTAL_BYTES + 2 * 1024 * 1024,
+            encoding: 'buffer' });
+        await writeFile(bundle, packed.stdout);
+        await exec('tar', ['-xf', bundle, '-C', dropped,
+          '--no-same-owner', '--no-same-permissions'], { timeout: 30_000 });
       } finally {
         await cleanupContainer(name);
-      }
-      // Коды 125/126/127 (и невозможность получить код) — проверка не состоялась:
-      // контейнер не запустился или команда не найдена. Это среда, не дефект кандидата.
-      if (exit === null || exit === 125 || exit === 126 || exit === 127) {
-        throw new Error(`visual_runner_not_executed:${String(output).slice(-200)}`);
       }
       const file = `visual-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}.log`;
       await writeFile(join(journal, file), output, { flag: 'wx', mode: 0o600 });

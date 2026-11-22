@@ -103,8 +103,12 @@ test('визуальный гейт: tmpfs-квота при записи, ар�
   const binding = { task_id: 't-visual', worktree: tree, candidate_sha: candidate };
   const visual = (argv) => ({ visual: { image, argv, cwd: '.', timeoutMs: 60_000 } });
 
-  // Обычный артефакт возвращается через tmpfs-квоту и копирование в /out.
-  const res = await runner(binding, visual(['sh', '-c', 'echo shot > /artifacts/shot.png']));
+  // Обычный артефакт возвращается через docker exec tar из tmpfs живого
+  // контейнера; у рецепта нет writable-монтирования на диск хоста — запись в
+  // любой путь вне tmpfs уходит в read-only rootfs и не попадает в сбор.
+  const res = await runner(binding, visual(['sh', '-c',
+    'mkdir -p /out 2>/dev/null; echo x > /out/leak 2>/dev/null; ' +
+    'echo shot > /artifacts/shot.png']));
   assert.equal(res.ok, true, JSON.stringify(res));
   assert.equal(res.status, 'pass');
   assert.equal(res.artifacts.length, 1);

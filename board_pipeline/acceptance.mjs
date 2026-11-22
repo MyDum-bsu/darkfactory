@@ -491,13 +491,21 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
         Number.isSafeInteger(a.bytes) && a.bytes >= 1) &&
       (() => {
         const ev = vis.evidence;
-        if (ev === null || typeof ev !== 'object') return false;
-        const items = Array.isArray(ev) ? ev : [ev];
-        // Каждая наблюдаемая запись — аттестованный артефакт с нулевым кодом.
-        return items.length > 0 && items.every((item) =>
-          item !== null && typeof item === 'object' && !Array.isArray(item) &&
-          item.exit === 0 && typeof item.file === 'string' && item.file.length > 0 &&
-          /^[0-9a-f]{64}$/.test(item.sha256 ?? ''));
+        const isPlain = (item) => item !== null && typeof item === 'object' &&
+          (Object.getPrototypeOf(item) === Object.prototype ||
+            Object.getPrototypeOf(item) === null);
+        const isObserved = (item) => isPlain(item) && item.exit === 0 &&
+          typeof item.file === 'string' && item.file.length > 0 &&
+          /^[0-9a-f]{64}$/.test(item.sha256 ?? '');
+        if (Array.isArray(ev)) {
+          // Индексный обход: разреженные массивы без записей отклоняются.
+          if (ev.length === 0) return false;
+          for (let i = 0; i < ev.length; i++) {
+            if (!Object.hasOwn(ev, i) || !isObserved(ev[i])) return false;
+          }
+          return true;
+        }
+        return isObserved(ev);
       })();
     if (!attested) {
       return { status: 'hold', reason: 'visual_receipt_invalid' };
@@ -740,7 +748,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     submission.candidate_sha, policy.version) + (key ? `-s${key}` : '') +
     '-h' + createHash('sha256').update(JSON.stringify([
       attempt.task_id, attempt.attempt_id, attempt.epoch, submission.candidate_sha,
-      String(policy.version), attempt.has_ui ?? null, key ?? null,
+      policy.version, attempt.has_ui ?? null, key ?? null,
     ])).digest('hex').slice(0, 16));
   const file = path.join(journal, `${id}.jsonl`);
 

@@ -351,3 +351,19 @@ test('scripts.test удалён на строке с metadata.test — gate_bypa
   assert.ok(v, JSON.stringify(res.violations));
   assert.match(v.detail, /scripts\.test/);
 });
+
+test('одновременное ужесточение разных assert — не ослабление', async () => {
+  const res = await gate({
+    base: { 'src/lib.js': 'assert(x >= 1);\nassert(y >= 10);\nexport const z = 1;\n' },
+    candidate: { 'src/lib.js': 'assert(x >= 2);\nassert(y >= 11);\nexport const z = 1;\n' },
+  });
+  assert.equal(res.ok, true, JSON.stringify(res.violations));
+});
+
+test('неизменный scripts.test при смене metadata.test — не обход гейта', async () => {
+  const res = await gate({
+    base: { 'package.json': '{"scripts":{"test":"node ./checks.mjs"},"metadata":{"test":"a"}}\n' },
+    candidate: { 'package.json': '{"scripts":{"test":"node ./checks.mjs"},"metadata":{"test":"b"}}\n' },
+  });
+  assert.equal(res.ok, true, JSON.stringify(res.violations));
+});
