@@ -315,14 +315,20 @@ else console.log('Onboarding controls are present');`;
       o.outcome === 'rework' && /^review_verdict:REVIEW_BLOCKED/.test(o.reason ?? '') &&
       Array.isArray(o.feedback?.findings) && o.feedback.findings.length > 0) === true;
     const defectVisual = forSha(DEFECT, /^visual-artifact-/) && forSha(DEFECT, /^review-/);
-    const finalVerified = outcomes[FINAL]?.some(o => o.outcome === 'verified') === true;
-    const finalVisual = forSha(FINAL, /^visual-artifact-/) && forSha(FINAL, /^review-/);
+    let final1Parsed = null;
+    try { final1Parsed = JSON.parse(final1.result ?? 'null'); } catch { /* ignore */ }
+    const acceptedSha = typeof final1Parsed?.sha === 'string' ? final1Parsed.sha : null;
+    const finalVerified = acceptedSha !== null &&
+      acceptedSha !== BASE && acceptedSha !== DEFECT &&
+      outcomes[acceptedSha]?.some(o => o.outcome === 'verified') === true;
+    const finalVisual = acceptedSha !== null &&
+      forSha(acceptedSha, /^visual-artifact-/) && forSha(acceptedSha, /^review-/);
     proof.gateSequence = {
       turn1_redL1_noL2: redL1 && noL2OnBase,
       turn2_l2Rework: defectRework && defectVisual,
       turn3_verified: finalVerified && finalVisual,
       card1Completed: final1.state === 'completed' &&
-        typeof JSON.parse(final1.result ?? 'null')?.subject_digest === 'string',
+        typeof final1Parsed?.subject_digest === 'string',
       card2Ready: final2.state === 'ready' && final2.epoch === 0,
     };
 
