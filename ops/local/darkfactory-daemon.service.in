@@ -1,0 +1,25 @@
+# systemd user-unit для фонового контроллера Board (P2.3).
+# Шаблон: подставьте @NODE@, @REPO@, @POLICY@, @STATE@, @SWITCH@, @LOGDIR@
+# (см. ops/local/daemon.md). Установка — только явной командой оператора.
+[Unit]
+Description=Darkfactory board controller daemon
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+ExecStart=@NODE@ @REPO@/board_pipeline/run-isolated.mjs --execute --daemon --policy @POLICY@ --state @STATE@ --interval-ms 15000 --switch @SWITCH@
+# Обрыв — рестарт; корректный стоп — только SIGTERM (TimeoutStopSec даёт
+# завершить активный тик и записать журнал попытки).
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=120
+MemoryMax=2G
+NoNewPrivileges=true
+# stdout/stderr ограничены journald (SystemMaxUse в user-journald конфиге);
+# основной журнал попытки — @STATE@/daemon.jsonl с ротацией RotatingJournal.
+StandardOutput=append:@LOGDIR@/daemon.out.log
+StandardError=append:@LOGDIR@/daemon.err.log
+
+[Install]
+WantedBy=default.target
