@@ -1048,3 +1048,144 @@ test('JSON null и примитивы в журнале не роняют чте
   assert.equal(corrupted.reason, 'interrupted_run');
   assert.notEqual(corrupted.receipt?.settle, 'completed', 'вердикт старого запуска не возвращается');
 });
+
+// --- L1 tamper-gate и L3 визуальный UI-гейт ---
+
+test('красный tamper-gate: rework с нарушениями, 0 вызовов L3 и L2, аренда жива', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  const gateCalls = { tamper: 0, visual: 0 };
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, { has_ui: true }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port,
+      tamper: async (binding) => {
+        gateCalls.tamper++;
+        return { ok: false, sha: binding.candidate_sha, base_sha: BASE,
+          violations: [{ kind: 'secret_leak', file: 'src/app.js', line: 3, detail: 'github_token' }],
+          digest: 'd'.repeat(64) };
+      },
+      visual: async () => { gateCalls.visual++; throw new Error('unreachable'); } },
+  });
+  assert.equal(res.outcome, 'rework');
+  assert.equal(res.reason, 'tamper_gate_failed');
+  assert.equal(res.feedback.violations[0].kind, 'secret_leak');
+  assert.equal(res.feedback.digest, 'd'.repeat(64));
+  assert.deepEqual(gateCalls, { tamper: 1, visual: 0 });
+  assert.equal(calls.review, 0);
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'claimed');
+  assert.equal(after.result, null);
+  assert.equal((await port.verifyHeld(id, epoch)).epoch, epoch, 'та же аренда остаётся живой');
+});
+
+test('has_ui: красный L3 — rework с артефактом и дефектом, 0 вызовов L2', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  const artifact = { name: 'shot-broken.png', sha256: 'e'.repeat(64), bytes: 42 };
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, { has_ui: true }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port,
+      visual: async (binding) => ({
+        ok: false, status: 'fail', sha: binding.candidate_sha,
+        artifacts: [artifact], evidence: { file: 'visual.log', sha256: 'f'.repeat(64), exit: 2 },
+      }) },
+  });
+  assert.equal(res.outcome, 'rework');
+  assert.equal(res.reason, 'visual_gate_failed');
+  assert.equal(res.feedback.status, 'fail');
+  assert.deepEqual(res.feedback.artifacts, [artifact]);
+  assert.equal(calls.review, 0);
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'claimed');
+  assert.equal((await port.verifyHeld(id, epoch)).epoch, epoch);
+});
+
+test('has_ui: зелёный L3 — L2 вызывается, компактная квитанция несёт pass и хэш артефактов', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  const gateCalls = { tamper: 0, visual: 0 };
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch, { has_ui: true }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port,
+      tamper: async (binding) => {
+        gateCalls.tamper++;
+        return { ok: true, sha: binding.candidate_sha, base_sha: BASE,
+          violations: [], digest: 'c'.repeat(64) };
+      },
+      visual: async (binding) => {
+        gateCalls.visual++;
+        return { ok: true, status: 'pass', sha: binding.candidate_sha,
+          artifacts: [{ name: 'shot.png', sha256: 'e'.repeat(64), bytes: 42 }],
+          evidence: { file: 'visual.log', sha256: 'f'.repeat(64), exit: 0 } };
+      } },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+  assert.deepEqual(gateCalls, { tamper: 1, visual: 1 });
+  assert.equal(calls.review, 1);
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'completed');
+  const receipt = after.result;
+  const text = JSON.stringify(receipt);
+  assert.equal(text.length <= 1000, true, `лимит Board.complete: ${text.length}`);
+  assert.equal(receipt.tamper, 'pass');
+  assert.equal(receipt.visual.status, 'pass');
+  assert.equal(receipt.visual.n, 1);
+  assert.match(receipt.visual.sha256, /^[0-9a-f]{64}$/);
+  assert.equal(receipt.subject_digest, expectedDigest());
+});
+
+test('has_ui: false/отсутствует — порт visual не вызывается, квитанция фиксирует na', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  let visual = 0;
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch),
+    submission: submission(id, epoch),
+    policy: policy(id),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port,
+      visual: async () => { visual++; throw new Error('unreachable'); } },
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+  assert.equal(visual, 0);
+  assert.equal(calls.review, 1);
+  const after = await settled(handle, id);
+  assert.equal(after.state, 'completed');
+  assert.equal(after.result.visual.status, 'na');
+  assert.equal(after.result.tamper, 'na');
+});
+
+test('has_ui без подключённого порта visual — операционный hold, не слепой пропуск', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  const { ports, calls } = stubs();
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, { has_ui: true }),
+    submission: submission(id, epoch),
+    policy: policy(id, { has_ui: true }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port },
+  });
+  assert.equal(res.outcome, 'hold');
+  assert.equal(res.reason, 'visual_port_missing');
+  assert.equal(calls.review, 0);
+  assert.equal((await settled(handle, id)).state, 'blocked');
+});

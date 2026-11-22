@@ -36,6 +36,7 @@ const ATTEMPT_OPTIONAL = [
   'policy_digest',
   'fixtures_digest',
   'release_target',
+  'has_ui',
 ];
 const CONTRACT_REQUIRED = ['repo_id', 'spec_digest', 'policy_digest'];
 const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
@@ -322,6 +323,18 @@ function compactChecks(checks) {
   return { ok: list.length > 0 && list.every(entry => entry.ok), n: list.length, checks: list };
 }
 
+// Компактный статус L3: на карточку уходит verdict и сводный хэш артефактов,
+// полный VisualReceipt с побайтовыми sha256 остаётся в локальном журнале.
+function compactVisual(visual) {
+  if (visual === null || typeof visual !== 'object' || visual.status === 'not_applicable') {
+    return { status: 'na' };
+  }
+  const artifacts = Array.isArray(visual.artifacts) ? visual.artifacts : [];
+  const hash = createHash('sha256');
+  for (const artifact of artifacts) hash.update(String(artifact?.sha256 ?? ''));
+  return { status: visual.status === 'pass' ? 'pass' : 'fail', n: artifacts.length, sha256: hash.digest('hex') };
+}
+
 function compactEvidence(evidence, run) {
   const review = evidence.review ?? {};
   const base = {
@@ -330,6 +343,8 @@ function compactEvidence(evidence, run) {
     subject_digest: evidence.subject_digest,
     worker: evidence.worker,
     checks: compactChecks(evidence.checks),
+    tamper: evidence.tamper === 'pass' ? 'pass' : 'na',
+    visual: compactVisual(evidence.visual),
     review: {
       verdict: review.verdict,
       checkpoint: review.checkpoint,
@@ -395,6 +410,62 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     return { status: 'hold', reason: 'missing_evidence' };
   }
 
+  // L1 tamper-gate: статический diff base..candidate до любых вызовов L3 и L2.
+  // Красный гейт — исправимый дефект воркера, аренда остаётся живой.
+  let tamper = null;
+  if (typeof ports.tamper === 'function' && profile.tamper !== false) {
+    await intent('tamper');
+    try {
+      tamper = await ports.tamper(binding, profile);
+      await step('tamper', true, { ok: tamper?.ok === true, digest: tamper?.digest ?? null });
+    } catch (e) {
+      await step('tamper', false, messageOf(e));
+      return { status: 'hold', reason: `tamper_error:${messageOf(e)}` };
+    }
+    if (tamper?.sha !== undefined && tamper.sha !== binding.candidate_sha) {
+      return { status: 'hold', reason: `tamper_sha_mismatch:${tamper.sha}` };
+    }
+    if (tamper?.ok !== true) {
+      return {
+        status: 'rework',
+        reason: 'tamper_gate_failed',
+        feedback: { reason: 'tamper_gate_failed', violations: tamper?.violations ?? [],
+          digest: tamper?.digest ?? null },
+      };
+    }
+  }
+
+  // L3 визуальный UI-гейт: только при has_ui в попытке или профиле, на том же
+  // неизменяемом снимке, до вызова независимого ревьюера.
+  let visual = { status: 'not_applicable' };
+  if (binding.has_ui === true || profile.has_ui === true) {
+    if (typeof ports.visual !== 'function') {
+      return { status: 'hold', reason: 'visual_port_missing' };
+    }
+    await intent('visual');
+    let vis;
+    try {
+      vis = await ports.visual(binding, profile);
+      await step('visual', true, { status: vis?.status ?? null });
+    } catch (e) {
+      await step('visual', false, messageOf(e));
+      return { status: 'hold', reason: `visual_error:${messageOf(e)}` };
+    }
+    if (vis?.sha !== undefined && vis.sha !== binding.candidate_sha) {
+      return { status: 'hold', reason: `visual_sha_mismatch:${vis.sha}` };
+    }
+    if (vis?.ok !== true) {
+      return {
+        status: 'rework',
+        reason: 'visual_gate_failed',
+        feedback: { reason: 'visual_gate_failed', status: vis?.status ?? 'fail',
+          artifacts: vis?.artifacts ?? [], evidence: vis?.evidence ?? null },
+        visual: vis,
+      };
+    }
+    visual = vis;
+  }
+
   // Независимое ревью, квитанция на тот же SHA; не запускать после потери hold.
   if (beforeReview) {
     try { await beforeReview(); } catch (error) {
@@ -430,7 +501,7 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     };
   }
 
-  return { status: 'verified', loc, review: rev, actual };
+  return { status: 'verified', loc, review: rev, actual, tamper, visual };
 }
 
 export async function accept({ handoff, policy, journal, ports }) {
@@ -550,7 +621,7 @@ export async function accept({ handoff, policy, journal, ports }) {
 
   const verdict = await runVerification({ binding: handoff, profile, ports, intent, step });
   if (verdict.status !== 'verified') return block(verdict.reason, epoch);
-  const { loc, review: rev, actual } = verdict;
+  const { loc, review: rev, actual, tamper, visual } = verdict;
 
   await intent('seal');
   try {
@@ -566,7 +637,8 @@ export async function accept({ handoff, policy, journal, ports }) {
   try {
     await ports.board.complete(handoff.task_id, epoch, {
       sha: handoff.candidate_sha, worker: handoff.worker_thread_id,
-      checks: loc.evidence, review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
+      checks: loc.evidence, tamper: tamper ? 'pass' : 'na', visual: compactVisual(visual),
+      review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
     });
     await step('complete', true, { epoch });
   } catch (e) {
@@ -621,6 +693,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     base_sha: attempt.base_sha,
     check_profile: attempt.check_profile,
     candidate_sha: submission.candidate_sha,
+    has_ui: attempt.has_ui === true,
   };
   // Ключ запуска включает контракт: новый манифест при том же SHA не переиспользует
   // терминальный вердикт старого.
@@ -793,7 +866,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     return hold(verdict.reason);
   }
 
-  const { loc, review: rev, actual } = verdict;
+  const { loc, review: rev, actual, tamper, visual } = verdict;
 
   // Печать: операторские входы, контракт карточки и снимок перепроверяются после L2
   // и до complete — смена брифа, политики или спеки во время проверок останавливает
@@ -873,6 +946,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     subject_digest: digest,
     worker: attempt.bb_thread_id,
     checks: loc.evidence,
+    tamper: tamper ? 'pass' : 'na',
+    visual,
     review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
   }, id);
 

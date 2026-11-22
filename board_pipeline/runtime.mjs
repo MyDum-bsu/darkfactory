@@ -156,6 +156,76 @@ export function offlineDockerRunner(journal) {
   };
 }
 
+// L3 визуальный гейт: та же изоляция rootless Docker, плюс каталог артефактов,
+// смонтированный rw только для выгрузки скриншотов в приватный журнал контроллера.
+export function offlineVisualRunner(journal) {
+  return async (binding, profile) => {
+    const recipe = checkCommand(profile.visual ?? {});
+    const { image, argv, cwd, timeoutMs } = recipe;
+    if (!SHA.test(binding.candidate_sha)) throw new Error('Visual runner requires a full SHA');
+    const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
+      timeout: 12_000,
+    })).stdout);
+    if (!security.includes('name=rootless')) throw new Error('The visual runner requires rootless Docker');
+
+    const scratch = await mkdtemp(join(tmpdir(), 'board-visual-'));
+    const name = `board-visual-${randomUUID()}`;
+    try {
+      const archive = join(scratch, 'candidate.tar');
+      const source = join(scratch, 'candidate');
+      const dropped = join(scratch, 'artifacts');
+      await mkdir(source);
+      await chmod(source, 0o755);
+      // Единственная rw-точка контейнера вне tmpfs: выгрузка артефактов рендера.
+      await mkdir(dropped, { mode: 0o777 });
+      await chmod(dropped, 0o777);
+      await unpackExact(binding.worktree, binding.candidate_sha, archive, source);
+      const extras = await sandboxExtras(recipe, source);
+      const args = ['run', '--rm', '--name', name, '--pull=never', '--network=none', '--read-only',
+        '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
+        '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777', '-e', 'HOME=/tmp',
+        '--mount', `type=bind,src=${source},dst=/candidate,readonly`,
+        '--mount', `type=bind,src=${dropped},dst=/artifacts`, ...extras,
+        '--workdir', posix.join('/candidate', cwd), image, ...argv];
+      let output;
+      let exit = 0;
+      try {
+        const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
+        output = `${run.stdout}${run.stderr}`;
+      } catch (error) {
+        exit = typeof error.code === 'number' ? error.code : null;
+        output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+      } finally {
+        await cleanupContainer(name);
+      }
+      const file = `visual-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}.log`;
+      await writeFile(join(journal, file), output, { flag: 'wx', mode: 0o600 });
+
+      // Артефакты: только регулярные файлы, побайтово копируем в приватный журнал
+      // и фиксируем sha256 — квитанция привязана к тем же байтам, что видел гейт.
+      const artifacts = [];
+      const { readdir } = await import('node:fs/promises');
+      for (const entry of (await readdir(dropped)).sort()) {
+        const from = join(dropped, entry);
+        const info = await lstat(from);
+        if (!info.isFile()) continue;
+        const data = await readFile(from);
+        const safe = basename(entry).replace(/[^A-Za-z0-9_.-]/g, '_');
+        const stored = `visual-artifact-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}-${safe}`;
+        await writeFile(join(journal, stored), data, { flag: 'wx', mode: 0o600 });
+        artifacts.push({ name: stored, sha256: createHash('sha256').update(data).digest('hex'), bytes: data.length });
+      }
+      return {
+        sha: binding.candidate_sha, ok: exit === 0, status: exit === 0 ? 'pass' : 'fail',
+        artifacts,
+        evidence: { file, sha256: createHash('sha256').update(output).digest('hex'), exit },
+      };
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  };
+}
+
 export function offlineProfileRunner(journal) {
   const check = offlineDockerRunner(journal);
   return async (handoff, profile) => {
