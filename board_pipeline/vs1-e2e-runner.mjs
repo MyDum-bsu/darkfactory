@@ -247,7 +247,10 @@ else console.log('Onboarding controls are present');`;
     await rename(join(dirs.state, 'attempt.json'), join(dirs.state, 'attempt-main.json'));
     const idle = await runController(idlePolicyFile, dirs.state, env, wlog, () => {});
     const after = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
-    const allIdle = idle.lines.length >= 2 && idle.lines.every(l => {
+    // run-isolated печатает только изменившиеся строки: серия тиков idle —
+    // одна строка. Ноль эффектов доказывают отсутствие новых квитанций и
+    // неизменность карточки #2.
+    const allIdle = idle.lines.length >= 1 && idle.lines.every(l => {
       try { return JSON.parse(l).phase === 'idle'; } catch { return false; }
     });
     const untouched = JSON.stringify(before) === JSON.stringify(after);
