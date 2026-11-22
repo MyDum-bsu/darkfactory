@@ -1,0 +1,15 @@
+node_modules/
+.board/
+.env
+.env.*
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+review-jobs/
+journal/
+routes.json
+config/
+out/
+*.log
+__pycache__/
+.pytest_cache/
