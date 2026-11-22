@@ -97,7 +97,9 @@ PATH=${JSON.stringify(basePath)} exec ${execTarget} "$@"
   }
   await copyFile(join(shimDir, 'pi'), join(idleHome, '.pi', 'agent', 'bin', 'pi'));
   await chmod(join(idleHome, '.pi', 'agent', 'bin', 'pi'), 0o700);
-  await symlink(join(homedir(), '.local'), join(idleHome, '.local'));
+  await mkdir(join(idleHome, '.local', 'share'), { recursive: true, mode: 0o700 });
+  await symlink(join(homedir(), '.local', 'share', 'vercel-board'),
+    join(idleHome, '.local', 'share', 'vercel-board'));
 }
 
 // Снимок состояния карточки для сравнения «без эффектов»: только стабильные поля.
