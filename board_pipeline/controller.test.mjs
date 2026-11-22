@@ -3,6 +3,9 @@ import test from 'node:test';
 import { advance } from './controller.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
+import * as ws from './worker-selector.mjs';
+
+const workerSelector = (over = {}) => ({ ...ws, ...over });
 
 async function lab(t, finish = 'verified') {
   const { board, local } = loadSdk();
@@ -40,7 +43,8 @@ async function lab(t, finish = 'verified') {
       return { outcome: 'verified', receipt: { settle: 'completed' } };
     },
   };
-  return { cfg, handle, effects, submit: (ch, id) => { candidate = ch?.repeat(40); wireTaskId = id; turnSeq++; },
+  const shaOf = ch => typeof ch === 'string' && /^[0-9a-f]{40}$/.test(ch) ? ch : ch?.repeat(40);
+  return { cfg, handle, effects, submit: (ch, id) => { candidate = shaOf(ch); wireTaskId = id; turnSeq++; },
     tick: () => advance(cfg), inspect: () => cfg.board.lookup(task.id) };
 }
 
@@ -106,7 +110,8 @@ async function queueLab(t, { finish = 'verified', owner = 'board:client', labels
   };
   const card = index => handle.thread(created[index].id, { limit: 1 }).then(({ message }) => message.task);
   return { cfg, handle, effects, seen, route, card, headId: () => created[0]?.id,
-    submit: (ch, id) => { candidate = ch?.repeat(40);
+    submit: (ch, id) => { candidate = typeof ch === 'string' && /^[0-9a-f]{40}$/.test(ch)
+      ? ch : ch?.repeat(40);
       wireTaskId = id; turnSeq++; },
     tick: () => advance(cfg), reset: () => { stored = undefined; } };
 }
@@ -360,4 +365,243 @@ test('queue mode does not admit a card whose profile_id differs from the route p
   assert.equal(x.seen.claim, 0);
   assert.equal(x.effects.spawn, 0);
   assert.equal((await x.card(0)).state, 'ready');
+});
+
+test('worker selector spawns the agreed fallback only on a confirmed refusal and records the trail', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector();
+  x.cfg.bb.probeAvailability = async w => w.provider === 'acp-devin'
+    ? { status: 'confirmed_refusal' }
+    : { status: 'available', zcodeQuota: 'available' };
+  x.cfg.bb.spawn = async env => {
+    x.effects.spawn++;
+    assert.equal(env.executor.provider, 'acp-zcode-start');
+    assert.equal(env.executor.model, 'builtin:zai-start-plan\\GLM-5.3-Flash');
+    return { threadId: 'thr_glm1' };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.equal(record.executor.provider, 'acp-zcode-start');
+  assert.equal(record.fallbackReason, 'confirmed_refusal:acp-devin');
+  assert.equal(record.attemptedWorkers.length, 2);
+  assert.equal(x.effects.spawn, 1, 'первичный не спаунился после probe confirmed_refusal');
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  const attempt = x.effects.attempts.at(-1);
+  assert.equal(attempt.executor.provider, 'acp-zcode-start',
+    'доверенная попытка несёт фактического исполнителя');
+});
+
+test('worker selector quarantines an unknown launch outcome without a second writer', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector();
+  x.cfg.bb.probeAvailability = async () => 'unknown_outcome';
+  x.cfg.bb.spawn = async () => { x.effects.spawn++; return { threadId: 'thr_never' }; };
+  assert.equal((await x.tick()).phase, 'uncertain');
+  assert.equal((await x.tick()).reason, 'worker_launch_outcome_unknown');
+  assert.equal(x.effects.spawn, 0);
+  const record = await x.cfg.state.load();
+  assert.equal(record.attemptedWorkers[0].verdict, 'unknown_outcome');
+});
+
+test('a triad violation rejects the route before any claim or spawn', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector();
+  x.cfg.route.critic = { provider: 'acp-devin', model: 'swe-2-medium' };
+  assert.equal((await x.tick()).reason, 'route_triad_violation:review_same_family');
+  assert.equal((await x.inspect()).state, 'ready');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('three converging rework rounds complete without a round cap', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => { arbitrations++; } });
+  await x.tick();
+  const bad = {
+    ['b' + '1'.repeat(39)]: { outcome: 'rework', reason: 'local_checks_failed',
+      signature: 'npm:test', feedback: { reason: 'local_checks_failed' } },
+    ['b' + '2'.repeat(39)]: { outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+      feedback: { reason: 'review_verdict:REVIEW_BLOCKED',
+        findings: [{ file: 'a.js', expected: 'e1', actual: 'x1' },
+          { file: 'a2.js', expected: 'e2', actual: 'x2' }] } },
+    ['b' + '3'.repeat(39)]: { outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+      feedback: { reason: 'review_verdict:REVIEW_BLOCKED',
+        findings: [{ file: 'b.js', expected: 'e3', actual: 'x3' }] } },
+  };
+  x.cfg.verify = async (attempt, submission) => {
+    x.effects.verify++;
+    const scripted = bad[submission.candidate_sha];
+    if (scripted) return scripted;
+    await x.cfg.board.complete(attempt.task_id, attempt.epoch, { sha: submission.candidate_sha });
+    return { outcome: 'verified', receipt: { settle: 'completed' } };
+  };
+  for (const sha of Object.keys(bad)) {
+    x.submit(sha);
+    assert.equal((await x.tick()).phase, 'working', `раунд ${sha.slice(-2)} сходится`);
+  }
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(x.effects.feedback.length, 3, 'три сходящихся раунда — три возврата воркеру');
+  assert.equal(arbitrations, 0, 'арбитр не вызывался при нормальной сходимости');
+  const record = await x.cfg.state.load();
+  assert.equal(record.roundsHistory.length, 3);
+});
+
+// Сдача со структурированным спором против замечания L2.
+function withDispute(x) {
+  const inner = x.cfg.submissions.read;
+  x.cfg.submissions.read = async (attempt, after) => {
+    const obs = await inner(attempt, after);
+    if (obs?.submission) {
+      obs.submission = { ...obs.submission, dispute: {
+        finding_ref: 'f1', justification: 'по спеке это корректно', spec_evidence: 'spec.md §2' } };
+    }
+    return obs;
+  };
+}
+
+const L2_REWORK = (findings, extra = {}) => ({
+  outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+  feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings }, ...extra });
+
+const BAD1 = 'b' + '1'.repeat(39);
+const BAD2 = 'b' + '2'.repeat(39);
+const GOOD = 'c'.repeat(40);
+const FINDING = { file: 'a.js', expected: 'spec behaviour', actual: 'other behaviour' };
+
+// Верификатор со сценарием: заскриптованные sha возвращают rework, остальные
+// завершают карточку через реальный порт Board.
+function scriptedVerify(x, bad) {
+  x.cfg.verify = async (attempt, submission) => {
+    x.effects.verify++;
+    const scripted = bad[submission.candidate_sha];
+    if (scripted) return typeof scripted === 'function' ? scripted() : scripted;
+    await x.cfg.board.complete(attempt.task_id, attempt.epoch, { sha: submission.candidate_sha });
+    return { outcome: 'verified', receipt: { settle: 'completed' } };
+  };
+}
+
+test('a substantive dispute triggers a third-family arbiter and one directed rework round', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async req => {
+    arbitrations++;
+    assert.equal(req.arbiter.provider, 'google', 'арбитр из третьего семейства');
+    assert.equal(req.task_id, x.cfg.route.taskId);
+    return { decision: 'directed_rework', directive: 'исправь только оспариваемую находку' };
+  } });
+  await x.tick();
+  withDispute(x);
+  scriptedVerify(x, { [BAD1]: L2_REWORK([FINDING]) });
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(arbitrations, 1);
+  const last = x.effects.feedback.at(-1);
+  assert.equal(last.reason, 'arbiter_directed_rework');
+  assert.equal(last.evidence.directive, 'исправь только оспариваемую находку');
+  assert.ok(last.feedbackId.endsWith(':arb'));
+  let record = await x.cfg.state.load();
+  assert.equal(record.arbitrationUsed, 1);
+  x.submit(GOOD);
+  assert.equal((await x.tick()).phase, 'done');
+});
+
+test('arbiter accept_with_notes completes the card and pins the arbitration receipt', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => ({
+    decision: 'accept_with_notes', notes: 'cosmetic finding only' }) });
+  await x.tick();
+  withDispute(x);
+  scriptedVerify(x, { [BAD1]: L2_REWORK([FINDING]) });
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'done');
+  const head = await x.inspect();
+  assert.equal(head.state, 'completed');
+  assert.equal(head.result.sha, BAD1);
+  const record = await x.cfg.state.load();
+  assert.equal(record.arbitration.decision, 'accept_with_notes');
+  assert.equal(record.arbitration.arbiter.provider, 'google');
+});
+
+test('arbiter escalate_owner puts one concrete needs_input question on the card', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => ({
+    decision: 'escalate_owner', question: 'Какое поведение верно по spec §3?' }) });
+  await x.tick();
+  withDispute(x);
+  scriptedVerify(x, { [BAD1]: L2_REWORK([FINDING]) });
+  let blockedMessage = '';
+  const origBlock = x.cfg.board.block.bind(x.cfg.board);
+  x.cfg.board.block = async (id, epoch, message) => {
+    blockedMessage = message;
+    return origBlock(id, epoch, message);
+  };
+  x.submit(BAD1);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'arbiter_escalated_to_owner');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.match(blockedMessage, /Какое поведение верно по spec §3\?/);
+});
+
+test('a second dispute after a directed rework exhausts arbitration into needs_input', async t => {
+  const x = await lab(t);
+  let calls = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => {
+    calls++;
+    return { decision: 'directed_rework', directive: `fix ${calls}` };
+  } });
+  await x.tick();
+  withDispute(x);
+  scriptedVerify(x, {
+    [BAD1]: L2_REWORK([FINDING]),
+    [BAD2]: L2_REWORK([{ ...FINDING, file: 'b.js' }]),
+  });
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(calls, 1);
+  x.submit(BAD2);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'arbitration_exhausted');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(calls, 1, 'арбитр вызывается не более одного раза на попытку');
+});
+
+test('a harm=10 finding goes straight to the owner, never to arbiter acceptance', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => {
+    arbitrations++;
+    return { decision: 'accept_with_notes', notes: 'n' };
+  } });
+  await x.tick();
+  withDispute(x);
+  scriptedVerify(x, { [BAD1]: L2_REWORK([{ ...FINDING, harm: 10 }]) });
+  x.submit(BAD1);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'harm10_requires_owner');
+  assert.equal(arbitrations, 0);
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('two identical deterministic failures hold without calling the arbiter', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => { arbitrations++; } });
+  await x.tick();
+  const l1 = { outcome: 'rework', reason: 'local_checks_failed', signature: 'npm:test',
+    feedback: { reason: 'local_checks_failed' } };
+  scriptedVerify(x, { [BAD1]: l1, [BAD2]: l1 });
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'no_progress_deterministic_gate');
+  assert.equal(arbitrations, 0, 'красный детерминированный гейт не арбитрируется');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.feedback.length, 1);
 });

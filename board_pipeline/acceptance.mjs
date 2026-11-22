@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
+import { assertTriadIndependent } from './worker-selector.mjs';
 
 const HANDOFF_KEYS = [
   'task_id',
@@ -39,12 +40,16 @@ const ATTEMPT_OPTIONAL = [
   'release_target',
   'has_ui',
   'executor',
+  'arbiter',
+  'fallback_reason',
+  'attempted_workers',
 ];
 const CONTRACT_REQUIRED = ['repo_id', 'spec_digest', 'policy_digest'];
 const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
 
 // Сдача воркера: типизированный результат, без worktree/профиля/команд/токена.
 const SUBMISSION_KEYS = ['task_id', 'epoch', 'attempt_id', 'worker_thread_id', 'candidate_sha'];
+const SUBMISSION_OPTIONAL = ['dispute'];
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -187,13 +192,21 @@ function validateAttempt(attempt) {
   if (attempt.has_ui !== undefined && typeof attempt.has_ui !== 'boolean') {
     throw new Denied('invalid_has_ui');
   }
-  if (attempt.executor !== undefined) {
-    const ok = (typeof attempt.executor === 'string' && attempt.executor.length > 0 &&
-        attempt.executor.length <= 128) ||
-      (attempt.executor !== null && typeof attempt.executor === 'object' &&
-        !Array.isArray(attempt.executor) &&
-        typeof attempt.executor.provider === 'string' && attempt.executor.provider.length > 0);
-    if (!ok) throw new Denied('invalid_executor');
+  if (attempt.executor !== undefined && !validWorkerSpec(attempt.executor)) {
+    throw new Denied('invalid_executor');
+  }
+  if (attempt.arbiter !== undefined && !validWorkerSpec(attempt.arbiter)) {
+    throw new Denied('invalid_arbiter');
+  }
+  if (attempt.fallback_reason !== undefined && attempt.fallback_reason !== null &&
+      typeof attempt.fallback_reason !== 'string') {
+    throw new Denied('invalid_fallback_reason');
+  }
+  if (attempt.attempted_workers !== undefined &&
+      (!Array.isArray(attempt.attempted_workers) ||
+        !attempt.attempted_workers.every(w => w !== null && typeof w === 'object' &&
+          !Array.isArray(w) && typeof w.provider === 'string' && w.provider.length > 0))) {
+    throw new Denied('invalid_attempted_workers');
   }
   validateContract(attempt);
 }
@@ -256,8 +269,14 @@ function sameContract(runEntry, attempt) {
 }
 
 // Сверка сдачи с доверенной попыткой. Любое расхождение — отказ до эффекта.
+function validWorkerSpec(spec) {
+  return (typeof spec === 'string' && spec.length > 0 && spec.length <= 128) ||
+    (spec !== null && typeof spec === 'object' && !Array.isArray(spec) &&
+      typeof spec.provider === 'string' && spec.provider.length > 0);
+}
+
 function validateSubmission(submission, attempt) {
-  strictKeys(submission, SUBMISSION_KEYS);
+  strictKeys(submission, SUBMISSION_KEYS, SUBMISSION_OPTIONAL);
   if (!/^[1-9][0-9]{0,14}$/.test(submission.task_id)) throw new Denied('invalid_task_id');
   if (!Number.isSafeInteger(submission.epoch) || submission.epoch <= 0) throw new Denied('invalid_epoch');
   if (!ID_RE.test(submission.attempt_id)) throw new Denied('invalid_attempt_id');
@@ -267,6 +286,15 @@ function validateSubmission(submission, attempt) {
   if (submission.epoch !== attempt.epoch) throw new Denied('epoch_mismatch');
   if (submission.attempt_id !== attempt.attempt_id) throw new Denied('attempt_mismatch');
   if (submission.worker_thread_id !== attempt.bb_thread_id) throw new Denied('worker_thread_mismatch');
+  // Структурированный спор против замечания L2: ссылка на находку, аргументация
+  // и опора на спеку — все три непустые строки, иначе это не спор.
+  if (submission.dispute !== undefined) {
+    const d = submission.dispute;
+    const ok = d !== null && typeof d === 'object' && !Array.isArray(d) &&
+      ['finding_ref', 'justification', 'spec_evidence'].every(
+        k => typeof d[k] === 'string' && d[k].trim().length > 0);
+    if (!ok) throw new Denied('invalid_dispute');
+  }
 }
 
 // Политика профиля должна описывать именно эту попытку, а не сдачу.
@@ -803,13 +831,19 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     profile = validatePolicy(policy, attempt.check_profile);
     validateEnrolled(attempt, profile);
     // Исполнитель из доверенной попытки (или профиля) и критик — разные семейства.
+    // При настроенном арбитре проверяется вся триада: арбитр обязан быть из
+    // третьего независимого семейства — как для первичного воркера, так и после
+    // переключения на резерв.
     const executor = attempt.executor ?? profile.executor;
-    if (executor !== undefined) {
-      try {
+    const arbiter = attempt.arbiter ?? profile.arbiter;
+    try {
+      if (arbiter !== undefined) {
+        assertTriadIndependent({ executor, critic: profile.review, arbiter });
+      } else if (executor !== undefined) {
         assertCrossFamily(executor, profile.review);
-      } catch (e) {
-        throw new Denied(e instanceof ReviewDenied ? e.reason : 'review_same_family');
       }
+    } catch (e) {
+      throw new Denied(e instanceof ReviewDenied ? e.reason : 'review_same_family');
     }
   } catch (e) {
     if (e instanceof Denied) {
@@ -919,6 +953,11 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     finish: attempt.finish,
     has_ui: attempt.has_ui ?? null,
     subject_digest: null,
+    // Переключение на резерв фиксируется в квитанции попытки.
+    ...((attempt.fallback_reason !== undefined || attempt.attempted_workers !== undefined)
+      ? { worker_trail: { fallback_reason: attempt.fallback_reason ?? null,
+          attempted_workers: attempt.attempted_workers ?? [] } }
+      : {}),
     ...(key ? { contract: {
       repo_id: attempt.repo_id,
       tree_sha: attempt.tree_sha ?? null,
@@ -951,6 +990,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         finish: attempt.finish,
         subject_digest: digest,
         outcome,
+        ...((attempt.fallback_reason !== undefined || attempt.attempted_workers !== undefined)
+          ? { worker_trail: { fallback_reason: attempt.fallback_reason ?? null,
+              attempted_workers: attempt.attempted_workers ?? [] } }
+          : {}),
         ...receiptExtra,
       },
       ...rest,

@@ -56,6 +56,7 @@ function attemptOf(record, route) {
   const attempt = { task_id: record.taskId ?? route.taskId, attempt_id: record.attemptId, epoch: record.epoch,
     bb_thread_id: record.threadId, worktree: route.worktree, base_sha: route.base,
     check_profile: route.checkProfile, finish: route.finish };
+  if (record.executor !== undefined) attempt.executor = record.executor;
   if (record.contract) {
     attempt.repo_id = record.contract.repo_id;
     attempt.spec_digest = record.contract.spec_digest;
@@ -67,7 +68,9 @@ function attemptOf(record, route) {
 
 // One serialized tick. Board keeps the work queue; state records only effects of this attempt.
 // Unconfirmed external effects never become another spawn, tell or settle on restart.
-export async function advance({ route, state, board, bb, submissions, verify, authorize, recheckRejectedHandoff }) {
+// workerSelector (опционально, обратная совместимость) реализует политику выбора
+// исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
+export async function advance({ route, state, board, bb, submissions, verify, authorize, recheckRejectedHandoff, workerSelector }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const binding = createHash('sha256').update(JSON.stringify(route)).digest('hex');
@@ -85,6 +88,21 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     record.reason === 'invalid_or_stale_submission' && !record.turnSeq && record.seenShas.length === 0;
   if (recheckRejectedHandoff && !recheck) return { phase: 'hold', reason: 'no_rejected_handoff_to_recheck' };
   if (!record) {
+    // Кросс-семейственная триада отвергает маршрут до claim: исполнитель,
+    // критик и арбитр обязаны быть из известных различных семейств.
+    if (workerSelector) {
+      try {
+        workerSelector.assertTriadIndependent({
+          executor: workerSelector.selectWorker({ route })[0],
+          critic: route.critic ?? workerSelector.DEFAULT_CRITIC,
+          arbiter: route.arbiter ?? workerSelector.DEFAULT_ARBITER,
+        });
+      } catch (e) {
+        await save({ binding, phase: 'hold',
+          reason: `route_triad_violation:${e.reason ?? e.message}`, seenShas: [] });
+        return visible();
+      }
+    }
     if (route.taskId) {
       if ((await board.lookup(route.taskId)).state !== 'ready') return { phase: 'idle' };
     }
@@ -121,9 +139,34 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         await save({ phase: 'lease_lost', reason: 'lease_lost_before_spawn' });
         return visible();
       }
-      const launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
+      let launched;
+      let workerTrail = null;
+      if (workerSelector) {
+        // Приоритет acp-devin/swe-2-high; резерв только при подтверждённом
+        // отказе, неизвестный исход — карантин без второго писателя.
+        const selection = await workerSelector.attemptSpawnWithFallback({
+          route, attempt: attemptOf(record, route),
+          probe: typeof bb.probeAvailability === 'function' ? w => bb.probeAvailability(w) : undefined,
+          spawn: envelope => bb.spawn(envelope),
+        });
+        if (selection.outcome === 'uncertain') {
+          await save({ phase: 'uncertain', reason: 'worker_launch_outcome_unknown',
+            attemptedWorkers: selection.attemptedWorkers });
+          return visible();
+        }
+        if (selection.outcome !== 'spawned') {
+          await save({ phase: 'hold', reason: selection.reason ?? 'no_available_worker',
+            attemptedWorkers: selection.attemptedWorkers });
+          return visible();
+        }
+        launched = { threadId: selection.threadId };
+        workerTrail = { executor: selection.worker, fallbackReason: selection.fallbackReason ?? null,
+          attemptedWorkers: selection.attemptedWorkers };
+      } else {
+        launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
+      }
       if (!/^thr_[a-z0-9]+$/.test(launched?.threadId ?? '')) throw new Error('No confirmed BB thread');
-      await save({ phase: 'working', threadId: launched.threadId });
+      await save({ phase: 'working', threadId: launched.threadId, ...(workerTrail ?? {}) });
     } catch {
       await save({ phase: 'uncertain', reason: 'claim_or_spawn_unconfirmed' });
     }
@@ -155,10 +198,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   if (!after && record.seenShas.length && (!submission || record.seenShas.includes(submission.candidate_sha))) {
     return visible();
   }
-  const stopWith = async reason => {
-    await save({ phase: 'blocking', turnSeq });
+  const stopWith = async (reason, extraState = null, detail = '') => {
+    await save({ phase: 'blocking', turnSeq, ...(extraState ?? {}) });
     try {
-      await board.block(attempt.task_id, attempt.epoch, `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}. Проверьте ход; повтор не отправлен.`);
+      await board.block(attempt.task_id, attempt.epoch, `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}.${detail ? ` ${detail}` : ''} Проверьте ход; повтор не отправлен.`);
       await save({ phase: 'hold', reason });
     } catch {
       await save({ phase: 'uncertain', reason: 'handoff_block_unconfirmed' });
@@ -178,15 +221,91 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     seenShas: [...record.seenShas, submission.candidate_sha] });
   const result = await verify(attempt, { ...submission, task_id: taskId });
   if (result.outcome === 'rework') {
+    let roundsHistory;
+    let arbitrationUsed = record.arbitrationUsed ?? 0;
+    let feedbackReason = result.reason;
+    let feedbackEvidence = result.feedback;
+    let feedbackSuffix = '';
+    if (workerSelector) {
+      // Раунд фиксируется в истории попытки; сходящаяся починка не ограничена
+      // счётчиком кругов — триггеры только содержательные.
+      const round = {
+        sha: submission.candidate_sha,
+        tree_sha: submission.tree_sha ?? null,
+        gate: workerSelector.roundGate(result),
+        signature: workerSelector.roundSignature(result),
+        blocking: Array.isArray(result.feedback?.findings) ? result.feedback.findings.length : null,
+        dispute: submission.dispute ?? null,
+        contradictory: result.contradictory === true,
+      };
+      roundsHistory = [...(record.roundsHistory ?? []), round];
+      const progress = workerSelector.evaluateReworkProgress({ roundsHistory });
+      if (progress.trigger === 'no_progress' && progress.deterministicGate) {
+        // Красный детерминированный гейт без прогресса не арбитрируется.
+        return stopWith('no_progress_deterministic_gate', { roundsHistory },
+          JSON.stringify(progress.evidence ?? {}));
+      }
+      if (progress.trigger) {
+        const ruling = await workerSelector.resolveArbitration({
+          attempt, trigger: progress, arbitrationUsed,
+          arbiter: route.arbiter ?? workerSelector.DEFAULT_ARBITER,
+          critic: route.critic ?? workerSelector.DEFAULT_CRITIC,
+          maxHarm: workerSelector.maxHarmOf(result.feedback?.findings),
+          subjectDigest: result.subject_digest ?? null,
+          verifyHeld: (id, ep) => board.verifyHeld(id, ep),
+          arbitrate: workerSelector.arbitrate,
+        });
+        if (ruling.decision === 'lease_lost') {
+          await save({ phase: 'lease_lost', reason: ruling.reason, roundsHistory });
+          return visible();
+        }
+        if (ruling.decision === 'directed_rework') {
+          arbitrationUsed = 1;
+          feedbackReason = 'arbiter_directed_rework';
+          feedbackEvidence = { directive: ruling.directive, findings: ruling.findings,
+            trigger: progress.kind };
+          feedbackSuffix = ':arb';
+        } else if (ruling.decision === 'accept_with_notes') {
+          await save({ phase: 'checking', roundsHistory, arbitrationUsed: 1,
+            arbitration: ruling.receipt });
+          if (route.finish === 'verified') {
+            try {
+              await board.complete(attempt.task_id, attempt.epoch,
+                { sha: submission.candidate_sha, arbitration: ruling.receipt });
+            } catch {
+              await save({ phase: 'uncertain', reason: 'arbitrated_complete_unconfirmed' });
+              return visible();
+            }
+            const settled = await board.lookup(attempt.task_id).catch(() => null);
+            if (settled?.state !== 'completed' || settled.result?.sha !== submission.candidate_sha) {
+              await save({ phase: 'uncertain', reason: 'completed_sha_not_confirmed' });
+            } else {
+              await save({ phase: 'done' });
+            }
+            return visible();
+          }
+          await save({ phase: 'blocking' });
+          await board.block(attempt.task_id, attempt.epoch,
+            `Выпуск не разрешён этим контуром. Проверен SHA ${record.sha}`);
+          await save({ phase: 'hold', reason: 'release_not_authorized' });
+          return visible();
+        } else if (ruling.decision === 'escalate_owner') {
+          return stopWith('arbiter_escalated_to_owner', { roundsHistory }, ruling.question);
+        } else {
+          return stopWith(ruling.reason ?? 'arbitration_hold', { roundsHistory },
+            JSON.stringify(ruling.evidence ?? {}));
+        }
+      }
+    }
     const proof = await board.verifyHeld(attempt.task_id, attempt.epoch).catch(() => null);
     if (proof?.epoch !== attempt.epoch) {
-      await save({ phase: 'lease_lost', reason: 'lease_lost_before_feedback' });
+      await save({ phase: 'lease_lost', reason: 'lease_lost_before_feedback', ...(roundsHistory ? { roundsHistory } : {}) });
       return visible();
     }
-    const feedbackId = `${attempt.attempt_id}:${submission.candidate_sha}`;
-    await save({ phase: 'returning', feedbackId });
+    const feedbackId = `${attempt.attempt_id}:${submission.candidate_sha}${feedbackSuffix}`;
+    await save({ phase: 'returning', feedbackId, ...(roundsHistory ? { roundsHistory } : {}), arbitrationUsed });
     const sent = await bb.feedback({ attempt, feedbackId, sha: submission.candidate_sha,
-      reason: result.reason, evidence: result.feedback });
+      reason: feedbackReason, evidence: feedbackEvidence });
     if (!sent?.confirmed) {
       await save({ phase: 'uncertain', reason: 'feedback_delivery_unconfirmed' });
       return visible();
