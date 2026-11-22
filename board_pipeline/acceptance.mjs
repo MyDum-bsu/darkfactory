@@ -1128,7 +1128,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         policy_digest: attempt.policy_digest,
       };
       for (const [field, expected] of Object.entries(expectedLabels)) {
-        if (labels[field] !== expected) {
+        // GUARD:NoStaleCommit — seal обязан видеть живые метки равными контракту.
+        if (!ports.__unsafeSkipSealCheck && labels[field] !== expected) {
           await step('seal', false, `${field}_drift`);
           return { fail: `${field}_drift` };
         }
@@ -1187,7 +1188,9 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     journal });
   if (verdict.status === 'lost') return settle('denied', { reason: verdict.reason });
 
-  if (verdict.status === 'rework') {
+  // GUARD:NoBlindRoundClose — возврат на доработку никогда не превращается в
+  // complete без свежего verified-вердикта на тот же кандидат.
+  if (!ports.__unsafeAutoCloseRework && verdict.status === 'rework') {
     // Исправимый дефект: та же аренда остаётся живой, никаких settle-эффектов.
     const record = await settle('rework', {
       reason: verdict.reason,

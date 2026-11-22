@@ -70,9 +70,10 @@ function attemptOf(record, route) {
 // Unconfirmed external effects never become another spawn, tell or settle on restart.
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
-export async function advance({ route, state, board, bb, submissions, verify, authorize, recheckRejectedHandoff, workerSelector }) {
+export async function advance({ route, state, board, bb, submissions, verify, authorize, recheckRejectedHandoff, workerSelector, mutants }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
+  const hazards = mutants ?? {};
   const binding = createHash('sha256').update(JSON.stringify(route)).digest('hex');
   let record = await state.load();
   if (record && record.binding !== binding) throw new Error('The enrolled route changed');
@@ -82,6 +83,86 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   };
   const visible = () => ({ phase: record.phase, attemptId: record.attemptId,
     epoch: record.epoch, threadId: record.threadId, reason: record.reason, sha: record.sha });
+
+  // Долговечный WAL: перед spawn/feedback/block пишется intent, после
+  // подтверждения — receipt. Рестарт с IN_FLIGHT записью никогда не повторяет
+  // эффект вслепую: сначала детерминированная сверка с внешним миром.
+  const leaseAlive = async () => {
+    try {
+      await board.adopt(record.taskId ?? route.taskId, { epoch: record.epoch, token: record.token });
+      const proof = await board.verifyHeld(record.taskId ?? route.taskId, record.epoch);
+      return proof.epoch === record.epoch;
+    } catch {
+      return false;
+    }
+  };
+  const lostLease = async () => {
+    await save({ phase: 'lease_lost', reason: 'no_verified_claim_keep_worktree_reserved' });
+    return visible();
+  };
+  const reconcileInFlight = async () => {
+    const taskId = record.taskId ?? route.taskId;
+    const intent = record.intent;
+    const uncertain = async reason => {
+      await save({ phase: 'uncertain', reason });
+      return visible();
+    };
+    if (record.phase === 'blocking' && intent?.kind === 'block') {
+      // block уже мог достичь Board до обрыва: факт сверяется с карточкой,
+      // повторный board.block не отправляется никогда.
+      const looked = await board.lookup(taskId).catch(() => null);
+      if (looked?.state === 'blocked' && (looked.epoch === undefined || looked.epoch === intent.epoch)) {
+        await save({ phase: 'hold', reason: intent.reason ?? 'blocked',
+          receipt: { kind: 'block', confirmed: 'observed' } });
+        return visible();
+      }
+      return uncertain('block_outcome_unconfirmed');
+    }
+    if (record.phase === 'launching' && intent?.kind === 'spawn') {
+      if (!await leaseAlive()) return lostLease();
+      if (typeof bb.reconcileSpawn !== 'function') {
+        return uncertain('spawn_outcome_unconfirmed_quarantine');
+      }
+      const res = await bb.reconcileSpawn(attemptOf(record, route)).catch(() => null);
+      // GUARD:NoDuplicateSpawn — только ровно одно точное совпадение маркера
+      // при живой аренде подхватывает тред; empty/ambiguous/ошибка — карантин
+      // с сохранением брони worktree и нулём повторных bb.spawn.
+      const confirmed = res?.status === 'matched' && /^thr_[a-z0-9]+$/.test(res.threadId ?? '');
+      if (hazards.retrySpawnOnEmpty && !confirmed) {
+        try {
+          const retried = await bb.spawn(attemptOf(record, route));
+          if (/^thr_[a-z0-9]+$/.test(retried?.threadId ?? '')) {
+            await save({ phase: 'working', threadId: retried.threadId,
+              receipt: { kind: 'spawn', threadId: retried.threadId, confirmed: 'unsafe_retry' } });
+            return visible();
+          }
+        } catch { /* fall through to quarantine */ }
+      }
+      if (!confirmed) return uncertain('spawn_outcome_unconfirmed_quarantine');
+      if (!await leaseAlive()) return lostLease();
+      await save({ phase: 'working', threadId: res.threadId,
+        receipt: { kind: 'spawn', threadId: res.threadId, confirmed: 'reconciled' } });
+      return visible();
+    }
+    if (record.phase === 'returning' && intent?.kind === 'feedback') {
+      if (!await leaseAlive()) return lostLease();
+      if (typeof bb.reconcileFeedback !== 'function') {
+        return uncertain('feedback_delivery_unconfirmed');
+      }
+      const res = await bb.reconcileFeedback({
+        attempt: attemptOf(record, route),
+        feedbackId: intent.feedbackId ?? record.feedbackId,
+        threadId: record.threadId,
+      }).catch(() => null);
+      if (res?.status !== 'delivered') return uncertain('feedback_delivery_unconfirmed');
+      if (!await leaseAlive()) return lostLease();
+      await save({ phase: 'working',
+        receipt: { kind: 'feedback', feedbackId: intent.feedbackId, confirmed: 'reconciled' } });
+      return visible();
+    }
+    // claiming/checking или отсутствующий intent: внешний эффект не доказан.
+    return uncertain(`interrupted_${record.phase}`);
+  };
 
   // Единый фактический критик/арбитр для триады: настроенный селектор важнее
   // маршрутного; расхождение route.critic с фактическим — отказ до claim.
@@ -141,7 +222,9 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       }
       if (!Number.isSafeInteger(claim.epoch) || claim.epoch < 1) throw new Error('No native claim epoch');
       await save({ phase: 'launching', taskId: claim.taskId ?? route.taskId, epoch: claim.epoch,
-        until: claim.until, ...(contract ? { contract } : {}) });
+        until: claim.until, ...(contract ? { contract } : {}),
+        intent: { kind: 'spawn', attemptId: record.attemptId, epoch: claim.epoch,
+          marker: record.attemptId } });
       if (!await authorize('claimed', record.taskId)) {
         await save({ phase: 'hold', reason: 'route_changed_before_spawn' });
         return visible();
@@ -183,17 +266,17 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
       }
       if (!/^thr_[a-z0-9]+$/.test(launched?.threadId ?? '')) throw new Error('No confirmed BB thread');
-      await save({ phase: 'working', threadId: launched.threadId, ...(workerTrail ?? {}) });
+      await save({ phase: 'working', threadId: launched.threadId,
+        receipt: { kind: 'spawn', threadId: launched.threadId }, ...(workerTrail ?? {}) });
     } catch {
-      await save({ phase: 'uncertain', reason: 'claim_or_spawn_unconfirmed' });
+      // Обрыв в любой точке claim/launch не повторяет эффект: та же сверка,
+      // что и при рестарте процесса с записью IN_FLIGHT.
+      return reconcileInFlight();
     }
     return visible();
   }
   if (TERMINAL.has(record.phase) && !recheck) return visible();
-  if (IN_FLIGHT.has(record.phase)) {
-    await save({ phase: 'uncertain', reason: `interrupted_${record.phase}` });
-    return visible();
-  }
+  if (IN_FLIGHT.has(record.phase)) return reconcileInFlight();
   if (record.phase !== 'working' && !recheck) throw new Error('Unknown attempt state');
 
   // After process restart the adapter can recover the same held capability. It cannot re-claim.
@@ -209,19 +292,25 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   const attempt = attemptOf(record, route);
   const after = record.turnSeq ?? 0;
   const observation = await submissions.read(attempt, after);
-  if (!observation || !Number.isSafeInteger(observation.turnSeq) || observation.turnSeq <= after) return visible();
+  // GUARD:NoWatermarkRegression — ход не новее watermark никогда не засчитывается
+  // за ответ на уже отправленный feedback.
+  if (!observation || !Number.isSafeInteger(observation.turnSeq) ||
+      (!hazards.staleTurnWatermark && observation.turnSeq <= after)) return visible();
   const { submission, turnSeq } = observation;
   // A legacy record remembers its checked SHA, but not which BB turn produced it.
   if (!after && record.seenShas.length && (!submission || record.seenShas.includes(submission.candidate_sha))) {
     return visible();
   }
   const stopWith = async (reason, extraState = null, detail = '') => {
-    await save({ phase: 'blocking', turnSeq, ...(extraState ?? {}) });
+    await save({ phase: 'blocking', turnSeq,
+      intent: { kind: 'block', attemptId: record.attemptId, epoch: attempt.epoch,
+        turnSeq, reason },
+      ...(extraState ?? {}) });
     try {
       await board.block(attempt.task_id, attempt.epoch, `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}.${detail ? ` ${detail}` : ''} Проверьте ход; повтор не отправлен.`);
-      await save({ phase: 'hold', reason });
+      await save({ phase: 'hold', reason, receipt: { kind: 'block' } });
     } catch {
-      await save({ phase: 'uncertain', reason: 'handoff_block_unconfirmed' });
+      return reconcileInFlight();
     }
     return visible();
   };
@@ -319,10 +408,17 @@ export async function advance({ route, state, board, bb, submissions, verify, au
             return visible();
           }
           if (sealed.outcome === 'verified' && sealed.receipt?.settle === 'deferred') {
-            await save({ phase: 'blocking' });
-            await board.block(attempt.task_id, attempt.epoch,
-              `Выпуск не разрешён этим контуром. Проверен SHA ${record.sha}`);
-            await save({ phase: 'hold', reason: 'release_not_authorized' });
+            await save({ phase: 'blocking',
+              intent: { kind: 'block', attemptId: record.attemptId, epoch: attempt.epoch,
+                reason: 'release_not_authorized' } });
+            try {
+              await board.block(attempt.task_id, attempt.epoch,
+                `Выпуск не разрешён этим контуром. Проверен SHA ${record.sha}`);
+              await save({ phase: 'hold', reason: 'release_not_authorized',
+                receipt: { kind: 'block' } });
+            } catch {
+              return reconcileInFlight();
+            }
             return visible();
           }
           if (sealed.outcome === 'denied' && /claim_not_held/.test(sealed.reason ?? '')) {
@@ -350,14 +446,15 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       return visible();
     }
     const feedbackId = `${attempt.attempt_id}:${submission.candidate_sha}${feedbackSuffix}`;
-    await save({ phase: 'returning', feedbackId, ...(roundsHistory ? { roundsHistory } : {}), arbitrationUsed });
+    await save({ phase: 'returning', feedbackId,
+      intent: { kind: 'feedback', attemptId: record.attemptId, epoch: attempt.epoch,
+        feedbackId, sha: submission.candidate_sha, turnSeq },
+      ...(roundsHistory ? { roundsHistory } : {}), arbitrationUsed });
     const sent = await bb.feedback({ attempt, feedbackId, sha: submission.candidate_sha,
-      reason: feedbackReason, evidence: feedbackEvidence });
-    if (!sent?.confirmed) {
-      await save({ phase: 'uncertain', reason: 'feedback_delivery_unconfirmed' });
-      return visible();
-    }
-    await save({ phase: 'working' });
+      reason: feedbackReason, evidence: feedbackEvidence })
+      .catch(() => null);
+    if (!sent?.confirmed) return reconcileInFlight();
+    await save({ phase: 'working', receipt: { kind: 'feedback', feedbackId } });
   } else if (result.outcome === 'verified' && result.receipt?.settle === 'completed' && route.finish === 'verified') {
     const settled = await board.lookup(attempt.task_id);
     if (settled.state !== 'completed' || settled.result?.sha !== submission.candidate_sha) {
@@ -366,9 +463,16 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       await save({ phase: 'done' });
     }
   } else if (result.outcome === 'verified' && result.receipt?.settle === 'deferred' && route.finish === 'deployed') {
-    await save({ phase: 'blocking' });
-    await board.block(attempt.task_id, attempt.epoch, `Выпуск не разрешён этим контуром. Проверен SHA ${record.sha}`);
-    await save({ phase: 'hold', reason: 'release_not_authorized' });
+    await save({ phase: 'blocking',
+      intent: { kind: 'block', attemptId: record.attemptId, epoch: attempt.epoch,
+        reason: 'release_not_authorized' } });
+    try {
+      await board.block(attempt.task_id, attempt.epoch,
+        `Выпуск не разрешён этим контуром. Проверен SHA ${record.sha}`);
+      await save({ phase: 'hold', reason: 'release_not_authorized', receipt: { kind: 'block' } });
+    } catch {
+      return reconcileInFlight();
+    }
   } else {
     await save({ phase: result.outcome === 'uncertain' ? 'uncertain' : 'hold', reason: result.reason ?? 'unverified' });
   }

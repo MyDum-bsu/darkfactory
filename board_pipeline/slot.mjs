@@ -36,7 +36,7 @@ async function kernelLock(path) {
 }
 
 // The durable reservation is independent of the process lock. A dead CLI does not free a writer.
-export async function reserveWorktree(registry, tree, state) {
+export async function reserveWorktree(registry, tree, state, opts = {}) {
   await mkdir(registry, { mode: 0o700, recursive: true });
   const info = await lstat(registry);
   if (!info.isDirectory() || info.uid !== process.getuid() || info.mode & 0o077 || await realpath(registry) !== registry) {
@@ -50,7 +50,10 @@ export async function reserveWorktree(registry, tree, state) {
     let old;
     try { old = JSON.parse(await readFile(`${path}.json`, 'utf8')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (old && (old.state !== state || old.device !== identity.dev || old.inode !== identity.ino)) {
+    // GUARD:SingleLiveWriter — бронь прежнего писателя держится до подтверждения
+    // отсутствия живого писателя, а не до истечения аренды.
+    if (!opts.allowTakeoverWithLiveWriter &&
+        old && (old.state !== state || old.device !== identity.dev || old.inode !== identity.ino)) {
       throw new Error('Prior writer is still reserved; reconcile before reusing this worktree');
     }
     if (!old) await saveState(`${path}.json`, reservation);
