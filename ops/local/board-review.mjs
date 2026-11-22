@@ -53,7 +53,7 @@ export function reviewerArguments(job, scope, promptFile) {
   const preset = jobPreset(job);
   return ['thread','spawn','--project',scope.projectId,'--environment',scope.environmentId,
     '--parent-thread',job.source,'--parent-notifications','off', '--provider',preset.provider,'--model',preset.model,
-    '--reasoning-level',preset.reasoningLevel,'--title',`Ревью #${job.task} · ${job.sha.slice(0,7)}`,
+    '--reasoning-level',preset.reasoningLevel,'--permission-mode','accept-edits','--title',`Ревью #${job.task} · ${job.sha.slice(0,7)}`,
     '--prompt-file',promptFile,'--json'];
 }
 

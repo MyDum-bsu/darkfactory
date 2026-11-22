@@ -75,17 +75,29 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   }
 
   const attempt = attemptOf(record, route);
-  const submission = await submissions.read(attempt);
-  if (!submission) return visible();
+  const after = record.turnSeq ?? 0;
+  const observation = await submissions.read(attempt, after);
+  if (!observation || !Number.isSafeInteger(observation.turnSeq) || observation.turnSeq <= after) return visible();
+  const { submission, turnSeq } = observation;
+  if (!submission || record.seenShas.includes(submission.candidate_sha)) {
+    const reason = after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff';
+    await save({ phase: 'blocking', turnSeq });
+    try {
+      await board.block(attempt.task_id, attempt.epoch, `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}. Проверьте ход; повтор не отправлен.`);
+      await save({ phase: 'hold', reason });
+    } catch {
+      await save({ phase: 'uncertain', reason: 'missing_handoff_block_unconfirmed' });
+    }
+    return visible();
+  }
   if (submission.task_id !== attempt.task_id || submission.epoch !== attempt.epoch ||
       submission.attempt_id !== attempt.attempt_id || submission.worker_thread_id !== attempt.bb_thread_id ||
       !shaRE.test(submission.candidate_sha ?? '')) {
     await save({ phase: 'hold', reason: 'invalid_or_stale_submission' });
     return visible();
   }
-  if (record.seenShas.includes(submission.candidate_sha)) return visible();
 
-  await save({ phase: 'checking', sha: submission.candidate_sha,
+  await save({ phase: 'checking', sha: submission.candidate_sha, turnSeq,
     seenShas: [...record.seenShas, submission.candidate_sha] });
   const result = await verify(attempt, submission);
   if (result.outcome === 'rework') {

@@ -46,7 +46,7 @@ function checkCommand(recipe) {
   return recipe;
 }
 
-const HOST_SYSTEM_DIRS = new Set(['/usr', '/etc/fonts', '/etc/texmf', '/var/lib/texmf']);
+const HOST_SYSTEM_DIRS = new Set(['/usr', '/etc/fonts', '/etc/texmf', '/var/lib/texmf', '/opt/google/chrome']);
 const SANDBOX_ENV = new Set(['PYTHONPATH', 'PYTHONDONTWRITEBYTECODE', 'MO_TRACKER_DATA', 'MO_TRACKER_DB']);
 
 async function sandboxExtras(recipe, source) {

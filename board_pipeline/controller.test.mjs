@@ -15,16 +15,20 @@ async function lab(t, finish = 'verified') {
     worktree: '/synthetic', finish };
   let stored;
   let candidate;
+  let turnSeq = 0;
   const effects = { spawn: 0, feedback: [], verify: 0 };
   const cfg = {
     route, authorize: async () => true, state: { load: async () => structuredClone(stored), save: async value => { stored = structuredClone(value); } },
     board: nativeBoardPort(handle, { channel: 'pilot', lease: 30 }),
     bb: { async spawn() { effects.spawn++; return { threadId: 'thr_fixture' }; },
       async feedback(packet) { effects.feedback.push(packet); return { confirmed: true }; } },
-    submissions: { async read(attempt) { return candidate && {
-      task_id: task.id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
-      worker_thread_id: attempt.bb_thread_id, candidate_sha: candidate,
-    }; } },
+    submissions: { async read(attempt, after) {
+      if (turnSeq <= after) return;
+      return { turnSeq, submission: candidate && {
+        task_id: task.id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+        worker_thread_id: attempt.bb_thread_id, candidate_sha: candidate,
+      } };
+    } },
     async verify(attempt, submission) {
       effects.verify++;
       if (submission.candidate_sha.startsWith('b')) return { outcome: 'rework', reason: 'real_test_failed' };
@@ -33,7 +37,7 @@ async function lab(t, finish = 'verified') {
       return { outcome: 'verified', receipt: { settle: 'completed' } };
     },
   };
-  return { cfg, handle, effects, submit: ch => { candidate = ch.repeat(40); },
+  return { cfg, handle, effects, submit: ch => { candidate = ch?.repeat(40); turnSeq++; },
     tick: () => advance(cfg), inspect: () => cfg.board.lookup(task.id) };
 }
 
@@ -54,6 +58,31 @@ test('ready launches once, restart adopts the lease, red returns once and new SH
   assert.equal((await x.inspect()).result.sha, 'c'.repeat(40));
   assert.equal((await x.tick()).phase, 'done');
   assert.equal(x.effects.verify, 2);
+});
+
+test('a completed first turn without a handoff blocks the card, not another spawn', async t => {
+  const x = await lab(t);
+  await x.tick();
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit();
+  assert.equal((await x.tick()).reason, 'worker_turn_finished_without_handoff');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal((await x.tick()).phase, 'hold');
+  assert.equal(x.effects.spawn, 1);
+  assert.equal(x.effects.verify, 0);
+});
+
+test('after feedback an old completed turn is not treated as a missing new handoff', async t => {
+  const x = await lab(t);
+  await x.tick();
+  x.submit('b');
+  await x.tick();
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit('b');
+  assert.equal((await x.tick()).reason, 'worker_turn_finished_without_new_handoff');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.feedback.length, 1);
+  assert.equal(x.effects.verify, 1);
 });
 
 test('lost lease with a still-bound worker neither verifies nor launches a second writer', async t => {
