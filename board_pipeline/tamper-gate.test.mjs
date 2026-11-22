@@ -376,3 +376,12 @@ test('ослабление второго операнда в составном
   assert.equal(res.ok, false);
   assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
 });
+
+test('ослабление операнда после && против одиночного assert — отказ', async () => {
+  const res = await gate({
+    base: { 'src/lib.js': 'assert(y >= 10);\nexport const z = 1;\n' },
+    candidate: { 'src/lib.js': 'assert(x >= 1 && y >= 0);\nexport const z = 1;\n' },
+  });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
+});

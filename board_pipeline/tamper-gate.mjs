@@ -55,11 +55,16 @@ const cmpStr = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 // операнда при ужесточении другого сопоставляется и ловится точно.
 const operandKey = (text, index) => {
   const left = text.slice(0, index);
-  const cut = Math.max(
-    left.lastIndexOf('&&'), left.lastIndexOf('||'), left.lastIndexOf('('),
-    left.lastIndexOf(','), left.lastIndexOf(';'), left.lastIndexOf('?'),
-    left.lastIndexOf(':'));
-  return left.slice(cut + 1).replace(/\s+/g, '');
+  let cut = -1;
+  let sepLen = 0;
+  for (const sep of ['&&', '||', '(', ',', ';', '?', ':']) {
+    const at = left.lastIndexOf(sep);
+    if (at > cut) {
+      cut = at;
+      sepLen = sep.length;
+    }
+  }
+  return left.slice(cut + sepLen).replace(/\s+/g, '');
 };
 
 // Метаданные изменений из `git diff-tree -r -z --no-commit-id -M base cand`:
