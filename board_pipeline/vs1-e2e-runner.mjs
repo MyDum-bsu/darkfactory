@@ -6,9 +6,11 @@
 // Границы: никогда порт 44100, никакой живой Board/кабинета/сети кандидата.
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, promisify } from 'node:util';
 import { requireWorkspaceSpace } from '../ops/local/check-workspace-space.mjs';
 
@@ -55,14 +57,42 @@ async function vbCli(url, argv) {
   return JSON.parse(stdout);
 }
 
-// Число живых тредов проекта для дельты пустого тика (0 новых spawn).
-async function bbThreadCount(env) {
+// Строгая проверка доступности TCP-порта на 127.0.0.1 до запуска vb serve.
+async function assertPortFree(port) {
+  await new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.unref();
+    srv.once('error', err => reject(new Error(`Port ${port} is not free (${err.code ?? err.message}); refusing to start`)));
+    srv.listen(port, '127.0.0.1', () => srv.close(err => (err ? reject(err) : resolve())));
+  });
+}
+
+// Прямой счётчик append-only журнала событий SQLite изолированной Board:
+// любой claim/release/complete/block увеличивает a2_events.
+async function boardEventCount(sqliteDir) {
+  const dbFile = (await readdir(sqliteDir)).find(f => f.endsWith('.db'));
+  if (!dbFile) throw new Error(`No SQLite .db file in ${sqliteDir}`);
+  const db = new DatabaseSync(join(sqliteDir, dbFile), { readOnly: true });
   try {
-    const { stdout } = await exec('bb', ['thread', 'list', '--project', 'proj_xdrdfgw7hs',
-      '--json'], { timeout: 30_000, env });
-    const list = JSON.parse(stdout);
-    return Array.isArray(list) ? list.length : (list.threads?.length ?? null);
-  } catch { return null; }
+    return Number(db.prepare('SELECT COUNT(*) AS n FROM a2_events').get().n);
+  } finally {
+    db.close();
+  }
+}
+
+// Исполняемые шимы на время пустого тика: логируют любой реальный вызов
+// bb / docker / pi до его исполнения (включая неуспешные вызовы до записи файлов).
+async function createIdleShims(shimDir, logFile, basePath) {
+  await mkdir(shimDir, { recursive: true, mode: 0o700 });
+  await writeFile(logFile, '', { mode: 0o600 });
+  for (const bin of ['bb', 'docker', 'pi']) {
+    const p = join(shimDir, bin);
+    await writeFile(p, `#!/bin/sh
+printf '%s\\n' ${JSON.stringify(bin)} >> ${JSON.stringify(logFile)}
+PATH=${JSON.stringify(basePath)} exec ${bin} "$@"
+`, { mode: 0o700 });
+    await chmod(p, 0o700);
+  }
 }
 
 // Снимок состояния карточки для сравнения «без эффектов»: только стабильные поля.
@@ -134,9 +164,10 @@ async function execute() {
   await exec('git', ['clone', '--no-hardlinks', '-q', bsu, origin], { timeout: 180_000 });
   await exec('git', ['-C', origin, 'fetch', '-q', BUNDLE,
     'refs/tags/*:refs/tags/*'], { timeout: 60_000 });
+  await exec('git', ['-C', origin, 'config', 'extensions.worktreeConfig', 'true']);
   await exec('git', ['-C', origin, 'worktree', 'add', dirs.worktree, '-b', branch, BASE],
     { timeout: 60_000 });
-  await exec('git', ['-C', dirs.worktree, 'config', 'core.filemode', 'false']);
+  await exec('git', ['-C', dirs.worktree, 'config', '--worktree', 'core.filemode', 'false']);
   const factorySha = (await exec('git', ['-C', HERE, 'rev-parse', 'HEAD'])).stdout.trim();
   await say({ step: 'worktree', path: dirs.worktree, branch, base: BASE, factorySha });
 
@@ -153,37 +184,37 @@ async function execute() {
   // seal сверяет её с живой меткой карточки (policy_digest_drift при смене).
   const policyDigest = sha256Text(`vs1-bsu-e2e-1:${specDigest}`);
 
-  // Порт обязан быть свободен ДО старта: любой HTTP-ответ — чужой endpoint.
-  const probe = async () => {
-    const { stdout } = await exec('curl', ['-sS', '-o', '/dev/null', '-w', '%{http_code}',
-      '--max-time', '0.5', `http://127.0.0.1:${port}/`]);
-    return stdout.trim();
-  };
-  try {
-    if (await probe()) throw new Error(`Port ${port} already serves an endpoint; refusing to start`);
-  } catch (e) {
-    if (/already serves/.test(e.message)) throw e;
-    // соединение отклонено — порт свободен
-  }
+  // Порт обязан быть свободен ДО старта (прямой TCP bind на 127.0.0.1).
+  await assertPortFree(port);
   // Изолированный vb serve на loopback, порт != 44100.
+  const boardUrl = `http://127.0.0.1:${port}/api/board`;
+  const readyBanner = `serving a local board at ${boardUrl}`;
   const boardProc = spawn(VB, ['serve', '--port', String(port), '--dir', dirs.sqlite,
     '--no-inspect', '--no-open'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  boardProc.stdout.on('data', c => wlog(`[vb] ${c}`));
+  let sawBanner = false;
+  let boardOut = '';
+  boardProc.stdout.on('data', c => {
+    const s = String(c);
+    wlog(`[vb] ${s}`);
+    boardOut += s;
+    if (boardOut.includes(readyBanner)) sawBanner = true;
+  });
   boardProc.stderr.on('data', c => wlog(`[vb:err] ${c}`));
-  const boardUrl = `http://127.0.0.1:${port}/api/board`;
   let boardReady = false;
   for (let i = 0; i < 60 && boardProc.exitCode === null; i++) {
-    try {
-      // Любой HTTP-ответ (включая 401/404) означает, что listener поднялся;
-      // готовность подтверждается файлом БД, созданным нашим процессом.
-      if (await probe() &&
-          (await readdir(dirs.sqlite)).some(f => f.endsWith('.db'))) {
-        boardReady = true; break;
-      }
-    } catch { /* ещё не поднялся */ }
+    if (sawBanner && (await readdir(dirs.sqlite)).some(f => f.endsWith('.db'))) {
+      try {
+        await vbCli(boardUrl, ['channels', 'list']);
+        boardReady = true;
+        break;
+      } catch { /* ждём завершение инициализации Board API */ }
+    }
     await new Promise(r => setTimeout(r, 300));
   }
-  if (!boardReady) throw new Error('Isolated vb serve did not become ready');
+  if (!boardReady) {
+    boardProc.kill('SIGTERM');
+    throw new Error('Isolated vb serve did not become ready');
+  }
   await say({ step: 'board', url: boardUrl, pid: boardProc.pid });
 
   const env = { ...process.env, XDG_CONFIG_HOME: join(dirs.gate, 'config'), TMPDIR: dirs.tmp };
@@ -291,11 +322,11 @@ else console.log('Onboarding controls are present');`;
       }
     }
 
-    // === Явная проверка последовательности гейтов по журналу:
-    // 1) база — красный L1 и ровно 0 вызовов L2;
-    // 2) дефектный кандидат — зелёные L1/tamper/L3 + реальный L2 REWORK
-    //    (REVIEW_BLOCKED) с непустыми findings;
-    // 3) финал — зелёные все гейты + L2 PASS → verified + complete(#1).
+    // === Явная проверка упорядоченной последовательности ходов одной попытки:
+    // ход 1 — BASE: красный L1 и ровно 0 вызовов L2;
+    // ход 2 — DEFECT: зелёные L1/tamper/L3 + реальный L2 REWORK с findings;
+    // промежуточные ходы (если критик поймал дополнительный дефект) — только rework;
+    // финальный ход — принятый SHA из квитанции Board: L1/L3/L2 PASS → verified + complete(#1).
     const stateFiles = await readdir(dirs.state);
     const forSha = (sha, re) => stateFiles.some(f => re.test(f) && f.includes(sha));
     const outcomes = {};
@@ -303,24 +334,42 @@ else console.log('Onboarding controls are present');`;
       for (const line of (await readFile(join(dirs.state, file), 'utf8')).split('\n')) {
         if (!line.trim()) continue;
         let rec; try { rec = JSON.parse(line); } catch { continue; }
-        if (rec.kind === 'outcome' && rec.candidate_sha) {
+        if (rec.kind === 'outcome' && rec.candidate_sha &&
+            rec.attempt_id === attempt.attemptId && rec.epoch === attempt.epoch) {
           (outcomes[rec.candidate_sha] ??= []).push(rec);
         }
       }
     }
-    const redL1 = outcomes[BASE]?.some(o => o.reason === 'local_checks_failed') === true;
-    const noL2OnBase = !forSha(BASE, /^review-/) &&
-      !outcomes[BASE]?.some(o => /^review/.test(o.reason ?? ''));
-    const defectRework = outcomes[DEFECT]?.some(o =>
-      o.outcome === 'rework' && /^review_verdict:REVIEW_BLOCKED/.test(o.reason ?? '') &&
-      Array.isArray(o.feedback?.findings) && o.feedback.findings.length > 0) === true;
-    const defectVisual = forSha(DEFECT, /^visual-artifact-/) && forSha(DEFECT, /^review-/);
     let final1Parsed = null;
     try { final1Parsed = JSON.parse(final1.result ?? 'null'); } catch { /* ignore */ }
     const acceptedSha = typeof final1Parsed?.sha === 'string' ? final1Parsed.sha : null;
-    const finalVerified = acceptedSha !== null &&
-      acceptedSha !== BASE && acceptedSha !== DEFECT &&
-      outcomes[acceptedSha]?.some(o => o.outcome === 'verified') === true;
+    const turns = seen.submitted.map((sha, index) => {
+      const list = outcomes[sha] ?? [];
+      const last = list[list.length - 1] ?? null;
+      return {
+        index, sha, count: list.length,
+        outcome: last?.outcome ?? null,
+        reason: last?.reason ?? null,
+        findingsCount: Array.isArray(last?.feedback?.findings) ? last.feedback.findings.length : 0,
+      };
+    });
+    proof.turns = turns;
+    const exactOrderAndCount = turns.length >= 3 &&
+      Object.keys(outcomes).length === seen.submitted.length &&
+      turns.every(t => t.count === 1);
+    const turn0 = turns[0];
+    const turn1 = turns[1];
+    const turnLast = turns[turns.length - 1];
+    const middleAllRework = turns.slice(2, -1).every(t => t.outcome === 'rework');
+    const redL1 = turn0?.sha === BASE && turn0.reason === 'local_checks_failed';
+    const noL2OnBase = !forSha(BASE, /^review-/) &&
+      !outcomes[BASE]?.some(o => /^review/.test(o.reason ?? ''));
+    const defectRework = turn1?.sha === DEFECT && turn1.outcome === 'rework' &&
+      /^review_verdict:REVIEW_BLOCKED/.test(turn1.reason ?? '') && turn1.findingsCount > 0;
+    const defectVisual = forSha(DEFECT, /^visual-artifact-/) && forSha(DEFECT, /^review-/);
+    const finalVerified = exactOrderAndCount && middleAllRework &&
+      acceptedSha !== null && acceptedSha !== BASE && acceptedSha !== DEFECT &&
+      turnLast?.sha === acceptedSha && turnLast.outcome === 'verified';
     const finalVisual = acceptedSha !== null &&
       forSha(acceptedSha, /^visual-artifact-/) && forSha(acceptedSha, /^review-/);
     proof.gateSequence = {
@@ -334,38 +383,38 @@ else console.log('Onboarding controls are present');`;
 
     // === Пустой тик: worktree обратно на базу, тот же state dir (броня слота
     // привязана к паре worktree+state), attempt.json отложен — свежий тик.
-    // --stop-on-idle: один тик, phase=idle, чистый выход 0.
+    // Прямые измерения: append-only a2_events в SQLite (0 claims/мутаций Board)
+    // и шимы PATH для bb / docker / pi (0 запусков воркеров и моделей).
     await exec('git', ['-C', dirs.worktree, 'reset', '--hard', BASE], { timeout: 20_000 });
     await exec('git', ['-C', dirs.worktree, 'clean', '-fd'], { timeout: 20_000 });
     const idlePolicyFile = join(dirs.operator, 'policy-idle.json');
     await writeFile(idlePolicyFile, JSON.stringify({ ...policy, waitMs: 12_000 }), { mode: 0o600 });
     const before = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
-    const claimsBefore = (await vbCli(boardUrl, ['tasks', 'pilot', '--state', 'all']))
-      .tasks?.filter(t => t?.message?.task?.claim != null).length ?? null;
-    const threadsBefore = await bbThreadCount(env);
-    const gateFilesBefore = (await readdir(dirs.state))
-      .filter(f => /^(checks|visual|review)-/.test(f)).length;
+    const eventsBefore = await boardEventCount(dirs.sqlite);
+    const idleShimsDir = join(dirs.operator, 'idle-shims');
+    const idleCallsLog = join(dirs.operator, 'idle-calls.log');
+    const basePath = env.PATH ?? process.env.PATH ?? '';
+    await createIdleShims(idleShimsDir, idleCallsLog, basePath);
     await rename(join(dirs.state, 'attempt.json'), join(dirs.state, 'attempt-main.json'));
-    const idle = await runController(idlePolicyFile, dirs.state, env, wlog, () => {},
+    const idleEnv = { ...env, PATH: `${idleShimsDir}:${basePath}` };
+    const idle = await runController(idlePolicyFile, dirs.state, idleEnv, wlog, () => {},
       ['--stop-on-idle']);
     const after = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
-    const claimsAfter = (await vbCli(boardUrl, ['tasks', 'pilot', '--state', 'all']))
-      .tasks?.filter(t => t?.message?.task?.claim != null).length ?? null;
-    const threadsAfter = await bbThreadCount(env);
+    const eventsAfter = await boardEventCount(dirs.sqlite);
+    const idleCalls = (await readFile(idleCallsLog, 'utf8')).split('\n').filter(Boolean);
+    const bbCallsDelta = idleCalls.filter(c => c === 'bb').length;
+    const dockerCallsDelta = idleCalls.filter(c => c === 'docker').length;
+    const piCallsDelta = idleCalls.filter(c => c === 'pi').length;
+    const attemptCreated = await stat(join(dirs.state, 'attempt.json')).then(() => true, () => false);
     const allIdle = idle.lines.length >= 1 && idle.lines.every(l => {
       try { return JSON.parse(l).phase === 'idle'; } catch { return false; }
     });
     const untouched = JSON.stringify(before) === JSON.stringify(after);
-    const claimsDelta = claimsBefore !== null && claimsAfter !== null
-      ? claimsAfter - claimsBefore : null;
-    const bbSpawnsDelta = threadsBefore !== null && threadsAfter !== null
-      ? threadsAfter - threadsBefore : null;
-    const modelCallsDelta = (await readdir(dirs.state))
-      .filter(f => /^(checks|visual|review)-/.test(f)).length - gateFilesBefore;
+    const boardEventsDelta = eventsAfter - eventsBefore;
     proof.idleTick = { lines: idle.lines, exitCode: idle.code, card2Unchanged: untouched,
-      claimsDelta, bbSpawnsDelta, modelCallsDelta };
-    proof.idleTickZeroCalls = idle.code === 0 && allIdle && untouched &&
-      claimsDelta === 0 && bbSpawnsDelta === 0 && modelCallsDelta === 0;
+      attemptCreated, boardEventsDelta, bbCallsDelta, dockerCallsDelta, piCallsDelta };
+    proof.idleTickZeroCalls = idle.code === 0 && allIdle && untouched && !attemptCreated &&
+      boardEventsDelta === 0 && bbCallsDelta === 0 && dockerCallsDelta === 0 && piCallsDelta === 0;
 
     // Кандидаты: по порядку из журналов сдачи (три SHA: база, дефект, финал).
     proof.candidates = seen.submitted;

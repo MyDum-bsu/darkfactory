@@ -15,6 +15,7 @@ function isAllowlist(a) {
   if (typeof key !== 'string' || !key || typeof value !== 'string' || !value) return false;
   if (a.required !== undefined &&
       (!Array.isArray(a.required) || !a.required.every(item => typeof item === 'string' && item))) return false;
+  if (a.repoId !== undefined && (typeof a.repoId !== 'string' || !a.repoId)) return false;
   return true;
 }
 
@@ -40,7 +41,7 @@ function queueFilter(route) {
     finish: route.finish,
     profileId: route.checkProfile,
     required: [...new Set([...CONTRACT_LABELS, ...(route.allowlist.required ?? [])])],
-    ...(route.allowlist.repoId ? { repoId: route.allowlist.repoId } : {}),
+    ...(route.allowlist.repoId !== undefined ? { repoId: route.allowlist.repoId } : {}),
   };
 }
 

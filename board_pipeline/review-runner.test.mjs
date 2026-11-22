@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -911,6 +911,108 @@ test('runner: в контейнер уходит кред без refresh и бе
     assert.equal(cred.access, 'acc-token');
     assert.ok(!String(seen.env.PI_ALLOW_CONNECT).includes('auth.openai.com'),
       `в allow попал auth.openai.com: ${seen.env.PI_ALLOW_CONNECT}`);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+  }
+});
+
+test('runner: истекающий OAuth (<10m) обновляется на хосте до sandbox и перечитывается', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'runner-repo-'));
+  const journal = await mkdtemp(join(tmpdir(), 'runner-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'runner-pi-'));
+  try {
+    const git = async (...args) =>
+      (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
+    await git('init', '-q', '-b', 'pilot');
+    await git('config', 'user.email', 't@l');
+    await git('config', 'user.name', 't');
+    await writeFile(join(repo, 'a.txt'), 'x\n');
+    await git('add', 'a.txt');
+    await git('commit', '-qm', 'cand');
+    const sha = await git('rev-parse', 'HEAD');
+
+    const expiring = { type: 'oauth', access: 'acc-old', refresh: 'rt-old',
+      expires: Date.now() + 60_000, clientId: 'cid' };
+    const authPath = join(piRoot, 'auth.json');
+    const argvLog = join(piRoot, 'pi-argv.json');
+    await writeFile(authPath, JSON.stringify({ openai: expiring }));
+    await mkdir(join(piRoot, 'bin'), { recursive: true });
+    const fakePi = join(piRoot, 'bin', 'pi');
+    await writeFile(fakePi, `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(argvLog)}, JSON.stringify(process.argv.slice(2)));
+fs.writeFileSync(${JSON.stringify(authPath)}, JSON.stringify({
+  openai: { type: 'oauth', access: 'acc-refreshed', refresh: 'rt-rotated',
+    expires: Date.now() + 7200_000, clientId: 'cid' },
+}));
+console.log('acc-refreshed');
+`);
+    await chmod(fakePi, 0o755);
+
+    let cred = null;
+    const stream = [
+      msg({ content: [{ type: 'text', text: '{"verdict":"PASS","summary":"ok"}' }] }),
+      settled,
+    ].join('\n');
+    const runner = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async (opts) => {
+        const cfg = opts.mounts.find((m) => m.dst === '/pi-cfg');
+        const { readFile } = await import('node:fs/promises');
+        cred = JSON.parse(await readFile(join(cfg.src, 'auth.json'), 'utf8')).openai;
+        return { code: 0, stdout: stream, stderr: '' };
+      } });
+    await runner({ task_id: '1', candidate_sha: sha, worktree: repo,
+      executor: 'acp-devin/swe-2-high' }, { review: CRITIC });
+
+    const { readFile } = await import('node:fs/promises');
+    const seenArgv = JSON.parse(await readFile(argvLog, 'utf8'));
+    assert.deepEqual(seenArgv, ['auth', 'print-bearer-token', '--provider', 'openai', '--min-expiry', '10m']);
+    assert.equal(cred.access, 'acc-refreshed');
+    assert.equal(cred.refresh, 'sandbox-redacted');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+  }
+});
+
+test('runner: ошибка host OAuth refresh отклоняет ревью до запуска sandbox', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'runner-repo-'));
+  const journal = await mkdtemp(join(tmpdir(), 'runner-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'runner-pi-'));
+  try {
+    const git = async (...args) =>
+      (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
+    await git('init', '-q', '-b', 'pilot');
+    await git('config', 'user.email', 't@l');
+    await git('config', 'user.name', 't');
+    await writeFile(join(repo, 'a.txt'), 'x\n');
+    await git('add', 'a.txt');
+    await git('commit', '-qm', 'cand');
+    const sha = await git('rev-parse', 'HEAD');
+
+    const expiring = { type: 'oauth', access: 'acc-old', refresh: 'rt-old',
+      expires: Date.now() + 60_000, clientId: 'cid' };
+    await writeFile(join(piRoot, 'auth.json'), JSON.stringify({ openai: expiring }));
+    await mkdir(join(piRoot, 'bin'), { recursive: true });
+    const fakePi = join(piRoot, 'bin', 'pi');
+    await writeFile(fakePi, '#!/bin/sh\necho "invalid_grant" >&2\nexit 1\n');
+    await chmod(fakePi, 0o755);
+
+    let sandboxCalls = 0;
+    const runner = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async () => {
+        sandboxCalls++;
+        return { code: 0, stdout: '', stderr: '' };
+      } });
+    await assert.rejects(
+      () => runner({ task_id: '1', candidate_sha: sha, worktree: repo,
+        executor: 'acp-devin/swe-2-high' }, { review: CRITIC }),
+      (e) => e instanceof ReviewDenied && e.reason === 'review_auth_refresh_failed',
+    );
+    assert.equal(sandboxCalls, 0);
   } finally {
     await rm(repo, { recursive: true, force: true });
     await rm(journal, { recursive: true, force: true });

@@ -922,3 +922,16 @@ test('a dispute is judged by combined findings: prior-round DoD violation blocks
   assert.equal(arbitrations, 0);
   assert.equal((await x.inspect()).state, 'blocked');
 });
+
+test('allowlist rejects empty or null repoId instead of silently dropping filter', async t => {
+  for (const badRepoId of ['', null]) {
+    const x = await lab(t);
+    delete x.cfg.route.taskId;
+    x.cfg.route.allowlist = {
+      owner: 'owner-1',
+      label: { key: 'automation', value: 'vs1' },
+      repoId: badRepoId,
+    };
+    await assert.rejects(() => x.tick(), /A trusted, enrolled route is required/);
+  }
+});
