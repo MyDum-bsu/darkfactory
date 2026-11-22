@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { isolatedArbiterRunner, isolatedPiReviewRunner } from './review-runner.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
-import { NEON_CRITIC, SOL_ARBITER } from './review-policy.mjs';
+import { NEON_CRITIC, NEON_ISOLATION, SOL_ARBITER } from './review-policy.mjs';
 import { makeRepo, commitFile, neonFixture, SPEC } from './review-test-fixture.mjs';
 
 const exec = promisify(execFile);
@@ -91,6 +91,8 @@ test('Neon live: real medium model returns bound REWORK then PASS', async t => {
     assert.equal(receipt.status, status);
     assert.equal(receipt.subject_digest, subject_digest);
     assert.deepEqual(receipt.actual, NEON_CRITIC);
+    assert.equal(receipt.isolation, NEON_ISOLATION);
+    assert.deepEqual(receipt.attestation, { model: 'agy_stream_init', effort: 'agy_cli_request' });
     assert.match(receipt.transcript_sha256, /^[a-f0-9]{64}$/);
   }
 });

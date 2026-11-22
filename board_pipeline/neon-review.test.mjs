@@ -1,106 +1,120 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { lstat, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { promisify } from 'node:util';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
+import { hostAgyTransport } from './agy-transport.mjs';
+import { agyStreamFixture, commitFile, neonFixture } from './review-test-fixture.mjs';
+import agyStream from './agy-stream.cjs';
+import { NEON_ISOLATION } from './review-policy.mjs';
 
-const exec = promisify(execFile);
-const review = { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' };
 const subject_digest = 'a'.repeat(64);
 const verdict = { verdict: 'PASS', subject_digest, summary: 'Matches the spec',
   findings: [], checked_invariants: ['arithmetic'] };
-const providerReply = (result = verdict, meta = {}) => ({
-  modelVersion: 'gemini-4-neon', responseId: 'live-turn',
-  candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify(result) }] } }],
-  ...meta,
-});
+const snapshot = async () => ({ code: 0, stdout: '[{"path":"sum.js","text":"code"}]' });
+const wire = (result = verdict, options) => ({ code: 0, cwd: '/candidate', stdout: agyStreamFixture(result, options) });
 
 async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'neon-review-test-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const journal = join(root, 'journal');
-  const worktree = join(root, 'repo');
-  await mkdir(journal, { mode: 0o700 });
-  await mkdir(worktree);
-  const git = async (...args) => (await exec('git', ['-C', worktree, ...args])).stdout.trim();
-  await git('init', '-q');
-  await git('config', 'user.email', 'test@local');
-  await git('config', 'user.name', 'test');
-  await git('commit', '-qm', 'base', '--allow-empty');
-  const base_sha = await git('rev-parse', 'HEAD');
-  await writeFile(join(worktree, 'sum.js'), 'export const sum = (a,b) => a+b;\n');
-  await git('add', 'sum.js');
-  await git('commit', '-qm', 'candidate');
-  const candidate_sha = await git('rev-parse', 'HEAD');
-  return { journal, binding: { task_id: '9', candidate_sha, base_sha, subject_digest,
-    worktree, executor: 'acp-devin/swe-2-high' }, profile: { review } };
+  const { repo, journal, binding, profile } = await neonFixture(t);
+  const candidate_sha = await commitFile(repo, 'export const sum = (a,b) => a+b;\n');
+  return { journal, binding: { ...binding, candidate_sha, subject_digest }, profile };
 }
 
-const snapshot = async () => ({ code: 0, stdout: '[{"path":"sum.js","text":"code"}]' });
-
-test('Neon ReviewPort separates offline snapshot and authenticated model request', async t => {
+test('Neon ReviewPort separates offline snapshot and Agy model-only request', async t => {
   const { journal, binding, profile } = await fixture(t);
   const runner = isolatedNeonReviewRunner({ journal, prompt: 'approved logika and specification',
-    credential: async () => 'synthetic-key', sandbox: async req => {
-      assert.notEqual(req.snapshot, binding.worktree);
-      assert.equal(req.env, undefined);
-      assert.equal(req.mounts, undefined);
-      assert.match(await readFile(join(req.snapshot, 'sum.js'), 'utf8'), /a\+b/);
+    sandbox: async request => {
+      assert.notEqual(request.snapshot, binding.worktree);
+      assert.equal(request.env, undefined);
+      assert.equal(request.mounts, undefined);
+      assert.match(await readFile(join(request.snapshot, 'sum.js'), 'utf8'), /a\+b/);
       return snapshot();
-    }, request: async (url, options) => {
-      assert.equal(url, 'https://generativelanguage.googleapis.com/v1beta/models/gemini-4-neon:generateContent');
-      assert.equal(options.redirect, 'error');
-      assert.equal(options.headers['x-goog-api-key'], 'synthetic-key');
-      const body = JSON.parse(options.body);
-      assert.equal(body.tools, undefined);
-      assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, 'MEDIUM');
-      assert.match(body.systemInstruction.parts[0].text, /approved logika/);
-      assert.match(body.systemInstruction.parts[0].text, new RegExp(subject_digest));
-      const { diff, files } = JSON.parse(body.contents[0].parts[0].text);
+    }, transport: async ({ prompt }) => {
+      assert.match(prompt, /approved logika/);
+      assert.match(prompt, new RegExp(subject_digest));
+      const { diff, files } = JSON.parse(prompt.split('BEGIN CANDIDATE DATA\n')[1].split('\nEND CANDIDATE DATA')[0]);
       assert.match(diff, /\+export const sum/);
       assert.deepEqual(files, [{ path: 'sum.js', text: 'code' }]);
-      return Response.json(providerReply());
+      return wire();
     } });
   const receipt = await runner(binding, profile);
   assert.equal(receipt.verdict, 'REVIEW_OK');
   assert.equal(receipt.subject_digest, subject_digest);
-  assert.deepEqual(receipt.actual, review);
-  assert.equal(receipt.isolation, 'docker-ro-v1');
+  assert.deepEqual(receipt.actual, profile.review);
+  assert.equal(receipt.isolation, NEON_ISOLATION);
+  assert.deepEqual(receipt.attestation, { model: 'agy_stream_init', effort: 'agy_cli_request' });
   assert.match(receipt.transcript_sha256, /^[a-f0-9]{64}$/);
-  assert.doesNotMatch(await readFile(join(journal, receipt.transcript_file), 'utf8'), /synthetic-key/);
 });
 
-test('Neon refuses incomplete or mismatched evidence and never retries quota errors', async t => {
+test('Neon never retries unavailable, mismatched or tool-using attempts', async t => {
   const { journal, binding, profile } = await fixture(t);
-  const scenarios = [
-    [Response.json(providerReply(verdict, { modelVersion: 'gemini-4-other' })), 'review_model_mismatch'],
-    [Response.json(providerReply({ ...verdict, subject_digest: 'b'.repeat(64) })), 'review_verdict_subject_mismatch'],
-    [Response.json(providerReply(verdict, { candidates: [{ finishReason: 'MAX_TOKENS' }] })), 'review_incomplete_turn'],
-    [Response.json({ error: 'not safe to expose' }, { status: 429 }), 'review_neon_http:429'],
+  const outcomes = [
+    [wire(verdict, { model: 'wrong-model' }), 'agy_init_unattested'],
+    [wire({ ...verdict, subject_digest: 'b'.repeat(64) }), 'review_verdict_subject_mismatch'],
+    [wire(verdict, { step: { step_type: 'tool', tool_info: { name: 'view_file' } } }), 'review_tool_use_forbidden'],
+    [{ code: 1, stderr: 'agy_auth_unavailable\n' }, 'agy_auth_unavailable'],
   ];
-  for (const [response, reason] of scenarios) {
+  for (const [response, reason] of outcomes) {
     let calls = 0;
-    const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot, credential: async () => 'synthetic-key',
-      request: async () => { calls++; return response; } });
+    const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot,
+      transport: async () => { calls++; return response; } });
     await assert.rejects(run(binding, profile), { reason });
     assert.equal(calls, 1);
   }
 });
 
-test('Neon rejects a same-family executor and worktree drift', async t => {
+test('Neon rejects same-family and drifting worktree', async t => {
   const { journal, binding, profile } = await fixture(t);
   let calls = 0;
-  const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot, credential: async () => 'synthetic-key',
-    request: async () => {
-      calls++;
-      await writeFile(join(binding.worktree, 'sum.js'), 'changed during review');
-      return Response.json(providerReply());
-    } });
+  const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot, transport: async () => {
+    calls++;
+    await writeFile(join(binding.worktree, 'sum.js'), 'changed during review');
+    return wire();
+  } });
   await assert.rejects(run({ ...binding, executor: 'google/gemini-4-neon' }, profile),
     { reason: 'review_same_family' });
   assert.equal(calls, 0);
   await assert.rejects(run(binding, profile), { reason: 'worktree_drift_during_review' });
+});
+
+test('Agy transport launches with an empty 0500 directory and never inherits task authority', async t => {
+  const { journal, binding } = await fixture(t);
+  const binary = join(journal, 'synthetic-binary');
+  const scope = join(journal, 'synthetic-scope');
+  await writeFile(binary, '', { mode: 0o500 });
+  await writeFile(scope, 'synthetic-provider-label', { mode: 0o600 });
+  const env = { DF_AGY_BINARY: binary, DF_AGY_SCOPE_FILE: scope, DF_AGY_KEYRING_ITEM: '/org/freedesktop/secrets/collection/login/0',
+    DBUS_SESSION_BUS_ADDRESS: 'unix:path=/nonexistent-session-bus', HTTPS_PROXY: 'http://127.0.0.1:3189',
+    BOARD_TOKEN: 'fake-lease', BOARD_URL: 'http://127.0.0.1:44100/api/board', BB_THREAD_ID: 'thr_fake',
+    WORKTREE: binding.worktree, STATE: journal };
+  await hostAgyTransport({ env, prompt: 'synthetic prompt', launch: async request => {
+    assert.equal((await lstat(request.cwd)).mode & 0o777, 0o500);
+    assert.deepEqual(await readdir(request.cwd), []);
+    for (const key of ['BOARD_TOKEN', 'BOARD_URL', 'BB_THREAD_ID', 'WORKTREE', 'STATE']) {
+      assert.equal(Object.hasOwn(request.env, key), false);
+    }
+    assert.notEqual(request.env.HOME, process.env.HOME);
+    assert.equal(new URL(request.env.HTTPS_PROXY).hostname, '127.0.0.1');
+    await request.sealBootstrap();
+    return { code: 0, cwd: request.cwd };
+  } });
+});
+
+test('Agy watchdog SIGKILLs on a tool step before accepting later output', { timeout: 3000 }, async () => {
+  const attempted = agyStreamFixture(verdict, { step: { step_type: 'tool' } }).split('\n').slice(0, 3).join('\n');
+  const fake = spawn(process.execPath, ['-e', `console.log(${JSON.stringify(attempted)}); setInterval(()=>{},1000)`],
+    { stdio: ['ignore', 'pipe', 'ignore'] });
+  const exit = once(fake, 'close');
+  let released = 0;
+  try {
+    await assert.rejects(agyStream.superviseAgy(fake, exit, { cwd: '/candidate',
+      onInit: () => { released++; }, emit: () => {} }), { reason: 'review_tool_use_forbidden' });
+    assert.equal(released, 1);
+    assert.deepEqual(await exit, [null, 'SIGKILL']);
+  } finally {
+    fake.kill('SIGKILL');
+    await exit;
+  }
 });

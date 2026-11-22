@@ -4,9 +4,8 @@
 //    нет ни для тулов, ни для симлинков, ни для внешних утилит. Креденшельный
 //    код pi получает байты из замыкания — и только если его вызвал именно
 //    креденшельный стек (RuntimeCredentials/ModelsImpl).
-// 2. Egress ограничен allowlist PI_ALLOW_CONNECT + api.openai.com/chatgpt.com:443;
-//    приватные/loopback адреса и порт 44100 отклоняются ДО allowlist — даже
-//    явно разрешённый приватный прокси не пройдёт.
+// 2. Egress is limited to pinned model authorities and the sandbox-local
+//    proxy listener. Its host broker has a separate CONNECT allowlist.
 // 3. child_process ограничен read-only утилитами (rg/grep/find/ls), чтобы
 //    внутри контейнера нельзя было поднять curl/wget/nc/bash/node без гарда.
 const fs = require('fs');
@@ -235,6 +234,7 @@ if (fs.promises) {
 
 const allowEndpoints = new Set((process.env.PI_ALLOW_CONNECT ?? '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+const bridgePort = Number(process.env.DF_MODEL_PROXY_PORT);
 
 function privateHost(host) {
   const h = String(host ?? '').toLowerCase().replace(/^\[|\]$/g, '');
@@ -250,9 +250,10 @@ function privateHost(host) {
 function connectAllowed(host, port) {
   const h = String(host ?? '').toLowerCase();
   const p = Number(port);
-  // Приватное/loopback и порт Board отклоняются ДО allowlist: прокси на
-  // приватном адресе не считается разрешённым даже при явном совпадении.
-  if (p === 44100 || privateHost(h)) return false;
+  if (p === 44100) return false;
+  // This address is inside --network=none, never the host's loopback.
+  if (h === '127.0.0.1' && p === bridgePort && Number.isSafeInteger(p) && p > 0 && p <= 65535) return true;
+  if (privateHost(h)) return false;
   if (allowEndpoints.has(`${h}:${p}`)) return true;
   return (h === 'api.openai.com' || h === 'chatgpt.com') && p === 443;
 }

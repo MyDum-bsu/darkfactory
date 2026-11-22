@@ -2,19 +2,19 @@ import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { unpackExact } from './runtime.mjs';
 import { assertCrossFamily, hasValidFinding, parseReviewVerdict, ReviewDenied, runInReadOnlySandbox,
   snapshotDigest, worktreeFingerprint } from './review-runner.mjs';
-import { isNeonReview, NEON_CRITIC } from './review-policy.mjs';
+import { isNeonReview, NEON_CRITIC, NEON_ISOLATION } from './review-policy.mjs';
+import { hostAgyTransport } from './agy-transport.mjs';
+import agyStream from './agy-stream.cjs';
 
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const INPUT_LIMIT = 1024 * 1024;
-const RESPONSE_LIMIT = 1024 * 1024;
-const NEON_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-4-neon:generateContent';
 const hash = text => createHash('sha256').update(text).digest('hex');
 
 // Runs as fixed code inside the offline snapshot container. Never follows links,
@@ -51,64 +51,10 @@ walk('');
 process.stdout.write(JSON.stringify(files));
 `;
 
-async function googleCredential() {
-  const full = JSON.parse(await readFile(join(homedir(), '.pi', 'agent', 'auth.json'), 'utf8'));
-  return full.google?.type === 'api_key' ? full.google.key : null;
-}
-
-async function boundedResponse(response) {
-  const chunks = [];
-  let bytes = 0;
-  for await (const chunk of response.body) {
-    bytes += chunk.length;
-    if (bytes > RESPONSE_LIMIT) throw new ReviewDenied('review_neon_response_too_large');
-    chunks.push(Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
-
-async function invokeNeon({ request, credential, body, timeoutMs }) {
-  let key;
-  try {
-    key = await credential();
-  } catch (cause) {
-    throw new ReviewDenied('review_neon_auth_unavailable', { cause });
-  }
-  if (typeof key !== 'string' || !key.trim()) throw new ReviewDenied('review_neon_auth_unavailable');
-  const signal = AbortSignal.timeout(timeoutMs);
-  try {
-    const response = await request(NEON_URL, { method: 'POST', redirect: 'error', signal,
-      headers: { 'content-type': 'application/json', 'x-goog-api-key': key }, body });
-    if (!response.ok) {
-      await response.body?.cancel();
-      throw new ReviewDenied(`review_neon_http:${response.status}`);
-    }
-    return await boundedResponse(response);
-  } catch (cause) {
-    if (cause instanceof ReviewDenied) throw cause;
-    throw new ReviewDenied(signal.aborted ? 'review_neon_timeout' : 'review_neon_transport', { cause });
-  }
-}
-
-function neonVerdict(raw, digest) {
-  let response;
-  try { response = JSON.parse(raw); } catch (cause) {
-    throw new ReviewDenied('review_transcript_corrupt', { cause });
-  }
-  if (response?.modelVersion !== NEON_CRITIC.model) throw new ReviewDenied('review_model_mismatch');
-  // Gemini does not normally echo thinkingLevel. The accepted, hashed HTTPS
-  // request records the effective configured level; reject a contradictory echo.
-  if (response.thinkingLevel !== undefined && response.thinkingLevel !== 'MEDIUM') {
-    throw new ReviewDenied('review_effort_mismatch');
-  }
-  const turn = response.candidates?.[0];
-  const parts = turn?.content?.parts;
-  if (typeof response.responseId !== 'string' || !response.responseId.trim() ||
-      !Array.isArray(response.candidates) || response.candidates.length !== 1 || turn?.finishReason !== 'STOP' ||
-      !Array.isArray(parts) || parts.some(part => typeof part?.text !== 'string' || Object.hasOwn(part, 'functionCall'))) {
-    throw new ReviewDenied('review_incomplete_turn');
-  }
-  const text = parts.filter(part => part.thought !== true).map(part => part.text).join('');
+function neonVerdict(response, digest) {
+  // Headless stdout is attested by the in-container watchdog; parse the
+  // model's verdict independently of the stream protocol.
+  const text = /^\s*```(?:json)?\s+([\s\S]*?)```\s*$/i.exec(response)?.[1] ?? response;
   let verdict;
   try { verdict = JSON.parse(text); } catch (cause) {
     throw new ReviewDenied('review_verdict_invalid', { cause });
@@ -133,14 +79,11 @@ function neonBody({ task_id, candidate_sha, subject_digest }, prompt, diff, file
     `Copy this exact subject_digest into the JSON: ${subject_digest}.`,
     prompt,
   ].join('\n');
-  return JSON.stringify({ systemInstruction: { parts: [{ text: system }] },
-    contents: [{ role: 'user', parts: [{ text: JSON.stringify({ diff, files }) }] }],
-    generationConfig: { candidateCount: 1, responseMimeType: 'application/json',
-      thinkingConfig: { thinkingLevel: 'MEDIUM' } } });
+  return `${system}\n\nBEGIN CANDIDATE DATA\n${JSON.stringify({ diff, files })}\nEND CANDIDATE DATA`;
 }
 
 export function isolatedNeonReviewRunner({ journal, prompt = '', timeoutMs = 480_000,
-  sandbox = runInReadOnlySandbox, request = fetch, credential = googleCredential }) {
+  sandbox = runInReadOnlySandbox, transport = hostAgyTransport }) {
   if (!isAbsolute(journal ?? '')) throw new ReviewDenied('review_runner_misconfigured');
   return async (binding, profile) => {
     if (!isNeonReview(profile?.review)) throw new ReviewDenied('review_profile_not_approved');
@@ -166,20 +109,27 @@ export function isolatedNeonReviewRunner({ journal, prompt = '', timeoutMs = 480
       if (run.code !== 0) throw new ReviewDenied(run.code === 3 ? 'review_neon_context_too_large' : 'review_neon_snapshot_failed');
       const body = neonBody(binding, prompt, diff, JSON.parse(run.stdout));
       if (Buffer.byteLength(body) > INPUT_LIMIT) throw new ReviewDenied('review_neon_context_too_large');
-      const raw = await invokeNeon({ request, credential, body, timeoutMs });
-      const transcript = JSON.stringify({ provider: NEON_CRITIC.provider, model: NEON_CRITIC.model,
-        thinkingLevel: 'MEDIUM', effortEvidence: 'accepted_api_request', requestSha256: hash(body), response: raw });
+      const live = await transport({ prompt: body, timeoutMs });
+      if (live.code !== 0) {
+        const reason = (live.stderr ?? '').split('\n').find(line => /^(?:agy_[a-z_]+|review_tool_use_forbidden)$/.test(line));
+        throw new ReviewDenied(reason ?? 'agy_transport_failed');
+      }
+      if (!isAbsolute(live.cwd ?? '')) throw new ReviewDenied('agy_init_unattested');
+      const observed = agyStream.parseAgyStream(live.stdout, live.cwd);
+      if (!isDeepStrictEqual(observed.actual, NEON_CRITIC)) throw new ReviewDenied('review_model_mismatch');
+      const transcript = JSON.stringify({ ...observed.evidence, actual: observed.actual,
+        requestSha256: hash(body), stream: live.stdout });
       const transcript_sha256 = hash(transcript);
       const name = `review-${binding.candidate_sha}-${randomUUID()}.json`;
       await writeFile(join(journal, name), transcript, { mode: 0o600, flag: 'wx' });
-      const verdict = neonVerdict(raw, binding.subject_digest);
+      const verdict = neonVerdict(observed.text, binding.subject_digest);
       if (!isDeepStrictEqual(await snapshotDigest(source), snapshot)) throw new ReviewDenied('snapshot_mutated');
       if (!isDeepStrictEqual(await worktreeFingerprint(binding.worktree), before)) {
         throw new ReviewDenied('worktree_drift_during_review');
       }
       return { ...verdict, task: binding.task_id, sha: binding.candidate_sha, tree_sha: before.tree,
         checkpoint: transcript_sha256.slice(0, 32), transcript_sha256, transcript_file: name,
-        actual: { ...NEON_CRITIC }, isolation: 'docker-ro-v1' };
+        actual: observed.actual, attestation: observed.evidence, isolation: NEON_ISOLATION };
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }

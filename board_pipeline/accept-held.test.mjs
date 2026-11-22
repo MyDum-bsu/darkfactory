@@ -9,7 +9,7 @@ import { acceptHeld } from './acceptance.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
 import { loadSdk } from './sdk.mjs';
-import { NEON_CRITIC, SOL_ARBITER } from './review-policy.mjs';
+import { NEON_CRITIC, NEON_ISOLATION, SOL_ARBITER } from './review-policy.mjs';
 
 const { board, local } = loadSdk();
 
@@ -568,7 +568,7 @@ test('Neon policy requires approved skills, independent Sol and an attested boun
       reviewed++;
       assert.equal(binding.subject_digest, expectedDigest());
       return { task: id, sha: CAND, actual: NEON_CRITIC, verdict: 'REVIEW_OK', checkpoint: 'feed80ab',
-        ...(!legacyReceipt && { isolation: 'docker-ro-v1', subject_digest: binding.subject_digest,
+        ...(!legacyReceipt && { isolation: NEON_ISOLATION, subject_digest: binding.subject_digest,
           transcript_file: 'neon.json', transcript_sha256: createHash('sha256').update(transcript).digest('hex') }) };
     } });
     const result = await acceptHeld({ attempt: contractAttempt(id, epoch, { executor }),

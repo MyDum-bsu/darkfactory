@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
-import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter } from './review-policy.mjs';
+import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter, NEON_ISOLATION } from './review-policy.mjs';
 import { assertTriadIndependent } from './worker-selector.mjs';
 
 const HANDOFF_KEYS = [
@@ -630,7 +630,8 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   const attestationRequired = hasAttestationFields ||
     profile.review?.requireAttestation === true || isNeonReview(profile.review);
   if (attestationRequired) {
-    if (rev.isolation !== 'docker-ro-v1') {
+    const isolation = isNeonReview(profile.review) ? NEON_ISOLATION : 'docker-ro-v1';
+    if (rev.isolation !== isolation) {
       return { status: 'hold', reason: 'review_isolation_missing' };
     }
     if (!SHA256_RE.test(rev.transcript_sha256 ?? '')) {

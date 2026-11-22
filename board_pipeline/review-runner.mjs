@@ -12,6 +12,7 @@ import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { unpackExact } from './runtime.mjs';
+import { withModelProxy } from './model-proxy.mjs';
 
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
@@ -24,28 +25,14 @@ export const REVIEW_IMAGE =
 
 // В контейнер критика монтируются только каталоги кода ~/.pi/agent:
 // sessions/, subagents/ и auth.json исключены — секрет едет копией в tmpfs.
-const PROXY_ENV = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'];
-
-// Дублирует правила pi-guard.cjs на стороне хоста: приватный прокси
-// не должен даже попадать в окружение контейнера.
-function privateProxyHost(hostname) {
-  const h = String(hostname ?? '').toLowerCase().replace(/^\[|\]$/g, '');
-  if (h === 'localhost' || h.endsWith('.localhost') || h === '::1' || h === '::' ||
-      h.startsWith('fe80') || h.startsWith('fc') || h.startsWith('fd')) return true;
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-  if (!m) return false;
-  const [a, b] = m.slice(1).map(Number);
-  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
-}
+const PROXY_BOOTSTRAP = new URL('./model-proxy-client.cjs', import.meta.url).pathname;
 
 const READ_ONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
 
 // Монтируются только каталоги кода; конфиги идут через /pi-cfg копией в tmpfs.
 const PI_MOUNT_DIRS = ['bin', 'install', 'npm'];
 const PI_CONFIG_FILES = ['settings.json', 'models.json', 'models-store.json'];
-// Хостовый httpProxy (обычно loopback-relay) в изолированном песочнике
-// недостижим и не нужен: egress уже ограничен PI_ALLOW_CONNECT и pi-guard.
+// Host proxy URLs (including any credentials) stay in the host broker.
 async function sandboxedPiConfig(file, src) {
   const body = await readFile(src);
   if (file !== 'settings.json') return body;
@@ -459,12 +446,9 @@ export function assertToolsAllowed(toolsAdded) {
   }
 }
 
-// Внутренний вызов команды внутри rootless Docker read-only контура.
-// Публичный раннер всегда работает с --network=none; сеть для модельного
-// вызова включает только piSandbox (дополнительно режется pi-guard.cjs).
-async function sandboxExec({ snapshot, argv, image = REVIEW_IMAGE,
-  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate',
-  modelNetwork = false }) {
+// Both snapshot tools and model clients have an isolated network namespace.
+export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAGE,
+  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate' }) {
   if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length) {
     throw new ReviewDenied('sandbox_request_invalid');
   }
@@ -475,13 +459,8 @@ async function sandboxExec({ snapshot, argv, image = REVIEW_IMAGE,
     throw new ReviewDenied('sandbox_requires_rootless_docker');
   }
   const name = `board-review-${randomUUID()}`;
-  const args = ['run', '--rm', '--name', name, '--pull=never', '--read-only',
+  const args = ['run', '--rm', '--name', name, '--pull=never', '--read-only', '--network=none',
     '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0'];
-  if (modelNetwork) {
-    args.push('--add-host', 'localhost:127.0.0.254');
-  } else {
-    args.push('--network=none');
-  }
   args.push('--tmpfs=/tmp:rw,nosuid,nodev,size=64m', '-e', 'HOME=/tmp',
     '--mount', `type=bind,src=${snapshot},dst=/candidate,readonly`);
   for (const { src, dst } of mounts) {
@@ -511,19 +490,26 @@ async function sandboxExec({ snapshot, argv, image = REVIEW_IMAGE,
   } finally {
     try {
       await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
-    } catch { /* контейнер уже удалён --rm или не стартовал */ }
+    } catch (failure) {
+      if (!String(failure.stderr).includes('No such container')) {
+        throw new ReviewDenied('sandbox_cleanup_failed', { cause: failure });
+      }
+    }
   }
   return { code, stdout, stderr };
 }
 
-// Публичный sandbox-раннер: сеть физически отключена всегда.
-export function runInReadOnlySandbox(opts) {
-  return sandboxExec({ ...opts, modelNetwork: false });
+function runModelInReadOnlySandbox({ allow, argv, env = {}, mounts = [], ...options }) {
+  const { NODE_OPTIONS, ...bootEnv } = env;
+  if (NODE_OPTIONS) bootEnv.DF_CHILD_NODE_OPTIONS = NODE_OPTIONS;
+  return withModelProxy({ allow }, socket => runInReadOnlySandbox({ ...options,
+    argv: ['node', '/model-proxy/client.cjs', ...argv], env: bootEnv,
+    mounts: [...mounts, { src: PROXY_BOOTSTRAP, dst: '/model-proxy/client.cjs' },
+      { src: socket, dst: '/model-proxy/upstream.sock' }] }));
 }
 
-// Внутренний раннер ревьюера: единственный, кому нужен egress модели.
 function piSandbox(opts) {
-  return sandboxExec({ ...opts, modelNetwork: true });
+  return runModelInReadOnlySandbox(opts);
 }
 
 async function sandboxPiCredential(piRoot, provider, kind) {
@@ -619,31 +605,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         const info = await lstat(src).catch(() => null);
         if (info) mounts.push({ src, dst: `/pi-ro/${component}` });
       }
-      // Egress-allowlist для pi-guard: только адрес прокси и публичные
-      // endpoint'ы модели. Прокси на :44100 запрещён до запуска; NO_PROXY
-      // в контейнер не передаётся.
-      const allow = ['api.openai.com:443', 'chatgpt.com:443'];
-      // PI_OFFLINE: pi не скачивает внешние инструменты (fd/rg с github.com)
-      // — иначе egress-allowlist роняет процесс на старте.
-      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1' };
-      for (const key of PROXY_ENV) {
-        const value = process.env[key];
-        if (typeof value !== 'string' || !value) continue;
-        let u;
-        try {
-          u = new URL(value);
-        } catch {
-          throw new ReviewDenied('review_proxy_invalid');
-        }
-        // Прокси на приватном/loopback адресе или порту Board запрещён до
-        // запуска: такой endpoint дал бы контейнеру выход к локальным службам.
-        if (u.port === '44100' || privateProxyHost(u.hostname)) {
-          throw new ReviewDenied('review_proxy_blocked');
-        }
-        env[key] = value;
-        allow.push(`${u.hostname.toLowerCase()}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`);
-      }
-      env.PI_ALLOW_CONNECT = [...new Set(allow)].join(',');
+      const allow = PROVIDER_EGRESS.get(critic.provider) ?? [];
+      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1',
+        PI_ALLOW_CONNECT: allow.join(',') };
 
       const hasDiff = mounts.some((m) => m.dst === '/review/diff.patch');
       const diffLine = hasDiff
@@ -686,8 +650,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         '--no-approve', '--tools', READ_ONLY_TOOLS.join(','),
         '--session-dir', '/tmp/session', instruction];
 
-      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts,
-        timeoutMs });
+      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs });
       if (run.code !== 0) {
         // Сырой вывод — только в приватный журнал (0600), не в причину Board.
         try {
@@ -818,24 +781,9 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
           mounts.push({ src, dst: `/pi-ro/${component}` });
         }
       }
-      const allow = [...(PROVIDER_EGRESS.get(arbiter.provider) ?? [])];
-      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1' };
-      for (const key of PROXY_ENV) {
-        const value = process.env[key];
-        if (typeof value !== 'string' || !value) continue;
-        let u;
-        try {
-          u = new URL(value);
-        } catch {
-          throw new ReviewDenied('arbiter_proxy_invalid');
-        }
-        if (u.port === '44100' || privateProxyHost(u.hostname)) {
-          throw new ReviewDenied('arbiter_proxy_blocked');
-        }
-        env[key] = value;
-        allow.push(`${u.hostname.toLowerCase()}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`);
-      }
-      env.PI_ALLOW_CONNECT = [...new Set(allow)].join(',');
+      const allow = PROVIDER_EGRESS.get(arbiter.provider) ?? [];
+      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1',
+        PI_ALLOW_CONNECT: allow.join(',') };
 
       const instruction = [
         `Independent arbitration for Board #${req.task_id} attempt ${req.attempt_id}.`,
@@ -874,7 +822,7 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
 
       const snapshot = join(scratch, 'empty');
       await mkdir(snapshot);
-      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, timeoutMs });
+      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, allow, timeoutMs });
       if (run.code !== 0) {
         throw new ReviewDenied(`arbiter_runner_exit:${run.code ?? 'timeout'}`);
       }

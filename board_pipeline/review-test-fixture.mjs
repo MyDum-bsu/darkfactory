@@ -6,6 +6,15 @@ import { promisify } from 'node:util';
 import { NEON_CRITIC } from './review-policy.mjs';
 
 const exec = promisify(execFile);
+export function agyStreamFixture(response, { model = NEON_CRITIC.model, step = {} } = {}) {
+  const conversation_id = 'synthetic-review';
+  return [
+    { event: 'init', conversation_id, init: { model, cwd: '/candidate', permission_mode: 'request-review', tools: [] } },
+    { event: 'step_update', step_update: { conversation_id, step_index: 0, state: 'DONE', step_type: 'user_input' } },
+    { event: 'step_update', step_update: { conversation_id, step_index: 1, state: 'DONE', step_type: 'agent_response', ...step } },
+    { event: 'result', result: { conversation_id, status: 'SUCCESS', num_turns: 1, response: JSON.stringify(response) } },
+  ].map(x => JSON.stringify(x)).join('\n');
+}
 export const SPEC = 'Spec: sum.js must export sum(a,b) returning the exact arithmetic sum a+b. ' +
   'The function must not add or subtract a constant. Checked invariant: sum(2,2)===4.';
 
