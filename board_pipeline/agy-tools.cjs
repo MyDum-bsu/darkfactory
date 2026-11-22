@@ -1,7 +1,7 @@
 'use strict';
 
-const { realpathSync } = require('node:fs');
-const { isAbsolute, relative, resolve, sep } = require('node:path');
+const { lstatSync, realpathSync } = require('node:fs');
+const { dirname, isAbsolute, relative, resolve, sep } = require('node:path');
 
 const schemas = new Map([
   ['view_file', ['AbsolutePath', 'StartLine', 'EndLine', 'IsSkillFile']],
@@ -25,7 +25,31 @@ function checkedPath(root, request) {
   // Check the spelling and the raw filesystem resolution separately. Do not
   // normalize away a component before checking what the native tool opens.
   const raw = isAbsolute(request) ? request : `${root}${sep}${request}`;
-  if (!within(root, path) || !within(root, realpathSync(raw))) throw forbidden();
+  let real;
+  try {
+    real = realpathSync(raw);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw forbidden();
+    // Allow verifying that a deleted file inside the snapshot is absent, while
+    // rejecting dangling symlinks and any path whose nearest existing ancestor
+    // resolves outside root.
+    try { lstatSync(raw); throw forbidden(); } catch (stErr) {
+      if (stErr?.code !== 'ENOENT') throw forbidden();
+    }
+    let cur = dirname(raw);
+    while (true) {
+      try {
+        real = realpathSync(cur);
+        break;
+      } catch (ancErr) {
+        if (ancErr?.code !== 'ENOENT') throw forbidden();
+        const parent = dirname(cur);
+        if (parent === cur) throw forbidden();
+        cur = parent;
+      }
+    }
+  }
+  if (!within(root, path) || !within(root, real)) throw forbidden();
   return relative(root, path) || '.';
 }
 

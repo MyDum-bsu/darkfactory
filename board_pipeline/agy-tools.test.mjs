@@ -64,6 +64,28 @@ test('a URL-shaped argument is not a file path even if a matching pathname exist
     { reason: 'review_tool_use_forbidden' });
 });
 
+test('missing files inside the snapshot are permitted for deletion checks, but dangling or outside symlinks are denied', async t => {
+  const { root, snapshot } = await fixture(t);
+  assert.deepEqual(
+    tools.checkSnapshotTool(snapshot, 'view_file', { AbsolutePath: join(snapshot, 'candidate', 'deleted.py') }),
+    { name: 'view_file', path: 'candidate/deleted.py' },
+  );
+  assert.deepEqual(
+    tools.checkSnapshotTool(snapshot, 'read_file', { Path: 'candidate/removed-dir/deleted.py' }),
+    { name: 'read_file', path: 'candidate/removed-dir/deleted.py' },
+  );
+  await symlink(join(root, 'missing-outside.txt'), join(snapshot, 'candidate', 'dangling'));
+  await symlink(root, join(snapshot, 'candidate', 'ext-dir'));
+  for (const bad of [
+    join(snapshot, 'candidate', 'dangling'),
+    join(snapshot, 'candidate', 'ext-dir', 'missing.txt'),
+    join(root, 'missing-outside.txt'),
+  ]) {
+    assert.throws(() => tools.checkSnapshotTool(snapshot, 'read_file', { Path: bad }),
+      { reason: 'review_tool_use_forbidden' });
+  }
+});
+
 test('the trusted pre-tool hook records contained reads and denies traversal before dispatch', async t => {
   const { root, snapshot, outside } = await fixture(t);
   // This standalone test intentionally has no process-group file. Live Agy
