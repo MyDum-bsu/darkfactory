@@ -31,6 +31,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   const visible = () => ({ phase: record.phase, attemptId: record.attemptId,
     epoch: record.epoch, threadId: record.threadId, reason: record.reason, sha: record.sha });
 
+  // Recovery may only reinterpret a rejected first envelope, never create an attempt.
+  const recheck = recheckRejectedHandoff && record?.phase === 'hold' &&
+    record.reason === 'invalid_or_stale_submission' && !record.turnSeq && record.seenShas.length === 0;
+  if (recheckRejectedHandoff && !recheck) return { phase: 'hold', reason: 'no_rejected_handoff_to_recheck' };
   if (!record) {
     if ((await board.lookup(route.taskId)).state !== 'ready') return { phase: 'idle' };
     if (!await authorize('ready')) return { phase: 'hold', reason: 'route_not_authorized' };
@@ -57,9 +61,6 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     }
     return visible();
   }
-  // Compatibility recovery for a pre-block receipt. No check or external effect was attempted.
-  const recheck = recheckRejectedHandoff && record.phase === 'hold' &&
-    record.reason === 'invalid_or_stale_submission' && !record.turnSeq && record.seenShas.length === 0;
   if (TERMINAL.has(record.phase) && !recheck) return visible();
   if (IN_FLIGHT.has(record.phase)) {
     await save({ phase: 'uncertain', reason: `interrupted_${record.phase}` });
@@ -82,6 +83,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   const observation = await submissions.read(attempt, after);
   if (!observation || !Number.isSafeInteger(observation.turnSeq) || observation.turnSeq <= after) return visible();
   const { submission, turnSeq } = observation;
+  // A legacy record remembers its checked SHA, but not which BB turn produced it.
+  if (!after && record.seenShas.length && (!submission || record.seenShas.includes(submission.candidate_sha))) {
+    return visible();
+  }
   const stopWith = async reason => {
     await save({ phase: 'blocking', turnSeq });
     try {

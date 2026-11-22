@@ -110,6 +110,27 @@ test('operator can recheck a previously rejected first envelope on the same held
   assert.equal(x.effects.verify, 1);
 });
 
+test('a recheck without a recorded attempt cannot claim or create a worker', async t => {
+  const x = await lab(t);
+  x.cfg.recheckRejectedHandoff = true;
+  assert.equal((await x.tick()).reason, 'no_rejected_handoff_to_recheck');
+  assert.equal(x.effects.spawn, 0);
+  assert.equal((await x.inspect()).state, 'ready');
+});
+
+test('a legacy record without a turn watermark cannot mistake the old handoff for a new turn', async t => {
+  const x = await lab(t);
+  await x.tick();
+  x.submit('b');
+  await x.tick();
+  const { turnSeq: _old, ...legacy } = await x.cfg.state.load();
+  await x.cfg.state.save(legacy);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.inspect()).state, 'claimed');
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+});
+
 test('lost lease with a still-bound worker neither verifies nor launches a second writer', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
   const x = await lab(t);

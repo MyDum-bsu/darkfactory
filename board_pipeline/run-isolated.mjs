@@ -184,9 +184,11 @@ async function execute() {
   try {
     const deadline = Date.now() + p.waitMs;
     let previous;
+    let recheck = values['recheck-rejected-handoff'];
     while (Date.now() <= deadline) {
       const result = await advance({ route, state, board: port, bb, submissions, verify, authorize,
-        recheckRejectedHandoff: values['recheck-rejected-handoff'] });
+        recheckRejectedHandoff: recheck });
+      recheck = false;
       const line = JSON.stringify(result);
       if (line !== previous) console.log(line);
       previous = line;
