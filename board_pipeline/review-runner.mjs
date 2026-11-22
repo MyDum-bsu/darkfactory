@@ -22,15 +22,16 @@ const CHECKPOINT = /^[0-9a-f]{8,64}$/;
 export const REVIEW_IMAGE =
   'node@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9';
 
-// Только эти компоненты ~/.pi/agent монтируются в контейнер критика:
-// sessions/ и subagents/ исключены — у ревьюера нет чужих сессий.
-const PI_COMPONENTS = ['bin', 'install', 'npm', 'auth.json', 'settings.json',
-  'models.json', 'models-store.json'];
-
-const PROXY_ENV = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY',
-  'https_proxy', 'http_proxy', 'no_proxy'];
+// В контейнер критика монтируются только каталоги кода ~/.pi/agent:
+// sessions/, subagents/ и auth.json исключены — секрет едет копией в tmpfs.
+const PROXY_ENV = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'];
 
 const READ_ONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
+
+// Монтируются только каталоги кода; конфиги идут через /pi-cfg копией в tmpfs.
+const PI_MOUNT_DIRS = ['bin', 'install', 'npm'];
+const PI_CONFIG_FILES = ['settings.json', 'models.json', 'models-store.json'];
+const GUARD_FILE = new URL('./pi-guard.cjs', import.meta.url).pathname;
 
 export class ReviewDenied extends Error {
   constructor(reason) {
@@ -39,19 +40,64 @@ export class ReviewDenied extends Error {
   }
 }
 
-// Семейство по идентификатору harness/провайдера/модели. Строка вида
-// 'acp-devin', 'openai/gpt-6.2-sol' или объект { provider, model }.
+// Строгая таблица разрешённых идентификаторов: provider и model должны быть
+// известны и принадлежать одному семейству. Никакого поиска по подстроке.
+const PROVIDER_FAMILY = new Map([
+  ['acp-devin', 'cognition'],
+  ['acp-zcode-start', 'glm'],
+  ['opencode-go', 'deepseek'],
+  ['openai', 'openai'],
+  ['google', 'google'],
+  ['acp-antigravity-acp', 'google'],
+]);
+const MODEL_FAMILY = new Map([
+  ['swe-2-high', 'cognition'],
+  ['swe-2-medium', 'cognition'],
+  ['swe-2-low', 'cognition'],
+  ['glm-5.3-flash', 'glm'],
+  ['builtin:zai-start-plan\\glm-5.3-flash', 'glm'],
+  ['deepseek-v4.1-flash', 'deepseek'],
+  ['deepseek-v4', 'deepseek'],
+  ['deepseek-reasoner', 'deepseek'],
+  ['gpt-6.2-sol', 'openai'],
+  ['gpt-6.2-astra', 'openai'],
+  ['gpt-6.1-sol', 'openai'],
+  ['gpt-6.1-terra', 'openai'],
+  ['gpt-5.6-sol', 'openai'],
+  ['codex', 'openai'],
+  ['gemini-4-neon', 'google'],
+]);
+
+// Семейство по идентификатору исполнителя/критика. Строка вида 'acp-devin'
+// или 'openai/gpt-6.2-sol', либо объект { provider, model }. Пара
+// provider+model обязана состоять в одном семействе; противоречивая пара
+// и неизвестный id дают null → отказ review_unknown_family.
 export function executorFamily(spec) {
   if (spec === null || spec === undefined) return null;
-  const id = (typeof spec === 'string' ? spec
-    : [spec.provider, spec.model].filter(Boolean).join('/')).toLowerCase();
-  if (!id) return null;
-  if (/acp-devin|swe-2/.test(id)) return 'cognition';
-  if (/acp-zcode-start|glm/.test(id)) return 'glm';
-  if (/deepseek|opencode-go/.test(id)) return 'deepseek';
-  if (/openai|gpt-|codex/.test(id)) return 'openai';
-  if (/gemini|acp-antigravity-acp|google/.test(id)) return 'google';
-  return null;
+  let provider;
+  let model;
+  if (typeof spec === 'string') {
+    const i = spec.indexOf('/');
+    if (i >= 0) {
+      provider = spec.slice(0, i);
+      model = spec.slice(i + 1);
+    } else {
+      provider = spec;
+    }
+  } else if (typeof spec === 'object' && !Array.isArray(spec)) {
+    provider = spec.provider;
+    model = spec.model;
+  } else {
+    return null;
+  }
+  const pf = typeof provider === 'string' && provider !== ''
+    ? PROVIDER_FAMILY.get(provider.toLowerCase()) : undefined;
+  const mf = typeof model === 'string' && model !== ''
+    ? MODEL_FAMILY.get(model.toLowerCase()) : undefined;
+  if (typeof model === 'string' && model !== '') {
+    return pf !== undefined && pf === mf ? pf : null;
+  }
+  return pf ?? null;
 }
 
 // Жёсткий инвариант до любого эффекта: оба семейства известны и различны.
@@ -76,8 +122,10 @@ export function hasValidFinding(findings) {
 }
 
 // Парсинг NDJSON-потока `pi --print --mode json`.
-// Возвращает actual { provider, model, reasoningLevel } каждого ассистентского
-// message_end (все обязаны совпадать), toolsAdded и текст финального сообщения.
+// Возвращает actual { provider, model, reasoningLevel } ассистентских
+// message_end (все обязаны совпадать, включая responseModel/actualModel и
+// providerThinkingLevel/reasoningEffort, когда те присутствуют), объединение
+// ВСЕХ toolsAdded по потоку и текст строго последнего хода.
 export function parseReviewTranscript(ndjson) {
   const events = [];
   for (const line of String(ndjson).split('\n')) {
@@ -88,76 +136,148 @@ export function parseReviewTranscript(ndjson) {
       throw new ReviewDenied('review_transcript_corrupt');
     }
   }
-  let toolsAdded = null;
+  const tools = new Set();
   const noteTools = (list) => {
     if (Array.isArray(list)) {
-      toolsAdded = list.map(t => typeof t === 'string' ? t : t?.name);
+      for (const t of list) tools.add(typeof t === 'string' ? t : t?.name);
     }
   };
   const seen = [];
-  let finalText = '';
-  let responseId = null;
+  let hasError = false;
+  let aborted = false;
   for (const event of events) {
     noteTools(event?.toolsAdded);
     if (event?.type === 'session_info') noteTools(event.data?.toolsAdded);
     if (event?.type === 'agent_end') noteTools(event.messages?.[0]?.toolsAdded);
+    if (event?.type === 'error' || event?.type === 'auto_retry_end' && event.success === false) {
+      hasError = true;
+    }
+    if (event?.type === 'agent_settled' && event.aborted === true) aborted = true;
     if (event?.type !== 'message_end') continue;
     const message = event.message ?? event.data?.message;
     if (message?.role !== 'assistant') continue;
+    const parts = Array.isArray(message.content) ? message.content : [];
+    const text = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
     seen.push({
       provider: message.provider,
       model: message.model,
       reasoningLevel: message.thinkingLevel,
+      responseModel: message.responseModel ?? message.actualModel ??
+        message.usage?.responseModel ?? message.metadata?.responseModel,
+      effort: message.providerThinkingLevel ?? message.reasoningEffort ??
+        message.usage?.providerThinkingLevel ?? message.metadata?.reasoningEffort,
+      stopReason: message.stopReason,
+      rawStopReason: message.rawStopReason,
+      responseId: message.responseId,
+      text,
     });
-    responseId = message.responseId ?? responseId;
-    const parts = Array.isArray(message.content) ? message.content : [];
-    const text = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
-    if (text.trim()) finalText = text;
   }
   if (seen.length === 0) throw new ReviewDenied('review_transcript_empty');
   const actual = seen[0];
   for (const msg of seen) {
     if (msg.provider !== actual.provider || msg.model !== actual.model ||
-        msg.reasoningLevel !== actual.reasoningLevel) {
-      throw new ReviewDenied('review_model_switch');
+        (msg.responseModel !== undefined && msg.responseModel !== actual.model) ||
+        (actual.responseModel !== undefined && msg.responseModel !== undefined &&
+          msg.responseModel !== actual.responseModel)) {
+      throw new ReviewDenied('review_model_mismatch');
+    }
+    if (msg.reasoningLevel !== actual.reasoningLevel ||
+        (msg.effort !== undefined && msg.effort !== actual.reasoningLevel)) {
+      throw new ReviewDenied('review_effort_mismatch');
     }
   }
-  return { actual, seen, toolsAdded, finalText, responseId, events };
+  // Только последний ход определяет вердикт: оборванный/пустой финал — отказ,
+  // текст из более ранних ходов не засчитывается.
+  const last = seen.at(-1);
+  const toolsAdded = tools.size ? [...tools] : null;
+  if (hasError || aborted || last.stopReason !== 'stop' ||
+      (last.rawStopReason !== undefined && last.rawStopReason !== 'completed') ||
+      !last.text.trim()) {
+    throw new ReviewDenied('review_incomplete_turn');
+  }
+  return {
+    actual: { provider: actual.provider, model: actual.model,
+      reasoningLevel: actual.reasoningLevel },
+    seen, toolsAdded, finalText: last.text, responseId: last.responseId, events,
+  };
 }
 
-// Извлечение вердикта критика: канонический JSON-блок или legacy-строки
-// REVIEW_OK / REVIEW_BLOCKED. Возвращает каноническую форму:
-// { status: PASS|REWORK|ESCALATE, verdict, summary, findings, checked_invariants, excerpt }.
+// Сканер сбалансированных JSON-объектов: извлекает верхнеуровневые {...}
+// из свободного текста (включая fenced-блоки), игнорируя скобки внутри строк.
+function extractJsonObjects(body) {
+  const objects = [];
+  const s = String(body);
+  let depth = 0;
+  let start = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) objects.push(s.slice(start, i + 1));
+      if (depth < 0) depth = 0;
+    }
+  }
+  return objects;
+}
+
+// Извлечение вердикта критика: ровно один JSON-объект с полем verdict либо
+// legacy-маркер строго в первой/последней непустой строке.
+// Возвращает { status: PASS|REWORK|ESCALATE, verdict, summary, findings,
+// checked_invariants, excerpt, subject_digest }.
 export function parseReviewVerdict(text) {
   const body = String(text ?? '');
-  // Сначала структурированный вердикт: последний JSON-объект с полем verdict.
-  const candidates = [];
-  const fenced = /```(?:json)?\s*\n([\s\S]*?)```/g;
-  let m;
-  while ((m = fenced.exec(body)) !== null) candidates.push(m[1]);
-  candidates.push(body.slice(Math.max(0, body.lastIndexOf('{'))));
-  for (const chunk of candidates.reverse()) {
+  const verdictObjects = [];
+  for (const chunk of extractJsonObjects(body)) {
     let parsed;
     try {
-      parsed = JSON.parse(chunk.trim());
+      parsed = JSON.parse(chunk);
     } catch {
       continue;
     }
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) ||
-        typeof parsed.verdict !== 'string') continue;
-    return canonicalVerdict(parsed);
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) &&
+        typeof parsed.verdict === 'string') {
+      verdictObjects.push(parsed);
+    }
   }
-  // Legacy-формат: ровно одна строка вердикта в конце ответа.
-  const lines = body.split(/\r?\n/);
-  const verdicts = lines.map(l => l.trim()).filter(l => ['REVIEW_OK', 'REVIEW_BLOCKED'].includes(l));
-  if (verdicts.length === 1) {
-    const status = verdicts[0] === 'REVIEW_OK' ? 'PASS' : 'REWORK';
+  const markerLines = body.split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l === 'REVIEW_OK' || l === 'REVIEW_BLOCKED');
+  if (verdictObjects.length > 1 ||
+      (verdictObjects.length === 0 && new Set(markerLines).size > 1)) {
+    throw new ReviewDenied('review_ambiguous_verdict');
+  }
+  if (verdictObjects.length === 1) {
+    return canonicalVerdict(verdictObjects[0]);
+  }
+  // Legacy-формат: маркер принимается только в первой или последней непустой
+  // строке — упоминание в середине ответа вердиктом не является.
+  const nonEmpty = body.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const edge = [nonEmpty[0], nonEmpty.at(-1)]
+    .filter(l => l === 'REVIEW_OK' || l === 'REVIEW_BLOCKED');
+  if (edge.length === 1 || (edge.length === 2 && edge[0] === edge[1])) {
+    const verdict = edge[0];
+    const status = verdict === 'REVIEW_OK' ? 'PASS' : 'REWORK';
     const excerpt = status === 'REWORK'
-      ? lines.filter(l => !['REVIEW_OK', 'REVIEW_BLOCKED'].includes(l.trim()))
+      ? nonEmpty.filter(l => l !== verdict)
         .join('\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').trim().slice(0, 1400)
       : undefined;
-    return { status, verdict: verdicts[0], summary: '', findings: [],
-      checked_invariants: [], excerpt };
+    if (status === 'REWORK' && !excerpt) {
+      throw new ReviewDenied('review_objection_missing');
+    }
+    return { status, verdict, summary: '', findings: [], checked_invariants: [],
+      excerpt, subject_digest: undefined };
   }
   throw new ReviewDenied('review_verdict_missing');
 }
@@ -173,22 +293,29 @@ const STATUS_MAP = {
 function canonicalVerdict(parsed) {
   const mapped = STATUS_MAP[parsed.verdict];
   if (!mapped) throw new ReviewDenied('review_verdict_unknown');
-  const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
+  const findings = Array.isArray(parsed.findings)
+    ? parsed.findings.filter(f => f !== null && typeof f === 'object' && !Array.isArray(f))
+    : [];
   const summary = typeof parsed.summary === 'string' ? parsed.summary : '';
-  const excerpt = nonEmpty(parsed.excerpt) ? parsed.excerpt.trim().slice(0, 1400)
-    : hasValidFinding(findings)
-      ? findings.filter(validFinding).map(f =>
+  // REWORK никогда не берёт возражение из summary: только явный excerpt
+  // или валидный finding с file/expected/actual.
+  const excerpt = mapped.status !== 'PASS'
+    ? (nonEmpty(parsed.excerpt) ? parsed.excerpt.trim().slice(0, 1400)
+      : findings.filter(validFinding).map(f =>
           `${f.file}${f.line ? `:${f.line}` : ''}: expected ${f.expected}, actual ${f.actual}`)
-          .join('\n').slice(0, 1400)
-      : nonEmpty(summary) ? summary.trim().slice(0, 1400)
-      : '';
+          .join('\n').slice(0, 1400) || undefined)
+    : undefined;
+  if (mapped.status === 'REWORK' && !excerpt) {
+    throw new ReviewDenied('review_objection_missing');
+  }
   return {
     ...mapped,
     summary,
-    findings: findings.filter(f => f !== null && typeof f === 'object' && !Array.isArray(f)),
+    findings,
     checked_invariants: Array.isArray(parsed.checked_invariants)
       ? parsed.checked_invariants.filter(nonEmpty) : [],
-    excerpt: mapped.status === 'PASS' ? undefined : (excerpt || undefined),
+    excerpt,
+    subject_digest: typeof parsed.subject_digest === 'string' ? parsed.subject_digest : undefined,
   };
 }
 
@@ -235,12 +362,58 @@ async function verifySnapshotUnchanged(source, before) {
   }
 }
 
-// Универсальный вызов команды внутри rootless Docker read-only контура:
-// точная архитектура, подтверждённая живым [VERIFY] на хосте.
-// argv — команда внутри контейнера; env — allowlist env; mounts — дополнительные
-// read-only bind-монтирования поверх обязательного снимка /candidate.
+async function gitRaw(worktree, ...args) {
+  return (await exec('git', ['-C', worktree, ...args],
+    { timeout: 20_000, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 })).stdout;
+}
+
+// Полный отпечаток рабочего дерева: HEAD, дерево HEAD, статус, байтовый diff
+// и SHA-256 содержимого всех изменённых/untracked файлов — правка уже
+// модифицированного файла во время L2 обязана менять fingerprint.
+export async function worktreeFingerprint(worktree) {
+  const head = await git(worktree, 'rev-parse', 'HEAD');
+  const tree = await git(worktree, 'rev-parse', 'HEAD^{tree}');
+  const status = await gitRaw(worktree, 'status', '--porcelain=v1', '-z', '--untracked-files=all');
+  const diff = await gitRaw(worktree, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', 'HEAD');
+  const paths = status.toString('utf8').split('\0').filter(Boolean).map(e => e.slice(3)).sort();
+  const filesHash = createHash('sha256');
+  for (const rel of paths) {
+    filesHash.update(rel + '\0');
+    let bytes = null;
+    try {
+      bytes = await readFile(join(worktree, rel));
+    } catch { /* файл удалён или недоступен — сам факт фиксируем */ }
+    filesHash.update(bytes ?? '<absent>');
+  }
+  return {
+    head, tree,
+    status: createHash('sha256').update(status).digest('hex'),
+    diff: createHash('sha256').update(diff).digest('hex'),
+    files: filesHash.digest('hex'),
+  };
+}
+
+function sameFingerprint(a, b) {
+  return a.head === b.head && a.tree === b.tree && a.status === b.status &&
+    a.diff === b.diff && a.files === b.files;
+}
+
+// Объединённые toolsAdded должны быть подмножеством read-only набора.
+export function assertToolsAllowed(toolsAdded) {
+  for (const tool of toolsAdded ?? []) {
+    if (!READ_ONLY_TOOLS.includes(tool)) {
+      throw new ReviewDenied(`review_forbidden_tool:${tool}`);
+    }
+  }
+}
+
+// Универсальный вызов команды внутри rootless Docker read-only контура.
+// Сеть по умолчанию отключена (--network=none); allowModelNetwork:true
+// включает egress только для модельного вызова (дополнительно режется
+// pi-guard.cjs внутри процесса) и уводит 'localhost' с loopback-адреса.
 export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAGE,
-  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate' }) {
+  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate',
+  allowModelNetwork = false }) {
   if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length) {
     throw new ReviewDenied('sandbox_request_invalid');
   }
@@ -252,9 +425,14 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   }
   const name = `board-review-${randomUUID()}`;
   const args = ['run', '--rm', '--name', name, '--pull=never', '--read-only',
-    '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0',
-    '--tmpfs=/tmp:rw,nosuid,nodev,size=64m', '-e', 'HOME=/tmp',
-    '--mount', `type=bind,src=${snapshot},dst=/candidate,readonly`];
+    '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0'];
+  if (allowModelNetwork) {
+    args.push('--add-host', 'localhost:127.0.0.254');
+  } else {
+    args.push('--network=none');
+  }
+  args.push('--tmpfs=/tmp:rw,nosuid,nodev,size=64m', '-e', 'HOME=/tmp',
+    '--mount', `type=bind,src=${snapshot},dst=/candidate,readonly`);
   for (const { src, dst } of mounts) {
     if (!isAbsolute(src ?? '') || !isAbsolute(dst ?? '')) {
       throw new ReviewDenied('sandbox_mount_invalid');
@@ -319,24 +497,60 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // Контрольные значения ДО запуска: дерево, байты снимка и worktree.
       const treeSha = await git(binding.worktree, 'rev-parse', `${binding.candidate_sha}^{tree}`);
       const before = await snapshotDigest(source);
-      const headBefore = await git(binding.worktree, 'rev-parse', 'HEAD');
-      const dirtyBefore = await git(binding.worktree, 'status', '--porcelain=v1', '--untracked-files=all');
+      const fpBefore = await worktreeFingerprint(binding.worktree);
 
-      // Монтирования критика: только необходимые компоненты ~/.pi/agent,
-      // без sessions/ и subagents/. Worktree, state/, Board — отсутствуют.
-      const mounts = [];
-      for (const component of PI_COMPONENTS) {
+      // Монтирования критика: только каталоги кода ~/.pi/agent — ни sessions/,
+      // ни auth.json на диске контейнера. Конфиги собираются в /pi-cfg и
+      // копируются в tmpfs /tmp/.pi/agent: auth.json содержит ТОЛЬКО запись
+      // одного провайдера критика и уничтожается pi-guard после первого чтения.
+      const cfgDir = join(scratch, 'pi-cfg');
+      await mkdir(cfgDir, { mode: 0o700 });
+      const fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
+      const credential = fullAuth?.[critic.provider];
+      if (credential === undefined || credential === null) {
+        throw new ReviewDenied('review_auth_missing');
+      }
+      await writeFile(join(cfgDir, 'auth.json'),
+        JSON.stringify({ [critic.provider]: credential }));
+      for (const file of PI_CONFIG_FILES) {
+        const src = join(piRoot, file);
+        if (await lstat(src).catch(() => null)) {
+          await writeFile(join(cfgDir, file), await readFile(src));
+        }
+      }
+      const mounts = [
+        { src: cfgDir, dst: '/pi-cfg' },
+        { src: GUARD_FILE, dst: '/pi-guard/pi-guard.cjs' },
+      ];
+      for (const component of PI_MOUNT_DIRS) {
         const src = join(piRoot, component);
         const info = await lstat(src).catch(() => null);
         if (info) mounts.push({ src, dst: `/pi-ro/${component}` });
       }
-      const env = {};
+      // Egress-allowlist для pi-guard: только адрес прокси и публичные
+      // endpoint'ы модели. Прокси на :44100 запрещён до запуска; NO_PROXY
+      // в контейнер не передаётся.
+      const allow = ['api.openai.com:443', 'chatgpt.com:443'];
+      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs' };
       for (const key of PROXY_ENV) {
-        if (typeof process.env[key] === 'string' && process.env[key]) {
-          env[key] = process.env[key];
+        const value = process.env[key];
+        if (typeof value !== 'string' || !value) continue;
+        let u;
+        try {
+          u = new URL(value);
+        } catch {
+          throw new ReviewDenied('review_proxy_invalid');
         }
+        if (u.port === '44100') throw new ReviewDenied('review_proxy_blocked');
+        env[key] = value;
+        allow.push(`${u.hostname.toLowerCase()}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`);
       }
+      env.PI_ALLOW_CONNECT = [...new Set(allow)].join(',');
 
+      const subjectLine = binding.subject_digest
+        ? `The required subject_digest for this candidate is "${binding.subject_digest}". ` +
+          'Include "subject_digest":"<that value>" inside the verdict JSON.'
+        : '';
       const instruction = [
         `Independent, read-only review for Board #${binding.task_id} at ${binding.candidate_sha}.`,
         'The candidate tree is mounted read-only at /candidate. Review the diff and the tree',
@@ -344,19 +558,22 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         'Finish with exactly one verdict: a JSON code block {"verdict":"PASS"|"REWORK"|"ESCALATE",',
         '"summary":"...","findings":[{"file","line","input","expected","actual","freq","harm"}],',
         '"checked_invariants":["..."]}, or a final line REVIEW_OK or REVIEW_BLOCKED.',
-        'REWORK requires at least one concrete finding (file, expected, actual).',
+        'A REWORK verdict is rejected unless "findings" contains at least one object',
+        'with non-empty "file", "expected" and "actual" (or an explicit "excerpt" string).',
+        subjectLine,
         '',
         prompt,
       ].join('\n');
 
-      // Каталоги pi — симлинки на read-only монтирования; конфиги копируются
-      // в tmpfs, потому что pi кладёт <name>.lock рядом с auth.json/settings.json.
+      // Каталоги pi — симлинки на read-only монтирования кода; конфиги
+      // копируются в tmpfs (pi кладёт <name>.lock рядом), guard — в /tmp.
       const piArgv = ['/bin/sh', '-c',
-        'mkdir -p /tmp/.pi/agent; ' +
+        'mkdir -p /tmp/.pi/agent /tmp/session; ' +
         'for f in bin install npm; do ' +
         '[ -e "/pi-ro/$f" ] && ln -s "/pi-ro/$f" "/tmp/.pi/agent/$f"; done; ' +
         'for f in auth.json settings.json models.json models-store.json; do ' +
-        '[ -e "/pi-ro/$f" ] && cp "/pi-ro/$f" "/tmp/.pi/agent/$f"; done; ' +
+        '[ -e "/pi-cfg/$f" ] && cp "/pi-cfg/$f" "/tmp/.pi/agent/$f"; done; ' +
+        'cp /pi-guard/pi-guard.cjs /tmp/pi-guard.cjs; ' +
         'exec /pi-ro/bin/pi "$@"', 'pi',
         '--print', '--mode', 'json',
         '--provider', critic.provider, '--model', critic.model,
@@ -365,7 +582,8 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         '--no-approve', '--tools', READ_ONLY_TOOLS.join(','),
         '--session-dir', '/tmp/session', instruction];
 
-      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, timeoutMs });
+      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts,
+        timeoutMs, allowModelNetwork: true });
       if (run.code !== 0) {
         throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
       }
@@ -381,20 +599,17 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           throw new ReviewDenied(`review_${key}_mismatch`);
         }
       }
-      if (parsed.toolsAdded !== null &&
-          !parsed.toolsAdded.every(t => READ_ONLY_TOOLS.includes(t))) {
-        throw new ReviewDenied('review_tools_violation');
-      }
+      assertToolsAllowed(parsed.toolsAdded);
       const verdict = parseReviewVerdict(parsed.finalText);
-      if (verdict.status === 'REWORK' && !hasValidFinding(verdict.findings) &&
-          !nonEmpty(verdict.excerpt)) {
-        throw new ReviewDenied('review_objection_missing');
+      if (verdict.subject_digest !== undefined && binding.subject_digest &&
+          verdict.subject_digest !== binding.subject_digest) {
+        throw new ReviewDenied('review_verdict_subject_mismatch');
       }
 
       // После завершения: снимок и worktree обязаны быть побайтово неизменны.
       await verifySnapshotUnchanged(source, before);
-      if (await git(binding.worktree, 'rev-parse', 'HEAD') !== headBefore ||
-          await git(binding.worktree, 'status', '--porcelain=v1', '--untracked-files=all') !== dirtyBefore ||
+      const fpAfter = await worktreeFingerprint(binding.worktree);
+      if (!sameFingerprint(fpBefore, fpAfter) ||
           await git(binding.worktree, 'rev-parse', `${binding.candidate_sha}^{tree}`) !== treeSha) {
         throw new ReviewDenied('worktree_drift_during_review');
       }
@@ -407,7 +622,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         task: binding.task_id,
         sha: binding.candidate_sha,
         tree_sha: treeSha,
-        subject_digest: binding.subject_digest ?? undefined,
+        subject_digest: binding.subject_digest ?? null,
         verdict: verdict.verdict,
         status: verdict.status,
         summary: verdict.summary,

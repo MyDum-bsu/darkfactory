@@ -12,7 +12,7 @@ import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
-import { isolatedPiReviewRunner } from './review-runner.mjs';
+import { assertCrossFamily, isolatedPiReviewRunner } from './review-runner.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 
 const exec = promisify(execFile);
@@ -57,6 +57,16 @@ async function execute() {
   if (p.version !== route.policyVersion || !p.owner || !p.label?.key || !p.label?.value ||
       !p.profiles?.[route.checkProfile]?.branch) throw new Error('Incomplete enrolled policy');
   if (!Number.isSafeInteger(p.waitMs) || p.waitMs < 1) throw new Error('Configure the pilot wait time');
+  // Кросс-семейственный инвариант до claim и spawn: исполнитель и критик из
+  // закреплённой политики обязаны принадлежать разным известным семействам.
+  const assertFamilies = () => {
+    try {
+      assertCrossFamily(p.bb, p.profiles?.[route.checkProfile]?.review);
+    } catch (e) {
+      throw new Error(`review_family_check:${e.reason ?? e.message}`);
+    }
+  };
+  assertFamilies();
 
   delete process.env.BOARD_TOKEN;
   process.env.BOARD_URL = p.boardUrl;
@@ -67,6 +77,7 @@ async function execute() {
   const record = join(root, 'attempt.json');
   const authorize = async (state, taskId) => {
     await assertPinned();
+    assertFamilies();
     const git = async (...args) => (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
     // В queue-режиме на фазе 'ready' карточки ещё нет — allowlist-допуск делает claimReady
     // адаптера; при известной карточке сверяем владельца, метку и состояние нативно.
@@ -165,7 +176,8 @@ async function execute() {
     if (!profile) throw new Error('Missing approved checks');
     const policy = { version: p.version, digest: await fingerprint(), profiles: { [attempt.check_profile]: { ...profile,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
-      executor: { provider: p.bb.provider, model: p.bb.model } } } };
+      executor: { provider: p.bb.provider, model: p.bb.model },
+      review: { ...profile.review, requireAttestation: true } } } };
     let lost = false;
     let renewal = Promise.resolve();
     const timer = setInterval(() => {

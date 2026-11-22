@@ -393,7 +393,7 @@ function compactEvidence(evidence, run) {
 
 // Один общий механизм Git-снимка, проверок и ревью для ручного v1 и для приёмки по аренде.
 // Возвращает verified | rework (исправимый дефект) | hold (среда/неизвестный эффект).
-async function runVerification({ binding, profile, ports, intent, step, beforeReview, onSnapshot, subjectDigest }) {
+async function runVerification({ binding, profile, ports, intent, step, beforeReview, onSnapshot, subjectDigest, journal }) {
   await intent('inspect');
   let ins;
   try {
@@ -534,7 +534,10 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   await intent('review');
   let rev;
   try {
-    rev = await ports.review(binding, profile);
+    // Рецензент получает subject_digest манифеста в запросе; квитанция обязана
+    // вернуть тот же digest (проверка ниже).
+    const digestForReview = typeof subjectDigest === 'function' ? subjectDigest() : null;
+    rev = await ports.review({ ...binding, subject_digest: digestForReview }, profile);
     await step('review', true, rev);
   } catch (e) {
     await step('review', false, messageOf(e));
@@ -548,16 +551,41 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     if (actual[key] !== expected) return { status: 'hold', reason: `review_${key}_mismatch` };
   }
   if (!/^[0-9a-f]{8,64}$/.test(rev.checkpoint ?? '')) return { status: 'hold', reason: 'review_unconfirmed' };
-  // Расширенный ReviewReceipt (review-runner.mjs) несёт доказательства сверх
-  // legacy-ответа board-review.mjs: subject_digest манифеста и хэш транскрипта.
-  if (rev.isolation !== undefined || rev.transcript_sha256 !== undefined ||
-      rev.subject_digest !== undefined) {
+  // Аттестация ревью: расширенный ReviewReceipt обязан нести полный набор
+  // доказательств — изоляцию docker-ro-v1, валидный sha256 транскрипта и
+  // реальный файл транскрипта в журнале, чей байтовый хэш сверяется здесь.
+  // Полный набор обязателен также, когда манифест закреплён и профиль включил
+  // requireAttestation — подмена legacy-квитанцией не проходит.
+  const hasAttestationFields = rev.isolation !== undefined ||
+    rev.transcript_sha256 !== undefined || rev.transcript_file !== undefined ||
+    rev.status !== undefined || rev.findings !== undefined;
+  const digestNow = typeof subjectDigest === 'function' ? subjectDigest() : null;
+  const attestationRequired = hasAttestationFields ||
+    (digestNow !== null && profile.review?.requireAttestation === true);
+  if (attestationRequired) {
+    if (rev.isolation !== 'docker-ro-v1') {
+      return { status: 'hold', reason: 'review_isolation_missing' };
+    }
     if (!SHA256_RE.test(rev.transcript_sha256 ?? '')) {
       return { status: 'hold', reason: 'review_transcript_missing' };
     }
-    const digestNow = typeof subjectDigest === 'function' ? subjectDigest() : null;
+    const transcriptName = rev.transcript_file;
+    if (typeof transcriptName !== 'string' ||
+        !/^[A-Za-z0-9_.-]{1,200}$/.test(transcriptName) || journal === undefined) {
+      return { status: 'hold', reason: 'review_transcript_missing' };
+    }
+    let transcriptBytes;
+    try {
+      transcriptBytes = await readFile(path.join(journal, transcriptName));
+    } catch {
+      return { status: 'hold', reason: 'review_transcript_mismatch' };
+    }
+    if (createHash('sha256').update(transcriptBytes).digest('hex') !== rev.transcript_sha256) {
+      return { status: 'hold', reason: 'review_transcript_mismatch' };
+    }
     if (digestNow === null) {
-      if (!SHA256_RE.test(rev.subject_digest ?? '')) {
+      if (rev.subject_digest !== undefined && rev.subject_digest !== null &&
+          !SHA256_RE.test(rev.subject_digest)) {
         return { status: 'hold', reason: 'review_subject_missing' };
       }
     } else if (rev.subject_digest !== digestNow) {
@@ -707,7 +735,8 @@ export async function accept({ handoff, policy, journal, ports }) {
     return finish('denied', { reason: `claim_failed:${e?.message ?? e}` });
   }
 
-  const verdict = await runVerification({ binding: handoff, profile, ports, intent, step });
+  const verdict = await runVerification({ binding: handoff, profile, ports, intent, step,
+    journal, subjectDigest: () => null });
   if (verdict.status !== 'verified') return block(verdict.reason, epoch);
   const { loc, review: rev, actual, tamper, visual } = verdict;
 
@@ -966,7 +995,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   const verdict = await runVerification({ binding, profile, ports, intent, step,
     beforeReview: () => ports.board.verifyHeld(attempt.task_id, attempt.epoch),
     onSnapshot: finalizeSubject,
-    subjectDigest: () => digest });
+    subjectDigest: () => digest,
+    journal });
   if (verdict.status === 'lost') return settle('denied', { reason: verdict.reason });
 
   if (verdict.status === 'rework') {
