@@ -47,13 +47,15 @@ export function prepareReview(request, configured) {
   return { policy, preset, task: request.task, sha: request.sha, source: request.source };
 }
 
-export function reviewerArguments(job, scope, promptFile) {
+export function reviewerArguments(job, scope, promptFile, permissionMode) {
   requireThat(/^proj_[a-z0-9]+$/.test(scope.projectId ?? '') && /^env_[a-z0-9]+$/.test(scope.environmentId ?? ''),
     'review requires an existing BB project and environment');
   const preset = jobPreset(job);
+  requireThat(permissionMode === undefined || permissionMode === 'accept-edits', 'unsupported explicit review mode');
+  const modeArgs = permissionMode === undefined ? [] : ['--permission-mode',permissionMode];
   return ['thread','spawn','--project',scope.projectId,'--environment',scope.environmentId,
     '--parent-thread',job.source,'--parent-notifications','off', '--provider',preset.provider,'--model',preset.model,
-    '--reasoning-level',preset.reasoningLevel,'--permission-mode','accept-edits','--title',`Ревью #${job.task} · ${job.sha.slice(0,7)}`,
+    '--reasoning-level',preset.reasoningLevel,...modeArgs,'--title',`Ревью #${job.task} · ${job.sha.slice(0,7)}`,
     '--prompt-file',promptFile,'--json'];
 }
 
@@ -169,7 +171,7 @@ async function start(values) {
   try { await saveNew(receipt,intent); }
   catch (error) { if (error.code==='EEXIST') throw new Error('launch already exists for this task and revision; do not retry blindly'); throw error; }
   await writeFile(prompt, `Independent, read-only review for Board #${plan.task} at ${plan.sha}. No writes, subagents, other providers, CI or release actions. Finish with exactly one verdict line: REVIEW_OK or REVIEW_BLOCKED.\n\n${body}\n`, { flag:'wx',mode:0o600 });
-  const spawned = bb(...reviewerArguments(plan,scope,prompt));
+  const spawned = bb(...reviewerArguments(plan,scope,prompt,values['permission-mode']));
   requireThat(THREAD_ID.test(spawned.id ?? ''), 'BB launch did not return a thread ID; reconcile before retrying');
   const launched = { ...intent, phase:'launched', threadId:spawned.id };
   const temp=receipt+'.tmp';
@@ -203,7 +205,9 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href===import.meta.url) {
     const [op,...args]=process.argv.slice(2);
     requireThat(op==='launch'||op==='verify','usage: board-review.mjs launch|verify --task ID --sha SHA');
     const options={task:{type:'string'},sha:{type:'string'}};
-    if (op==='launch') for (const key of ['source','prompt-file','provider','model','reasoning-level']) options[key]={type:'string'};
+    if (op==='launch') for (const key of ['source','prompt-file','provider','model','reasoning-level','permission-mode']) {
+      options[key]={type:'string'};
+    }
     else options.publish={type:'boolean'};
     const {values}=parseArgs({args,options});
     const result=op==='launch'?await start(values):await verify(values);

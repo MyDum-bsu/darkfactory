@@ -32,7 +32,11 @@ test('reject Codex or a 6.1 request before producing any spawn arguments', () =>
 });
 
 test('the one valid route pins provider, model, effort and environment', () => {
-  const args = reviewerArguments(job(),{projectId:'proj_test',environmentId:'env_review'},'/tmp/review-prompt.md');
+  const scope = {projectId:'proj_test',environmentId:'env_review'};
+  const prompt = '/tmp/review-prompt.md';
+  assert.equal(reviewerArguments(job(),scope,prompt).includes('--permission-mode'),false);
+  assert.throws(() => reviewerArguments(job(),scope,prompt,'full'), /review mode/);
+  const args = reviewerArguments(job(),scope,prompt,'accept-edits');
   for (const [flag,value] of [['--provider','pi'],['--model','openai/gpt-6.2-sol'],['--reasoning-level','medium'],
     ['--permission-mode','accept-edits'],['--environment','env_review']]) {
     assert.equal(args[args.indexOf(flag)+1],value);

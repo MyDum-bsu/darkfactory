@@ -21,7 +21,7 @@ const approved = new Map([['acp-devin', 'swe-2-high'], ['acp-zcode-start', 'buil
 
 async function execute() {
   const { values } = parseArgs({ options: { execute: { type: 'boolean' }, policy: { type: 'string' },
-    state: { type: 'string' } } });
+    state: { type: 'string' }, 'recheck-rejected-handoff': { type: 'boolean' } } });
   if (!values.execute || !values.policy || !values.state) throw new Error('Use --execute --policy FILE --state DIR');
   const policyFile = await realpath(values.policy);
   const p = await readJson(policyFile);
@@ -84,8 +84,11 @@ async function execute() {
       await mkdir(dirname(handoffPath(attempt)), { mode: 0o700 });
       const initial = join(root, `worker-${attempt.attempt_id}.md`);
       const text = await readFile(brief, 'utf8');
-      await writeFile(initial, `${text}\n\nРабочий путь: ${tree}. Конверт: task_id=${attempt.task_id}, epoch=${attempt.epoch}, attempt_id=${attempt.attempt_id}. Сдача только JSON: task_id, epoch (число), attempt_id, worker_thread_id (фактический BB_THREAD_ID), candidate_sha (полный Git SHA). Запиши атомарно в ${handoffPath(attempt)}; после сдачи закончи ход. Это твоя единственная задача, другие треды и доски не трогай.\n`,
-      { mode: 0o600, flag: 'wx' });
+      const example = JSON.stringify({ task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+        worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' });
+      const handoff = `Запиши JSON атомарно в ${handoffPath(attempt)} и заверши ход. Сохрани типы полей: ${example}`;
+      await writeFile(initial, `${text}\n\nРабочий путь: ${tree}. ${handoff}\nДругие треды и доски не трогай.\n`,
+        { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
         '--provider', p.bb.provider, '--model', p.bb.model, '--title', `Пилот #${route.taskId}`, '--prompt-file', initial,
         '--parent-notifications', 'off', '--permission-mode', 'accept-edits', '--json'];
@@ -161,7 +164,7 @@ async function execute() {
         .catch(() => { lost = true; });
     }, 20_000);
     try {
-      const review = nativeReviewVerifier(reviewGate, reviewPrompt);
+      const review = nativeReviewVerifier(reviewGate, reviewPrompt, { permissionMode: 'accept-edits' });
       return await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: worktreeInspector(policy), local: offlineProfileRunner(root),
         review: async handoff => {
@@ -182,7 +185,8 @@ async function execute() {
     const deadline = Date.now() + p.waitMs;
     let previous;
     while (Date.now() <= deadline) {
-      const result = await advance({ route, state, board: port, bb, submissions, verify, authorize });
+      const result = await advance({ route, state, board: port, bb, submissions, verify, authorize,
+        recheckRejectedHandoff: values['recheck-rejected-handoff'] });
       const line = JSON.stringify(result);
       if (line !== previous) console.log(line);
       previous = line;

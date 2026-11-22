@@ -169,14 +169,23 @@ export function offlineProfileRunner(journal) {
 }
 
 // Only the operator chooses this trusted verifier. The handoff cannot supply a receipt or command.
-export function nativeReviewVerifier(gate, prompt) {
+export function nativeReviewVerifier(gate, prompt, { permissionMode } = {}) {
   if (!isAbsolute(gate ?? '')) throw new Error('Configure the absolute board-review.mjs path');
   if (prompt !== undefined && !isAbsolute(prompt)) throw new Error('Review prompt must be an operator file');
   return async handoff => {
     const args = ['--task', handoff.task_id, '--sha', handoff.candidate_sha];
     if (prompt) {
+      const modeArgs = [];
+      if (permissionMode) {
+        const { stdout } = await exec('bb', ['provider', 'list', '--json'], { timeout: 12_000 });
+        const pi = JSON.parse(stdout).find(provider => provider.id === 'pi');
+        if (!pi?.capabilities?.permissionModes?.includes(permissionMode)) {
+          throw new Error(`review_permission_mode_unavailable:pi:${permissionMode}`);
+        }
+        modeArgs.push('--permission-mode', permissionMode);
+      }
       const launch = await exec(process.execPath, [gate, 'launch', ...args,
-        '--source', handoff.worker_thread_id, '--prompt-file', prompt], { timeout: 70_000 });
+        '--source', handoff.worker_thread_id, '--prompt-file', prompt, ...modeArgs], { timeout: 70_000 });
       const { threadId } = JSON.parse(launch.stdout);
       if (!/^thr_[a-z0-9]+$/.test(threadId ?? '')) throw new Error('No verified BB review launch');
       await exec('bb', ['thread', 'wait', threadId, '--status', 'idle', '--timeout', '8m', '--json'], {

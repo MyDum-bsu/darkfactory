@@ -18,7 +18,7 @@ function attemptOf(record, route) {
 
 // One serialized tick. Board keeps the work queue; state records only effects of this attempt.
 // Unconfirmed external effects never become another spawn, tell or settle on restart.
-export async function advance({ route, state, board, bb, submissions, verify, authorize }) {
+export async function advance({ route, state, board, bb, submissions, verify, authorize, recheckRejectedHandoff }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const binding = createHash('sha256').update(JSON.stringify(route)).digest('hex');
@@ -57,12 +57,15 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     }
     return visible();
   }
-  if (TERMINAL.has(record.phase)) return visible();
+  // Compatibility recovery for a pre-block receipt. No check or external effect was attempted.
+  const recheck = recheckRejectedHandoff && record.phase === 'hold' &&
+    record.reason === 'invalid_or_stale_submission' && !record.turnSeq && record.seenShas.length === 0;
+  if (TERMINAL.has(record.phase) && !recheck) return visible();
   if (IN_FLIGHT.has(record.phase)) {
     await save({ phase: 'uncertain', reason: `interrupted_${record.phase}` });
     return visible();
   }
-  if (record.phase !== 'working') throw new Error('Unknown attempt state');
+  if (record.phase !== 'working' && !recheck) throw new Error('Unknown attempt state');
 
   // After process restart the adapter can recover the same held capability. It cannot re-claim.
   try {
@@ -79,27 +82,28 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   const observation = await submissions.read(attempt, after);
   if (!observation || !Number.isSafeInteger(observation.turnSeq) || observation.turnSeq <= after) return visible();
   const { submission, turnSeq } = observation;
-  if (!submission || record.seenShas.includes(submission.candidate_sha)) {
-    const reason = after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff';
+  const stopWith = async reason => {
     await save({ phase: 'blocking', turnSeq });
     try {
       await board.block(attempt.task_id, attempt.epoch, `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}. Проверьте ход; повтор не отправлен.`);
       await save({ phase: 'hold', reason });
     } catch {
-      await save({ phase: 'uncertain', reason: 'missing_handoff_block_unconfirmed' });
+      await save({ phase: 'uncertain', reason: 'handoff_block_unconfirmed' });
     }
     return visible();
-  }
-  if (submission.task_id !== attempt.task_id || submission.epoch !== attempt.epoch ||
+  };
+  if (!submission) return stopWith(after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
+  const taskId = Number.isSafeInteger(submission.task_id) ? String(submission.task_id) : submission.task_id;
+  if (taskId !== attempt.task_id || submission.epoch !== attempt.epoch ||
       submission.attempt_id !== attempt.attempt_id || submission.worker_thread_id !== attempt.bb_thread_id ||
-      !shaRE.test(submission.candidate_sha ?? '')) {
-    await save({ phase: 'hold', reason: 'invalid_or_stale_submission' });
-    return visible();
+      typeof submission.candidate_sha !== 'string' || !shaRE.test(submission.candidate_sha)) {
+    return stopWith('invalid_or_stale_submission');
   }
+  if (record.seenShas.includes(submission.candidate_sha)) return stopWith('worker_turn_finished_without_new_handoff');
 
-  await save({ phase: 'checking', sha: submission.candidate_sha, turnSeq,
+  await save({ phase: 'checking', reason: undefined, sha: submission.candidate_sha, turnSeq,
     seenShas: [...record.seenShas, submission.candidate_sha] });
-  const result = await verify(attempt, submission);
+  const result = await verify(attempt, { ...submission, task_id: taskId });
   if (result.outcome === 'rework') {
     const proof = await board.verifyHeld(attempt.task_id, attempt.epoch).catch(() => null);
     if (proof?.epoch !== attempt.epoch) {

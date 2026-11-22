@@ -15,6 +15,7 @@ async function lab(t, finish = 'verified') {
     worktree: '/synthetic', finish };
   let stored;
   let candidate;
+  let wireTaskId;
   let turnSeq = 0;
   const effects = { spawn: 0, feedback: [], verify: 0 };
   const cfg = {
@@ -25,7 +26,7 @@ async function lab(t, finish = 'verified') {
     submissions: { async read(attempt, after) {
       if (turnSeq <= after) return;
       return { turnSeq, submission: candidate && {
-        task_id: task.id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+        task_id: wireTaskId ?? task.id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
         worker_thread_id: attempt.bb_thread_id, candidate_sha: candidate,
       } };
     } },
@@ -37,7 +38,7 @@ async function lab(t, finish = 'verified') {
       return { outcome: 'verified', receipt: { settle: 'completed' } };
     },
   };
-  return { cfg, handle, effects, submit: ch => { candidate = ch?.repeat(40); turnSeq++; },
+  return { cfg, handle, effects, submit: (ch, id) => { candidate = ch?.repeat(40); wireTaskId = id; turnSeq++; },
     tick: () => advance(cfg), inspect: () => cfg.board.lookup(task.id) };
 }
 
@@ -82,6 +83,30 @@ test('after feedback an old completed turn is not treated as a missing new hando
   assert.equal((await x.tick()).reason, 'worker_turn_finished_without_new_handoff');
   assert.equal((await x.inspect()).state, 'blocked');
   assert.equal(x.effects.feedback.length, 1);
+  assert.equal(x.effects.verify, 1);
+});
+
+test('a safe integer Board id normalizes to the enrolled string, without weakening the binding', async t => {
+  const x = await lab(t);
+  await x.tick();
+  x.submit('c', Number(x.cfg.route.taskId));
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(x.effects.verify, 1);
+});
+
+test('operator can recheck a previously rejected first envelope on the same held attempt', async t => {
+  const x = await lab(t);
+  const started = await x.tick();
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'hold', reason: 'invalid_or_stale_submission' });
+  x.submit('c', Number(x.cfg.route.taskId));
+  assert.equal((await x.tick()).phase, 'hold');
+  x.cfg.recheckRejectedHandoff = true;
+  const result = await x.tick();
+  assert.equal(result.phase, 'done');
+  assert.equal(result.epoch, started.epoch);
+  assert.equal(result.threadId, started.threadId);
+  assert.equal(x.effects.spawn, 1);
   assert.equal(x.effects.verify, 1);
 });
 
