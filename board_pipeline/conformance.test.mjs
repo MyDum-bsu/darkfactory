@@ -8,12 +8,14 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { execFile, execFileSync, spawn as spawnProcess } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
+import { createServer, request as httpRequest } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { acceptHeld } from './acceptance.mjs';
 import { advanceWithProjection } from './controller.mjs';
@@ -246,7 +248,7 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
   t.after(() => releaseSlot());
   const tick = guardedEffect(admission?.assertOpen, advanceWithProjection);
   return {
-    handle, port, bb, effects, cfg, card, tree, root, registry, stateDir, dir, channel, ...controls,
+    handle, port, bb, effects, cfg, card, tree, root, registry, stateDir, dir, url, channel, ...controls,
     taskId: task.id, base, candidate, stored: () => stored,
     submit: (sha, seq, extra = {}) => { turns.push({ seq, sha, ...extra }); },
     pushTurn: entry => { turns.push(entry); },
@@ -1068,6 +1070,147 @@ test('VS-2 release: exact signed package, one real publication, version/smoke an
   assert.equal(x.effects.spawnCalls, 1);
   assert.equal(x.effects.feedbackCalls, 0);
   assert.equal(x.effects.completeCalls, 1);
+});
+
+async function watchLoopback(t, listener) {
+  const server = createServer(listener);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+async function watchFixture(t, site) {
+  const calls = [];
+  let mode = 'healthy';
+  const url = await watchLoopback(t, async (req, res) => {
+    calls.push(`${req.method} ${req.url}`);
+    if (req.method !== 'GET' || !['/version', '/artifact'].includes(req.url)) {
+      res.writeHead(405).end();
+      return;
+    }
+    if (req.url === '/artifact' && mode === 'down') {
+      res.writeHead(503).end('unverified response');
+      return;
+    }
+    try {
+      const reply = await fetch(site.url + req.url, { redirect: 'error', signal: AbortSignal.timeout(5000) });
+      const headers = Object.fromEntries(reply.headers);
+      const bytes = Buffer.from(await reply.arrayBuffer());
+      if (req.url === '/artifact' && mode !== 'healthy') headers['content-type'] = 'application/octet-stream';
+      if (req.url === '/artifact' && mode === 'wrong-bytes') bytes[0] ^= 1;
+      res.writeHead(reply.status, headers).end(bytes);
+    } catch {
+      res.writeHead(502).end();
+    }
+  });
+  return { url, calls, setMode(value) { mode = value; } };
+}
+
+async function watchBoardWire(t, boardUrl) {
+  const upstream = new URL(boardUrl);
+  const calls = [];
+  let dropPostAck = false;
+  const url = await watchLoopback(t, (req, res) => {
+    calls.push({ method: req.method, path: req.url, can: req.headers['x-board-can'] });
+    const forward = httpRequest(new URL(req.url, upstream), { method: req.method,
+      headers: { ...req.headers, host: upstream.host }, signal: AbortSignal.timeout(5000) }, reply => {
+      if (dropPostAck && req.method === 'POST' && req.url === '/api/board/messages' &&
+          reply.statusCode >= 200 && reply.statusCode < 300) {
+        dropPostAck = false;
+        reply.resume();
+        reply.once('end', () => res.destroy());
+      } else {
+        res.writeHead(reply.statusCode, reply.headers);
+        reply.pipe(res);
+      }
+    });
+    forward.once('error', () => res.destroy());
+    req.pipe(forward);
+  });
+  return { url: url + upstream.pathname, calls, losePostAck() { dropPostAck = true; } };
+}
+
+test('P2.2: verified post-release smoke updates only one native Board incident', { timeout: 30_000 }, async t => {
+  const f = await releaseLab(t);
+  const { x } = f;
+  const source = await watchFixture(t, f.site);
+  const boardWire = await watchBoardWire(t, x.url);
+  const { instance } = await (await fetch(`${f.site.url}/version`)).json();
+  await x.handle.createChannel('intake');
+  const { message: root } = await x.handle.thread(x.taskId);
+  const policy = { url: source.url, boardUrl: boardWire.url, releaseTask: x.taskId, owner: root.task.owner,
+    target: LIVE_TARGET, repo: REPO, instance };
+  const config = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+  const name = createHash('sha256').update(x.url).digest('hex').slice(0, 32);
+  const { token } = JSON.parse(await readFile(join(config, 'board', 'local', `${name}.json`), 'utf8'));
+  const file = join(x.root, 'watch.json');
+  await writeFile(file, JSON.stringify(policy), { mode: 0o600 });
+  const cli = fileURLToPath(new URL('./run-release-watch.mjs', import.meta.url));
+  const tick = async () => {
+    const { stdout } = await exec(process.execPath, [cli, '--policy', file],
+      { env: { DF_WATCH_BOARD_TOKEN: token, PATH: '' }, timeout: 8000 });
+    return JSON.parse(stdout);
+  };
+  const incidents = async () => (await x.handle.threads({ channel: 'intake' })).threads.map(item => item.message);
+
+  await assert.rejects(tick(), /watch_release_unconfirmed/);
+  assert.deepEqual(source.calls, []);
+  assert.deepEqual(await incidents(), []);
+  await f.approve();
+  assert.equal((await x.tick()).phase, 'release_smoke');
+  assert.equal((await x.tick()).phase, 'done');
+  const effects = { ...x.effects };
+  boardWire.calls.length = 0;
+  assert.deepEqual(await tick(), { status: 'healthy', sha: x.candidate });
+  assert.deepEqual(source.calls, ['GET /version', 'GET /artifact']);
+  assert.deepEqual(boardWire.calls, [{ method: 'GET', path: `/api/board/messages/${x.taskId}?limit=1`,
+    can: 'pilot=read;intake=read,post' }]);
+  assert.deepEqual(await incidents(), []);
+
+  source.setMode('down');
+  await assert.rejects(tick(), /release_target_readback_failed/);
+  assert.deepEqual(await incidents(), []);
+  source.setMode('wrong-bytes');
+  await assert.rejects(tick(), /release_smoke_version_changed/);
+  assert.deepEqual(await incidents(), []);
+
+  source.setMode('red');
+  boardWire.losePostAck();
+  await assert.rejects(tick(), /watch_board_unavailable/);
+  const [created] = await incidents();
+  assert.ok(created, 'Board committed the root before the acknowledgement was lost');
+  assert.match(created.text, new RegExp(x.candidate));
+  assert.ok(created.text.includes(`/messages/${x.taskId}`));
+  assert.ok(created.text.includes(`GET ${source.url}/artifact`));
+  assert.ok(!created.text.includes(f.text.trim()));
+  assert.equal(created.task ?? null, null);
+  assert.deepEqual(created.labels, {});
+  assert.equal(created.noSync, true);
+  const b = await tick();
+  assert.equal(b.status, 'updated');
+  assert.equal(b.id, created.id);
+  assert.ok(created.text.includes(b.fingerprint));
+  const [updated] = await incidents();
+  assert.ok(updated.revision > created.revision);
+  assert.equal((await incidents()).length, 1);
+
+  source.setMode('down');
+  await assert.rejects(tick(), /release_target_readback_failed/);
+  assert.equal((await incidents())[0].revision, updated.revision);
+  const leadEdit = 'Лид уточняет воспроизведение.';
+  await x.handle.edit(created.id, leadEdit);
+  source.setMode('red');
+  await assert.rejects(tick(), /watch_incident_conflict/);
+  assert.equal((await incidents())[0].text, leadEdit);
+  assert.equal((await incidents()).length, 1);
+  assert.deepEqual(boardWire.calls.filter(call => call.method !== 'GET').map(call => call.path),
+    ['/api/board/messages', `/api/board/messages/${created.id}/edit`]);
+  assert.ok(boardWire.calls.every(call => call.can === 'pilot=read;intake=read,post'));
+  assert.deepEqual(x.effects, effects);
+  assert.deepEqual(f.counts(), { promotions: 1, rollbacks: 0 });
 });
 
 test('VS-2 release: red smoke restores actual previous artifact and never closes as deployed', async t => {
