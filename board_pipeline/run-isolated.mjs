@@ -290,7 +290,9 @@ async function execute() {
     }
   };
 
-  const release = await reserveWorktree(join(homedir(), '.local', 'state', 'darkfactory-lab', 'slots'), tree, root);
+  const stateHome = process.env.XDG_STATE_HOME?.startsWith('/')
+    ? process.env.XDG_STATE_HOME : join(homedir(), '.local', 'state');
+  const release = await reserveWorktree(join(stateHome, 'darkfactory-lab', 'slots'), tree, root);
   // Порт арбитра: реальный изолированный раннер третьего семейства в том же
   // rootless Docker read-only контуре, что и критик. Создаётся лениво —
   // только когда арбитраж действительно запрошен.

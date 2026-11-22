@@ -224,7 +224,8 @@ async function execute() {
   }
   await say({ step: 'board', url: boardUrl, pid: boardProc.pid });
 
-  const env = { ...process.env, XDG_CONFIG_HOME: join(dirs.gate, 'config'), TMPDIR: dirs.tmp };
+  const env = { ...process.env, XDG_CONFIG_HOME: join(dirs.gate, 'config'),
+    XDG_STATE_HOME: join(homedir(), '.local', 'state'), TMPDIR: dirs.tmp };
   // Изолированный XDG_CONFIG_HOME: идентичность Board (~/.config/board)
   // переносим в приватный config, чтобы claimReady мог аутентифицироваться.
   await mkdir(join(dirs.gate, 'config'), { recursive: true });
@@ -366,7 +367,10 @@ else console.log('Onboarding controls are present');`;
       };
     });
     proof.turns = turns;
+    const journalStrictlyOrdered = journalOrder.every((entry, idx) =>
+      idx === 0 || entry.mtimeMs > journalOrder[idx - 1].mtimeMs);
     const journalMatchesOrder = journalOrder.length === seen.submitted.length &&
+      journalStrictlyOrdered &&
       journalOrder.every((entry, idx) => entry.sha === seen.submitted[idx]);
     const exactOrderAndCount = turns.length >= 3 &&
       Object.keys(outcomes).length === seen.submitted.length &&
@@ -412,7 +416,8 @@ else console.log('Onboarding controls are present');`;
     const realPi = join(homedir(), '.pi', 'agent', 'bin', 'pi');
     await createIdleShims(idleShimsDir, idleHome, idleCallsLog, basePath, realPi);
     await rename(join(dirs.state, 'attempt.json'), join(dirs.state, 'attempt-main.json'));
-    const idleEnv = { ...env, HOME: idleHome, PATH: `${idleShimsDir}:${basePath}` };
+    const idleEnv = { ...env, HOME: idleHome, XDG_STATE_HOME: join(homedir(), '.local', 'state'),
+      PATH: `${idleShimsDir}:${basePath}` };
     const idle = await runController(idlePolicyFile, dirs.state, idleEnv, wlog, () => {},
       ['--stop-on-idle']);
     const after = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
