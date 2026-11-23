@@ -18,6 +18,7 @@ import { canonicalJson } from './subject.mjs';
 
 export const PROJECT_MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 export const PROJECT_MEMORY_SCHEMA = 'darkfactory.project-memory.v1';
+export const REVIEW_RECEIPT_SCHEMA = 'darkfactory.review-receipt.v1';
 export const PROJECT_MEMORY_SECTIONS = Object.freeze([
   'invariants',
   'pitfalls',
@@ -31,6 +32,10 @@ export const TRUSTED_WRITE_ROLES = Object.freeze([
 ]);
 export const DEFAULT_MAX_CHARS = 4000;
 export const DEFAULT_MAX_ENTRIES_PER_SECTION = 25;
+
+const TRUSTED_RECEIPT_CAP = Symbol('darkfactory.project-memory.trusted-receipt');
+const TRUSTED_RECEIPTS = new WeakSet();
+const MAX_RECEIPT_BYTES = 256 * 1024;
 
 const SECTION_SET = new Set(PROJECT_MEMORY_SECTIONS);
 const TRUSTED_ROLE_SET = new Set(TRUSTED_WRITE_ROLES);
@@ -363,98 +368,208 @@ function toCanonicalFamilySpec(spec) {
   return null;
 }
 
-// Жёсткая граница доверия на запись:
-// - явный allowlist доверенного post-review контекста (post_review_steward / operator / controller);
-// - подтверждённая квитанция ревью (receipt.verdict === 'REVIEW_OK' и receipt.sha === verified_sha);
-// - строгий формат Git SHA (40 или 64 hex-символа);
-// - каноническое кросс-семейство через executorFamily/assertCrossFamily из review-runner.mjs.
-function assertTrustedAttestation(attestation, explicitSourceCard) {
-  if (attestation === null || typeof attestation !== 'object' || Array.isArray(attestation)) {
+export function reviewReceiptDigest(receipt) {
+  const { receipt_sha256, ...body } = receipt;
+  return createHash('sha256').update(canonicalJson(body)).digest('hex');
+}
+
+function validateReceiptFields(raw, { requireDigest = false } = {}) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('project_memory_untrusted_write');
   }
-  if (attestation.untrusted === true) {
+  if (raw.schema !== REVIEW_RECEIPT_SCHEMA) {
     throw new Error('project_memory_untrusted_write');
   }
-  const roleCandidates = [attestation.trusted_role, attestation.role, attestation.actor]
-    .filter(v => v !== undefined);
-  if (roleCandidates.length === 0 ||
-      roleCandidates.some(v => typeof v !== 'string' || !TRUSTED_ROLE_SET.has(v.trim().toLowerCase()))) {
+  const role = typeof raw.role === 'string' ? raw.role.trim().toLowerCase() : '';
+  if (!TRUSTED_ROLE_SET.has(role)) {
     throw new Error('project_memory_untrusted_write');
   }
-  for (const field of ['source', 'caller']) {
-    if (attestation[field] !== undefined) {
-      const val = typeof attestation[field] === 'string' ? attestation[field].trim().toLowerCase() : '';
-      if (!TRUSTED_ROLE_SET.has(val)) throw new Error('project_memory_untrusted_write');
-    }
-  }
-  if (attestation.review_verdict !== 'REVIEW_OK') {
+  if (raw.verdict !== 'REVIEW_OK') {
     throw new Error('project_memory_untrusted_write');
   }
-  if (typeof attestation.verified_sha !== 'string' || !GIT_SHA.test(attestation.verified_sha)) {
+  if (typeof raw.sha !== 'string' || !GIT_SHA.test(raw.sha)) {
     throw new Error('project_memory_untrusted_write');
   }
-  const receipt = attestation.receipt;
-  if (receipt === null || typeof receipt !== 'object' || Array.isArray(receipt) ||
-      receipt.verdict !== 'REVIEW_OK' ||
-      typeof receipt.sha !== 'string' || !GIT_SHA.test(receipt.sha) ||
-      receipt.sha !== attestation.verified_sha) {
-    throw new Error('project_memory_untrusted_write');
-  }
-  const workerExecSpec = attestation.worker_executor !== undefined
-    ? toCanonicalFamilySpec(attestation.worker_executor) : null;
-  const workerFamSpec = attestation.worker_family !== undefined
-    ? toCanonicalFamilySpec(attestation.worker_family) : null;
-  if (attestation.worker_executor !== undefined && workerExecSpec === null) {
-    throw new Error('project_memory_untrusted_write');
-  }
-  if (attestation.worker_family !== undefined && workerFamSpec === null) {
-    throw new Error('project_memory_untrusted_write');
-  }
-  if (workerExecSpec !== null && workerFamSpec !== null &&
-      executorFamily(workerExecSpec) !== executorFamily(workerFamSpec)) {
-    throw new Error('project_memory_untrusted_write');
-  }
-  const reviewerExecSpec = attestation.reviewer_executor !== undefined
-    ? toCanonicalFamilySpec(attestation.reviewer_executor) : null;
-  const reviewerFamSpec = attestation.reviewer_family !== undefined
-    ? toCanonicalFamilySpec(attestation.reviewer_family) : null;
-  if (attestation.reviewer_executor !== undefined && reviewerExecSpec === null) {
-    throw new Error('project_memory_untrusted_write');
-  }
-  if (attestation.reviewer_family !== undefined && reviewerFamSpec === null) {
-    throw new Error('project_memory_untrusted_write');
-  }
-  if (reviewerExecSpec !== null && reviewerFamSpec !== null &&
-      executorFamily(reviewerExecSpec) !== executorFamily(reviewerFamSpec)) {
-    throw new Error('project_memory_untrusted_write');
-  }
-  const workerSpec = workerExecSpec ?? workerFamSpec;
-  const reviewerSpec = reviewerExecSpec ?? reviewerFamSpec;
+  const workerSpec = toCanonicalFamilySpec(raw.worker);
+  const reviewerSpec = toCanonicalFamilySpec(raw.reviewer);
   let families;
   try {
     families = assertCrossFamily(workerSpec, reviewerSpec);
   } catch {
     throw new Error('project_memory_untrusted_write');
   }
-  const attCard = attestation.source_card !== undefined ? String(attestation.source_card) : undefined;
-  const paramCard = explicitSourceCard !== undefined ? String(explicitSourceCard) : undefined;
-  const receiptCard = receipt.source_card !== undefined ? String(receipt.source_card) : undefined;
-  if (attCard !== undefined && paramCard !== undefined && attCard !== paramCard) {
-    throw new Error('project_memory_untrusted_write');
-  }
-  if (receiptCard !== undefined && (attCard ?? paramCard) !== undefined && receiptCard !== (attCard ?? paramCard)) {
-    throw new Error('project_memory_untrusted_write');
-  }
-  const card = attCard ?? paramCard ?? receiptCard ?? '';
+  const card = String(raw.source_card ?? '');
   if (!CARD.test(card)) {
     throw new Error('project_memory_source_card_invalid');
   }
+  if (requireDigest) {
+    if (typeof raw.receipt_sha256 !== 'string' || !DIGEST.test(raw.receipt_sha256) ||
+        reviewReceiptDigest(raw) !== raw.receipt_sha256) {
+      throw new Error('project_memory_untrusted_write');
+    }
+  }
   return {
-    verifiedSha: attestation.verified_sha,
+    role,
+    verifiedSha: raw.sha,
     sourceCard: card,
     workerFamily: families.executor,
     reviewerFamily: families.critic,
   };
+}
+
+// Выдача runtime capability-токена доверенной квитанции ревью:
+// обычный JSON-объект не может попасть в приватный WeakSet TRUSTED_RECEIPTS.
+export function createTrustedReviewReceipt({
+  role,
+  verdict,
+  sha,
+  worker,
+  reviewer,
+  sourceCard,
+  source_card,
+}) {
+  const card = sourceCard ?? source_card;
+  const body = {
+    schema: REVIEW_RECEIPT_SCHEMA,
+    role: typeof role === 'string' ? role.trim().toLowerCase() : role,
+    verdict,
+    sha,
+    worker,
+    reviewer,
+    source_card: card !== undefined ? String(card) : undefined,
+  };
+  validateReceiptFields(body, { requireDigest: false });
+  const receipt = Object.freeze({
+    ...body,
+    receipt_sha256: reviewReceiptDigest(body),
+    [TRUSTED_RECEIPT_CAP]: true,
+  });
+  TRUSTED_RECEIPTS.add(receipt);
+  return receipt;
+}
+
+export async function writeTrustedReviewReceipt({ receiptPath, receipt, worktree }) {
+  if (typeof receiptPath !== 'string' || !isAbsolute(receiptPath)) {
+    throw new Error('project_memory_path_relative');
+  }
+  if (!TRUSTED_RECEIPTS.has(receipt) || receipt[TRUSTED_RECEIPT_CAP] !== true) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  const dir = await assertStoreOutside(dirname(receiptPath), worktree);
+  const expectedFile = join(dir, basename(receiptPath));
+  try {
+    const st = lstatSync(expectedFile);
+    if (st.isSymbolicLink()) throw new Error('project_memory_symlink_disallowed');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const resolved = await resolveLoose(expectedFile);
+  if (resolved !== expectedFile) throw new Error('project_memory_symlink_disallowed');
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${expectedFile}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, expectedFile);
+    return expectedFile;
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+}
+
+async function readTrustedReceiptFile(receiptPath, worktree) {
+  if (typeof receiptPath !== 'string' || !isAbsolute(receiptPath)) {
+    throw new Error('project_memory_path_relative');
+  }
+  const dir = await assertStoreOutside(dirname(receiptPath), worktree);
+  const expectedFile = join(dir, basename(receiptPath));
+  let st;
+  try {
+    st = lstatSync(expectedFile);
+  } catch {
+    throw new Error('project_memory_untrusted_write');
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error('project_memory_symlink_disallowed');
+  }
+  const resolved = await resolveLoose(expectedFile);
+  if (resolved !== expectedFile) {
+    throw new Error('project_memory_symlink_disallowed');
+  }
+  let raw;
+  try { raw = await readFile(expectedFile, 'utf8'); } catch {
+    throw new Error('project_memory_untrusted_write');
+  }
+  if (Buffer.byteLength(raw) > MAX_RECEIPT_BYTES) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch {
+    throw new Error('project_memory_untrusted_write');
+  }
+  return validateReceiptFields(parsed, { requireDigest: true });
+}
+
+// Жёсткая граница доверия на запись:
+// простой неподписанный JSON-объект без доверенного файла квитанции вне worktree
+// (receiptPath) или runtime capability-токена createTrustedReviewReceipt()
+// немедленно отклоняется fail-closed (project_memory_untrusted_write).
+async function verifyTrustedWrite({ attestation, receiptPath, receipt, sourceCard, worktree }) {
+  let verified;
+  if (receiptPath !== undefined) {
+    verified = await readTrustedReceiptFile(receiptPath, worktree);
+  } else {
+    const cap = receipt ?? attestation?.receipt;
+    if (cap === null || typeof cap !== 'object' ||
+        !TRUSTED_RECEIPTS.has(cap) || cap[TRUSTED_RECEIPT_CAP] !== true) {
+      throw new Error('project_memory_untrusted_write');
+    }
+    verified = validateReceiptFields(cap, { requireDigest: true });
+  }
+
+  if (sourceCard !== undefined && String(sourceCard) !== verified.sourceCard) {
+    throw new Error('project_memory_untrusted_write');
+  }
+
+  if (attestation !== undefined) {
+    if (attestation === null || typeof attestation !== 'object' || Array.isArray(attestation) ||
+        attestation.untrusted === true) {
+      throw new Error('project_memory_untrusted_write');
+    }
+    for (const field of ['trusted_role', 'role', 'actor', 'source', 'caller']) {
+      if (field in attestation) {
+        const val = typeof attestation[field] === 'string' ? attestation[field].trim().toLowerCase() : '';
+        if (!TRUSTED_ROLE_SET.has(val) || val !== verified.role) {
+          throw new Error('project_memory_untrusted_write');
+        }
+      }
+    }
+    if ('review_verdict' in attestation && attestation.review_verdict !== 'REVIEW_OK') {
+      throw new Error('project_memory_untrusted_write');
+    }
+    if ('verified_sha' in attestation && attestation.verified_sha !== verified.verifiedSha) {
+      throw new Error('project_memory_untrusted_write');
+    }
+    if ('source_card' in attestation && String(attestation.source_card) !== verified.sourceCard) {
+      throw new Error('project_memory_untrusted_write');
+    }
+    for (const wField of ['worker_executor', 'worker_family']) {
+      if (wField in attestation) {
+        const spec = toCanonicalFamilySpec(attestation[wField]);
+        if (spec === null || executorFamily(spec) !== verified.workerFamily) {
+          throw new Error('project_memory_untrusted_write');
+        }
+      }
+    }
+    for (const rField of ['reviewer_executor', 'reviewer_family']) {
+      if (rField in attestation) {
+        const spec = toCanonicalFamilySpec(attestation[rField]);
+        if (spec === null || executorFamily(spec) !== verified.reviewerFamily) {
+          throw new Error('project_memory_untrusted_write');
+        }
+      }
+    }
+  }
+  return verified;
 }
 
 export async function resolveProjectMemory({
@@ -500,13 +615,15 @@ export async function recordProjectMemoryUpdate({
   projectId,
   updates,
   attestation,
+  receiptPath,
+  receipt,
   sourceCard,
   worktree,
   maxChars = DEFAULT_MAX_CHARS,
   maxEntriesPerSection = DEFAULT_MAX_ENTRIES_PER_SECTION,
   now = new Date(),
 }) {
-  const verified = assertTrustedAttestation(attestation, sourceCard);
+  const verified = await verifyTrustedWrite({ attestation, receiptPath, receipt, sourceCard, worktree });
   if (!Array.isArray(updates) || updates.length === 0) {
     throw new Error('project_memory_updates_invalid');
   }
@@ -684,6 +801,7 @@ const isSlice = s => s !== null && typeof s === 'object' && !Array.isArray(s) &&
 const pinIntegrity = s => createHash('sha256').update(canonicalJson({
   project_id: s.project_id,
   pin_key: s.pin_key,
+  enabled: s.enabled,
   digest: s.digest,
   ids: s.ids,
   items: s.items,
@@ -703,12 +821,16 @@ const isSliceContent = s => isSlice(s) && Array.isArray(s.items) &&
   sliceDigest(s.projectId, s.items) === s.digest;
 
 const isPin = (s, expectedKey, expectedProjectId) => isSliceContent(s) &&
+  typeof s.enabled === 'boolean' &&
+  (s.enabled === true || (s.ids.length === 0 && s.items.length === 0 && s.total === 0 &&
+    s.text === '' && s.truncated === false)) &&
   typeof s.project_id === 'string' && s.project_id === s.projectId &&
   (expectedProjectId === undefined || s.project_id === expectedProjectId) &&
   typeof s.pin_key === 'string' && s.pin_key.length > 0 && s.pin_key === expectedKey &&
   DIGEST.test(s.pin_sha256 ?? '') && pinIntegrity(s) === s.pin_sha256;
 
-const emptySlice = projectId => ({
+const emptySlice = (projectId, enabled = true) => ({
+  enabled,
   projectId,
   text: '',
   digest: sliceDigest(projectId, []),
@@ -721,7 +843,8 @@ const emptySlice = projectId => ({
 // Закрепление read-only среза памяти проекта за попыткой (task_id:attempt_id:epoch):
 // воркер, критик и арбитр одного кандидата видят один и тот же snapshot/digest.
 // При persistDir публикация атомарна через tmp + link с pin_sha256, привязанным
-// к project_id + pin_key; отсутствие памяти (пустой срез) также персистится.
+// к project_id + pin_key + enabled; отсутствие памяти и отключённая память
+// (enabled: false) также персистятся, защищая попытку от смены DF_PROJECT_MEMORY_DIR.
 export function pinProjectMemory(resolve_, { persistDir, projectId: expectedProjectId } = {}) {
   if (expectedProjectId !== undefined && (typeof expectedProjectId !== 'string' || !PROJECT.test(expectedProjectId))) {
     throw new Error('project_memory_project_invalid');
@@ -734,8 +857,8 @@ export function pinProjectMemory(resolve_, { persistDir, projectId: expectedProj
     try { saved = JSON.parse(await readFile(file, 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
     if (!isPin(saved, expectedKey, expectedProjectId)) throw new Error('project_memory_pin_invalid');
-    const { projectId, text, digest, ids, truncated, total, items } = saved;
-    return { projectId, text, digest, ids, truncated, total, items };
+    const { enabled, projectId, text, digest, ids, truncated, total, items } = saved;
+    return { enabled, projectId, text, digest, ids, truncated, total, items };
   };
   return key => {
     if (typeof key !== 'string' || !key) throw new Error('project_memory_pin_key_invalid');
@@ -747,17 +870,22 @@ export function pinProjectMemory(resolve_, { persistDir, projectId: expectedProj
           const saved = await readPinned(file, key);
           if (saved !== undefined) return saved;
         }
-        let slice = (await resolve_()) ?? null;
-        if (slice === null && expectedProjectId !== undefined) {
-          slice = emptySlice(expectedProjectId);
+        const raw = (await resolve_()) ?? null;
+        let slice;
+        if (raw === null) {
+          slice = expectedProjectId !== undefined ? emptySlice(expectedProjectId, false) : null;
+        } else {
+          slice = { enabled: raw.enabled ?? true, ...raw };
         }
         if (file !== null && slice !== null) {
-          if (!isSliceContent(slice)) throw new Error('project_memory_slice_invalid');
+          if (!isSliceContent(slice) || typeof slice.enabled !== 'boolean') {
+            throw new Error('project_memory_slice_invalid');
+          }
           if (expectedProjectId !== undefined && slice.projectId !== expectedProjectId) {
             throw new Error('project_memory_pin_invalid');
           }
-          const { projectId, text, digest, ids, truncated, total, items } = slice;
-          const payload = { projectId, text, digest, ids, truncated, total, items };
+          const { enabled, projectId, text, digest, ids, truncated, total, items } = slice;
+          const payload = { enabled, projectId, text, digest, ids, truncated, total, items };
           const stored = { project_id: projectId, pin_key: key, ...payload };
           stored.pin_sha256 = pinIntegrity(stored);
           const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;

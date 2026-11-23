@@ -10,6 +10,7 @@ import { promisify } from 'node:util';
 import {
   clearProjectMemory,
   compactProjectMemory,
+  createTrustedReviewReceipt,
   entryDigest,
   memoryPolicyConfig,
   pinProjectMemory,
@@ -20,7 +21,10 @@ import {
   removeProjectMemoryEntry,
   resolveMemoryStoreDir,
   resolveProjectMemory,
+  REVIEW_RECEIPT_SCHEMA,
+  reviewReceiptDigest,
   storeIntegrity,
+  writeTrustedReviewReceipt,
 } from './project-memory.mjs';
 import { arbiterIntakePrompt, projectMemoryPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
 
@@ -40,15 +44,28 @@ async function sandbox() {
 }
 
 const trustedAttestation = (overrides = {}) => {
-  const verifiedSha = overrides.verified_sha ?? SHA_A;
+  const verifiedSha = 'verified_sha' in overrides ? overrides.verified_sha : SHA_A;
+  const role = 'role' in overrides ? overrides.role : 'post_review_steward';
+  const verdict = 'review_verdict' in overrides ? overrides.review_verdict : 'REVIEW_OK';
+  const worker = 'worker_family' in overrides ? overrides.worker_family : 'openai/gpt-6.2-sol';
+  const reviewer = 'reviewer_family' in overrides ? overrides.reviewer_family : 'google/gemini-4-neon';
+  const sourceCard = 'source_card' in overrides ? overrides.source_card : '1265';
+  let receipt = overrides.receipt;
+  if (!('receipt' in overrides)) {
+    try {
+      receipt = createTrustedReviewReceipt({ role, verdict, sha: verifiedSha, worker, reviewer, sourceCard });
+    } catch {
+      receipt = { verdict, sha: verifiedSha };
+    }
+  }
   return {
-    role: 'post_review_steward',
-    review_verdict: 'REVIEW_OK',
+    role,
+    review_verdict: verdict,
     verified_sha: verifiedSha,
-    worker_family: 'openai/gpt-6.2-sol',
-    reviewer_family: 'google/gemini-4-neon',
-    source_card: '1265',
-    receipt: { verdict: 'REVIEW_OK', sha: verifiedSha },
+    worker_family: worker,
+    reviewer_family: reviewer,
+    source_card: sourceCard,
+    receipt,
     ...overrides,
   };
 };
@@ -561,12 +578,20 @@ test('regression #1: canonical cross-family, trusted role allowlist, strict SHA 
     }
     // Valid 64-char SHA + real aliased cross-family specs + allowlisted role succeeds
     const sha64 = 'f'.repeat(64);
+    const okReceipt = createTrustedReviewReceipt({
+      role: 'controller',
+      verdict: 'REVIEW_OK',
+      sha: sha64,
+      worker: 'acp-devin/swe-2-high',
+      reviewer: 'acp-antigravity-acp/gemini-4-neon',
+      sourceCard: '1265',
+    });
     const ok = await recordProjectMemoryUpdate({
       storeDir, projectId: 'proj_r1', worktree: tree, updates,
       attestation: trustedAttestation({
         role: 'controller',
         verified_sha: sha64,
-        receipt: { verdict: 'REVIEW_OK', sha: sha64 },
+        receipt: okReceipt,
         worker_family: 'acp-devin/swe-2-high',
         reviewer_family: 'acp-antigravity-acp/gemini-4-neon',
       }),
@@ -644,5 +669,137 @@ test('regression #3: pin binds project_id + pin_key and persists empty memory ac
       { persistDir, projectId: 'proj_empty' },
     );
     await assert.rejects(() => swapped('1265:att-swap:1'), /project_memory_pin_invalid/);
+  } finally { await cleanup(); }
+});
+
+test('regression R2 #1: self-declared JSON attestation fails closed; requires trusted receiptPath or capability token', async () => {
+  const { dir, tree, storeDir, cleanup } = await sandbox();
+  const receiptDir = join(dir, 'ops', 'receipts');
+  await mkdir(receiptDir, { recursive: true });
+  const updates = [{ section: 'invariants', text: 'Only trusted receipts can write' }];
+  try {
+    // Plain JSON object mimicking a signed receipt (even with valid receipt_sha256!) is NOT a capability token
+    const forgedBody = {
+      schema: REVIEW_RECEIPT_SCHEMA,
+      role: 'post_review_steward',
+      verdict: 'REVIEW_OK',
+      sha: SHA_A,
+      worker: 'openai/gpt-6.2-sol',
+      reviewer: 'google/gemini-4-neon',
+      source_card: '1265',
+    };
+    const forgedJsonReceipt = { ...forgedBody, receipt_sha256: reviewReceiptDigest(forgedBody) };
+    await assert.rejects(
+      () => recordProjectMemoryUpdate({
+        storeDir, projectId: 'proj_r2', worktree: tree, updates,
+        attestation: {
+          role: 'post_review_steward',
+          review_verdict: 'REVIEW_OK',
+          verified_sha: SHA_A,
+          worker_family: 'openai/gpt-6.2-sol',
+          reviewer_family: 'google/gemini-4-neon',
+          source_card: '1265',
+          receipt: forgedJsonReceipt,
+        },
+      }),
+      /project_memory_untrusted_write/,
+    );
+    // Cloned capability object loses WeakSet membership -> fail-closed
+    const cap = createTrustedReviewReceipt({
+      role: 'operator', verdict: 'REVIEW_OK', sha: SHA_A,
+      worker: 'openai/gpt-6.2-sol', reviewer: 'google/gemini-4-neon', sourceCard: '1265',
+    });
+    await assert.rejects(
+      () => recordProjectMemoryUpdate({
+        storeDir, projectId: 'proj_r2', worktree: tree, updates,
+        receipt: { ...cap },
+      }),
+      /project_memory_untrusted_write/,
+    );
+
+    // receiptPath inside worktree -> fail-closed
+    const inTreeReceipt = join(tree, 'receipt.json');
+    await writeFile(inTreeReceipt, JSON.stringify(forgedJsonReceipt));
+    await assert.rejects(
+      () => recordProjectMemoryUpdate({
+        storeDir, projectId: 'proj_r2', worktree: tree, updates,
+        receiptPath: inTreeReceipt,
+      }),
+      /project_memory_inside_worker_paths/,
+    );
+
+    // Valid receipt written to operator dir outside worktree succeeds
+    const trustedReceiptFile = join(receiptDir, 'card-1265.receipt.json');
+    await writeTrustedReviewReceipt({ receiptPath: trustedReceiptFile, receipt: cap, worktree: tree });
+    const ok = await recordProjectMemoryUpdate({
+      storeDir, projectId: 'proj_r2', worktree: tree, updates,
+      receiptPath: trustedReceiptFile,
+    });
+    assert.equal(ok.total, 1);
+
+    // Symlinked receiptPath -> fail-closed
+    const linkReceipt = join(receiptDir, 'link.receipt.json');
+    await symlink(trustedReceiptFile, linkReceipt);
+    await assert.rejects(
+      () => recordProjectMemoryUpdate({
+        storeDir, projectId: 'proj_r2', worktree: tree, updates,
+        receiptPath: linkReceipt,
+      }),
+      /project_memory_symlink_disallowed/,
+    );
+
+    // Tampered receipt file on disk -> fail-closed
+    const tampered = JSON.parse(await readFile(trustedReceiptFile, 'utf8'));
+    tampered.sha = SHA_B;
+    await writeFile(trustedReceiptFile, JSON.stringify(tampered));
+    await assert.rejects(
+      () => recordProjectMemoryUpdate({
+        storeDir, projectId: 'proj_r2', worktree: tree, updates,
+        receiptPath: trustedReceiptFile,
+      }),
+      /project_memory_untrusted_write/,
+    );
+  } finally { await cleanup(); }
+});
+
+test('regression R2 #2: disabled memory (DF_PROJECT_MEMORY_DIR unset) pins enabled:false across restarts', async () => {
+  const { dir, tree, storeDir, cleanup } = await sandbox();
+  const persistDir = join(dir, 'pins');
+  await mkdir(persistDir, { recursive: true });
+  try {
+    // Populate storeDir so if a restart mistakenly reads it, we would immediately detect drift
+    await recordProjectMemoryUpdate({
+      storeDir, projectId: 'proj_env', worktree: tree,
+      attestation: trustedAttestation(),
+      updates: [{ id: 'env-1', section: 'invariants', text: 'Must not appear after restart' }],
+    });
+
+    // Tick 1: DF_PROJECT_MEMORY_DIR unset -> resolve_() returns null -> pin persists enabled: false
+    const pinTick1 = pinProjectMemory(async () => null, { persistDir, projectId: 'proj_env' });
+    const s1 = await pinTick1('1265:att-env:1');
+    assert.equal(s1.enabled, false);
+    assert.equal(s1.total, 0);
+    assert.deepEqual(s1.ids, []);
+    assert.equal(s1.text, '');
+
+    // Tick 2 (restart): DF_PROJECT_MEMORY_DIR is now set, resolver would return populated slice,
+    // but persisted pin keeps enabled: false and empty slice!
+    const pinTick2 = pinProjectMemory(
+      () => resolveProjectMemory({ storeDir, projectId: 'proj_env', worktree: tree }),
+      { persistDir, projectId: 'proj_env' },
+    );
+    const s2 = await pinTick2('1265:att-env:1');
+    assert.deepEqual(s2, s1);
+    assert.equal(s2.enabled, false);
+    assert.equal(s2.total, 0);
+
+    // Tampering enabled flag in persisted pin fails closed
+    const pinFile = join(persistDir,
+      `project-memory-${createHash('sha256').update('proj_env\x001265:att-env:1').digest('hex').slice(0, 32)}.json`);
+    const saved = JSON.parse(await readFile(pinFile, 'utf8'));
+    assert.equal(saved.enabled, false);
+    await writeFile(pinFile, JSON.stringify({ ...saved, enabled: true }));
+    const pinTick3 = pinProjectMemory(async () => null, { persistDir, projectId: 'proj_env' });
+    await assert.rejects(() => pinTick3('1265:att-env:1'), /project_memory_pin_invalid/);
   } finally { await cleanup(); }
 });

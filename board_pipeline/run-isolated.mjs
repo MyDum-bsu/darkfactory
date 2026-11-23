@@ -212,9 +212,14 @@ async function execute() {
   const currentProjectMemory = async () => memoryStoreDir === null ? null : resolveProjectMemory({
     storeDir: memoryStoreDir, projectId: p.bb.project, worktree: tree,
     maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS });
-  const pinnedProjectMemory = memoryStoreDir === null
-    ? async () => null
-    : pinProjectMemory(currentProjectMemory, { persistDir: root, projectId: p.bb.project });
+  // Всегда создаём/читаем pin в root (даже при выключенной памяти: enabled:false),
+  // чтобы смена DF_PROJECT_MEMORY_DIR при рестарте не подменила срез той же попытки.
+  const pinnedProjectMemory = pinProjectMemory(currentProjectMemory,
+    { persistDir: root, projectId: p.bb.project });
+  const activeProjectMemory = async key => {
+    const slice = await pinnedProjectMemory(key);
+    return slice && slice.enabled !== false ? slice : undefined;
+  };
   const decisionLedger = ledgerPath !== null && ledgerCfg.recordAnswers === true
     ? ({ answer, question }) => recordDecision({ ledgerPath, scope: decisionScope, rule: answer,
         sourceCard: question.task_id, recordedBy: ledgerCfg.recordedBy ?? 'question-resume',
@@ -277,7 +282,7 @@ async function execute() {
       const prompt = workerIntakePrompt({ brief: pinned.inputs.get(brief).toString('utf8'), tree,
         handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers),
         decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined,
-        projectMemory: await pinnedProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`) ?? undefined });
+        projectMemory: await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`) });
       await writeFile(initial, prompt, { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
         '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
@@ -438,7 +443,7 @@ async function execute() {
     if (!profile) throw new Error('Missing approved checks');
     const beforeEffect = activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
     const decisionSlice = await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`);
-    const memorySlice = await pinnedProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`);
+    const memorySlice = await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`);
     const criticPrompt = [reviewText, decisionSlice && decisionsPromptBlock(decisionSlice),
       memorySlice && projectMemoryPromptBlock(memorySlice)].filter(Boolean).join('\n\n');
     const review = reviewRunner({ journal: root, prompt: criticPrompt, beforeEffect });
@@ -498,7 +503,7 @@ async function execute() {
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
       prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
         await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined,
-        await pinnedProjectMemory(`${req.task_id}:${req.attempt_id}:${req.epoch}`) ?? undefined) });
+        await activeProjectMemory(`${req.task_id}:${req.attempt_id}:${req.epoch}`)) });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
     telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
     telemetry.recordArbitration();
