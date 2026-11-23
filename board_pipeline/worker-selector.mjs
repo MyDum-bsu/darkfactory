@@ -70,11 +70,22 @@ export function opencodeGoPolicyViolation(spec) {
 
 // Полный запрет выбывшего провайдера: acp-zcode-start отклоняется в любом
 // списке кандидатов (явный plan, allowlist политики), не только в дефолтном
-// плане. Причина — 'zcode_provider_retired'.
+// плане. Проверка рекурсивна: харнесс 'pi' с вложенной моделью вида
+// 'acp-zcode-start/...' (в любой вложенности) тоже отклоняется.
+// Причина — 'zcode_provider_retired'.
 export function retiredProviderViolation(spec) {
-  return typeof spec?.provider === 'string' &&
-    spec.provider.toLowerCase() === 'acp-zcode-start'
-    ? 'zcode_provider_retired' : null;
+  const retired = id => typeof id === 'string' && id.toLowerCase() === 'acp-zcode-start';
+  const scan = entry => {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    if (retired(entry.provider)) return true;
+    if (typeof entry.model === 'string' && entry.model.includes('/')) {
+      const i = entry.model.indexOf('/');
+      if (retired(entry.model.slice(0, i))) return true;
+      return scan({ provider: entry.model.slice(0, i), model: entry.model.slice(i + 1) });
+    }
+    return false;
+  };
+  return scan(spec) ? 'zcode_provider_retired' : null;
 }
 
 // Упорядоченный план исполнителей маршрута: первичный acp-devin/swe-2-high,

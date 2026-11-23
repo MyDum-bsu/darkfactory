@@ -970,3 +970,27 @@ test('selectEscalationReviewer: worker и critic одного семейства
     assert.equal(fb.reason, 'escalation_triad_invalid');
   }
 });
+
+test('retiredProviderViolation рекурсивен: pi/acp-zcode-start в allowlist и plan', async () => {
+  const nested = { provider: 'pi', model: 'acp-zcode-start/builtin:zai-start-plan\\GLM-5.3-Flash' };
+  assert.equal(retiredProviderViolation(nested), 'zcode_provider_retired');
+  // normalizeRoutingPolicy: вложенный zcode через харнесс — тот же отказ.
+  assert.throws(() => normalizeRoutingPolicy({
+    routing: { allowlist: { worker: [nested] } },
+  }), e => e instanceof ReviewDenied && e.reason === 'zcode_provider_retired');
+  // Явный plan: вложенный zcode-резерв пропускается с той же причиной.
+  const refused = { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
+  const { calls, spawn } = spawnLog([{ threadId: 'thr_ds10' }]);
+  const sel = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn, inspectWorktree: cleanTree,
+    plan: [PRIMARY_WORKER, nested, NARROW_RESERVE_PI],
+    probe: async w => w.provider === 'acp-devin' ? refused : QUOTA_OK,
+  });
+  assert.equal(sel.outcome, 'spawned');
+  assert.equal(sel.worker.provider, 'pi');
+  assert.equal(sel.worker.model, 'opencode-go/deepseek-v4.1-flash');
+  const retired = sel.attemptedWorkers.find(w => w.model === nested.model);
+  assert.equal(retired.verdict, 'skipped');
+  assert.equal(retired.reason, 'zcode_provider_retired');
+  assert.equal(calls.length, 1);
+});
