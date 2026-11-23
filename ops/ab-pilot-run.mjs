@@ -42,14 +42,11 @@ async function writeCatalog(catalog, name) {
   const role = (kind, model, verifier, skills) => ({ kind, model, verifier, skills,
     reasoning: kind === 'verifier' ? 'medium' : 'inherit', tools: kind === 'writer' ? ['snapshot-read', 'worktree-edit'] : ['snapshot-read'] });
   const roles = {
-    intake: role('analyst', 'executor', 'inventory', ['materials-intake']),
     implementation: role('writer', 'executor', 'change-set', name === 'policy'
       ? ['feature-blueprint', 'property-testing'] : ['writer-course', 'session-handoff']),
-    verification: role('verifier', 'critic', 'rubric-review', ['sparring', 'issue-register']),
+    verification: role('verifier', 'critic', 'change-set', ['sparring', 'issue-register']),
   };
-  if (name === 'docs') roles.outline = role('analyst', 'executor', 'inventory', ['feature-blueprint', 'writer-course']);
-  const steps = Object.keys(roles).filter(key => key !== 'outline');
-  if (name === 'docs') steps.splice(1, 0, 'outline');
+  const steps = Object.keys(roles);
   const stages = steps.map((id, i) => ({ id, role: id, next: { pass: steps[i + 1] ?? 'ready', rework: 'hold' } }));
   await writeFile(join(catalog, '.darkfactory/factory.yaml'), JSON.stringify({ version: 1, roles, playbooks: { [name]: { entry: steps[0], stages } } }), { mode: 0o600 });
   return (await loadRoleRegistry(catalog)).digest;
@@ -138,6 +135,10 @@ async function stopKnownChildren(run, parent, project) {
 }
 
 async function runCell(name, arm, root, parent, project) {
+  const runnerSha = await trim('git', ['-C', SOURCE, 'rev-parse', 'HEAD']);
+  if (await trim('git', ['-C', SOURCE, 'status', '--porcelain=v1', '--untracked-files=all'])) {
+    throw new Error('pilot_runner_not_clean');
+  }
   const run = join(root, `${name}-${arm}`);
   await mkdir(run, { mode: 0o700 }); // a second launch of the same cell must fail
   for (const sub of ['seed', 'inbox', 'state', 'config', 'xdg-state', 'tmp']) await mkdir(join(run, sub), { mode: 0o700 });
@@ -181,7 +182,9 @@ async function runCell(name, arm, root, parent, project) {
     const wall = Date.now() - started;
     await writeFile(join(run, 'runner.log'), output.stdout + '\n' + output.stderr, { mode: 0o600 });
     const snapshot = await callBoard('read', taskId);
-    const outcome = { name, arm, taskId, baseSha, elapsed_ms: wall, exit: output.code,
+    if (await trim('git', ['-C', SOURCE, 'rev-parse', 'HEAD']) !== runnerSha ||
+        await trim('git', ['-C', SOURCE, 'status', '--porcelain=v1', '--untracked-files=all'])) throw new Error('pilot_runner_drift');
+    const outcome = { name, arm, taskId, baseSha, runnerSha, elapsed_ms: wall, exit: output.code,
       board: snapshot.message?.task?.state ?? null };
     await writeFile(join(run, 'outcome.json'), JSON.stringify(outcome), { mode: 0o600 });
     await writeFile(join(run, 'board-receipt.json'), JSON.stringify(snapshot.message), { mode: 0o600 });

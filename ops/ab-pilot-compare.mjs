@@ -7,6 +7,7 @@ import { CASES } from '../board_pipeline/ab-pilot.mjs';
 import { collectTelemetry, diffSnapshots } from '../board_pipeline/telemetry-collector.mjs';
 import { normalizeCost, normalizeUsage, sumUsages } from '../board_pipeline/telemetry.mjs';
 import { canonicalDigest } from '../board_pipeline/subject.mjs';
+import { loadRoleRegistry } from '../board_pipeline/role-registry.mjs';
 
 const ARMS = ['linear', 'foreman'];
 const exec = promisify(execFile);
@@ -39,9 +40,32 @@ async function readBb(run, threadId, policy, taskId, role, workspace) {
     provider: thread.providerId, model: requested[0]?.data?.execution?.model ?? null, role, usage, cost_usd: cost, complete };
 }
 
+async function stagesCovered(run, policy, stages, accepted) {
+  const registry = await loadRoleRegistry(policy.abPilot.catalog);
+  const graph = registry.playbooks[policy.abPilot.playbook];
+  if (!graph || registry.digest !== policy.abPilot.registryDigest) return false;
+  const planned = [];
+  for (let next = graph.entry; next !== 'ready' && next !== 'hold'; next = graph.stages[next].next.pass) planned.push(next);
+  const receipts = await readLines(join(run, 'state/ab-stage-receipts.jsonl'));
+  const traces = await readLines(join(run, 'state/ab-foreman.jsonl'));
+  const trace = traces[0];
+  return traces.length === 1 && trace.status === 'ready_for_native_acceptance' &&
+    trace.candidate === accepted?.sha && trace.subject === accepted?.subject_digest &&
+    Array.isArray(trace.history) && planned.length === stages.length && stages.length === receipts.length &&
+    receipts.length === trace.history.length && planned.every((stage, i) => {
+      const row = receipts[i];
+      return stage === stages[i].stage && stage === row.stage && row.threadId === stages[i].threadId &&
+        row.verdict === 'PASS' && trace.history[i].stage === stage && trace.history[i].verdict === 'PASS' &&
+        row.artifactDigest === trace.history[i].digest && /^[a-f0-9]{64}$/.test(row.artifactDigest ?? '') &&
+        Number.isSafeInteger(row.eventSeq) && row.eventSeq > 0 && typeof row.checkpoint === 'string' && !!row.checkpoint &&
+        typeof row.session === 'string' && !!row.session;
+    });
+}
+
 async function readCell(root, name, arm) {
   const run = join(root, `${name}-${arm}`);
   const outcome = await readObject(join(run, 'outcome.json'));
+  if (outcome.runnerSha !== undefined && !/^[a-f0-9]{40}$/.test(outcome.runnerSha)) throw new Error('ab_metrics_runner_invalid');
   const policy = await readObject(join(run, 'operator/policy.json'));
   const receipt = await readObject(join(run, 'board-receipt.json'));
   if (outcome?.name !== name || outcome.arm !== arm || receipt?.id !== outcome.taskId ||
@@ -63,8 +87,9 @@ async function readCell(root, name, arm) {
   for (const stage of stages) bb.push(await readBb(run, stage.threadId, policy, name, 'stage', 'observer'));
   if (new Set(bb.map(row => row.id)).size !== bb.length) throw new Error('ab_metrics_duplicate_thread');
   const closed = outcome.exit === 0 && outcome.board === 'completed' && attempt.outcome === 'done';
+  let accepted = null;
   if (outcome.board === 'completed') {
-    const accepted = typeof receipt.task.result === 'string' ? JSON.parse(receipt.task.result) : receipt.task.result;
+    accepted = typeof receipt.task.result === 'string' ? JSON.parse(receipt.task.result) : receipt.task.result;
     if (!closed || wal.phase !== 'done' || !/^[a-f0-9]{40}$/.test(wal.sha ?? '') || accepted?.sha !== wal.sha) {
       throw new Error('ab_metrics_completion_unconfirmed');
     }
@@ -74,13 +99,13 @@ async function readCell(root, name, arm) {
     ...(attempt.tokens?.arbiter ? [attempt.tokens.arbiter] : []), ...bb.filter(item => item.role === 'stage').map(item => item.usage)];
   const fragment = sumUsages(modelUsages);
   // A truncated turn or aggregate L2 receipt cannot prove complete coverage of a cell.
-  const coverage = first && bb.length > 0 && bb.every(row => row.complete) &&
-    modelUsages.every(usage => usage && usage.input !== null && usage.output !== null && usage.cached !== null) &&
-    (arm === 'linear' || stages.length > 0);
+  const allStages = arm === 'linear' ? stages.length === 0 : first && await stagesCovered(run, policy, stages, accepted);
+  const completeRoles = first && attempt.rounds.arbitration === 0 && allStages && bb.length > 0 && bb.every(row => row.complete);
+  const coverage = completeRoles &&
+    modelUsages.every(usage => usage && usage.input !== null && usage.output !== null && usage.cached !== null);
   const costs = [bb[0]?.cost_usd ?? null, normalizeCost(attempt.costs?.critic),
     ...bb.filter(item => item.role === 'stage').map(item => item.cost_usd)];
-  const completeCost = first && bb.length > 0 && bb.every(row => row.complete) &&
-    costs.every(value => value !== null) && (arm === 'linear' || stages.length > 0);
+  const completeCost = completeRoles && costs.every(value => value !== null);
   const envelope = { case: name, arm, closed, first_round_pass: first, elapsed_ms: outcome.elapsed_ms,
     rework: attempt.rounds.rework, attempted_rounds: attempt.rounds.total, stage_threads: stages.length,
     tokens: coverage ? fragment : null, known_tokens: fragment,
@@ -89,7 +114,7 @@ async function readCell(root, name, arm) {
     review: policy.profiles.case.review, worker: { provider: policy.bb.provider, model: policy.bb.model },
     arbiter: policy.arbiter, routing: policy.routing, timeout: policy.waitMs,
     brief: sha(await readFile(join(run, 'operator/brief.md'))), reviewPrompt: sha(await readFile(join(run, 'operator/review.md'))) });
-  return { envelope, pinned, bb, attempt: { ...attempt, task_id: name } };
+  return { envelope, pinned, bb, runnerSha: outcome.runnerSha ?? null, attempt: { ...attempt, task_id: name } };
 }
 
 async function snapshot(cells) {
@@ -106,7 +131,7 @@ async function snapshot(cells) {
 }
 
 try {
-  const root = process.argv[2];
+  const root = process.argv[2], legacy = process.argv[3];
   if (!isAbsolute(root ?? '') || await realpath(root) !== root) throw new Error('Use absolute pilot evidence root');
   const cells = {};
   for (const arm of ARMS) {
@@ -114,11 +139,18 @@ try {
     for (const name of Object.keys(CASES)) cells[arm].push(await readCell(root, name, arm));
   }
   if (cells.linear.some((cell, i) => cell.pinned !== cells.foreman[i].pinned)) throw new Error('ab_metrics_pair_mismatch');
+  const revisions = new Set(ARMS.flatMap(arm => cells[arm].map(row => row.runnerSha)));
+  if (revisions.size !== 1) throw new Error('ab_metrics_runner_mismatch');
+  const [recorded] = revisions;
+  if (recorded === null ? !/^[a-f0-9]{40}$/.test(legacy ?? '') : legacy !== undefined) {
+    throw new Error('ab_metrics_runner_unconfirmed');
+  }
+  const provenance = { runnerSha: recorded ?? legacy, source: recorded ? 'recorded' : 'operator-declared-legacy' };
   const [a, b] = await Promise.all(ARMS.map(arm => snapshot(cells[arm])));
   const envelopes = ARMS.flatMap(arm => cells[arm].map(row => row.envelope));
   const delta = diffSnapshots(a, b).portfolio;
   if (envelopes.some(row => !row.closed)) delta.median_wall_clock_ms.speedup_pct = null;
-  console.log(JSON.stringify({ cells: envelopes, delta }, null, 2));
+  console.log(JSON.stringify({ provenance, timing: 'controller_until_exit', cells: envelopes, delta }, null, 2));
 } catch (error) {
   console.error('ab-pilot-compare:', error.message.split('\n')[0]);
   process.exitCode = 1;

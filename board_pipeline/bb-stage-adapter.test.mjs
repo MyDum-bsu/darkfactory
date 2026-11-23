@@ -16,25 +16,34 @@ function trace(workspace, nonce = challenge) {
   const snapshot = { thread: { id: threadId, parentThreadId: parentThread, projectId: project, providerId: provider,
     status: 'idle', activeBackgroundAgentCount: 0, queuedMessageCount: 0 }, environment: { path: workspace } };
   const event = (seq, type, data) => ({ threadId, seq, type, data, scope: { turnId: 't1' } });
-  const events = [event(1, 'client/turn/requested', { execution: { model }, input: [{ type: 'text', text: `Challenge: ${nonce}` }] }),
-    event(2, 'item/completed', { item: { type: 'agentMessage', text: `${nonce} PASS` } }),
-    event(3, 'turn/completed', { status: 'completed' })];
+  const providerThreadId = 'pid-1';
+  const events = [event(1, 'client/turn/requested', { execution: { model, permissionMode: 'accept-edits' },
+    input: [{ type: 'text', text: `Challenge: ${nonce}` }] }),
+    event(2, 'thread/identity', { providerThreadId }),
+    event(3, 'turn/started', { providerThreadId }),
+    event(4, 'item/completed', { providerThreadId, item: { type: 'agentMessage', text: `${nonce} PASS` } }),
+    event(5, 'turn/completed', { providerThreadId, providerCheckpointId: 'checkpoint-1', status: 'completed' })];
   return { snapshot, events, threadId, workspace, parentThread, project, provider, model, reasoning: null, challenge: nonce,
     promptText: `Challenge: ${nonce}` };
 }
 
 test('native stage proof binds only the single requested turn and rejects foreign/model/tool evidence', () => {
   const valid = trace('/isolated');
-  assert.deepEqual(verifyBbStageTurn(valid), { verdict: 'PASS', eventSeq: 3 });
+  assert.deepEqual(verifyBbStageTurn(valid), { verdict: 'PASS', eventSeq: 5, checkpoint: 'checkpoint-1', session: 'pid-1' });
+  const noCheckpoint = structuredClone(valid);
+  delete noCheckpoint.events[4].data.providerCheckpointId;
+  assert.throws(() => verifyBbStageTurn(noCheckpoint), /stage_turn_unconfirmed/);
+  const noStart = { ...valid, events: valid.events.filter(event => event.type !== 'turn/started') };
+  assert.throws(() => verifyBbStageTurn(noStart), /stage_turn_unconfirmed/);
   assert.throws(() => verifyBbStageTurn({ ...valid, parentThread: 'thr_other' }), /stage_bb_unconfirmed/);
   assert.throws(() => verifyBbStageTurn({ ...valid, model: 'another-model' }), /stage_turn_unconfirmed/);
   assert.throws(() => verifyBbStageTurn({ ...valid, promptText: `Changed artifact. Challenge: ${challenge}` }), /stage_turn_unconfirmed/);
   assert.throws(() => verifyBbStageTurn({ ...valid, events: valid.events.slice(0, 2) }), /stage_turn_unconfirmed/);
   const tool = structuredClone(valid);
-  tool.events[1].data.item.type = 'commandExecution';
+  tool.events[3].data.item.type = 'commandExecution';
   assert.throws(() => verifyBbStageTurn(tool), /stage_unexpected_tool_use/);
   const badNonce = structuredClone(valid);
-  badNonce.events[1].data.item.text = 'b'.repeat(64) + ' PASS';
+  badNonce.events[3].data.item.text = 'b'.repeat(64) + ' PASS';
   assert.throws(() => verifyBbStageTurn(badNonce), /stage_verdict_unconfirmed/);
 });
 
@@ -55,7 +64,7 @@ test('observer binds embedded skill and host artifact to one operator-parented s
   await mkdir(workspace, { mode: 0o700 });
   await mkdir(journal, { mode: 0o700 });
   let current, spawnCalls = 0;
-  const tracked = [];
+  const tracked = [], witnesses = [];
   const artifact = Buffer.from(JSON.stringify({ type: 'inventory', inventory: 'a'.repeat(64), items: 1, unresolved: 0 }));
   const execBb = async argv => {
     let result = {};
@@ -63,6 +72,7 @@ test('observer binds embedded skill and host artifact to one operator-parented s
       spawnCalls++;
       assert.equal(argv[argv.indexOf('--parent-thread') + 1], parentThread);
       assert.equal(argv[argv.indexOf('--environment') + 1], workspace);
+      assert.equal(argv[argv.indexOf('--permission-mode') + 1], 'accept-edits');
       const prompt = await readFile(argv[argv.indexOf('--prompt-file') + 1], 'utf8');
       assert.match(prompt, /Embedded fixture skill/);
       assert.ok(prompt.includes(artifact.toString()));
@@ -73,18 +83,24 @@ test('observer binds embedded skill and host artifact to one operator-parented s
     else if (argv[1] === 'log') result = current.events;
     return { stdout: JSON.stringify(result) };
   };
-  const observe = await createBbStageObserver({ workspace, project, journal, parentThread }, {
-    assertCurrent() {}, readArtifact: () => artifact, record: row => tracked.push(row), execBb,
-  });
+  const ports = { assertCurrent() {}, readArtifact: () => ({ artifact, material: 'Measured facts' }),
+    record: row => tracked.push(row), recordWitness: row => witnesses.push(row), execBb };
+  const settings = { workspace, project, journal, parentThread, deadline: Date.now() + 60_000 };
+  const unapproved = await createBbStageObserver(settings, ports);
+  const observe = await createBbStageObserver(settings, { ...ports, assertReadOnly: () => true });
   const req = { stage: 'intake', role: 'materials-reader', verifier: 'inventory', playbook: 'policy',
     registryDigest: 'a'.repeat(64), inputArtifactDigest: null,
     model: { provider, model, reasoning: null },
     binding: { task_id: '1', candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) },
     skills: [{ text: 'Embedded fixture skill' }] };
+  await assert.rejects(unapproved(req), /stage_read_only_transport_not_enrolled/);
+  assert.equal(spawnCalls, 0);
   const got = await observe(req);
   assert.equal(got.verdict, 'PASS');
   assert.ok(got.artifact.equals(artifact));
   assert.equal(tracked[0].threadId, threadId);
+  assert.equal(witnesses[0].checkpoint, 'checkpoint-1');
+  assert.equal(witnesses[0].artifactDigest, got.artifactDigest);
   await assert.rejects(observe(req), /stage_intent_already_exists/);
   assert.equal(spawnCalls, 1);
 });
@@ -97,7 +113,9 @@ test('role artifacts require verified L1 evidence on the same Git candidate', ()
   assert.throws(() => pilotArtifacts({ ...args, localEvidence: null }), /ab_pilot_l1_unconfirmed/);
   assert.throws(() => pilotArtifacts({ ...args, localEvidence: { ...args.localEvidence, sha: 'b'.repeat(40) } }), /ab_pilot_l1_unconfirmed/);
   const read = pilotArtifacts(args);
-  assert.deepEqual(JSON.parse(read({ verifier: 'change-set' })), {
+  const { artifact, material } = read({ verifier: 'change-set' });
+  assert.match(material, /Frozen independent check/);
+  assert.deepEqual(JSON.parse(artifact), {
     type: 'change-set', diff: 'e'.repeat(64), changed: 2, failedChecks: 0,
   });
   assert.throws(() => read({ verifier: 'visual-report' }), /ab_pilot_artifact_not_available/);
@@ -110,8 +128,8 @@ test('retired or non-DeepSeek model cannot launch and out-of-scope pilot cannot 
   await mkdir(workspace, { mode: 0o700 });
   await mkdir(journal, { mode: 0o700 });
   const unexpected = () => assert.fail('unexpected effect');
-  const observe = await createBbStageObserver({ workspace, project, journal, parentThread }, {
-    assertCurrent() {}, readArtifact: unexpected, record: unexpected, execBb: unexpected,
+  const observe = await createBbStageObserver({ workspace, project, journal, parentThread, deadline: Date.now() + 60_000 }, {
+    assertCurrent() {}, readArtifact: unexpected, record: unexpected, recordWitness: unexpected, execBb: unexpected,
   });
   await assert.rejects(observe({ model: { provider: 'pi', model: 'opencode-go/other' } }), /stage_model_denied/);
   await assert.rejects(enrollAbPilot({ arm: 'linear', case: 'policy', parent: parentThread }, {

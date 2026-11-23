@@ -29,9 +29,15 @@ export async function enrollAbPilot(config, { policy, tree, root, inbox, daemon,
       policy.scope !== 'isolated' || policy.channel !== 'pilot' || policy.route.finish !== 'verified' ||
       policy.route.taskId !== undefined || policy.questionGate !== undefined || policy.release !== undefined ||
       policy.decisionLedger !== undefined || policy.projectMemory !== undefined ||
+      !Number.isSafeInteger(policy.waitMs) || policy.waitMs < 5000 || policy.waitMs > 180000 ||
       !policy.label?.key || !isId(/^ab-[a-z0-9-]+$/, policy.label.value)) throw new Error('ab_pilot_scope_denied');
   const roots = [tree, root, inbox];
-  const assertOpen = await createPilotSwitch(config.switch, { permitDirectory: dir => separate(dir, roots) });
+  const switchOpen = await createPilotSwitch(config.switch, { permitDirectory: dir => separate(dir, roots) });
+  const deadline = Date.now() + policy.waitMs;
+  const assertOpen = async () => {
+    await switchOpen();
+    if (Date.now() >= deadline) throw new Error('ab_pilot_dispatch_deadline');
+  };
   await assertOpen();
   if (config.arm === 'linear') {
     if (Object.keys(config).length !== 4) throw new Error('ab_pilot_linear_config_invalid');
@@ -51,7 +57,7 @@ export async function enrollAbPilot(config, { policy, tree, root, inbox, daemon,
   const playbook = registry.playbooks[config.playbook];
   const writers = Object.values(playbook.stages).map(stage => registry.roles[stage.role]).filter(role => role.kind === 'writer');
   if (writers.length !== 1) throw new Error('ab_pilot_writer_not_enrolled');
-  return { arm: 'foreman', case: config.case, parent, registry, writer: writers[0],
+  return { arm: 'foreman', case: config.case, parent, registry, writer: writers[0], deadline,
     playbook: config.playbook, workspace: config.observerWorkspace, assertOpen: async () => {
       await assertOpen();
       if ((await loadRoleRegistry(config.catalog)).digest !== config.registryDigest) throw new Error('ab_pilot_catalog_drift');
@@ -75,15 +81,13 @@ export function pilotArtifacts({ candidate, diff, localEvidence, brief, review }
       localEvidence.evidence.some(item => item?.exit !== 0 || !isId(hex, item.sha256))) {
     throw new Error('ab_pilot_l1_unconfirmed');
   }
-  const digests = new Map([
-    ['inventory', { inventory: sha(brief), items: 1, unresolved: 0 }],
-    ['change-set', { diff: diff.diffDigest, changed: diff.files.length, failedChecks: 0 }],
-    ['rubric-review', { rubric: sha(review), criteria: localEvidence.evidence.length, blockers: 0 }],
-  ]);
+  const material = JSON.stringify({ brief: brief.toString('utf8'), rubric: review,
+    changedPaths: diff.files, checks: localEvidence.evidence.map(({ sha256, exit }) => ({ sha256, exit })) });
   return request => {
-    const facts = digests.get(request.verifier);
-    if (!facts) throw new Error('ab_pilot_artifact_not_available');
-    return Buffer.from(JSON.stringify({ type: request.verifier, ...facts }));
+    if (request.verifier !== 'change-set') throw new Error('ab_pilot_artifact_not_available');
+    const artifact = Buffer.from(JSON.stringify({ type: 'change-set', diff: diff.diffDigest,
+      changed: diff.files.length, failedChecks: localEvidence.evidence.filter(item => item.exit !== 0).length }));
+    return { artifact, material };
   };
 }
 
@@ -101,9 +105,15 @@ export async function runPilotForeman(ab, { attempt, handoff, project, journal, 
     return { ...handoff, ...pin, attempt_id: state.attemptId, epoch: state.epoch, triad: state.triad,
       held: true, switchOpen: true, clean: true, baseAncestor: true };
   };
-  const observeStage = await createBbStageObserver({ project, workspace: ab.workspace, parentThread: ab.parent, journal }, {
+  const remaining = Math.floor((ab.deadline - Date.now()) / 1000);
+  if (remaining < 5) throw new Error('ab_pilot_dispatch_deadline');
+  const observeStage = await createBbStageObserver({ project, workspace: ab.workspace, parentThread: ab.parent,
+    journal, deadline: ab.deadline, maxSeconds: Math.min(remaining, 120) }, {
+    // This installed, same-host BB launcher has no attested read-only seat.
+    // A policy file or empty directory cannot mint the assertReadOnly capability.
     assertCurrent: guard, readArtifact,
     record: row => appendFile(join(journal, 'ab-stage-threads.jsonl'), `${JSON.stringify(row)}\n`, { mode: 0o600 }),
+    recordWitness: row => appendFile(join(journal, 'ab-stage-receipts.jsonl'), `${JSON.stringify(row)}\n`, { mode: 0o600 }),
   });
   const result = await runPlaybook({ registry: ab.registry, playbook: ab.playbook, attempt: subject },
     { assertKernel: guard, observeStage });
