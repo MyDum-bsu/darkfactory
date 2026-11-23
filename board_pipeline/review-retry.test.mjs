@@ -156,34 +156,87 @@ test('retry: обычный REWORK — один вызов, вердикт пр�
 });
 
 // Продукционный гейт l2ReviewRetryGuard: свежий verifyHeld (не кэш флага),
-// допуск карточки (owner/label), guardTask, закреплённые входы и kill-switch.
+// допуск карточки (owner/label), живые контрактные метки, guardTask,
+// daemon/pilot kill-switch, закреплённые входы и beforeEffect.
+const CONTRACT = { repo_id: 'df-ops-1', spec_digest: 's'.repeat(64),
+  policy_digest: 'p'.repeat(64), profile_id: 'code', finish: 'verified',
+  fixtures_digest: null, has_ui: undefined };
 function guardFixture(over = {}) {
   const seen = [];
   const port = {
     verifyHeld: async (taskId, epoch) => { seen.push('verifyHeld'); return { epoch }; },
     matches: async () => { seen.push('matches'); return true; },
+    labels: async () => { seen.push('labels'); return { ...CONTRACT }; },
     guardTask: async () => { seen.push('guardTask'); },
     ...over.port,
   };
   const args = { port, taskId: '1', epoch: 1, owner: 'local:user:t',
-    label: { key: 'queue', value: 'x' },
+    label: { key: 'queue', value: 'x' }, contract: CONTRACT,
     assertPinned: async () => { seen.push('assertPinned'); },
     beforeEffect: async () => { seen.push('beforeEffect'); },
+    daemonOpen: async () => { seen.push('daemonOpen'); },
     ...over };
   return { guard: l2ReviewRetryGuard(args), seen };
 }
 
-test('guard: production retry guard — каждая проверка живая и заново', async () => {
+test('guard: production retry guard — subject сначала, живые гейты перед dispatch', async () => {
   const { review, calls } = scriptedReview([
     timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
   const { guard, seen } = guardFixture();
   const receipt = await l2ReviewWithTransientRetry({ review, binding: BINDING,
     profile: { review: CRITIC }, beforeRetry: guard,
-    verifySubject: async () => {} });
+    verifySubject: async () => { seen.push('subject'); } });
   assert.equal(calls(), 2);
   assert.equal(receipt.verdict, 'REVIEW_OK');
-  // Порядок: lease → допуск карточки → guardTask → пины/switch → beforeEffect.
-  assert.deepEqual(seen, ['verifyHeld', 'matches', 'guardTask', 'assertPinned', 'beforeEffect']);
+  // Порядок: subject → lease → допуск → контракт → guardTask → daemon switch
+  // → пины/switch → beforeEffect — живые проверки непосредственно перед вызовом.
+  assert.deepEqual(seen, ['subject', 'verifyHeld', 'matches', 'labels',
+    'guardTask', 'daemonOpen', 'assertPinned', 'beforeEffect']);
+});
+
+test('guard: дрейф контрактных меток до повтора — ноль доп. вызовов', async () => {
+  for (const live of [
+      { ...CONTRACT, policy_digest: 'e'.repeat(64) },
+      { ...CONTRACT, spec_digest: 'e'.repeat(64) },
+      { ...CONTRACT, repo_id: 'other' },
+      { ...CONTRACT, has_ui: 'true' }]) {
+    const { review, calls } = scriptedReview([
+      timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
+    const { guard } = guardFixture({ port: {
+      verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true,
+      labels: async () => live, guardTask: async () => {} } });
+    await assert.rejects(
+      l2ReviewWithTransientRetry({ review, binding: BINDING,
+        profile: { review: CRITIC }, beforeRetry: guard,
+        verifySubject: async () => {} }),
+      (e) => e.message.startsWith('contract_drift:'));
+    assert.equal(calls(), 1, JSON.stringify(live));
+  }
+  // Нет порта меток — отказ до повтора, а не тихий пропуск.
+  const { review, calls } = scriptedReview([
+    timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
+  const { guard } = guardFixture({ port: {
+    verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true,
+    guardTask: async () => {} } });
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review, binding: BINDING,
+      profile: { review: CRITIC }, beforeRetry: guard,
+      verifySubject: async () => {} }),
+    (e) => e.message === 'contract_labels_unavailable');
+  assert.equal(calls(), 1);
+});
+
+test('guard: daemon kill-switch закрыт до повтора — ноль доп. вызовов', async () => {
+  const { review, calls } = scriptedReview([
+    timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
+  const { guard } = guardFixture({
+    daemonOpen: async () => { throw new Error('kill_switch'); } });
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review, binding: BINDING,
+      profile: { review: CRITIC }, beforeRetry: guard,
+      verifySubject: async () => {} }),
+    (e) => e.message === 'kill_switch');
+  assert.equal(calls(), 1);
 });
 
 test('guard: дрейф lease/epoch до повтора — ноль доп. вызовов', async () => {
@@ -207,14 +260,13 @@ test('guard: смена владельца/метки, отказ guardTask и �
     { port: { verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => false, guardTask: async () => {} },
       check: (e) => e.message === 'Task no longer authorized' },
     { port: { verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true,
+        labels: async () => ({ ...CONTRACT }),
         guardTask: async () => { throw new Error('task_denied'); } },
       check: (e) => e.message === 'task_denied' },
-    { port: { verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true, guardTask: async () => {} },
+    { port: { verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true,
+        labels: async () => ({ ...CONTRACT }), guardTask: async () => {} },
       assertPinned: async () => { throw new Error('Operator inputs changed'); },
       check: (e) => e.message === 'Operator inputs changed' },
-    { port: { verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true, guardTask: async () => {} },
-      assertOpen: async () => { throw new Error('kill_switch'); },
-      check: (e) => e.message === 'kill_switch' },
   ];
   for (const { check, ...over } of cases) {
     const { review, calls } = scriptedReview([
@@ -352,15 +404,18 @@ gitTest('runner: security-отказ (запрещённый tool) — один 
   assert.equal(calls(), 1);
 });
 
-gitTest('runner: завершённый ответ при коде 143 валидируется, а не повторяется', async (t) => {
-  // PASS-транскрипт при ненулевом выходе — обычная валидация, не transient.
+gitTest('runner: валидный PASS при коде 143 — hold без повтора и без приёмки', async (t) => {
+  // Завершённый ответ — не обрыв: повтора нет, но и квитанции приёмки по
+  // ненулевому выходу тоже нет — обычный hold сохраняется.
   const { review, binding, profile, calls } = await fixture(t, [
     { code: 143, stdout: PASS, stderr: 'killed at teardown' },
     { code: 0, stdout: PASS, stderr: '' }]);
-  const receipt = await l2ReviewWithTransientRetry({ review, binding, profile,
-    beforeRetry: async () => { throw new Error('no retry expected'); } });
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review, binding, profile,
+      beforeRetry: async () => { throw new Error('no retry expected'); } }),
+    (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout) &&
+      e.reason === 'review_runner_exit:143');
   assert.equal(calls(), 1);
-  assert.equal(receipt.verdict, 'REVIEW_OK');
 });
 
 gitTest('runner: завершённый REWORK при коде 143 — один вызов, вердикт сохранён', async (t) => {
@@ -377,15 +432,21 @@ gitTest('runner: завершённый REWORK при коде 143 — один 
 });
 
 gitTest('runner: завершённый, но misattested ответ при 143 — отказ без повтора', async (t) => {
-  const wrongModel = stream('REVIEW_OK', { model: 'gpt-6.2-astra' });
-  const { review, binding, profile, calls } = await fixture(t, [
-    { code: 143, stdout: wrongModel, stderr: '' },
-    { code: 0, stdout: PASS, stderr: '' }]);
-  await assert.rejects(
-    l2ReviewWithTransientRetry({ review, binding, profile,
-      beforeRetry: async () => { throw new Error('no retry expected'); } }),
-    (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout));
-  assert.equal(calls(), 1);
+  for (const bad of [
+      // message.model отличается от закреплённого критика.
+      stream('REVIEW_OK', { model: 'gpt-6.2-astra' }),
+      // model совпадает, но responseModel сообщает другую модель —
+      // review_model_mismatch внутри парсера тоже не transient.
+      stream('REVIEW_OK', { responseModel: 'gpt-6.2-astra' })]) {
+    const { review, binding, profile, calls } = await fixture(t, [
+      { code: 143, stdout: bad, stderr: '' },
+      { code: 0, stdout: PASS, stderr: '' }]);
+    await assert.rejects(
+      l2ReviewWithTransientRetry({ review, binding, profile,
+        beforeRetry: async () => { throw new Error('no retry expected'); } }),
+      (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout));
+    assert.equal(calls(), 1);
+  }
 });
 
 gitTest('runner: sandbox cleanup failure — typed ReviewDenied, без повтора', async (t) => {
@@ -449,6 +510,18 @@ gitTest('subject: worktree, ветка, SHA и чистое дерево на ca
   await assert.rejects(assertRetrySubjectUnchanged({ ...binding, branch: undefined }),
     (e) => e.reason === 'review_retry_subject_changed');
   await git('checkout', '-q', 'pilot');
+  // Путь, заменённый симлинком на другой чистый checkout с тем же SHA, — не
+  // тот зачисленный worktree: канонический путь записи не восстанавливается.
+  const { symlink } = await import('node:fs/promises');
+  const link = join(tmpdir(), `retry-link-${Date.now()}`);
+  await symlink(dir, link);
+  try {
+    await assert.rejects(
+      assertRetrySubjectUnchanged({ ...binding, worktree: link }),
+      (e) => e.reason === 'review_retry_subject_changed');
+  } finally {
+    await rm(link, { force: true });
+  }
   // Грязное дерево и смена HEAD — отказ.
   await writeFile(join(dir, 'd.txt'), 'd\n');
   await assert.rejects(assertRetrySubjectUnchanged(binding),

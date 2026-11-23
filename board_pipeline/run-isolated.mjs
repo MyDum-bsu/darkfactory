@@ -515,6 +515,16 @@ async function execute() {
       return { confirmed };
     },
   };
+  // Daemon kill-switch: создаётся до verify, чтобы единственный повтор L2
+  // проверял именно действующий стоп-файл, а не только activation switch.
+  const daemonSwitchPath = values.switch ?? p.pilot?.killSwitch;
+  // Демон без kill-switch не стартует: операторский стоп обязан существовать.
+  if (values.daemon && !daemonSwitchPath) {
+    throw new Error('Daemon mode requires --switch or pilot.killSwitch');
+  }
+  const daemonOpen = values.daemon ? await createPilotSwitch(daemonSwitchPath, {
+    permitDirectory: dir => [tree, inbox, root].every(path => !inside(path, dir) && !inside(dir, path)),
+  }) : undefined;
   async function observedTurn(threadId, after) {
     const { stdout } = await exec('bb', ['thread', 'show', threadId, '--json'], { timeout: 9000 });
     const snapshot = JSON.parse(stdout);
@@ -665,7 +675,13 @@ async function execute() {
             review, binding: handoff, profile: trusted,
             beforeRetry: l2ReviewRetryGuard({ port, taskId: attempt.task_id,
               epoch: attempt.epoch, owner: p.owner, label: p.label,
-              assertPinned, beforeEffect, assertOpen }),
+              contract: attempt.repo_id === undefined && attempt.policy_digest === undefined
+                ? undefined
+                : { repo_id: attempt.repo_id, spec_digest: attempt.spec_digest,
+                    policy_digest: attempt.policy_digest, profile_id: attempt.check_profile,
+                    fixtures_digest: attempt.fixtures_digest ?? null,
+                    has_ui: attempt.has_ui, finish: route.finish },
+              assertPinned, beforeEffect, assertOpen, daemonOpen }),
             verifySubject: b => assertRetrySubjectUnchanged({ ...b, worktree: tree,
               branch: profile.branch }),
             log: note => console.log(JSON.stringify(note)),
@@ -770,12 +786,6 @@ async function execute() {
       // (файл 'run' в приватном каталоге) или SIGTERM/SIGINT от systemd.
       const intervalMs = values['interval-ms'] === undefined ? DEFAULT_INTERVAL_MS
         : Number(values['interval-ms']);
-      const switchPath = values.switch ?? p.pilot?.killSwitch;
-      // Демон без kill-switch не стартует: операторский стоп обязан существовать.
-      if (!switchPath) throw new Error('Daemon mode requires --switch or pilot.killSwitch');
-      const daemonOpen = await createPilotSwitch(switchPath, {
-        permitDirectory: dir => [tree, inbox, root].every(path => !inside(path, dir) && !inside(dir, path)),
-      });
       // Стартовый 'stop' не отказ: цикл сам зафиксирует kill_switch в журнале
       // и выйдет с кодом 0 — Restart=on-failure под systemd не зациклится.
       const journal = new RotatingJournal({ directory: root });

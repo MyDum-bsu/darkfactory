@@ -30,6 +30,12 @@ const PROXY_BOOTSTRAP = new URL('./model-proxy-client.cjs', import.meta.url).pat
 
 const READ_ONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
 
+// Причины разбора, означающие действительно оборванный поток — только они
+// открывают transient-классификацию ненулевого выхода раннера.
+const TRUNCATED_TRANSCRIPT = new Set([
+  'review_transcript_empty', 'review_transcript_corrupt', 'review_incomplete_turn',
+]);
+
 // Монтируются только каталоги кода; конфиги идут через /pi-cfg копией в tmpfs.
 const PI_MOUNT_DIRS = ['bin', 'install', 'npm'];
 const PI_CONFIG_FILES = ['settings.json', 'models.json', 'models-store.json'];
@@ -563,12 +569,15 @@ export async function assertRetrySubjectUnchanged(binding) {
   if (!isAbsolute(binding?.worktree ?? '') || !SHA.test(binding?.candidate_sha ?? '')) {
     throw new ReviewDenied('review_retry_subject_unverified');
   }
+  // Путь обязан оставаться каноническим recorded-at-enrollment: подмена его
+  // симлинком на другой чистый checkout — не тот субъект, повтор запрещён.
+  const canonical = await realpath(binding.worktree).catch(() => null);
   const toplevel = await git(binding.worktree, 'rev-parse', '--show-toplevel');
   const head = await git(binding.worktree, 'rev-parse', 'HEAD');
   const branch = await git(binding.worktree, 'branch', '--show-current');
   const status = await git(binding.worktree, 'status', '--porcelain=v1', '--untracked-files=all');
-  if (toplevel !== await realpath(binding.worktree) || head !== binding.candidate_sha ||
-      status === undefined || status !== '' || branch === '' ||
+  if (canonical !== binding.worktree || toplevel !== binding.worktree ||
+      head !== binding.candidate_sha || status !== '' || branch === '' ||
       (nonEmpty(binding.branch) && branch !== binding.branch)) {
     throw new ReviewDenied('review_retry_subject_changed');
   }
@@ -580,18 +589,33 @@ export async function assertRetrySubjectUnchanged(binding) {
 
 // Контроллерские гейты перед единственным повтором: доказательство ТЕКУЩЕГО
 // lease/эпохи свежим verifyHeld (native renew + допуск 'claimed'), повторный
-// допуск карточки (владелец/метка), guardTask там, где сконфигурирован,
-// закреплённые входы оператора и kill-switch, передэффектные гейты пилота.
+// допуск карточки (владелец/метка) и сверка живых контрактных меток с
+// закреплёнными при спавне, guardTask там, где сконфигурирован, daemon и
+// pilot kill-switch, закреплённые входы оператора, передэффектные гейты.
 // Ничего не берётся из кэшированного флага — каждая проверка живая.
-export function l2ReviewRetryGuard({ port, taskId, epoch, owner, label,
-  assertPinned, beforeEffect, assertOpen }) {
+export function l2ReviewRetryGuard({ port, taskId, epoch, owner, label, contract,
+  assertPinned, beforeEffect, assertOpen, daemonOpen }) {
   return async () => {
     const live = await port.verifyHeld(taskId, epoch);
     if (live?.epoch !== epoch) throw new Error('Lease lost');
     if (owner && label && await port.matches?.(taskId, { owner, label, state: 'claimed' }) === false) {
       throw new Error('Task no longer authorized');
     }
+    if (contract) {
+      const live = await port.labels?.(taskId);
+      if (!live) throw new Error('contract_labels_unavailable');
+      for (const key of ['repo_id', 'spec_digest', 'policy_digest',
+          'profile_id', 'finish', 'fixtures_digest']) {
+        if ((live[key] ?? null) !== (contract[key] ?? null)) {
+          throw new Error(`contract_drift:${key}`);
+        }
+      }
+      if ((live.has_ui === 'true') !== (contract.has_ui === true)) {
+        throw new Error('contract_drift:has_ui');
+      }
+    }
     await port.guardTask?.(taskId, epoch);
+    await daemonOpen?.();
     if (assertOpen) await assertOpen(); else await assertPinned?.();
     await beforeEffect?.();
   };
@@ -610,8 +634,11 @@ export async function l2ReviewWithTransientRetry({ review, binding, profile, bef
     return await review(binding, profile);
   } catch (error) {
     if (!(error instanceof ReviewRunnerTimeout)) throw error;
-    await beforeRetry?.();
+    // Сначала неизменность субъекта (fs/git), затем живые контроллерские
+    // гейты непосредственно перед dispatch: дрейф во время subject-check
+    // не должен пропустить второй вызов под устаревшей авторизацией.
     await verifySubject(binding);
+    await beforeRetry?.();
     log?.({ kind: 'l2_review_retry', task: binding?.task_id ?? null,
       sha: binding?.candidate_sha ?? null, reason: error.reason });
     return await review(binding, profile);
@@ -773,7 +800,8 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         '--session-dir', '/tmp/session', instruction];
 
       const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs, beforeEffect });
-      if (run.code !== 0) {
+      const dirtyExit = run.code !== 0;
+      if (dirtyExit) {
         // Сырой вывод — только в приватный журнал (0600), не в причину Board.
         try {
           await writeFile(join(journal, `${name}.stderr`),
@@ -781,10 +809,16 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         } catch { /* журнал недоступен — не маскируем исходную ошибку */ }
         // Завершённый транскрипт при ненулевом выходе — не «чистый» transient:
         // ответ проходит обычную валидацию (модель, tools, verdict, REWORK),
-        // чтобы повтор не стёр содержательный исход или сбой аттестации.
+        // чтобы повтор не стёр содержательный исход. Структурные и
+        // аттестационные отказы парсера (mismatch модели/effort) сохраняются
+        // как есть — повтор по ним запрещён; transient-классификация только
+        // для действительно оборванного потока.
         try {
           parseReviewTranscript(run.stdout);
-        } catch {
+        } catch (error) {
+          if (error instanceof ReviewDenied && !TRUNCATED_TRANSCRIPT.has(error.reason)) {
+            throw error;
+          }
           throw reviewRunnerExitFailure(run);
         }
       }
@@ -808,6 +842,13 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         // При заданном дайджесте вердикт обязан подтвердить именно его;
         // непрошенный subject_digest без binding — тоже отказ.
         throw new ReviewDenied('review_verdict_subject_mismatch');
+      }
+
+      // Ненулевой выход с завершённым потоком не даёт квитанции приёмки:
+      // содержательный REWORK/ESCALATE сохраняется, а PASS по грязному
+      // выходу (включая 143) — обычный hold, не повтор и не accepted.
+      if (dirtyExit && verdict.status === 'PASS') {
+        throw new ReviewDenied(`review_runner_exit:${run.code}`);
       }
 
       // После завершения: снимок и worktree обязаны быть побайтово неизменны.
