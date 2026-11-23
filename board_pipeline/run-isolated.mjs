@@ -645,7 +645,9 @@ async function execute() {
     const { review, retry: retryReview } = l2CriticRunners({
       makeRunner: neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner,
       options: { journal: root, prompt: criticPrompt },
-      // Первый читатель — прежний пре-эффект, как до DF-OPS-1.
+      // Читатели конструируются лениво при вызове — после проверок
+      // review-порта ниже, а не на этой строке. Первый читатель — прежний
+      // пре-эффект, как до DF-OPS-1.
       beforeEffect,
       // Пре-эффект второго читателя — вся граница запуска: свежее
       // доказательство lease/допуска/контракта/пинов, чистый закреплённый

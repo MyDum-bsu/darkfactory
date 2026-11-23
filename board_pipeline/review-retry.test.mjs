@@ -13,6 +13,7 @@ import {
   reviewRunnerExitFailure, ReviewDenied, ReviewRunnerTimeout,
   runInReadOnlySandbox,
 } from './review-runner.mjs';
+import { nativeBoardPort } from './native-board.mjs';
 import { isNeonReview, isSolArbiter } from './review-policy.mjs';
 import { operatorReviewSetup } from './review-setup.mjs';
 
@@ -889,15 +890,23 @@ gitTest('runners: пара l2CriticRunners — первый запуск без 
     return { code: 0, stdout: PASS, stderr: '' };
   };
   const { review, retry } = l2CriticRunners({
-    makeRunner: opts => isolatedPiReviewRunner({ journal, piRoot, sandbox, ...opts }),
+    makeRunner: opts => {
+      seen.push('construct');
+      return isolatedPiReviewRunner({ journal, piRoot, sandbox, ...opts });
+    },
     options: {},
     beforeEffect: async () => { seen.push('beforeEffect'); },
     retryBeforeEffect: async () => { seen.push('retryBoundary'); },
   });
+  // Проверки review-порта идут до конструирования читателя: вызов пары
+  // здесь ещё не построил ни одного раннера.
+  assert.deepEqual(seen, []);
   const receipt = await l2ReviewWithTransientRetry({ review, retry, binding, profile,
     beforeRetry: async () => { seen.push('beforeRetry'); } });
   assert.equal(receipt.verdict, 'REVIEW_OK');
-  assert.deepEqual(seen, ['beforeEffect', 'dispatch']);
+  // Раннер построен лениво при первом вызове; retry-экземпляр без повтора
+  // не конструируется и не запускается вообще.
+  assert.deepEqual(seen, ['construct', 'beforeEffect', 'dispatch']);
 });
 
 gitTest('runners: retry-only хук — только на втором запуске того же раннера', async (t) => {
@@ -912,7 +921,10 @@ gitTest('runners: retry-only хук — только на втором запу�
                    : { code: 0, stdout: PASS, stderr: '' };
   };
   const { review, retry } = l2CriticRunners({
-    makeRunner: opts => isolatedPiReviewRunner({ journal, piRoot, sandbox, ...opts }),
+    makeRunner: opts => {
+      seen.push('construct');
+      return isolatedPiReviewRunner({ journal, piRoot, sandbox, ...opts });
+    },
     options: {},
     beforeEffect: async () => { seen.push('beforeEffect'); },
     retryBeforeEffect: async () => { seen.push('retryBoundary'); },
@@ -920,46 +932,82 @@ gitTest('runners: retry-only хук — только на втором запу�
   const receipt = await l2ReviewWithTransientRetry({ review, retry, binding, profile,
     beforeRetry: async () => { seen.push('beforeRetry'); } });
   assert.equal(receipt.verdict, 'REVIEW_OK');
-  // Второй вызов идёт отдельным экземпляром: граница запуска — на нём,
-  // после beforeRetry, непосредственно перед dispatch.
-  assert.deepEqual(seen, ['beforeEffect', 'dispatch', 'beforeRetry',
-    'retryBoundary', 'dispatch']);
+  // Второй вызов идёт отдельным экземпляром, построенным только на повторе:
+  // граница запуска — на нём, после beforeRetry, перед dispatch.
+  assert.deepEqual(seen, ['construct', 'beforeEffect', 'dispatch', 'beforeRetry',
+    'construct', 'retryBoundary', 'dispatch']);
 });
 
 dockerTest('boundary: свежий verifyHeld на границе второго запуска', async (t) => {
-  // Lease потерян ПОСЛЕ ранних проверок границы (guard и subject прошли),
-  // но до docker run второго читателя: продукционная композиция
-  // l2LaunchBoundary + l2FreshLeaseCheck обязана сделать свежий нативный
-  // verifyHeld — ошибка и эпоха-дрейф отменяют запуск. Кэш флага здесь
-  // не используется: вызов идёт в самой границе после асинхронных гейтов.
-  for (const lose of ['throw', 'epoch']) {
+  // Продукционная композиция повтора с НАСТОЯЩИМ nativeBoardPort над
+  // подставным бэкендом карточки: lease теряется после ранних проверок
+  // границы (guard и subject прошли), но до docker run второго читателя —
+  // свежий native renew обязан упасть и не допустить запуск. Кэш флага
+  // здесь не используется: вызов идёт в самой границе после async гейтов.
+  for (const lose of ['renew', 'epoch']) {
     const { calls } = await dockerStub(t);
     const { binding, profile, journal, piRoot } = await fixture(t, []);
-    let held = true;
+    const until = () => new Date(Date.now() + 600_000).toISOString();
+    const root = { id: '1', channel: 'ch',
+      labels: { ...CONTRACT, queue: 'x' },
+      task: { state: 'ready', epoch: 1, owner: 'local:user:t' } };
+    let renewable = true;
+    let claim;
+    const renewals = [];
+    const handle = {
+      thread: async () => ({ message: root }),
+      tasks: { claim: async () => {
+        root.task.state = 'claimed';
+        root.task.claim = { until: until() };
+        claim = { epoch: 1, until: root.task.claim.until,
+          renew: async () => {
+            renewals.push('renew');
+            if (!renewable) {
+              const e = new Error('claim_lost');
+              e.code = 'claim_lost';
+              throw e;
+            }
+            return { until: until() };
+          } };
+        return claim;
+      } },
+    };
+    // Та же проводка, что в run-isolated: нативный порт, retryGuard,
+    // launchBoundary с l2FreshLeaseCheck и пара читателей l2CriticRunners.
+    const port = nativeBoardPort(handle, { channel: 'ch' });
+    await port.claim('1', {});
     const seen = [];
-    const port = { verifyHeld: async (taskId, epoch) => {
-      seen.push('verifyHeld');
-      if (!held) {
-        if (lose === 'throw') throw new Error('claim_lost');
-        return { epoch: epoch + 1 };
-      }
-      return { epoch };
-    } };
+    const retryGuard = l2ReviewRetryGuard({ port, taskId: '1', epoch: 1,
+      owner: 'local:user:t', label: { key: 'queue', value: 'x' },
+      contract: CONTRACT,
+      assertPinned: async () => { seen.push('assertPinned'); },
+      beforeEffect: async () => { seen.push('beforeEffect'); },
+      daemonOpen: async () => { seen.push('guardSwitch'); } });
     const boundary = l2LaunchBoundary({
-      retryGuard: async () => { seen.push('guard'); },
-      verifySubject: async () => { seen.push('subject'); held = false; },
+      retryGuard,
+      verifySubject: async () => {
+        seen.push('subject');
+        // Потеря живого lease в окне границы, после ранних проверок.
+        if (lose === 'renew') renewable = false; else claim.epoch = 2;
+      },
+      assertPinned: async () => { seen.push('pins'); },
       checkLease: l2FreshLeaseCheck({ port, taskId: '1', epoch: 1 }),
       daemonOpen: async () => { seen.push('switch'); },
     });
-    const mk = beforeEffect => isolatedPiReviewRunner({ journal, piRoot,
-      sandbox: runInReadOnlySandbox, timeoutMs: 300, beforeEffect });
+    const { review, retry } = l2CriticRunners({
+      makeRunner: opts => isolatedPiReviewRunner({ journal, piRoot,
+        sandbox: runInReadOnlySandbox, timeoutMs: 300, ...opts }),
+      options: {},
+      beforeEffect: async () => { seen.push('first'); },
+      retryBeforeEffect: async () => { await boundary(); },
+    });
     await assert.rejects(
-      l2ReviewWithTransientRetry({ review: mk(), retry: mk(boundary),
-        binding, profile, beforeRetry: async () => {} }),
-      (e) => /claim_lost|Lease lost/.test(e.message), lose);
-    // Свежий verifyHeld — после асинхронных проверок, до стоп-файла;
-    // второй `docker run` не начался.
-    assert.deepEqual(seen, ['guard', 'subject', 'verifyHeld'], lose);
+      l2ReviewWithTransientRetry({ review, retry, binding, profile,
+        beforeRetry: retryGuard }),
+      (e) => e.code === 'claim_lost' || e.code === 'epoch_mismatch', lose);
+    // Свежий native renew на границе увидел потерю: второй `docker run`
+    // не начался; стоп-файл до проверки lease не дошёл и не требовался.
+    assert.ok(renewals.length >= 2, `${lose}: renewals=${renewals.length}`);
     assert.deepEqual(await calls(), ['info', 'run', 'rm', 'info'], lose);
   }
 });

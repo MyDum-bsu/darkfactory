@@ -757,11 +757,16 @@ export function l2LaunchBoundary({ retryGuard, verifySubject, assertOpen,
 // daemon-чтений, ожидания renewal и повторных гейтов в пре-эффекте. Второй
 // экземпляр того же раннера и pinned-модели получает retry-only хук
 // границы запуска — retry-проверки существуют только у него.
+// Оба раннера конструируются ЛЕНИВО, при первом вызове: проверки
+// review-порта (renewal, пины, пре-эффект) остаются впереди и
+// конструирования читателя, а не только его запуска.
 export function l2CriticRunners({ makeRunner, options, beforeEffect, retryBeforeEffect }) {
-  return {
-    review: makeRunner({ ...options, beforeEffect }),
-    retry: makeRunner({ ...options, beforeEffect: retryBeforeEffect }),
+  const lazy = hook => {
+    let runner;
+    return (binding, profile) =>
+      (runner ??= makeRunner({ ...options, beforeEffect: hook }))(binding, profile);
   };
+  return { review: lazy(beforeEffect), retry: lazy(retryBeforeEffect) };
 }
 
 // Доказательство lease на границе запуска — только свежий нативный
