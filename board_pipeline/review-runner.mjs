@@ -72,6 +72,12 @@ function transcriptDisqualifying(ndjson, critic) {
     if (event?.type !== 'message_end') continue;
     const message = event.message ?? event.data?.message;
     if (message?.role !== 'assistant') continue;
+    // Отказ провайдера может быть записан в самом assistant-сообщении
+    // (stopReason 'error' / errorMessage) без верхнеуровневого error-события —
+    // зафиксированный отказ — hold, не transient.
+    if (message.stopReason === 'error' || nonEmpty(message.errorMessage)) {
+      return 'review_runner_reported_error';
+    }
     const responseModel = message.responseModel ?? message.actualModel ??
       message.usage?.responseModel ?? message.metadata?.responseModel;
     const effort = message.providerThinkingLevel ?? message.reasoningEffort ??
@@ -924,7 +930,14 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           // зафиксированный отказ или чужую закреплённую модель.
           const disqualified = transcriptDisqualifying(run.stdout, critic);
           if (disqualified) throw new ReviewDenied(disqualified);
-          throw reviewRunnerExitFailure(run);
+          const exitError = reviewRunnerExitFailure(run);
+          if (exitError instanceof ReviewRunnerTimeout) {
+            // Прежде чем выход станет повторяемым — снимок первого читателя
+            // обязан быть нетронут: нарушение read-only границы — hold,
+            // не transient, иначе повтор сотрёт следы инцидента.
+            await verifySnapshotUnchanged(source, before);
+          }
+          throw exitError;
         }
       }
 

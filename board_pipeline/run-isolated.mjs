@@ -655,6 +655,7 @@ async function execute() {
             await retryGuard();
             await assertRetrySubjectUnchanged(launchBinding);
             await daemonOpen?.();
+            if (assertOpen) await assertOpen(); else await assertPinned?.();
             await renewal;
             if (lost) throw new Error('Lease lost');
           }

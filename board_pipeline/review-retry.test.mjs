@@ -677,7 +677,12 @@ gitTest('runner: незавершённый, но дисквалифицирую
     // инструментов зафиксировано потоком — потеря settlement его не стирает.
     { stdout: JSON.stringify({ type: 'session_info',
         data: { toolsAdded: ['read', 'bash'] } }),
-      reason: 'review_forbidden_tool:bash' }]) {
+      reason: 'review_forbidden_tool:bash' },
+    // Отказ провайдера в самом assistant-сообщении (stopReason error +
+    // errorMessage), без верхнеуровневого error-события и вердикта — hold.
+    { stdout: msg({ stopReason: 'error', errorMessage: 'provider refused',
+        content: [{ type: 'text', text: 'cannot comply' }] }),
+      reason: 'review_runner_reported_error' }]) {
     const { review, binding, profile, calls } = await fixture(t, [
       { code: 143, stdout, stderr: '' },
       { code: 0, stdout: PASS, stderr: '' }]);
@@ -754,6 +759,40 @@ gitTest('runner: грязный worktree до повтора — отказ, п�
   await assert.rejects(
     l2ReviewWithTransientRetry({ review, binding, profile, beforeRetry: async () => {} }),
     (e) => e.reason === 'review_retry_subject_changed');
+  assert.equal(calls(), 1);
+});
+
+gitTest('runner: мутация снимка первого читателя — hold, не transient', async (t) => {
+  // Read-only граница сломана: выход 143 нельзя сделать повторяемым —
+  // целостность снимка первого читателя проверяется ДО transient-
+  // классификации, иначе повтор стирает следы инцидента.
+  const { dir, base, sha } = await repo();
+  const journal = await mkdtemp(join(tmpdir(), 'retry-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'retry-pi-'));
+  await writeFile(join(piRoot, 'auth.json'), '{"openai":{"k":"v"}}');
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+  });
+  let count = 0;
+  const calls = () => count;
+  const sandbox = async ({ snapshot }) => {
+    count++;
+    if (count === 1) {
+      await writeFile(join(snapshot, 'planted.txt'), 'tampered\n');
+      return { code: 143, stdout: '', stderr: '' };
+    }
+    return { code: 0, stdout: PASS, stderr: '' };
+  };
+  const review = isolatedPiReviewRunner({ journal, piRoot, sandbox });
+  const binding = { task_id: '1', candidate_sha: sha, base_sha: base,
+    worktree: dir, executor: 'acp-devin/swe-2-high', subject_digest: DIGEST };
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review, binding, profile: { review: CRITIC },
+      beforeRetry: async () => { throw new Error('no retry expected'); } }),
+    (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout) &&
+      e.reason === 'snapshot_mutated');
   assert.equal(calls(), 1);
 });
 
