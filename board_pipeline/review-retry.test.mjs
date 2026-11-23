@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 
 import {
   assertRetrySubjectUnchanged, classifySandboxExit, isolatedPiReviewRunner,
-  l2CriticSpec, l2ReviewRetryGuard, l2ReviewWithTransientRetry,
+  l2CriticSpec, l2LaunchBoundary, l2ReviewRetryGuard, l2ReviewWithTransientRetry,
   reviewRunnerExitFailure, ReviewDenied, ReviewRunnerTimeout,
   runInReadOnlySandbox,
 } from './review-runner.mjs';
@@ -347,6 +347,31 @@ test('guard: смена владельца/метки, отказ guardTask и �
   }
 });
 
+test('boundary: продукционный l2LaunchBoundary — daemon-стоп читается последним', async () => {
+  // Порядок продукционного хука: живые гейты → субъект → пины/переключатели
+  // → lease → daemon-стоп-файл ПОСЛЕДНИМ, непосредственно перед запуском.
+  const seen = [];
+  await l2LaunchBoundary({
+    retryGuard: async () => seen.push('guard'),
+    verifySubject: async () => seen.push('subject'),
+    assertOpen: async () => seen.push('pins'),
+    checkLease: async () => seen.push('lease'),
+    daemonOpen: async () => seen.push('switch'),
+  })();
+  assert.deepEqual(seen, ['guard', 'subject', 'pins', 'lease', 'switch']);
+  // Daemon-стоп закрывается в окне асинхронной проверки пинов: финальное
+  // чтение стоп-файла обязано его увидеть — запуск отменяется.
+  let closed = false;
+  const boundary = l2LaunchBoundary({
+    retryGuard: async () => {},
+    verifySubject: async () => {},
+    assertOpen: async () => { await Promise.resolve(); closed = true; },
+    checkLease: async () => {},
+    daemonOpen: async () => { if (closed) throw new Error('kill_switch'); },
+  });
+  await assert.rejects(boundary(), /kill_switch/);
+});
+
 test('retry: отказ проверки субъекта до повтора — ноль доп. вызовов', async () => {
   const { review, calls } = scriptedReview([
     timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
@@ -682,7 +707,12 @@ gitTest('runner: незавершённый, но дисквалифицирую
     // errorMessage), без верхнеуровневого error-события и вердикта — hold.
     { stdout: msg({ stopReason: 'error', errorMessage: 'provider refused',
         content: [{ type: 'text', text: 'cannot comply' }] }),
-      reason: 'review_runner_reported_error' }]) {
+      reason: 'review_runner_reported_error' },
+    // Завершённый штатно ход (stop/completed + agent_settled), но ПУСТОЙ
+    // текст: ответ завершён и невалиден — не обрыв, повтора нет.
+    { stdout: [msg({ stopReason: 'stop', rawStopReason: 'completed',
+        content: [] }), settled].join('\n'),
+      reason: 'review_verdict_missing' }]) {
     const { review, binding, profile, calls } = await fixture(t, [
       { code: 143, stdout, stderr: '' },
       { code: 0, stdout: PASS, stderr: '' }]);

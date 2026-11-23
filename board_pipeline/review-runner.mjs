@@ -43,6 +43,8 @@ const TRUNCATED_TRANSCRIPT = new Set([
 // отказ или mismatch. Возвращает причину отказа либо null.
 function transcriptDisqualifying(ndjson, critic) {
   const tools = new Set();
+  let settledOk = false;
+  let lastAssistant = null;
   const noteTools = (list) => {
     if (Array.isArray(list)) {
       for (const t of list) tools.add(typeof t === 'string' ? t : t?.name);
@@ -69,9 +71,13 @@ function transcriptDisqualifying(ndjson, critic) {
         (event?.type === 'auto_retry_end' && event.success === false)) {
       return 'review_runner_reported_error';
     }
+    if (event?.type === 'agent_settled' && event.aborted === false) {
+      settledOk = true;
+    }
     if (event?.type !== 'message_end') continue;
     const message = event.message ?? event.data?.message;
     if (message?.role !== 'assistant') continue;
+    lastAssistant = message;
     // Отказ провайдера может быть записан в самом assistant-сообщении
     // (stopReason 'error' / errorMessage) без верхнеуровневого error-события —
     // зафиксированный отказ — hold, не transient.
@@ -110,6 +116,15 @@ function transcriptDisqualifying(ndjson, critic) {
   }
   for (const tool of tools) {
     if (!READ_ONLY_TOOLS.includes(tool)) return `review_forbidden_tool:${tool}`;
+  }
+  // Завершённый ответ без вердикта — невалидный исход, а не обрыв:
+  // settlement пришёл, ход закрылся штатно, но текст пуст/без вердикта —
+  // hold, повтор не должен заменять завершённый невалидный ответ.
+  if (settledOk && lastAssistant !== null &&
+      lastAssistant.stopReason === 'stop' &&
+      (lastAssistant.rawStopReason === undefined ||
+        lastAssistant.rawStopReason === 'completed')) {
+    return 'review_verdict_missing';
   }
   return null;
 }
@@ -718,6 +733,24 @@ export function l2ReviewRetryGuard({ port, taskId, epoch, owner, label, contract
     await daemonOpen?.();
     if (assertOpen) await assertOpen(); else await assertPinned?.();
     await beforeEffect?.();
+  };
+}
+
+// Пре-эффектная граница запуска ТОЛЬКО для повтора: сначала живые гейты и
+// асинхронная сверка субъекта, затем закреплённые входы/переключатели и
+// доказательство lease — а дешёвое чтение daemon-стоп-файла идёт
+// ПОСЛЕДНИМ: закрытие switch в любом из асинхронных окон (контракт,
+// субъект, пины, renewal) отменяет запуск, а не только его более ранняя
+// проверка. Порядок фиксирован здесь, чтобы регрессионный тест мог
+// прогнать сам продукционный хук, а не его копию.
+export function l2LaunchBoundary({ retryGuard, verifySubject, assertOpen,
+  assertPinned, checkLease, daemonOpen }) {
+  return async () => {
+    await retryGuard?.();
+    await verifySubject?.();
+    if (assertOpen) await assertOpen(); else await assertPinned?.();
+    await checkLease?.();
+    await daemonOpen?.();
   };
 }
 

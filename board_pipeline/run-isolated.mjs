@@ -14,7 +14,7 @@ import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
 import { assertRetrySubjectUnchanged, isolatedArbiterRunner, isolatedPiReviewRunner,
-  l2CriticSpec, l2ReviewRetryGuard, l2ReviewWithTransientRetry,
+  l2CriticSpec, l2LaunchBoundary, l2ReviewRetryGuard, l2ReviewWithTransientRetry,
   runnerReviewSpec } from './review-runner.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { isNeonReview } from './review-policy.mjs';
@@ -629,6 +629,15 @@ async function execute() {
     let launchBinding = null;
     // Граница-перепроверка вооружается только самим повтором: первый вызов
     // читателя идёт прежним путём, без дополнительного Board/git трафика.
+    // Продукционный порядок — в l2LaunchBoundary: дешёвый daemon-стоп-файл
+    // читается последним, после всех асинхронных проверок.
+    const launchBoundary = l2LaunchBoundary({ retryGuard,
+      verifySubject: () => assertRetrySubjectUnchanged(launchBinding),
+      assertOpen, assertPinned, daemonOpen,
+      checkLease: async () => {
+        await renewal;
+        if (lost) throw new Error('Lease lost');
+      } });
     let retryBoundary = false;
     // В телеметрию пишется закреплённый спек (worker-форма 'pi/opencode-go/…'),
     // как в allowlist, — canonical modelKey сопоставляет обе формы.
@@ -646,19 +655,9 @@ async function execute() {
           await renewal;
           if (lost) throw new Error('Lease lost');
           // Граница запуска ТОЛЬКО для повтора: свежее доказательство
-          // lease/допуска/контракта/пинов и чистый закреплённый checkout —
-          // дрейф между retry-гейтами и docker run закрывается здесь, а не
-          // снимком минутной давности. Дешёвые стоп-файл и lease проверяются
-          // последними — после асинхронной сверки субъекта: закрытие switch
-          // или потеря lease в её окне тоже отменяет запуск.
-          if (retryBoundary && launchBinding) {
-            await retryGuard();
-            await assertRetrySubjectUnchanged(launchBinding);
-            await daemonOpen?.();
-            if (assertOpen) await assertOpen(); else await assertPinned?.();
-            await renewal;
-            if (lost) throw new Error('Lease lost');
-          }
+          // lease/допуска/контракта/пинов, чистый закреплённый checkout и
+          // финальный стоп-файл — в продукционном l2LaunchBoundary.
+          if (retryBoundary && launchBinding) await launchBoundary();
         } });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
