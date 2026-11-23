@@ -549,7 +549,7 @@ export function reviewRunnerExitFailure(run) {
 // Перед единственным повтором L2: тот же чистый зачисленный worktree на том же
 // candidate_sha, с тем же base-предком. Смена HEAD, грязное дерево или
 // невозможность проверить — отказ, повторного вызова нет.
-async function assertRetrySubjectUnchanged(binding) {
+export async function assertRetrySubjectUnchanged(binding) {
   if (!isAbsolute(binding?.worktree ?? '') || !SHA.test(binding?.candidate_sha ?? '')) {
     throw new ReviewDenied('review_retry_subject_unverified');
   }
@@ -571,13 +571,14 @@ async function assertRetrySubjectUnchanged(binding) {
 // гейты (lease/epoch, допуск карточки, kill-switch, закреплённые входы);
 // любой неуспех гейта отменяет повтор, ошибка уходит в обычный hold.
 // Второй сбой пробрасывается наружу без третьей попытки.
-export async function l2ReviewWithTransientRetry({ review, binding, profile, beforeRetry, log }) {
+export async function l2ReviewWithTransientRetry({ review, binding, profile, beforeRetry,
+  verifySubject = assertRetrySubjectUnchanged, log }) {
   try {
     return await review(binding, profile);
   } catch (error) {
     if (!(error instanceof ReviewRunnerTimeout)) throw error;
     await beforeRetry?.();
-    await assertRetrySubjectUnchanged(binding);
+    await verifySubject(binding);
     log?.({ kind: 'l2_review_retry', task: binding?.task_id ?? null,
       sha: binding?.candidate_sha ?? null, reason: error.reason });
     return await review(binding, profile);
