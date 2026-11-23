@@ -1,0 +1,157 @@
+version: 1
+roles:
+  materials-reader:
+    kind: analyst
+    model: arbiter
+    reasoning: inherit
+    verifier: inventory
+    tools: [snapshot-read]
+    skills: [materials-intake]
+  ui-builder:
+    kind: writer
+    model: executor
+    reasoning: inherit
+    verifier: change-set
+    tools: [snapshot-read, worktree-edit, unit-check]
+    skills: [feature-blueprint, ui]
+  visual-verifier:
+    kind: verifier
+    model: critic
+    reasoning: medium
+    verifier: visual-report
+    tools: [snapshot-read, browser-observe]
+    skills: [ui, property-testing]
+  conjecturer:
+    kind: analyst
+    model: arbiter
+    reasoning: inherit
+    verifier: conjecture
+    tools: [snapshot-read]
+    skills: [feature-blueprint, math-lean]
+  falsify-first-oracle:
+    kind: verifier
+    model: critic
+    reasoning: medium
+    verifier: falsification
+    tools: [snapshot-read, counterexample-search]
+    skills: [property-testing, math-lean]
+  lean-prover:
+    kind: writer
+    model: executor
+    reasoning: inherit
+    verifier: lean-proof
+    tools: [snapshot-read, worktree-edit, lean-check]
+    skills: [math-lean, session-handoff]
+  literature-radar:
+    kind: analyst
+    model: arbiter
+    reasoning: inherit
+    verifier: source-review
+    tools: [snapshot-read, literature-read]
+    skills: [math-lean, issue-register]
+  dsp-experimenter:
+    kind: writer
+    model: executor
+    reasoning: inherit
+    verifier: experiment
+    tools: [snapshot-read, worktree-edit, audio-measure]
+    skills: [dsp-audio, property-testing]
+  pipeline-freezer:
+    kind: analyst
+    model: arbiter
+    reasoning: inherit
+    verifier: frozen-pipeline
+    tools: [snapshot-read, replay-check]
+    skills: [dsp-audio, session-handoff]
+  blind-panel:
+    kind: verifier
+    model: critic
+    reasoning: medium
+    verifier: blind-panel
+    tools: [snapshot-read, blind-score]
+    skills: [dsp-audio, sparring]
+  course-designer:
+    kind: analyst
+    model: arbiter
+    reasoning: inherit
+    verifier: course-outline
+    tools: [snapshot-read, rubric-read]
+    skills: [feature-blueprint, writer-course]
+  technical-writer:
+    kind: writer
+    model: executor
+    reasoning: inherit
+    verifier: technical-copy
+    tools: [snapshot-read, worktree-edit]
+    skills: [writer-course, session-handoff]
+  sparring-critic:
+    kind: verifier
+    model: critic
+    reasoning: medium
+    verifier: rubric-review
+    tools: [snapshot-read, rubric-read]
+    skills: [sparring, issue-register]
+playbooks:
+  ui:
+    entry: intake
+    stages:
+      - id: intake
+        role: materials-reader
+        next: { pass: build, rework: hold }
+      - id: build
+        role: ui-builder
+        next: { pass: visual, rework: hold }
+      - id: visual
+        role: visual-verifier
+        next: { pass: ready, rework: diagnose }
+      - id: diagnose
+        role: sparring-critic
+        next: { pass: hold, rework: hold }
+  math-lean:
+    entry: intake
+    stages:
+      - id: intake
+        role: materials-reader
+        next: { pass: conjecture, rework: hold }
+      - id: conjecture
+        role: conjecturer
+        next: { pass: falsify, rework: hold }
+      - id: falsify
+        role: falsify-first-oracle
+        next: { pass: prove, rework: hold }
+      - id: prove
+        role: lean-prover
+        next: { pass: literature, rework: hold }
+      - id: literature
+        role: literature-radar
+        next: { pass: ready, rework: hold }
+  dsp-audio:
+    entry: intake
+    stages:
+      - id: intake
+        role: materials-reader
+        next: { pass: experiment, rework: hold }
+      - id: experiment
+        role: dsp-experimenter
+        next: { pass: freeze, rework: hold }
+      - id: freeze
+        role: pipeline-freezer
+        next: { pass: panel, rework: hold }
+      - id: panel
+        role: blind-panel
+        next: { pass: ready, rework: hold }
+  writer-course:
+    entry: intake
+    stages:
+      - id: intake
+        role: materials-reader
+        next: { pass: outline, rework: hold }
+      - id: outline
+        role: course-designer
+        next: { pass: draft, rework: hold }
+      - id: draft
+        role: technical-writer
+        next: { pass: sparring, rework: hold }
+      - id: sparring
+        role: sparring-critic
+        next: { pass: ready, rework: hold }

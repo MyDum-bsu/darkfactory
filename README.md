@@ -5,6 +5,7 @@
 ## Проверить кандидат и хост
 
 ```bash
+npm ci --ignore-scripts
 npm run test:tla
 npm test
 npm run test:integration
@@ -21,6 +22,7 @@ npm run doctor
 | [`ops/local/`](ops/local/) | Исходники операторской обвязки, шаблоны systemd и инструкции по явному подключению |
 | [`docs/lead-intake.md`](docs/lead-intake.md) | Вход лида: решения владельца, спека и передача в Board |
 | [`docs/implementation-plan.md`](docs/implementation-plan.md) | Контракты и этапы от готовой карточки до проверенного выпуска |
+| [VS-5 beta](docs/vs5-role-playbooks.md) | Типизированные роли, Stage Skills и изолированная проверка DAG поверх Trust Kernel |
 | [`docs/STATUS.md`](docs/STATUS.md) | Входные ветки кандидата, принятые возможности и границы |
 | [`specs/tla/`](specs/tla/) | Модель протокола, инварианты и пять парных мутантов |
 

@@ -30,6 +30,9 @@ import { loadSdk } from './sdk.mjs';
 import { worktreeInspector } from './runtime.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 import { createTelemetryRecorder } from './telemetry.mjs';
+import { loadRoleRegistry } from './role-registry.mjs';
+import { runPlaybook } from './playbook-router.mjs';
+import { PLAYBOOK_TRIAD, stageObservation } from './playbook-test-fixture.mjs';
 import * as ws from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -212,6 +215,7 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
   // Сценарий sha->result подменяет исход, но порт Board остаётся реальным.
   let scripted = {};
   let unsafePorts = {};
+  let beforeReview;
   const verify = async (attempt, submission) => {
     effects.verifyCalls++;
     const hit = scripted[submission.candidate_sha];
@@ -225,7 +229,10 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
         return { sha: binding.candidate_sha, ok: true,
           evidence: [{ file: 'checks-vs1.log', sha256: 'f'.repeat(64), exit: 0 }] }; },
       tamper: tamperGate,
-      review: async binding => { await port.guardTask?.(attempt.task_id, attempt.epoch); effects.reviewCalls++;
+      review: async binding => {
+        await port.guardTask?.(attempt.task_id, attempt.epoch);
+        await beforeReview?.(binding, attempt);
+        effects.reviewCalls++;
         return { task: binding.task_id, sha: binding.candidate_sha,
           actual: REVIEW, verdict: 'REVIEW_OK', checkpoint: 'feed80ab' }; },
       ...(typeof unsafePorts === 'function' ? unsafePorts(journal) : unsafePorts),
@@ -255,6 +262,7 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
     pushTurn: entry => { turns.push(entry); },
     setScript: map => { scripted = map; },
     setUnsafePorts: p => { unsafePorts = p; },
+    setBeforeReview: fn => { beforeReview = fn; },
     releaseSlot,
     tick: () => tick(cfg),
     workerSelector: over => { cfg.workerSelector = { ...ws, critic: REVIEW,
@@ -265,6 +273,101 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
       ...over }; },
   };
 }
+
+async function enrollBetaPlaybook(x, registry, playbook, observeStage = stageObservation) {
+  const stopDir = join(x.root, 'beta-switch');
+  await mkdir(stopDir, { mode: 0o700 });
+  const stop = join(stopDir, 'switch');
+  await writeFile(stop, 'run\n', { mode: 0o600 });
+  const assertOpen = await createPilotSwitch(stop);
+  x.setBeforeReview(async (handoff, attempt) => {
+    const policy = { profiles: { pilot: { task: x.taskId, worker: handoff.worker_thread_id,
+      worktree: x.tree, branch: 'pilot', base: x.base } } };
+    const inspect = worktreeInspector(policy);
+    const subject = { ...handoff, attempt_id: attempt.attempt_id, epoch: attempt.epoch,
+      playbook, registry_digest: registry.digest };
+    const result = await runPlaybook({ registry, playbook, attempt: subject, triad: PLAYBOOK_TRIAD }, {
+      async assertKernel(binding) {
+        await assertOpen();
+        const live = await x.port.verifyHeld(binding.task_id, binding.epoch);
+        const tree = await inspect(handoff);
+        await assertOpen();
+        return { ...binding, held: live.epoch === binding.epoch && Date.parse(live.until) > Date.now(),
+          switchOpen: true, clean: tree.clean && tree.head === binding.candidate_sha, baseAncestor: tree.baseAncestor };
+      },
+      observeStage,
+    });
+    if (result.status !== 'ready_for_native_acceptance') throw new Error('beta_role_playbook_hold');
+  });
+  return stop;
+}
+
+test('VS-5 beta: four role DAGs on native Board and exact Git subject before independent acceptance', { timeout: 60_000 }, async t => {
+  const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+  const packs = {
+    ui: ['materials-reader', 'ui-builder', 'visual-verifier'],
+    'math-lean': ['materials-reader', 'conjecturer', 'falsify-first-oracle', 'lean-prover', 'literature-radar'],
+    'dsp-audio': ['materials-reader', 'dsp-experimenter', 'pipeline-freezer', 'blind-panel'],
+    'writer-course': ['materials-reader', 'course-designer', 'technical-writer', 'sparring-critic'],
+  };
+  for (const [pack, expected] of Object.entries(packs)) {
+    const x = await lab(t, { hasUi: pack === 'ui' });
+    if (pack === 'ui') {
+      x.setUnsafePorts({
+        visual: async binding => ({ ok: true, status: 'pass', sha: binding.candidate_sha,
+          artifacts: [{ name: 'page.png', sha256: 'a'.repeat(64), bytes: 5 }],
+          evidence: { file: 'visual.log', sha256: 'e'.repeat(64), exit: 0 } }),
+      });
+    }
+    const roles = [];
+    const subjects = new Set();
+    let previousArtifact = null;
+    await enrollBetaPlaybook(x, registry, pack, request => {
+      assert.equal(request.binding.task_id, x.taskId);
+      assert.equal(request.binding.candidate_sha, x.candidate);
+      assert.equal(request.binding.worktree, x.tree);
+      assert.equal(x.effects.completeCalls, 0);
+      assert.equal(x.effects.reviewCalls, 0, 'beta may not substitute for the independent gate');
+      assert.ok(request.skills.every(skill => skill.text.trim() && /^[a-f0-9]{64}$/.test(skill.digest)));
+      roles.push(request.role);
+      subjects.add(request.binding.subject_digest);
+      assert.equal(request.inputArtifactDigest, previousArtifact);
+      const receipt = stageObservation(request);
+      previousArtifact = receipt.artifactDigest;
+      return receipt;
+    });
+    assert.equal((await x.tick()).phase, 'working');
+    x.submit(x.candidate, 10);
+    const final = await x.tick();
+    assert.equal(final.phase, 'done', `${pack}: ${final.reason}`);
+    const { state, result } = await x.port.lookup(x.taskId);
+    assert.equal(state, 'completed');
+    assert.equal(result.sha, x.candidate);
+    assert.deepEqual([...subjects], [result.subject_digest]);
+    assert.deepEqual(roles, expected);
+    assert.equal(x.effects.spawnCalls, 1);
+    assert.equal(x.effects.reviewCalls, 1);
+    assert.equal(x.effects.completeCalls, 1);
+  }
+});
+
+test('VS-5 beta: losing the switch during an observation prevents L2 and native completion', { timeout: 30_000 }, async t => {
+  const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+  const x = await lab(t);
+  let stageCalls = 0;
+  const stop = await enrollBetaPlaybook(x, registry, 'math-lean', async request => {
+    stageCalls++;
+    await writeFile(stop, 'stop\n');
+    return stageObservation(request);
+  });
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'hold');
+  assert.notEqual((await x.card()).state, 'completed');
+  assert.equal(x.effects.reviewCalls, 0);
+  assert.equal(x.effects.completeCalls, 0);
+  assert.equal(stageCalls, 1);
+});
 
 // ---------------------------------------------------------------------------
 // Трасса 1A: потерянный ack после реального эффекта spawn — однозначное
