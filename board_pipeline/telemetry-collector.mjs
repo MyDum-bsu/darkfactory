@@ -6,7 +6,7 @@
 // без внешних зависимостей и CDN.
 
 import { execFile } from 'node:child_process';
-import { appendFile, lstat, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
@@ -42,6 +42,7 @@ const FAILURE_STATUSES = new Set([
 const PROVIDER_FAILURE_REASON_RE =
   /(provider|timeout|rate_limit|quota|unavailable|crash|spawn_failed|review_failed|critic_failed|arbiter_failed|model_error|api_error)/i;
 const SAFE_DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T_-][0-9]{2}-[0-9]{2}-[0-9]{2})?$/;
+const SAFE_FILENAME_RE = /^[A-Za-z0-9._-]+$/;
 
 const finiteNonNeg = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 
@@ -164,11 +165,15 @@ function extractBbThread(raw) {
     if (typeof val === 'number' && Number.isSafeInteger(val)) return String(val);
     return null;
   })();
-  const channel = normalizeChannel(raw.channel ?? raw.project ?? raw.metadata?.channel);
+  const channel = normalizeChannel(
+    raw.channel ?? raw.project ?? raw.projectId ?? raw.project_id ?? raw.metadata?.channel ?? raw.metadata?.projectId,
+  );
   const status = normalizeStatus(raw.status ?? raw.state);
+  const provider = raw.provider ?? raw.providerId ?? raw.provider_id;
+  const modelName = raw.model ?? raw.modelId ?? raw.model_id ?? raw.agent?.model;
+  // Не выдумываем модель из одного providerId: модель фиксируется только если она явно задана.
   const modelSpec = normalizeModelSpec(
-    raw.provider && raw.model ? { provider: raw.provider, model: raw.model }
-      : raw.model ?? raw.model_id ?? raw.agent?.model,
+    provider && modelName ? { provider, model: modelName } : modelName,
   );
   const usage = threadUsage(raw) ?? normalizeUsage(raw.tokens);
   const cost = normalizeCost(raw);
@@ -195,6 +200,29 @@ function extractBbThread(raw) {
     open: isOpen,
     rework_rounds: reworkRounds,
   };
+}
+
+function isRoleInvoked(entry, role, { roleUsage, roleCost, failCount, linkedThread }) {
+  if (roleUsage !== null || roleCost !== null || failCount > 0) return true;
+  const phases = entry?.phases_ms;
+  const rounds = entry?.rounds;
+  if (role === 'arbiter') {
+    return finiteNonNeg(phases?.arbiter) !== null ||
+      (finiteNonNeg(rounds?.arbitration) ?? 0) > 0 ||
+      (finiteNonNeg(rounds?.gates?.arbiter) ?? 0) > 0;
+  }
+  if (role === 'critic') {
+    return finiteNonNeg(phases?.l2_critic) !== null ||
+      (finiteNonNeg(rounds?.gates?.l2) ?? 0) > 0;
+  }
+  if (role === 'worker') {
+    return finiteNonNeg(phases?.spawn) !== null ||
+      finiteNonNeg(phases?.worker) !== null ||
+      finiteNonNeg(phases?.worker_feedback) !== null ||
+      linkedThread !== null ||
+      (finiteNonNeg(rounds?.total) ?? 0) > 0;
+  }
+  return false;
 }
 
 function extractAttemptCostByRole(entry) {
@@ -345,6 +373,7 @@ export async function collectTelemetry({
         channel: normalizeChannel(defaults.channel),
         title: defaults.title ?? null,
         status: normalizeStatus(defaults.status),
+        has_board_status: false,
         board_wall_clock_ms: null,
         explicit_rework_rounds: null,
         attempt_wall_ms_parts: [],
@@ -371,6 +400,7 @@ export async function collectTelemetry({
     rec.channel = task.channel;
     if (task.title) rec.title = task.title;
     rec.status = task.status;
+    rec.has_board_status = true;
     if (task.wall_clock_ms !== null) rec.board_wall_clock_ms = task.wall_clock_ms;
     if (task.explicit_rework_rounds !== null) rec.explicit_rework_rounds = task.explicit_rework_rounds;
     for (const spec of task.models) rec.models.add(spec.model_id);
@@ -378,11 +408,17 @@ export async function collectTelemetry({
     if (task.cost_usd !== null) rec.costs.push(task.cost_usd);
   }
 
-  // Индекс BB-тредов для связывания и дедупликации по thread_id.
-  const normalizedThreads = (resolvedThreads ?? []).map(extractBbThread).filter(Boolean);
+  // Индекс BB-тредов с дедупликацией по id до подсчёта и агрегации.
+  const normalizedThreads = [];
   const threadById = new Map();
-  for (const thread of normalizedThreads) {
-    if (thread.id) threadById.set(thread.id, thread);
+  for (const rawThread of resolvedThreads ?? []) {
+    const thread = extractBbThread(rawThread);
+    if (!thread) continue;
+    if (thread.id) {
+      if (threadById.has(thread.id)) continue;
+      threadById.set(thread.id, thread);
+    }
+    normalizedThreads.push(thread);
   }
   const linkedThreadIds = new Set();
 
@@ -451,16 +487,12 @@ export async function collectTelemetry({
       }
       if (!isOpen && isSuccessOutcome(outcome)) taskRec.any_attempt_passed = true;
       if (!isOpen && outcome !== 'unknown') taskRec.last_attempt_outcome = outcome;
-      if (taskRec.status === 'unknown' && outcome !== 'unknown') taskRec.status = outcome;
-    }
-
-    // Роли и модели попытки.
-    const roleSpecs = [];
-    for (const role of ROLES) {
-      const spec = normalizeModelSpec(entry.models?.[role]);
-      if (!spec) continue;
-      roleSpecs.push({ role, spec });
-      if (taskRec) taskRec.models.add(spec.model_id);
+      if (!taskRec.has_board_status) {
+        if (isOpen) taskRec.status = 'in_progress';
+        else if (outcome !== 'unknown') taskRec.status = outcome;
+      } else if (taskRec.status === 'unknown' && outcome !== 'unknown') {
+        taskRec.status = outcome;
+      }
     }
 
     // Если явный объект provider_failures задан по model_id.
@@ -470,28 +502,17 @@ export async function collectTelemetry({
       ? entry.provider_failures
       : null;
 
-    let anyRoleCost = false;
-    for (const { role, spec } of roleSpecs) {
-      const mRec = ensureModel(spec);
-      mRec.roles.add(role);
-      mRec.runs += 1;
+    // Роли и модели попытки: учитываем только фактически задействованные роли,
+    // а не просто настроенные в конфиге (например, арбитр без вызовов).
+    const invokedRoleSpecs = [];
+    for (const role of ROLES) {
+      const spec = normalizeModelSpec(entry.models?.[role]);
+      if (!spec) continue;
 
       const roleUsage = normalizeUsage(entry.tokens?.[role]) ??
         (role === 'worker' && linkedThread?.usage ? linkedThread.usage : null);
-      if (roleUsage) {
-        mRec.usages.push(roleUsage);
-        mRec.runs_with_usage += 1;
-        if (taskRec) taskRec.usages.push(roleUsage);
-      }
-
       const roleCost = roleCosts[role] ??
         (role === 'worker' && linkedThread?.cost_usd != null ? linkedThread.cost_usd : null);
-      if (roleCost !== null) {
-        anyRoleCost = true;
-        mRec.costs.push(roleCost);
-        mRec.runs_with_cost += 1;
-        if (taskRec) taskRec.costs.push(roleCost);
-      }
 
       let failCount = 0;
       if (explicitModelFailures && finiteNonNeg(explicitModelFailures[spec.model_id]) !== null) {
@@ -501,6 +522,34 @@ export async function collectTelemetry({
       } else if (failedRoles.has(role) || (role === 'worker' && linkedThread?.provider_failure)) {
         failCount = 1;
       }
+
+      if (!isRoleInvoked(entry, role, { roleUsage, roleCost, failCount, linkedThread })) {
+        continue;
+      }
+
+      invokedRoleSpecs.push({ role, spec, roleUsage, roleCost, failCount });
+      if (taskRec) taskRec.models.add(spec.model_id);
+    }
+
+    let anyRoleCost = false;
+    for (const { role, spec, roleUsage, roleCost, failCount } of invokedRoleSpecs) {
+      const mRec = ensureModel(spec);
+      mRec.roles.add(role);
+      mRec.runs += 1;
+
+      if (roleUsage) {
+        mRec.usages.push(roleUsage);
+        mRec.runs_with_usage += 1;
+        if (taskRec) taskRec.usages.push(roleUsage);
+      }
+
+      if (roleCost !== null) {
+        anyRoleCost = true;
+        mRec.costs.push(roleCost);
+        mRec.runs_with_cost += 1;
+        if (taskRec) taskRec.costs.push(roleCost);
+      }
+
       mRec.provider_failures += failCount;
 
       if (!isOpen) {
@@ -517,8 +566,8 @@ export async function collectTelemetry({
 
     if (!anyRoleCost && topCost !== null) {
       if (taskRec) taskRec.costs.push(topCost);
-      if (roleSpecs.length === 1) {
-        const mRec = ensureModel(roleSpecs[0].spec);
+      if (invokedRoleSpecs.length === 1) {
+        const mRec = ensureModel(invokedRoleSpecs[0].spec);
         mRec.costs.push(topCost);
         mRec.runs_with_cost += 1;
       }
@@ -641,16 +690,26 @@ export async function collectTelemetry({
 
   // Финализация уровня (б) — каналы / проекты.
   const channelGroups = new Map();
+  const channelThreads = new Map();
   for (const task of tasks) {
     const list = channelGroups.get(task.channel) ?? [];
     list.push(task);
     channelGroups.set(task.channel, list);
+  }
+  for (const thread of normalizedThreads) {
+    if (thread.channel !== 'unassigned' && !channelGroups.has(thread.channel)) {
+      channelGroups.set(thread.channel, []);
+    }
+    if (channelGroups.has(thread.channel)) {
+      channelThreads.set(thread.channel, (channelThreads.get(thread.channel) ?? 0) + 1);
+    }
   }
   const channels = [...channelGroups.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([channel, groupTasks]) => ({
       channel,
       ...summarizeTaskGroup(groupTasks),
+      bb_threads: channelThreads.get(channel) ?? 0,
     }));
 
   // Финализация уровня (г) — модели / провайдеры.
@@ -857,6 +916,17 @@ export async function readHistory(filePath) {
   return entries;
 }
 
+export function sanitizeHistoryFile(historyFile = DEFAULT_HISTORY_FILE) {
+  if (typeof historyFile !== 'string' || !historyFile.trim()) {
+    throw new Error('Invalid historyFile: must be a non-empty filename');
+  }
+  const name = historyFile.trim();
+  if (name === '.' || name === '..' || name.includes('/') || name.includes('\\') || !SAFE_FILENAME_RE.test(name)) {
+    throw new Error(`Invalid historyFile: ${historyFile}`);
+  }
+  return name;
+}
+
 export async function writeSnapshot(snapshot, {
   outDir,
   date = null,
@@ -865,16 +935,48 @@ export async function writeSnapshot(snapshot, {
 } = {}) {
   if (typeof outDir !== 'string' || !outDir) throw new Error('outDir is required');
   const snapDate = sanitizeSnapshotDate(date, snapshot.generated_at);
+  const safeHistoryFile = sanitizeHistoryFile(historyFile);
   await mkdir(outDir, { recursive: true });
 
-  const jsonPath = join(outDir, `snapshot-${snapDate}.json`);
-  const mdPath = join(outDir, `snapshot-${snapDate}.md`);
-  const historyPath = join(outDir, historyFile);
+  // Не затираем предыдущий снимок за ту же дату: атомарно подбираем уникальный суффикс.
+  let jsonPath = null;
+  let mdPath = null;
+  let snapshotFile = null;
+  const jsonBody = `${JSON.stringify(snapshot, null, 2)}\n`;
+  const mdBody = formatSnapshotMarkdown(snapshot);
 
-  await writeFile(jsonPath, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
-  await writeFile(mdPath, formatSnapshotMarkdown(snapshot), 'utf8');
-  const historyEntry = toHistoryEntry(snapshot, snapDate);
-  await appendFile(historyPath, `${JSON.stringify(historyEntry)}\n`, 'utf8');
+  for (let seq = 1; ; seq += 1) {
+    const stem = seq === 1 ? `snapshot-${snapDate}` : `snapshot-${snapDate}-${seq}`;
+    const candidateJson = join(outDir, `${stem}.json`);
+    const candidateMd = join(outDir, `${stem}.md`);
+    try {
+      await writeFile(candidateJson, jsonBody, { encoding: 'utf8', flag: 'wx' });
+      try {
+        await writeFile(candidateMd, mdBody, { encoding: 'utf8', flag: 'wx' });
+      } catch (mdError) {
+        await unlink(candidateJson).catch(() => {});
+        throw mdError;
+      }
+      jsonPath = candidateJson;
+      mdPath = candidateMd;
+      snapshotFile = `${stem}.json`;
+      break;
+    } catch (error) {
+      if (error?.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+
+  const historyPath = join(outDir, safeHistoryFile);
+  const historyEntry = { ...toHistoryEntry(snapshot, snapDate), snapshot_file: snapshotFile };
+
+  // Если непустой history.jsonl не оканчивается на \n, добавляем ведущий \n.
+  const existingHistory = await readFile(historyPath, 'utf8').catch(error => {
+    if (error?.code === 'ENOENT') return '';
+    throw error;
+  });
+  const prefix = existingHistory.length > 0 && !existingHistory.endsWith('\n') ? '\n' : '';
+  await appendFile(historyPath, `${prefix}${JSON.stringify(historyEntry)}\n`, 'utf8');
 
   let htmlPath = null;
   if (writeHtml) {
@@ -883,7 +985,7 @@ export async function writeSnapshot(snapshot, {
     await writeFile(htmlPath, renderTelemetryDashboardHtml(history, snapshot), 'utf8');
   }
 
-  return { date: snapDate, jsonPath, mdPath, historyPath, htmlPath, historyEntry };
+  return { date: snapDate, snapshotFile, jsonPath, mdPath, historyPath, htmlPath, historyEntry };
 }
 
 function numericDelta(before, after) {
@@ -909,8 +1011,8 @@ function tokenTotal(usage) {
   if (usage === null || typeof usage !== 'object') return null;
   const hasIn = typeof usage.input === 'number' && Number.isFinite(usage.input);
   const hasOut = typeof usage.output === 'number' && Number.isFinite(usage.output);
-  if (!hasIn && !hasOut) return null;
-  return (hasIn ? usage.input : 0) + (hasOut ? usage.output : 0);
+  if (!hasIn || !hasOut) return null;
+  return usage.input + usage.output;
 }
 
 function usageDelta(before, after) {

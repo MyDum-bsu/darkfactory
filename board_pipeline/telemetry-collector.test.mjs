@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
 
-import { computeMedian, normalizeCost, sumCosts, TELEMETRY_SCHEMA } from './telemetry.mjs';
+import { computeMedian, createTelemetryRecorder, normalizeCost, sumCosts, TELEMETRY_SCHEMA } from './telemetry.mjs';
 import {
   collectTelemetry,
   COLLECTOR_SCHEMA,
@@ -474,4 +474,243 @@ test('renderTelemetryDashboardHtml: автономный single-file HTML без
   assert.match(html, /<svg /);
   // Markdown snapshot helper smoke check
   assert.match(formatSnapshotMarkdown(snapshot), /## Portfolio/);
+});
+
+// ---------------------------------------------------------------------------
+// Регрессионные тесты по итогам независимого ревью Pi/Sol (#1268).
+// ---------------------------------------------------------------------------
+
+test('ревью #1: createTelemetryRecorder сохраняет bb_thread_id и дедуплицируется с тем же BB-тредом', async t => {
+  const journal = await mkdtemp(join(tmpdir(), 'telemetry-bb-dedupe-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+
+  let now = 1000;
+  const rec = createTelemetryRecorder({
+    journal,
+    clock: () => now,
+    subject: { task_id: '1', attempt_id: 'a1', bb_thread_id: 'thr_a' },
+    models: { worker: { provider: 'openai', model: 'gpt-6.2-sol' } },
+  });
+  await rec.phase('spawn', async () => { now = 2000; });
+  rec.roundStart();
+  rec.recordUsage('worker', { input_tokens: 100, output_tokens: 40 }, 'bb_thread');
+  rec.recordRound({ outcome: 'verified' });
+  const { record } = await rec.finish({ outcome: 'done', open: false });
+
+  assert.equal(record.bb_thread_id, 'thr_a');
+
+  const lines = (await readFile(join(journal, 'telemetry.jsonl'), 'utf8')).split('\n').filter(Boolean);
+  const snapshot = await collectTelemetry({
+    telemetryLines: lines,
+    bbThreads: [
+      {
+        id: 'thr_a',
+        projectId: 'pj_alpha',
+        task_id: '1',
+        provider: 'openai',
+        model: 'gpt-6.2-sol',
+        status: 'completed',
+        usage: { input_tokens: 100, output_tokens: 40 },
+      },
+    ],
+  });
+
+  assert.equal(snapshot.models.length, 1);
+  assert.equal(snapshot.models[0].runs, 1);
+  assert.equal(snapshot.models[0].tokens.input, 100);
+  assert.equal(snapshot.models[0].tokens.output, 40);
+  assert.equal(snapshot.tasks[0].channel, 'pj_alpha');
+});
+
+test('ревью #2: дубликат строки BB-треда с одним id не удваивает total_bb_threads, runs, tokens и cost', async () => {
+  const thread = {
+    id: 'thr_dup',
+    project: 'core',
+    task_id: '55',
+    provider: 'google',
+    model: 'gemini-4-neon',
+    status: 'completed',
+    usage: { input_tokens: 100, output_tokens: 25 },
+    cost_usd: 0.1,
+  };
+
+  const snapshot = await collectTelemetry({
+    bbThreads: [thread, { ...thread }],
+  });
+
+  assert.equal(snapshot.sources.bb_threads, 1);
+  assert.equal(snapshot.portfolio.total_bb_threads, 1);
+  assert.equal(snapshot.models.length, 1);
+  assert.equal(snapshot.models[0].runs, 1);
+  assert.equal(snapshot.models[0].tokens.input, 100);
+  assert.equal(snapshot.models[0].cost_usd, 0.1);
+});
+
+test('ревью #3: адаптер BB CLI со штатной формой {id, projectId, providerId, status} сохраняет projectId и не выдумывает модель/задачу', async () => {
+  const cliThreads = await loadBbThreadsFromCli({
+    execBb: async args => {
+      assert.deepEqual(args, ['thread', 'list', '--json']);
+      return {
+        stdout: JSON.stringify([
+          { id: 'thr_a', projectId: 'pj_a', providerId: 'pi', status: 'idle' },
+        ]),
+      };
+    },
+  });
+
+  const snapshot = await collectTelemetry({ bbThreads: cliThreads });
+
+  assert.equal(snapshot.portfolio.total_bb_threads, 1);
+  assert.equal(snapshot.portfolio.total_tasks, 0);
+  assert.deepEqual(snapshot.tasks, []);
+  assert.deepEqual(snapshot.models, []);
+  assert.equal(snapshot.channels.length, 1);
+  assert.equal(snapshot.channels[0].channel, 'pj_a');
+  assert.equal(snapshot.channels[0].bb_threads, 1);
+});
+
+test('ревью #4: повторная успешная попытка без Board (hold -> done) обновляет статус и закрывает задачу', async () => {
+  const snapshot = await collectTelemetry({
+    telemetryRuns: [
+      {
+        kind: 'attempt_summary',
+        schema: TELEMETRY_SCHEMA,
+        task_id: '77',
+        attempt_id: 'att-1',
+        phases_ms: { spawn: 500, total: 2000 },
+        rounds: { total: 1, rework: 1, pass: 0, arbitration: 0, open: 0 },
+        models: { worker: { provider: 'acp-devin', model: 'swe-2-high' }, critic: null, arbiter: null },
+        tokens: { worker: null, critic: null, arbiter: null },
+        outcome: 'hold',
+        open: false,
+      },
+      {
+        kind: 'attempt_summary',
+        schema: TELEMETRY_SCHEMA,
+        task_id: '77',
+        attempt_id: 'att-2',
+        phases_ms: { spawn: 500, total: 3000 },
+        rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+        models: { worker: { provider: 'acp-devin', model: 'swe-2-high' }, critic: null, arbiter: null },
+        tokens: { worker: null, critic: null, arbiter: null },
+        outcome: 'done',
+        open: false,
+      },
+    ],
+  });
+
+  assert.equal(snapshot.tasks.length, 1);
+  assert.equal(snapshot.tasks[0].status, 'done');
+  assert.equal(snapshot.tasks[0].closed, true);
+  assert.equal(snapshot.portfolio.closed_tasks, 1);
+  assert.equal(snapshot.portfolio.open_tasks, 0);
+});
+
+test('ревью #5: настроенный арбитр без recordArbitration() не даёт runs: 1, а вызванная роль без usage учитывается', async () => {
+  let now = 1000;
+  const rec = createTelemetryRecorder({
+    clock: () => now,
+    subject: { task_id: '88', attempt_id: 'att-88' },
+    models: {
+      worker: { provider: 'acp-devin', model: 'swe-2-high' },
+      critic: { provider: 'google', model: 'gemini-4-neon' },
+      arbiter: { provider: 'openai', model: 'gpt-6.2-sol' },
+    },
+  });
+  await rec.phase('spawn', async () => { now = 1500; });
+  rec.roundStart();
+  // Критик реально вызван (фаза l2_critic измерена), но usage = null
+  await rec.phase('l2_critic', async () => { now = 2500; });
+  rec.recordRound({ outcome: 'verified' });
+  // Арбитр НЕ вызывался (нет фазы arbiter и нет recordArbitration)
+  const { record } = await rec.finish({ outcome: 'done', open: false });
+
+  const snapshot = await collectTelemetry({
+    telemetryRuns: [{ kind: 'attempt_summary', schema: TELEMETRY_SCHEMA, ...record }],
+  });
+
+  const modelIds = snapshot.models.map(m => m.model_id);
+  assert.deepEqual(modelIds, ['acp-devin/swe-2-high', 'google/gemini-4-neon']);
+  assert.equal(snapshot.models.find(m => m.model_id === 'openai/gpt-6.2-sol'), undefined);
+  const critic = snapshot.models.find(m => m.model_id === 'google/gemini-4-neon');
+  assert.equal(critic.runs, 1);
+  assert.equal(critic.tokens, null);
+});
+
+test('ревью #6: неполный usage ({input: 100, output: null}) даёт строго null в total/delta/pct_change в diffSnapshots', () => {
+  const snapA = {
+    schema: COLLECTOR_SCHEMA,
+    generated_at: '2026-11-22T00:00:00.000Z',
+    portfolio: { tokens: { input: 100, output: null, cached: null } },
+    channels: [],
+    models: [],
+  };
+  const snapB = {
+    schema: COLLECTOR_SCHEMA,
+    generated_at: '2026-11-23T00:00:00.000Z',
+    portfolio: { tokens: { input: 100, output: 50, cached: null } },
+    channels: [],
+    models: [],
+  };
+
+  const diff = diffSnapshots(snapA, snapB);
+  assert.equal(diff.portfolio.tokens.total.before, null);
+  assert.equal(diff.portfolio.tokens.total.after, 150);
+  assert.equal(diff.portfolio.tokens.total.delta, null);
+  assert.equal(diff.portfolio.tokens.total.pct_change, null);
+});
+
+test('ревью #7: writeSnapshot отклоняет historyFile с разделителями/traversal до записи артефактов', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'telemetry-hist-valid-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const outDir = join(dir, 'out');
+  const snap = await collectTelemetry({ clock: () => Date.parse('2026-11-23T00:00:00.000Z') });
+
+  for (const bad of ['nested/history.jsonl', '../x', '..\\x', '..', '.']) {
+    await assert.rejects(
+      () => writeSnapshot(snap, { outDir, date: '2026-11-23', historyFile: bad }),
+      /Invalid historyFile/,
+    );
+  }
+  // Ни один файл/каталог не был создан при отклонённых вызовах
+  const entries = await readdir(dir);
+  assert.deepEqual(entries, []);
+});
+
+test('ревью #8: повторный снимок за ту же дату не затирает предыдущий, а append в history.jsonl без \\n сохраняет обе строки', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'telemetry-collision-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const snap1 = await collectTelemetry({
+    boardTasks: [{ id: '1', channel: 'core', status: 'ready' }],
+    clock: () => Date.parse('2026-11-23T08:00:00.000Z'),
+  });
+  const snap2 = await collectTelemetry({
+    boardTasks: [{ id: '1', channel: 'core', status: 'done' }],
+    clock: () => Date.parse('2026-11-23T12:00:00.000Z'),
+  });
+
+  const w1 = await writeSnapshot(snap1, { outDir: dir, date: '2026-11-23' });
+  // Симулируем history.jsonl без завершающего \n
+  const rawHist = await readFile(w1.historyPath, 'utf8');
+  await writeFile(w1.historyPath, rawHist.replace(/\n+$/, ''), 'utf8');
+
+  const w2 = await writeSnapshot(snap2, { outDir: dir, date: '2026-11-23' });
+
+  // Файлы раздельные, первый снимок не затёрт
+  assert.notEqual(w1.jsonPath, w2.jsonPath);
+  assert.notEqual(w1.mdPath, w2.mdPath);
+  assert.equal(w1.snapshotFile, 'snapshot-2026-11-23.json');
+  assert.equal(w2.snapshotFile, 'snapshot-2026-11-23-2.json');
+
+  const saved1 = JSON.parse(await readFile(w1.jsonPath, 'utf8'));
+  const saved2 = JSON.parse(await readFile(w2.jsonPath, 'utf8'));
+  assert.equal(saved1.portfolio.closed_tasks, 0);
+  assert.equal(saved2.portfolio.closed_tasks, 1);
+
+  // Обе записи валидно читаются из history.jsonl
+  const history = await readHistory(w1.historyPath);
+  assert.equal(history.length, 2);
+  assert.equal(history[0].snapshot_file, 'snapshot-2026-11-23.json');
+  assert.equal(history[1].snapshot_file, 'snapshot-2026-11-23-2.json');
 });

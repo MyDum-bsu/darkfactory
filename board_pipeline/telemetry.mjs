@@ -177,7 +177,7 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
   const rounds = { total: 0, rework: 0, pass: 0, arbitration: 0, open: 0 };
   const gateCounts = new Map();
   const tokens = { worker: null, critic: null, arbiter: null };
-  const identity = { task_id: null, attempt_id: null, epoch: null };
+  const identity = { task_id: null, attempt_id: null, epoch: null, bb_thread_id: null };
   const roleModels = { worker: null, critic: null, arbiter: null };
 
   // Модели из доверенной политики: фактические переопределяются при spawn.
@@ -205,6 +205,8 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
     if (typeof subject.task_id === 'string' && subject.task_id) identity.task_id = subject.task_id;
     if (typeof subject.attempt_id === 'string' && subject.attempt_id) identity.attempt_id = subject.attempt_id;
     if (Number.isSafeInteger(subject.epoch)) identity.epoch = subject.epoch;
+    const threadId = subject.bb_thread_id ?? subject.thread_id;
+    if (typeof threadId === 'string' && threadId) identity.bb_thread_id = threadId;
   };
   const model = (role, spec) => {
     if (!ROLES.includes(role) || spec === null || typeof spec !== 'object' ||
@@ -344,6 +346,7 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
           task_id: identity.task_id,
           attempt_id: identity.attempt_id,
           epoch: identity.epoch,
+          ...(identity.bb_thread_id !== null ? { bb_thread_id: identity.bb_thread_id } : {}),
           phases_ms: phasesMs,
           rounds: { ...rounds,
             ...(gateCounts.size ? { gates: Object.fromEntries([...gateCounts.entries()].sort()) } : {}) },
