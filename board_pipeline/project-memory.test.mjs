@@ -747,3 +747,48 @@ test('regression R6/R7: run-isolated recordPostReviewMemory extracts updates fro
     assert.match(slice.text, new RegExp(`Verified task #1266 \\(${SHA_B.slice(0, 12)}\\)`));
   } finally { await cleanup(); }
 });
+
+test('regression R8: post-review memory write failure never throws and never breaks accepted verify result', async () => {
+  const { tree, receiptDir, cleanup } = await sandbox();
+  const attempt = { task_id: '1265', attempt_id: 'att-r8', epoch: 1 };
+  const worker = { provider: 'openai', model: 'gpt-6.2-sol' };
+  const reviewer = { provider: 'google', model: 'gemini-4-neon' };
+  const acceptedResult = { status: 'verified', sha: SHA_A, review: { verdict: 'REVIEW_OK', sha: SHA_A } };
+  try {
+    // Throwing writer does not reject post-review step
+    const failingWriter = {
+      async recordUpdate() {
+        throw new Error('disk_full_simulated');
+      },
+    };
+    const res1 = await recordPostReviewMemory({
+      writer: failingWriter,
+      trustedReceiptDir: receiptDir,
+      hmacKey: TEST_HMAC_KEY,
+      projectId: 'proj_r8',
+      worktree: tree,
+      result: acceptedResult,
+      attempt,
+      worker,
+      reviewer,
+    });
+    assert.equal(res1.recorded, false);
+    assert.equal(res1.reason, 'post_review_memory_write_failed');
+    assert.match(res1.error, /disk_full_simulated/);
+
+    // Invalid/missing trustedReceiptDir also fails soft without throwing
+    const res2 = await recordPostReviewMemory({
+      writer: failingWriter,
+      trustedReceiptDir: join(tree, 'inside-worktree-bad'),
+      hmacKey: TEST_HMAC_KEY,
+      projectId: 'proj_r8',
+      worktree: tree,
+      result: acceptedResult,
+      attempt,
+      worker,
+      reviewer,
+    });
+    assert.equal(res2.recorded, false);
+    assert.equal(res2.reason, 'post_review_memory_write_failed');
+  } finally { await cleanup(); }
+});

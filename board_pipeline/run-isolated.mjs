@@ -150,22 +150,30 @@ export async function recordPostReviewMemory({
     trustedReceiptDir,
     `review-${attempt.task_id}-${attempt.attempt_id}-${verifiedSha.slice(0, 12)}.receipt.json`,
   );
-  await writeTrustedReviewReceipt({
-    receiptPath,
-    trustedReceiptDir,
-    hmacKey,
-    worktree,
-    receipt: {
-      role: 'controller',
-      verdict: 'REVIEW_OK',
-      sha: verifiedSha,
-      worker,
-      reviewer,
-      sourceCard: String(attempt.task_id),
-    },
-  });
-  const saved = await writer.recordUpdate({ projectId, receiptPath, updates: resolvedUpdates });
-  return { recorded: true, receiptPath, result: saved };
+  try {
+    await writeTrustedReviewReceipt({
+      receiptPath,
+      trustedReceiptDir,
+      hmacKey,
+      worktree,
+      receipt: {
+        role: 'controller',
+        verdict: 'REVIEW_OK',
+        sha: verifiedSha,
+        worker,
+        reviewer,
+        sourceCard: String(attempt.task_id),
+      },
+    });
+    const saved = await writer.recordUpdate({ projectId, receiptPath, updates: resolvedUpdates });
+    return { recorded: true, receiptPath, result: saved };
+  } catch (error) {
+    return {
+      recorded: false,
+      reason: 'post_review_memory_write_failed',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 async function execute() {
@@ -563,20 +571,29 @@ async function execute() {
         },
       } });
       telemetry.recordRound({ outcome: result.outcome, reason: result.reason, sha: submission.candidate_sha });
-      await recordPostReviewMemory({
-        writer: projectMemoryWriter,
-        trustedReceiptDir: memoryCfg.trustedReceiptDir,
-        hmacKey: memoryCfg.hmacKey,
-        projectId: p.bb.project,
-        worktree: tree,
-        result,
-        reviewReceipt: lastReviewReceipt,
-        attempt,
-        submission,
-        worker: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
-        reviewer: reviewSetup.critic,
-        updates: result.memoryUpdates ?? lastReviewReceipt?.memoryUpdates,
-      });
+      // Запись памяти идёт уже после приёмки/закрытия карточки: отказ записи
+      // памяти никогда не должен ронять verify() и переводить попытку в uncertain.
+      try {
+        const memResult = await recordPostReviewMemory({
+          writer: projectMemoryWriter,
+          trustedReceiptDir: memoryCfg.trustedReceiptDir,
+          hmacKey: memoryCfg.hmacKey,
+          projectId: p.bb.project,
+          worktree: tree,
+          result,
+          reviewReceipt: lastReviewReceipt,
+          attempt,
+          submission,
+          worker: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
+          reviewer: reviewSetup.critic,
+          updates: result.memoryUpdates ?? lastReviewReceipt?.memoryUpdates,
+        });
+        if (memResult.reason === 'post_review_memory_write_failed') {
+          console.error(`project-memory post-review write failed: ${memResult.error}`);
+        }
+      } catch (error) {
+        console.error(`project-memory post-review write failed: ${error?.message ?? String(error)}`);
+      }
       return result;
     } finally {
       clearInterval(timer);
