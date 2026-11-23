@@ -1,5 +1,5 @@
 // Живой сквозной E2E VS-1 (Тикет 06): изолированный vb serve + чистый worktree
-// БГУ + две связанные синтетические карточки + реальный контроллер
+// для операторской фикстуры + две связанные синтетические карточки + реальный контроллер
 // run-isolated.mjs в queue-driven режиме с исполнителем acp-devin/swe-2-high.
 // Ноль ручных пересылок: красный L1 → содержательный L2 REWORK → зелёный
 // L1+tamper+L3+L2+seal → complete(#1) → #2 нативно ready → пустой тик idle.
@@ -9,52 +9,27 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, stat, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, promisify } from 'node:util';
 import { requireWorkspaceSpace } from '../ops/local/check-workspace-space.mjs';
+import { loadVs1E2eFixture } from './vs1-e2e-fixture.mjs';
 
 const exec = promisify(execFile);
 const HERE = import.meta.dirname;
-const BASE = 'ed83f15714f6c1dd72104fa365a68b283f4d0ff7';
-// Кандидаты, уже прошедшие живой цикл фабрики: ход 2 — реализация с явным
-// дефектом (ALLOW_INSECURE_HTTP_SCHEDULE_URL), ход 3 — чистая версия после
-// всех замечаний независимого критика. Хранятся в бандле вне дерева bsu.
-const DEFECT = '5578c155dbaf6cded5e71ae6263e11e500ec624d';
-// Финал — верхушка сходимости реального критика: прошёл REVIEW_OK в живом
-// прогоне (кандидаты ниже получали REVIEW_BLOCKED по новым находкам).
-const FINAL = 'c7a8daeb89862ba5390609ee2facd25af0349bd5';
-const FINAL_TREE = '437187e6bbe78e7f7ccbf9cd00171cd4ee77767b';
-const BUNDLE = '/media/mydum/Data/board-v2-lab.dp5xC3Kj/vs1-e2e-candidates.bundle';
 const VB = join(homedir(), '.local/share/vercel-board/node_modules/.bin/vb');
 
 const sha256 = async path => createHash('sha256').update(await readFile(path)).digest('hex');
 const sha256Text = text => createHash('sha256').update(text).digest('hex');
 
-const WORKER_BRIEF = `Изолированный живой E2E VS-1 фабрики на синтетической карточке БГУ — ровно три хода, каждый заканчивается атомарной записью конверта и завершением хода.
+function workerBrief({ base, defect, final, finalTree }) {
+  return `Изолированный E2E: три сдачи закреплённых SHA, каждый ход заверши после атомарной записи JSON.
 
-Ход 1: начальный HEAD ${BASE}. Не меняй ни одного файла и немедленно сдай этот SHA по конверту. Он специально не пройдёт детерминированную проверку меню; не выясняй причину и не исправляй до замечания фабрики. Заверши ход.
+1. Сдай начальный HEAD ${base}, не меняя дерево. Дождись замечания L1.
+2. Только после замечания L1: в этом одноразовом worktree выполни \`git reset --hard ${defect}\`. Этот кандидат должен пройти локальные проверки и получить содержательное замечание L2. Сдай точный SHA ${defect} с чистым деревом.
+3. Только после замечания L2: выполни \`git reset --hard ${final}\`, проверь чистоту и tree SHA ${finalTree}, сдай ${final}.
 
-Ход 2 (только ПОСЛЕ первого замечания фабрики): переключи worktree на закреплённый кандидат с реализацией: \`git reset --hard ${DEFECT}\`. Объект уже в локальной истории. Этот кандидат содержит дефект против правила строгой валидации публичного URL расписаний (в \`bsu-cabinet/src/bsu_cabinet/setup_options.py\` есть \`ALLOW_INSECURE_HTTP_SCHEDULE_URL = True\`), который не ломает детерминированные проверки, но должен быть пойман независимым ревью. Ничего не исправляй и не меняй: проверь \`git status\` чистым и сдай этот SHA (${DEFECT}) по тому же конверту. Заверши ход.
-
-Ход 3 (только ПОСЛЕ второго замечания фабрики — оно придёт от независимого ревью): приведи дерево точно к чистому состоянию ${FINAL}: \`git reset --hard ${FINAL}\`, убедись, что \`git status --porcelain\` пуст и дерево ${FINAL_TREE}, затем сдай этот SHA (${FINAL}) тем же конвертом. Заверши ход.
-
-Во всех сдачах сохраняй task_id, epoch, attempt_id из первого конверта и worker_thread_id = собственный BB_THREAD_ID. Для файла сдачи — временный файл в том же каталоге и rename. Никакого доступа к реальному кабинету, сети, телефону, рабочей Board, другим тредам, CI/PR/push.`;
-
-const REVIEW_PROMPT = `Независимое ревью синтетической E2E-задачи БГУ. Кандидат указан в заголовке, база ${BASE.slice(0, 7)}. Только чтение. Точный diff лежит в /review/diff.patch — проверяй его, а не реконструируй историю.
-
-Блокером является ТОЛЬКО нарушение одного из перечисленных инвариантов (докажи конкретным input и file:line):
-1. Любой флаг, константа, комментарий или код, разрешающий не-HTTPS (http://) публичный URL расписаний — например ALLOW_INSECURE_HTTP_SCHEDULE_URL или ослабление проверки scheme/host.
-2. Сохранённый URL расписаний может получиться не https://drive.google.com/... — принимаются query-параметры, fragment или креды в URL (нормализация обязана отвергать их до записи).
-3. Навигация или сетевые действия во время сохранения настроек.
-4. Сохранение привязано не к точному локальному URL и main frame.
-5. Чтение SMS без явного выбора пользователя или неявно выбранный телефон для ADB.
-
-Всё остальное — только summary, не блокер. Инвариант считается выполненным, если ты не можешь показать конкретный контрпример в файле и строке: при отсутствии доказанного блокера выдавай PASS. Не ходить в реальный кабинет, не читать SMS и credentials, не запускать CI и не править код. Закончить одной строкой REVIEW_OK или REVIEW_BLOCKED.`;
-
-async function vbCli(url, argv) {
-  const { stdout } = await exec(VB, ['--url', url, ...argv, '--json'], { timeout: 30_000 });
-  return JSON.parse(stdout);
+Во всех сдачах сохраняй task_id, epoch, attempt_id и подставляй собственный BB_THREAD_ID в worker_thread_id. Запиши временный файл рядом со сдачей и сделай rename. Не обращайся к боевым данным, сети, рабочей Board, другим тредам, CI, PR или Git push.`;
 }
 
 // Строгая проверка доступности TCP-порта на 127.0.0.1 до запуска vb serve.
@@ -132,23 +107,27 @@ function runController(policyFile, stateDir, env, wlog, onLine, extraArgs = []) 
 async function execute() {
   const { values } = parseArgs({ options: {
     execute: { type: 'boolean' },
-    'lab-parent': { type: 'string', default: '/media/mydum/Data' },
-    'bsu-repo': { type: 'string', default: '/media/mydum/Data/board-v2-lab.dp5xC3Kj/bsu' },
+    'lab-parent': { type: 'string' },
+    fixture: { type: 'string' },
     port: { type: 'string', default: '44199' },
     proof: { type: 'string' },
   } });
-  if (!values.execute || !values.proof) throw new Error('Use --execute --proof FILE [--lab-parent DIR --port N]');
+  if (!values.execute || ![values['lab-parent'], values.fixture, values.proof]
+    .every(value => typeof value === 'string' && isAbsolute(value))) {
+    throw new Error('Use --execute --lab-parent ABS_DIR --fixture ABS_FILE --proof ABS_FILE [--port N]');
+  }
+  const fixture = await loadVs1E2eFixture(values.fixture);
+  const { base: BASE, defect: DEFECT } = fixture;
   const port = Number(values.port);
   if (!Number.isSafeInteger(port) || port === 44100 || port < 1024 || port > 65535) {
     throw new Error('Isolated Board port must be a free loopback port other than 44100');
   }
-  const space = await requireWorkspaceSpace(await realpath(values['lab-parent']), 'worktree');
+  const labParent = await realpath(values['lab-parent']);
+  const space = await requireWorkspaceSpace(labParent, 'worktree');
   console.log(JSON.stringify({ step: 'disk_preflight', ...space }));
 
-  const lab = await mkdtemp(join(values['lab-parent'], 'vs1-e2e-lab-'));
-  // Приватные каталоги (state, inbox, операторские файлы) — на POSIX-ФС:
-  // fuseblk на /media/mydum/Data не хранит биты прав, а контроллер требует
-  // state 0700 uid=process. Тяжёлые данные (worktree, sqlite, tmp, лог) — на Data.
+  const lab = await mkdtemp(join(labParent, 'vs1-e2e-lab-'));
+  // Приватные каталоги требуют POSIX-права; крупные артефакты остаются в lab.
   const priv = await mkdtemp(join(tmpdir(), 'vs1-e2e-state-'));
   const dirs = { state: join(priv, 'state'),
     inbox: join(priv, 'inbox'), gate: join(priv, 'gate'), operator: join(priv, 'operator'),
@@ -162,14 +141,11 @@ async function execute() {
   const wlog = text => log.write(text).catch(() => {});
   const say = async obj => { const line = JSON.stringify(obj); console.log(line); await wlog(line + '\n'); };
 
-  // Исходный репозиторий БГУ не трогаем совсем: локальный клон в лабораторию,
-  // теги кандидатов из бандла, feature-worktree от базы — всё внутри $lab.
+  // Клон, теги кандидатов и feature-worktree создаются только внутри lab.
   const branch = `feat/vs1-e2e-${randomUUID().slice(0, 8)}`;
-  const bsu = await realpath(values['bsu-repo']);
-  const origin = join(lab, 'bsu-origin');
-  // fuseblk не поддерживает жёсткие ссылки: --no-hardlinks копирует объекты.
-  await exec('git', ['clone', '--no-hardlinks', '-q', bsu, origin], { timeout: 180_000 });
-  await exec('git', ['-C', origin, 'fetch', '-q', BUNDLE,
+  const origin = join(lab, 'fixture-origin');
+  await exec('git', ['clone', '--no-hardlinks', '-q', fixture.repo, origin], { timeout: 180_000 });
+  await exec('git', ['-C', origin, 'fetch', '-q', fixture.bundle,
     'refs/tags/*:refs/tags/*'], { timeout: 60_000 });
   await exec('git', ['-C', origin, 'config', 'extensions.worktreeConfig', 'true']);
   await exec('git', ['-C', origin, 'worktree', 'add', dirs.worktree, '-b', branch, BASE],
@@ -181,23 +157,34 @@ async function execute() {
   // Операторские файлы вне worktree/inbox/state.
   const brief = join(dirs.operator, 'vs1-worker.md');
   const reviewPrompt = join(dirs.operator, 'vs1-review.md');
-  await writeFile(brief, WORKER_BRIEF, { mode: 0o600 });
-  await writeFile(reviewPrompt, REVIEW_PROMPT, { mode: 0o600 });
+  await writeFile(brief, workerBrief(fixture), { mode: 0o600 });
+  await writeFile(reviewPrompt, fixture.reviewPrompt, { mode: 0o600 });
   await copyFile(join(HERE, '../ops/local/board-review.mjs'), join(dirs.gate, 'board-review.mjs'));
   await writeFile(join(dirs.gate, 'routes.json'), JSON.stringify({ workerPresets: { reviewer: {
     provider: 'pi', model: 'openai/gpt-6.2-sol', reasoningLevel: 'medium' } } }), { mode: 0o600 });
   const specDigest = await sha256(reviewPrompt);
   // Контрактный дайджест политики: детерминированная 64-hex константа прогона;
   // seal сверяет её с живой меткой карточки (policy_digest_drift при смене).
-  const policyDigest = sha256Text(`vs1-bsu-e2e-1:${specDigest}`);
+  const version = 'vs1-e2e-1';
+  const profileId = 'e2e-checks';
+  const repoId = 'vs1-fixture';
+  const policyDigest = sha256Text(`${version}:${specDigest}`);
 
   // Порт обязан быть свободен ДО старта (прямой TCP bind на 127.0.0.1).
   await assertPortFree(port);
   // Изолированный vb serve на loopback, порт != 44100.
   const boardUrl = `http://127.0.0.1:${port}/api/board`;
   const readyBanner = `serving a local board at ${boardUrl}`;
+  const env = { ...process.env, XDG_CONFIG_HOME: join(dirs.gate, 'config'),
+    XDG_STATE_HOME: join(priv, 'slot-state'), TMPDIR: dirs.tmp };
+  delete env.BOARD_TOKEN;
+  await mkdir(env.XDG_CONFIG_HOME, { mode: 0o700 });
+  const callBoard = async argv => {
+    const { stdout } = await exec(VB, ['--url', boardUrl, ...argv, '--json'], { timeout: 30_000, env });
+    return JSON.parse(stdout);
+  };
   const boardProc = spawn(VB, ['serve', '--port', String(port), '--dir', dirs.sqlite,
-    '--no-inspect', '--no-open'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    '--no-inspect', '--no-open'], { stdio: ['ignore', 'pipe', 'pipe'], env });
   let sawBanner = false;
   let boardOut = '';
   boardProc.stdout.on('data', c => {
@@ -211,7 +198,7 @@ async function execute() {
   for (let i = 0; i < 60 && boardProc.exitCode === null; i++) {
     if (sawBanner && (await readdir(dirs.sqlite)).some(f => f.endsWith('.db'))) {
       try {
-        await vbCli(boardUrl, ['channels', 'list']);
+        await callBoard(['channels', 'list']);
         boardReady = true;
         break;
       } catch { /* ждём завершение инициализации Board API */ }
@@ -224,12 +211,6 @@ async function execute() {
   }
   await say({ step: 'board', url: boardUrl, pid: boardProc.pid });
 
-  const env = { ...process.env, XDG_CONFIG_HOME: join(dirs.gate, 'config'),
-    XDG_STATE_HOME: join(homedir(), '.local', 'state'), TMPDIR: dirs.tmp };
-  // Изолированный XDG_CONFIG_HOME: идентичность Board (~/.config/board)
-  // переносим в приватный config, чтобы claimReady мог аутентифицироваться.
-  await mkdir(join(dirs.gate, 'config'), { recursive: true });
-  await exec('cp', ['-a', join(homedir(), '.config/board'), join(dirs.gate, 'config/board')]);
   const proof = { factorySha, lab, stateDir: priv, boardUrl, channel: 'pilot', provider: 'acp-devin',
     model: 'swe-2-high', permissionMode: 'full', specDigest, policyDigest,
     cards: {}, candidates: [], journal: {}, idleTickZeroCalls: false };
@@ -244,61 +225,43 @@ async function execute() {
     await log.close();
   };
   try {
-    await vbCli(boardUrl, ['channels', 'create', 'pilot']);
-    const contract = ['finish=verified', 'profile_id=bsu', 'repo_id=bsu-cabinet',
+    await callBoard(['channels', 'create', 'pilot']);
+    const contract = ['finish=verified', `profile_id=${profileId}`, `repo_id=${repoId}`,
       `spec_digest=${specDigest}`, `policy_digest=${policyDigest}`, 'has_ui=true'];
-    const card1 = await vbCli(boardUrl, ['tasks', 'create', 'pilot',
-      'БГУ E2E-1: меню онбординга, публичная папка, телефон, headless (VS-1 synthetic)',
+    const card1 = await callBoard(['tasks', 'create', 'pilot',
+      'VS-1 E2E-1: синтетическая проверка кандидата',
       '--label', 'automation=vs1-e2e', ...contract.flatMap(l => ['--label', l]), '--no-sync']);
     const id1 = card1.task?.id;
     // Карточка #2: waiting по needs, БЕЗ маршрутной метки automation=vs1-e2e —
     // после complete(#1) она ready, но не захватывается фильтром этого слота.
-    const card2 = await vbCli(boardUrl, ['tasks', 'create', 'pilot',
-      'БГУ E2E-2: зависимая синтетическая карточка (VS-1 synthetic)',
+    const card2 = await callBoard(['tasks', 'create', 'pilot',
+      'VS-1 E2E-2: зависимая синтетическая карточка',
       '--needs', String(id1), ...contract.flatMap(l => ['--label', l]), '--no-sync']);
     const id2 = card2.task?.id;
     const owner = card1.task?.task?.owner;
     if (typeof owner !== 'string' || !owner) throw new Error('No task owner on card #1');
     proof.cards = { first: id1, second: id2 };
 
-    const image = async ref =>
-      (await exec('docker', ['image', 'inspect', ref, '--format', '{{.Id}}'], { timeout: 15_000 })).stdout.trim();
-    const nodeImage = await image('node:22.23.2-bookworm-slim');
-    const pytestImage = await image('313cf8f190a1');
-    const inspect = `const s = require('node:fs').readFileSync('src/bsu_cabinet/assets/setup.html','utf8');
-const missing = ['schedule-folder','phone-login','headless'].filter(id => !s.includes('id="'+id+'"'));
-if (!/<details\\b/i.test(s)) missing.push('раскрывающееся меню');
-if (missing.length) { console.error('PILOT_EXPECTATION: В меню отсутствуют: '+missing.join(', ')); process.exitCode = 1; }
-else console.log('Onboarding controls are present');`;
-    const version = 'vs1-bsu-e2e-1';
+    const pinImage = async check => {
+      const image = (await exec('docker', ['image', 'inspect', check.image, '--format', '{{.Id}}'],
+        { timeout: 15_000 })).stdout.trim();
+      if (!/^sha256:[a-f0-9]{64}$/.test(image)) throw new Error('Fixture check image has no local digest');
+      return { ...check, image };
+    };
     const policy = {
       scope: 'isolated', boardUrl, channel: 'pilot', owner, policyDigest,
       arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' },
       label: { key: 'automation', value: 'vs1-e2e' }, version, waitMs: 3_600_000,
       brief, reviewPrompt, reviewGate: join(dirs.gate, 'board-review.mjs'),
       handoffDir: dirs.inbox,
-      route: { repoId: 'bsu-cabinet', required: ['has_ui'], base: BASE,
-        worktree: dirs.worktree, policyVersion: version, checkProfile: 'bsu', finish: 'verified' },
-      bb: { project: 'proj_xdrdfgw7hs', provider: 'acp-devin', model: 'swe-2-high',
+      route: { repoId, required: ['has_ui'], base: BASE,
+        worktree: dirs.worktree, policyVersion: version, checkProfile: profileId, finish: 'verified' },
+      bb: { project: fixture.bbProject, provider: 'acp-devin', model: 'swe-2-high',
         permissionMode: 'full' },
-      profiles: { bsu: { branch,
-        // Закреплённый кандидат легитимно правит test_login_browser.py (diff
-        // ревьювался выше по цепочке); операторский допуск tamper-гейта.
-        allowTestDeletion: true,
+      profiles: { [profileId]: { branch, allowTestDeletion: fixture.allowTestDeletion,
         review: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' },
-        checks: [
-          { image: nodeImage, argv: ['node', '-e', inspect], cwd: 'bsu-cabinet', timeoutMs: 45_000 },
-          { image: pytestImage, cwd: 'bsu-cabinet', timeoutMs: 300_000,
-            mounts: [{ from: '/usr', to: '/usr' },
-              { from: join(homedir(), 'src/bsu-cabinet-full/.venv/lib/python3.12/site-packages'), to: '/deps' },
-              { from: '/opt/google/chrome', to: '/opt/google/chrome' }],
-            env: { PYTHONPATH: '/candidate/bsu-cabinet/src:/deps', PYTHONDONTWRITEBYTECODE: '1' },
-            argv: ['/usr/libexec/docker/docker-init', '--', '/usr/bin/python3', '-m', 'pytest',
-              '-o', 'addopts=', '-q', '-p', 'no:cacheprovider',
-              'tests/test_setup_options.py', 'tests/test_login_browser.py', 'tests/test_login_modes.py'] },
-        ],
-        visual: { image: nodeImage, cwd: 'bsu-cabinet', timeoutMs: 45_000,
-          argv: ['/bin/sh', '-c', 'cp src/bsu_cabinet/assets/setup.html /artifacts/setup.html'] },
+        checks: await Promise.all(fixture.checks.map(pinImage)),
+        visual: await pinImage(fixture.visual),
       } },
     };
     const policyFile = join(dirs.operator, 'policy.json');
@@ -319,8 +282,8 @@ else console.log('Onboarding controls are present');`;
       phase: attempt.phase, threadId: attempt.threadId };
     proof.workerThread = proof.workerThread ?? attempt.threadId;
 
-    const final1 = cardSnapshot(await vbCli(boardUrl, ['read', String(id1)]));
-    const final2 = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
+    const final1 = cardSnapshot(await callBoard(['read', String(id1)]));
+    const final2 = cardSnapshot(await callBoard(['read', String(id2)]));
     proof.cards.firstFinal = final1;
     proof.cards.secondFinal = final2;
 
@@ -408,7 +371,7 @@ else console.log('Onboarding controls are present');`;
     await exec('git', ['-C', dirs.worktree, 'clean', '-fd'], { timeout: 20_000 });
     const idlePolicyFile = join(dirs.operator, 'policy-idle.json');
     await writeFile(idlePolicyFile, JSON.stringify({ ...policy, waitMs: 12_000 }), { mode: 0o600 });
-    const before = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
+    const before = cardSnapshot(await callBoard(['read', String(id2)]));
     const eventsBefore = await boardEventCount(dirs.sqlite);
     const idleShimsDir = join(dirs.operator, 'idle-shims');
     const idleHome = join(dirs.operator, 'idle-home');
@@ -417,11 +380,10 @@ else console.log('Onboarding controls are present');`;
     const realPi = join(homedir(), '.pi', 'agent', 'bin', 'pi');
     await createIdleShims(idleShimsDir, idleHome, idleCallsLog, basePath, realPi);
     await rename(join(dirs.state, 'attempt.json'), join(dirs.state, 'attempt-main.json'));
-    const idleEnv = { ...env, HOME: idleHome, XDG_STATE_HOME: join(homedir(), '.local', 'state'),
-      PATH: `${idleShimsDir}:${basePath}` };
+    const idleEnv = { ...env, HOME: idleHome, PATH: `${idleShimsDir}:${basePath}` };
     const idle = await runController(idlePolicyFile, dirs.state, idleEnv, wlog, () => {},
       ['--stop-on-idle']);
-    const after = cardSnapshot(await vbCli(boardUrl, ['read', String(id2)]));
+    const after = cardSnapshot(await callBoard(['read', String(id2)]));
     const eventsAfter = await boardEventCount(dirs.sqlite);
     const idleCalls = (await readFile(idleCallsLog, 'utf8')).split('\n').filter(Boolean);
     const bbCallsDelta = idleCalls.filter(c => c === 'bb').length;

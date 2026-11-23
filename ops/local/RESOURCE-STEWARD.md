@@ -9,7 +9,7 @@
 
 ## Что делает один тик
 
-1. **Измерение.** Свободное место на `/` и `/media/mydum/Data` (`statfs`), `MemAvailable`
+1. **Измерение.** Свободное место на выбранных файловых системах (`statfs`), по умолчанию только `/`, и `MemAvailable`
    из `/proc/meminfo`. Ошибка измерения одного монта — ошибка в журнале, а не ноль байт.
 2. **Уборка Тира 1** — только если где-то **< 5 GiB**. Строго фиксированный allowlist:
    - Docker build cache: `docker builder prune -f`;
@@ -52,12 +52,11 @@ node board_pipeline/resource-steward.mjs --dry-run
 ## Установка (вручную, по отдельному решению владельца)
 
 ```sh
-mkdir -p ~/.local/state/resource-steward
-# bb должен быть стабильным путём в PATH (AppImage монтируется непостоянно):
-ln -sf "$(command -v bb)" ~/.local/bin/bb
+mkdir -p ~/.local/state/resource-steward ~/.config/darkfactory ~/.config/systemd/user
+# Для user-unit: указать абсолютные DF_NODE и DF_REPO в локальном файле:
+edit ~/.config/darkfactory/resource-steward.env
 cp ops/local/resource-steward.service ops/local/resource-steward.timer \
    ~/.config/systemd/user/
-edit ~/.config/systemd/user/resource-steward.service   # пути к репозиторию и node
 systemctl --user daemon-reload
 systemctl --user enable --now resource-steward.timer
 ```
@@ -66,9 +65,7 @@ systemctl --user enable --now resource-steward.timer
 `journalctl --user -u resource-steward.service`, разовый прогон:
 `systemctl --user start resource-steward.service`.
 
-**Node:** репозиторию нужен node ≥ 22.18 (см. `engines` в package.json). Системный
-`/usr/bin/node` на этой машине v18 — в шаблоне юнита указан node из nvm; сверь путь
-с `command -v node` и `node --version` перед установкой.
+**Пути установки:** `DF_NODE` — абсолютный путь к Node ≥ 22.18, `DF_REPO` — абсолютный путь к чекауту. Значения хранятся только в операторском `EnvironmentFile`. Проверьте `command -v node`, `node --version` и доступность `bb` из `PATH` юнита. Чтобы следить за дополнительным томом, добавьте в операторскую копию `ExecStart` `--mount / --mount /path/to/volume`.
 
 Удаление: `systemctl --user disable --now resource-steward.timer` и удалить юниты из
 `~/.config/systemd/user/`.
@@ -79,7 +76,7 @@ systemctl --user enable --now resource-steward.timer
 |---|---|
 | `--dry-run` | план без эффектов (см. выше) |
 | `--journal <path>` | путь JSONL-журнала (по умолчанию `~/.local/state/resource-steward/journal.jsonl`) |
-| `--mount <path>` | дополнительный/заменяющий монт (повторяемый; по умолчанию `/` и `/media/mydum/Data`) |
+| `--mount <path>` | файловая система для измерения (повторяемый). Явный список заменяет дефолт `/`: если нужен и корень, укажите `--mount /` отдельно |
 | `--tmp-days <n>` | возраст просрочки `/tmp/df-*` (дефолт 7) |
 | `--cache-days <n>` | возраст просрочки кэшей pip/npm/uv (дефолт 7) |
 | `--escalate-cmd <exec>` | хук эскалации: payload JSON на stdin, без shell, таймаут 120 с |
@@ -97,7 +94,7 @@ systemctl --user enable --now resource-steward.timer
   "thresholdGiB": 2,
   "availableGiB": 1.4,
   "afterTier1": true,
-  "journalPath": "/home/you/.local/state/resource-steward/journal.jsonl",
+  "journalPath": "/operator/private-state/resource-steward/journal.jsonl",
   "question": "Свободное место на «/» после уборки Тира 1 ниже 2 GiB. Запустить read-only расследование LLM-агента Steward для выявления нетипичного потребителя?"
 }
 ```

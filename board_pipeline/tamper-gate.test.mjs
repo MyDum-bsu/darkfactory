@@ -61,11 +61,11 @@ test('чистый дифф: новый код и новый тест прохо
 test('удаление driver.py и изменение runtime assert вне тестов не являются assertion_weakened', async () => {
   const res = await gate({
     base: {
-      'bsu-cabinet/src/bsu_cabinet/driver.py': 'def old_driver(value):\n    assert value > 0\n    return value\n',
+      'fixture-app/src/fixture_app/driver.py': 'def old_driver(value):\n    assert value > 0\n    return value\n',
       'src/runtime.js': 'assert(value >= 10);\n',
     },
     candidate: {
-      'bsu-cabinet/src/bsu_cabinet/driver.py': null,
+      'fixture-app/src/fixture_app/driver.py': null,
       'src/runtime.js': 'assert(value >= 0);\nassert(true);\n',
     },
   });

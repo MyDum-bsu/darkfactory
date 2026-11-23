@@ -95,7 +95,7 @@ async function enrollPilotFixture({ root, handle, url, channel, owner, pilotScop
   const activation = boardActivation({ scope: 'pilot', boardUrl: url, channel,
     owner: pilotScope.owner ?? owner, label: { key: 'queue', value: 'vs1' },
     route: { repoId: pilotScope.repoId ?? REPO, checkProfile: pilotScope.profileId ?? 'pilot', finish },
-    pilot: { enabled: true, killSwitch: switchFile } });
+    pilot: { enabled: true, killSwitch: switchFile } }, { pilotChannel: 'fixture-pilot' });
   const admission = { scope: activation.scope, assertOpen: await createPilotSwitch(switchFile) };
   effects.nativeClaims = 0;
   const portHandle = { ...handle,
@@ -116,7 +116,7 @@ async function enrollPilotFixture({ root, handle, url, channel, owner, pilotScop
 async function lab(t, { finish = 'verified', lease = 900, mutants, questions = false,
   pilot = false, pilotScope = {}, hasUi = false } = {}) {
   const { url, dir } = await startBoard(boardCli(), t);
-  const channel = pilot ? 'bgu-cabinet' : 'pilot';
+  const channel = pilot ? 'fixture-pilot' : 'pilot';
   process.env.BOARD_URL = url;
   const { board } = loadSdk();
   const handle = board();

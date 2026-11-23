@@ -21,6 +21,7 @@ node board_pipeline/run-isolated.mjs --execute --daemon \
   (ни флага, ни pilot.killSwitch) демон отказывается стартовать.
   Старт при уже остановленном switch — не ошибка: процесс пишет
   `daemon_stop`/`kill_switch` в журнал и завершается с кодом 0.
+- Для `scope: pilot` в доверенном окружении процесса отдельно задаётся `DF_PILOT_CHANNEL` с точным допущенным каналом. Для `scope: isolated` переменная не нужна.
 - SIGTERM/SIGINT — graceful shutdown: активный тик завершается, слот не
   бросается в неопределённой фазе, журнал дописывается `daemon_stop`.
 - Очередной маршрут: `done`/`hold` освобождают слот для следующей карточки,

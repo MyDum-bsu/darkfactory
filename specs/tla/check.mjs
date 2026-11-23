@@ -5,9 +5,9 @@
 
 import { execFile } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
@@ -15,14 +15,9 @@ const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
 const SPEC = join(here, 'ControllerProtocol.tla');
 
-const JAR_CANDIDATES = [
-  process.env.TLA_TOOLS_JAR,
-  '/home/mydum/.local/share/tlaplus/tla2tools.jar',
-  '/home/mydum/.cache/bsu-tlc/v1.7.4/tla2tools.jar',
-].filter(Boolean);
-const JAR = JAR_CANDIDATES.find(p => existsSync(p));
-if (!JAR) {
-  console.error('tla-check: tla2tools.jar not found');
+const JAR = process.env.TLA_TOOLS_JAR;
+if (!JAR || !isAbsolute(JAR) || !statSync(JAR, { throwIfNoEntry: false })?.isFile()) {
+  console.error('tla-check: TLA_TOOLS_JAR must name the absolute path of an installed tla2tools.jar');
   process.exit(1);
 }
 

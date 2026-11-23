@@ -96,7 +96,9 @@ async function execute() {
   const policyFile = await realpath(values.policy);
   const policyBytes = await readFile(policyFile);
   const p = JSON.parse(policyBytes);
-  const activation = boardActivation(p, { allowLive: values['allow-live-pilot'] });
+  const activation = boardActivation(p, {
+    allowLive: values['allow-live-pilot'], pilotChannel: process.env.DF_PILOT_CHANNEL,
+  });
   if (!p.bb || !approved.has(p.bb.provider) || approved.get(p.bb.provider) !== p.bb.model ||
       (p.bb.provider === 'acp-zcode-start' && p.bb.effort !== 'max') || !/^proj_[a-z0-9]+$/.test(p.bb.project ?? '')) {
     throw new Error('Implementation preset is not approved');

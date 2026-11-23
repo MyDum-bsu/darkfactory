@@ -267,7 +267,7 @@ async function daemonFixture(t, url, { pilot = false } = {}) {
   const policy = join(ops, 'policy.json');
   await writeFile(policy, JSON.stringify({
     ...(pilot
-      ? { scope: 'pilot', channel: 'bgu-cabinet',
+      ? { scope: 'pilot', channel: 'fixture-pilot',
           pilot: { enabled: true, killSwitch: switchFile } }
       : { scope: 'isolated', channel: 'pilot' }),
     boardUrl: url, version: 'daemon-it-1',
@@ -287,7 +287,8 @@ async function daemonFixture(t, url, { pilot = false } = {}) {
     const child = spawnProcess(process.execPath,
       [join(repoRoot, 'board_pipeline', 'run-isolated.mjs'), '--execute', '--daemon',
         '--policy', policy, '--state', state, '--interval-ms', '300', '--switch', switchFile],
-      { env: { ...process.env, ...env, XDG_STATE_HOME: xdg }, stdio: ['ignore', 'pipe', 'pipe'] });
+      { env: { ...process.env, ...env, DF_PILOT_CHANNEL: 'fixture-pilot', XDG_STATE_HOME: xdg },
+        stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     child.stdout.on('data', d => { output += String(d); });
     child.stderr.on('data', d => { output += String(d); });

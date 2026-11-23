@@ -5,23 +5,26 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.mjs';
 
-const base = { scope: 'pilot', boardUrl: 'http://127.0.0.1:44100/api/board', channel: 'bgu-cabinet',
-  owner: 'local:user:test', label: { key: 'automation', value: 'bgu' },
-  route: { repoId: 'bgu-repo', checkProfile: 'bgu-verified', finish: 'verified' } };
+const pilotChannel = 'fixture-pilot';
+const base = { scope: 'pilot', boardUrl: 'http://127.0.0.1:44100/api/board', channel: pilotChannel,
+  owner: 'local:user:test', label: { key: 'automation', value: 'fixture' },
+  route: { repoId: 'fixture-repo', checkProfile: 'fixture-verified', finish: 'verified' } };
 
-test('live pilot is default-off and requires explicit owner, repo, profile, finish and activation', () => {
-  assert.throws(() => boardActivation(base), { code: 'pilot_disabled' });
+test('live pilot requires a separately pinned channel, owner, repo, profile, finish and activation', () => {
+  assert.throws(() => boardActivation(base, { pilotChannel }), { code: 'pilot_disabled' });
   const policy = { ...base, pilot: { enabled: true, killSwitch: '/operator/switch' } };
-  assert.throws(() => boardActivation(policy), { code: 'pilot_live_not_authorized' });
-  assert.throws(() => boardActivation({ ...policy, channel: 'other' }, { allowLive: true }), { code: 'pilot_route_not_allowed' });
-  assert.throws(() => boardActivation({ ...policy, route: { ...base.route, finish: 'deployed' } }, { allowLive: true }),
+  assert.throws(() => boardActivation(policy, { allowLive: true }), { code: 'pilot_route_not_allowed' });
+  assert.throws(() => boardActivation(policy, { pilotChannel }), { code: 'pilot_live_not_authorized' });
+  const allowed = { pilotChannel, allowLive: true };
+  assert.throws(() => boardActivation({ ...policy, channel: 'other' }, allowed), { code: 'pilot_route_not_allowed' });
+  assert.throws(() => boardActivation({ ...policy, route: { ...base.route, finish: 'deployed' } }, allowed),
     { code: 'pilot_route_not_allowed' });
-  assert.throws(() => boardActivation({ ...policy, route: { ...base.route, repoId: '' } }, { allowLive: true }),
+  assert.throws(() => boardActivation({ ...policy, route: { ...base.route, repoId: '' } }, allowed),
     { code: 'pilot_route_not_allowed' });
-  assert.throws(() => boardActivation({ ...policy, questionGate: {} }, { allowLive: true }), { code: 'pilot_route_not_allowed' });
-  assert.deepEqual(boardActivation(policy, { allowLive: true }).scope, {
-    owner: 'local:user:test', channel: 'bgu-cabinet', repoId: 'bgu-repo', profileId: 'bgu-verified',
-    finish: 'verified', label: { key: 'automation', value: 'bgu' },
+  assert.throws(() => boardActivation({ ...policy, questionGate: {} }, allowed), { code: 'pilot_route_not_allowed' });
+  assert.deepEqual(boardActivation(policy, allowed).scope, {
+    owner: 'local:user:test', channel: pilotChannel, repoId: 'fixture-repo', profileId: 'fixture-verified',
+    finish: 'verified', label: { key: 'automation', value: 'fixture' },
   });
   assert.equal(boardActivation({ scope: 'isolated', boardUrl: 'http://127.0.0.1:44101/api/board', channel: 'pilot' }), null);
   assert.throws(() => boardActivation({ ...base, scope: 'isolated', channel: 'pilot' }), { code: 'pilot_route_not_allowed' });

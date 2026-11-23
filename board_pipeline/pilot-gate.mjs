@@ -14,7 +14,7 @@ export class PilotDenied extends Error {
   }
 }
 
-export function boardActivation(policy, { allowLive = false } = {}) {
+export function boardActivation(policy, { allowLive = false, pilotChannel } = {}) {
   const { scope, boardUrl, channel, owner, label, route, pilot, questionGate } = policy;
   if (!LOOPBACK_BOARD.test(boardUrl ?? '')) throw new PilotDenied('pilot_route_not_allowed');
   let url;
@@ -24,7 +24,7 @@ export function boardActivation(policy, { allowLive = false } = {}) {
     if (live || channel !== 'pilot') throw new PilotDenied('pilot_route_not_allowed');
     return null;
   }
-  if (scope !== 'pilot' || channel !== 'bgu-cabinet' || !isId(owner) ||
+  if (scope !== 'pilot' || !isId(pilotChannel) || channel !== pilotChannel || !isId(owner) ||
       !isId(label?.key) || label.key.startsWith('factory.') ||
       typeof label?.value !== 'string' || !label.value || label.value.length > 128 ||
       !isId(route?.repoId) || !isId(route?.checkProfile) ||

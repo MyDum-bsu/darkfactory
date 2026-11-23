@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile, utimes } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
+import { requireWorkspaceSpace } from '../ops/local/check-workspace-space.mjs';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import {
-  availableGiB, classifyTmpEntry, defaultCacheRoots, defaultJournalPath, DOCKER_ACTIONS,
+  availableGiB, classifyTmpEntry, defaultCacheRoots, defaultJournalPath, DEFAULT_MOUNTS, DOCKER_ACTIONS,
   escalateViaCommand, evaluateDisk, evaluateRam, measureMount, openJournal, parseArgv,
   parseBbThreadList, parseMemInfo, pruneCacheRoot, pruneExpiredTmp, raiseAlarm, runSteward,
   selectIdleThreads,
@@ -80,11 +81,11 @@ test('tmp allowlist: only expired df-* entries are deletable', () => {
   assert.equal(classifyTmpEntry('other-session', fileStat(cutoff - 100), { cutoffMs: cutoff }).action, 'keep');
   assert.equal(classifyTmpEntry('dfx', fileStat(cutoff - 100), { cutoffMs: cutoff }).action, 'keep');
   // pytest-of-* — тоже allowlist, но только каталоги (живой инцидент с /tmp)
-  assert.deepEqual(classifyTmpEntry('pytest-of-mydum', dirStat(cutoff - 1), { cutoffMs: cutoff }),
+  assert.deepEqual(classifyTmpEntry('pytest-of-fixture', dirStat(cutoff - 1), { cutoffMs: cutoff }),
     { action: 'delete', kind: 'dir' });
-  assert.equal(classifyTmpEntry('pytest-of-mydum', dirStat(cutoff), { cutoffMs: cutoff }).action, 'keep');
-  assert.equal(classifyTmpEntry('pytest-of-mydum', fileStat(cutoff - 1), { cutoffMs: cutoff }).action, 'keep');
-  assert.equal(classifyTmpEntry('pytest-of-mydum', fileStat(cutoff - 1), { cutoffMs: cutoff }).reason, 'allowlist_dir_only');
+  assert.equal(classifyTmpEntry('pytest-of-fixture', dirStat(cutoff), { cutoffMs: cutoff }).action, 'keep');
+  assert.equal(classifyTmpEntry('pytest-of-fixture', fileStat(cutoff - 1), { cutoffMs: cutoff }).action, 'keep');
+  assert.equal(classifyTmpEntry('pytest-of-fixture', fileStat(cutoff - 1), { cutoffMs: cutoff }).reason, 'allowlist_dir_only');
 });
 
 test('tmp refuse: symlinks, special files and unsafe names are never deleted', () => {
@@ -329,7 +330,7 @@ test('alarm triggers exactly one escalation with the owner question', async () =
 test('alarm without a configured hook is journaled honestly, escalation skipped', async () => {
   const events = [];
   const result = await raiseAlarm({
-    mount: '/media/mydum/Data', availableBytes: bytesGiB(1n), journal: async e => events.push(e),
+    mount: '/mnt/fixture', availableBytes: bytesGiB(1n), journal: async e => events.push(e),
   });
   assert.equal(result.raised, true);
   assert.equal(result.escalated, false);
@@ -751,15 +752,16 @@ test('escalation hook drains stderr (no pipe stall) and reports it in detail', a
   }
 });
 
-test('CLI without --journal writes the journal under XDG_STATE_HOME (real spawn)', async t => {
-  // Тихий CLI-тик без эффектов: монт с запасом места (> 5 GiB), docker выключен,
-  // bb подменён на /bin/false, журнал — в песочнице XDG_STATE_HOME.
-  let free = 0n;
-  try { free = await measureMount('/media/mydum/Data'); } catch { /* нет монта */ }
-  if (free < bytesGiB(6n)) return t.skip('нет здорового монта для тихого CLI-тика');
-  const work = await mkdtemp(join('/media/mydum/Data', 'rsteward-cli-'));
+test('default mounts contain no operator-specific filesystem', () => {
+  assert.deepEqual(DEFAULT_MOUNTS, ['/']);
+});
+
+test('CLI without --journal writes the journal under XDG_STATE_HOME (real spawn)', async () => {
+  const work = await sandbox('cli');
   const stateDir = join(work, 'state');
   try {
+    // Следим только за ФС песочницы с запасом, чтобы реальный CLI не начал уборку.
+    await requireWorkspaceSpace(work, 'build');
     const child = spawn(process.execPath, [
       join(import.meta.dirname, 'resource-steward.mjs'),
       '--no-docker', '--mount', work, '--bb', '/bin/false',
@@ -767,8 +769,6 @@ test('CLI without --journal writes the journal under XDG_STATE_HOME (real spawn)
     const [code] = await once(child, 'close');
     assert.equal(code, 0);
     const journalFile = join(stateDir, 'resource-steward', 'journal.jsonl');
-    // Права 0600 проверены в тестах журнала на tmpdir; на FUSE-монте
-    // /media/mydum/Data chmod — no-op (файлы видны как 0755), здесь не проверяем.
     const events = (await readFile(journalFile, 'utf8')).trim().split('\n').map(JSON.parse);
     assert.equal(events[events.length - 1].event, 'tick_end');
     assert.ok(events.every(e => e.event !== 'tier1_start')); // /tmp не тронут

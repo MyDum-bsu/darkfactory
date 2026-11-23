@@ -33,7 +33,7 @@ export const RAM_MIN_GIB = 1.5;   // < 1.5 GiB MemAvailable → стоп idle-т
 // Точная граница 1.5 GiB в байтах — сравнение в bigint, без float.
 export const RAM_MIN_BYTES = 1_610_612_736n;
 
-export const DEFAULT_MOUNTS = Object.freeze(['/', '/media/mydum/Data']);
+export const DEFAULT_MOUNTS = Object.freeze(['/']);
 // Allowlist прямых детей /tmp: df-* (любые записи) и pytest-of-* (только
 // каталоги — pytest копит прогоны в /tmp/pytest-of-<user>/pytest-<N>).
 export const TMP_ALLOW_RULES = Object.freeze([

@@ -17,8 +17,8 @@
     }
   },
   "reviewSkillFiles": {
-    "logika": "/home/mydum/.agents/skills/logika/SKILL.md",
-    "humanizer": "/home/mydum/.pi/agent/skills/humanizer/SKILL.md"
+    "logika": "/operator/review-skills/logika/SKILL.md",
+    "humanizer": "/operator/review-skills/humanizer/SKILL.md"
   },
   "arbiter": {
     "provider": "openai",
