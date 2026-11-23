@@ -165,8 +165,6 @@ async function execute() {
     models: { worker: { provider: p.bb.provider, model: p.bb.model },
       critic: reviewSetup.critic, arbiter: reviewSetup.arbiter } });
   let telemetry = newTelemetry();
-  // Фактический источник токенов критика: поток agy (neon) или pi-транскрипт.
-  const criticSource = reviewSetup.neon ? 'agy_stream' : 'pi_stream';
   const route = { ...p.route, policyDigest: pinned.digest };
   // Queue-driven маршрут без route.taskId: карточку берёт board.claimReady по
   // allowlist оператора (owner + маршрутная метка + дополнительно требуемые метки).
@@ -222,7 +220,8 @@ async function execute() {
   // в промпт не попадает никогда.
   const lessonsPath = join(root, 'lessons.jsonl');
   const currentLessons = async () => {
-    const existing = await loadLessons(lessonsPath);
+    // Границы хранилища: файл в приватном root, не симлинк, вне worktree.
+    const existing = await loadLessons(lessonsPath, { allowedDir: root, outside: [tree] });
     if (!existing.length) return [];
     const { accepted } = validateDistilledLessons(existing);
     return accepted.map(lesson => lesson.rule);
@@ -247,7 +246,7 @@ async function execute() {
       const candidates = distillReworkLessons(rounds,
         { cardId: String(record.taskId ?? route.taskId ?? 'unknown') });
       if (!candidates.length) return;
-      const existing = await loadLessons(lessonsPath);
+      const existing = await loadLessons(lessonsPath, { allowedDir: root, outside: [tree] });
       const { accepted, pending, rejected } = validateDistilledLessons(candidates, { existing });
       if (accepted.length) await appendLessons(lessonsPath, accepted, { existing });
       if (pending.length || rejected.length) {
@@ -463,7 +462,6 @@ async function execute() {
       return await stableCheckpoint(threadId, question.checkpoint.turn_seq) === question.checkpoint.sha;
     },
   };
-  const reviewRunner = reviewSetup.neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner;
   const verify = async (attempt, submission) => {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
@@ -472,7 +470,16 @@ async function execute() {
     const decisionSlice = await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`);
     const criticPrompt = decisionSlice ? [reviewText, decisionsPromptBlock(decisionSlice)].join('\n\n')
       : reviewText;
-    const review = reviewRunner({ journal: root, prompt: criticPrompt, beforeEffect });
+    // Фактический критик L2 и арбитр — закреплённая триада попытки
+    // (#1263), иначе проверенный дефолт. Раннер следует за типом критика:
+    // routed pi-критик не может уйти в neon-транспорт и наоборот.
+    const attemptCritic = attempt.triad?.critic ?? reviewSetup.critic;
+    const attemptArbiter = attempt.triad?.arbiter ?? reviewSetup.arbiter;
+    const neon = isNeonReview(attemptCritic);
+    telemetry.recordModel('critic', attemptCritic);
+    telemetry.recordModel('arbiter', attemptArbiter);
+    const review = (neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner)(
+      { journal: root, prompt: criticPrompt, beforeEffect });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
     // сверяется с доверенным значением, а не сам с собой.
@@ -481,7 +488,8 @@ async function execute() {
       profiles: { [attempt.check_profile]: { ...profile, visual: profile.visual,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
-      arbiter: reviewSetup.arbiter, review: { ...profile.review, requireAttestation: true } } } };
+      arbiter: attemptArbiter,
+      review: { ...profile.review, ...attemptCritic, requireAttestation: true } } } };
     let lost = false;
     let renewal = Promise.resolve();
     const timer = setInterval(() => {
@@ -505,7 +513,7 @@ async function execute() {
           await assertPinned();
           await beforeEffect?.();
           const receipt = await telemetry.phase('l2_critic', () => review(handoff, trusted));
-          telemetry.recordUsage('critic', receipt?.usage, criticSource);
+          telemetry.recordUsage('critic', receipt?.usage, neon ? 'agy_stream' : 'pi_stream');
           return receipt;
         },
       } });
@@ -538,26 +546,28 @@ async function execute() {
   let previous;
   let recheck = values['recheck-rejected-handoff'];
   const tick = guardedEffect(assertOpen, advanceWithProjection);
-  const runTick = async () => {
-    // VS-4.2 (#1263): routing.mode 'active' выбирает триаду по скоркарду
-    // строго поверх политики #1247; любая деградация — детерминированный
-    // откат к дефолтной триаде с причиной, журналируемой в stdout-тик.
-    const routed = workerSelector.resolveTriad({
-      policy: p,
-      scorecard: await currentScorecard(),
-      base: { worker: workerSelector.PRIMARY_WORKER,
-        critic: reviewSetup.critic, arbiter: reviewSetup.arbiter },
-      log: note => console.log(JSON.stringify(note)),
-    });
-    return tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
-      release: releasePort, recheckRejectedHandoff: recheck,
-      workerSelector: { ...workerSelector,
-        critic: routed.selected.critic ?? reviewSetup.critic,
-        arbiter: routed.selected.arbiter ?? reviewSetup.arbiter,
-        selectWorker: () => routed.plan,
-        arbitrate },
-      decisionLedger });
-  };
+  const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
+    release: releasePort, recheckRejectedHandoff: recheck,
+    workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter,
+      arbitrate,
+      // VS-4.2 (#1263): триада резолвится один раз — при запуске попытки —
+      // контроллером через pinTriad и закрепляется в записи (spawn, L2,
+      // арбитраж, seal идут на одной тройке; скоркард не перечитывается на
+      // каждом тике). Любая деградация — проверенный откат resolveTriad.
+      pinTriad: async () => {
+        const routed = workerSelector.resolveTriad({
+          policy: p,
+          scorecard: await currentScorecard(),
+          base: { worker: workerSelector.PRIMARY_WORKER,
+            critic: reviewSetup.critic, arbiter: reviewSetup.arbiter },
+          log: note => console.log(JSON.stringify(note)),
+        });
+        if (routed.outcome === 'rejected') return { outcome: 'rejected', reason: routed.reason };
+        return { plan: routed.plan,
+          critic: routed.selected.critic ?? reviewSetup.critic,
+          arbiter: routed.selected.arbiter ?? reviewSetup.arbiter };
+      } },
+    decisionLedger });
   const observeTick = result => {
     recheck = false;
     lastResult = result;

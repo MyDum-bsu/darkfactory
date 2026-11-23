@@ -8,11 +8,9 @@
 // причиной 'lesson_weakens_security_gate'. Критичные кандидаты помечаются
 // requires_owner_approval и НЕ попадают в чек-лист автоматически.
 
-import { createHash } from 'node:crypto';
-import { readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { mkdir } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { lstat, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 
 export const LESSONS_SCHEMA = 1;
 
@@ -105,24 +103,35 @@ const PATTERNS = Object.freeze([
 // пропуск ослабляющего правила — поэтому совпадение отклоняет кандидат
 // без исключений.
 const WEAKENING = [
-  /\b(skip|disable|bypass|ignore|remove|turn off|switch off)\b/,
-  /\bwithout\s+(tests?|review|checks?|isolation|gates?)\b/,
-  /\bno\s+(tests?|review|checks?|isolation|gates?)\b/,
+  /\b(skip|disable|bypass|ignore|remove|turn off|switch off|waive|waived|relax|relaxed)\b/,
+  /\bwithout\s+(tests?|review|checks?|isolation|gates?|triad|release|push)\b/,
+  /\bno\s+(tests?|review|checks?|isolation|gates?|triad|release|push)\b/,
   /отключ(и|ить|ать|ен|ена|ено)/,
-  /пропусти(ть|л|ла|ли)|пропускай(те)?\s+(тест|ревью|проверк|гейт|изоляц)/,
-  /обойти|обход(а|у)?\s+(гейт|проверк|ревью|изоляц|политик)/,
+  /пропусти(ть|л|ла|ли)|пропускай(те)?\s+(тест|ревью|проверк|гейт|изоляц|триад|выпуск|релиз|push)/,
+  /обойти|обход(а|у)?\s+(гейт|проверк|ревью|изоляц|политик|триад)/,
   /ослаб(ь|ить|лен|ляет|лять|ление)/,
-  /без\s+(тест|ревью|проверк|изоляц|квитанц|арбитр)/,
+  /без\s+(тест|ревью|проверк|изоляц|квитанц|арбитр|триад|выпуск|релиз|push)/,
   /разреш(и|ить|ено|ён)\s+(push|force|мердж|merge|выпуск|релиз)/,
   /force[\s-]?push|push\s+--force|push\s+-f\b/,
-  /не\s+нужн[аыо]?\s+(тест|ревью|проверк|арбитр|триад)/,
-  /ненужн[аыо]\s+(тест|ревью|проверк|арбитр|триад)/,
+  /не\s+нужн[аыо]?\s+(тест|ревью|проверк|арбитр|триад|изоляц)/,
+  /ненужн[аыо]\s+(тест|ревью|проверк|арбитр|триад|изоляц)/,
+  /можно\s+(пропусти|не\s+делать|обойтись|не\s+провер)/,
+  /необязательн|не\s+обязательн|не\s+требуется/,
 ];
+
+// Шесть охраняемых доменов: ревью, тесты, изоляция, push, release, триада.
+const GATE_DOMAINS =
+  /(ревью|review|тест|tests?|проверк|checks?|изоляц|isolation|sandbox|push|пуш|release|релиз|выпуск|триад|triad|арбитр|arbiter|гейт|gate)/i;
+// «Необязательность» охраняемого домена — то же ослабление, что и отключение.
+const OPTIONALIZING =
+  /(optional|not required|unnecessary|unneeded|waive|waived|relax|relaxed|необязательн|не\s+обязательн|не\s+требуется|можно\s+(пропусти|не\s+делать|обойтись)|без\s+необходимости)/i;
 
 export function weakensSecurityGate(text) {
   const normalized = normalizeText(text);
   if (!normalized) return false;
-  return WEAKENING.some(re => re.test(normalized));
+  if (WEAKENING.some(re => re.test(normalized))) return true;
+  // Свободная формулировка «X необязателен» по любому из шести доменов.
+  return OPTIONALIZING.test(normalized) && GATE_DOMAINS.test(normalized);
 }
 
 const lessonId = (category, rule) =>
@@ -139,8 +148,17 @@ export function validLesson(candidate) {
   if (!Array.isArray(candidate.evidence_cards)) return false;
   if (!Number.isSafeInteger(candidate.occurrences) || candidate.occurrences < 1) return false;
   if (!['low', 'medium', 'high'].includes(candidate.risk_level)) return false;
+  // Флаг owner-approval — строго boolean: строковое 'true' и прочие типы
+  // делают кандидата невалидным, а не «почти одобренным».
+  if (candidate.requires_owner_approval !== undefined &&
+      typeof candidate.requires_owner_approval !== 'boolean') return false;
   return true;
 }
+
+// Авто-инъекция строго из закрытого каталога проверенных шаблонов:
+// категория вне каталога (включая свободный текст repeated_finding) —
+// всегда pending для владельца, никогда в чек-лист автоматически.
+const SAFE_CATEGORIES = new Set(PATTERNS.map(p => p.category));
 
 // Дистилляция истории REWORK-раундов одной карточки. roundsHistory —
 // массив раундов из состояния попытки ({ gate, findings, excerpt,
@@ -199,6 +217,9 @@ export function distillReworkLessons(roundsHistory, { cardId = 'unknown',
       evidence_cards: [card],
       occurrences: entry.count,
       risk_level: 'medium',
+      // Свободный текст из ревью никогда не инъектируется автоматически —
+      // только после явного решения владельца.
+      requires_owner_approval: true,
     });
   }
   return candidates;
@@ -239,7 +260,8 @@ export function validateDistilledLessons(candidates, { existing = [],
       rejected.push({ id, reason: 'lesson_weakens_security_gate' });
       continue;
     }
-    if (candidate.requires_owner_approval === true || candidate.risk_level === 'high') {
+    if (candidate.requires_owner_approval === true || candidate.risk_level === 'high' ||
+        !SAFE_CATEGORIES.has(candidate.category)) {
       pending.push({ ...candidate, requires_owner_approval: true });
       continue;
     }
@@ -263,19 +285,47 @@ export function validateDistilledLessons(candidates, { existing = [],
   return { accepted, pending, rejected };
 }
 
+// path находится строго внутри root (как у изоляции run-isolated).
+const inside = (root, p) => {
+  const rel = relative(root, p);
+  return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
+};
+
 // Хранилище уроков — JSONL-файл в приватном каталоге состояния, вне
-// рабочего дерева воркера. Запись атомарна (tmp+rename), чтение
-// fail-open: битая строка пропускается, отсутствующий файл — пусто.
-export async function loadLessons(path) {
-  let text;
-  try {
-    text = await readFile(path, 'utf8');
-  } catch (error) {
-    if (error.code === 'ENOENT') return [];
+// рабочего дерева воркера. Fail-closed границы чтения:
+// — сам файл обязан быть обычным файлом, НЕ симлинком (lstat, не stat):
+//   симлинк, в том числе указывающий внутрь worktree, — отказ;
+// — канонический путь обязан совпасть с заданным и лежать в allowedDir
+//   вне любого каталога из outside (worktree и его поддеревья);
+// — незавершённая последняя строка без '\n' игнорируется (частичная
+//   запись убитого процесса не становится полууроком), полные строки
+//   перед ней сохраняются;
+// — битая полная строка пропускается, отсутствующий файл — пусто.
+export async function loadLessons(path, { allowedDir = null, outside = [] } = {}) {
+  const meta = await lstat(path).catch(error => {
+    if (error.code === 'ENOENT') return null;
     throw error;
+  });
+  if (meta === null) return [];
+  if (meta.isSymbolicLink() || !meta.isFile()) {
+    throw new Error('lessons_store_not_a_file');
   }
+  const real = await realpath(path);
+  if (real !== path) throw new Error('lessons_store_path_resolved');
+  if (allowedDir !== null && dirname(real) !== await realpath(allowedDir)) {
+    throw new Error('lessons_store_dir_mismatch');
+  }
+  for (const dir of Array.isArray(outside) ? outside : []) {
+    if (typeof dir === 'string' && dir && inside(dir, real)) {
+      throw new Error('lessons_store_in_worktree');
+    }
+  }
+  const text = await readFile(real, 'utf8');
+  const lines = text.split('\n');
+  // Хвост без завершающего перевода строки — неполная запись, не урок.
+  if (!text.endsWith('\n')) lines.pop();
   const lessons = [];
-  for (const line of text.split('\n')) {
+  for (const line of lines) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
@@ -292,6 +342,16 @@ export async function loadLessons(path) {
 // всего файла атомарна; число уроков ограничено maxLessons.
 export async function appendLessons(path, accepted, { existing = null,
   maxLessons = DEFAULT_MAX_LESSONS } = {}) {
+  // Симлинк на месте хранилища не перезаписывается по ссылке — отказ до
+  // любого чтения/записи (rename заменил бы саму ссылку, но чтение выше
+  // уже пошло бы по ней).
+  const meta = await lstat(path).catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (meta !== null && (meta.isSymbolicLink() || !meta.isFile())) {
+    throw new Error('lessons_store_not_a_file');
+  }
   const store = existing ?? await loadLessons(path);
   const byId = new Map(store.map(lesson => [lesson.id, lesson]));
   for (const lesson of Array.isArray(accepted) ? accepted : []) {

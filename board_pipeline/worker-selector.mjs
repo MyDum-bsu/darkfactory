@@ -751,56 +751,120 @@ export function routeTriad({ size, domain, policy, scorecard,
     mode: steps.worker.mode, selected, steps };
 }
 
-// План исполнителей по выбранной триаде: динамический первичный, затем
-// дефолтные резервы без дублей — попытка сама отфильтрует нарушителей
-// триады и запрещённые модели на каждом шаге.
-function planFor(worker) {
-  const key = w => `${w?.provider}/${w?.model}`;
-  const plan = [worker];
-  for (const reserve of [NARROW_RESERVE_PI, FALLBACK_ANTIGRAVITY_NEON]) {
-    if (key(reserve) !== key(worker)) plan.push(reserve);
+// Допуск кандидата по политике #1247: 0 zcode, DeepSeek-only в opencode-go,
+// а при непустом allowlist роли — строго внутри него.
+const admissible = (spec, list) =>
+  retiredProviderViolation(spec) === null && opencodeGoPolicyViolation(spec) === null &&
+  (list.length === 0 || inAllowlist(spec, list));
+
+// Попарная независимость кандидата от закреплённых критика и арбитра.
+const independent = (candidate, critic, arbiter) => {
+  try {
+    assertTriadIndependent({ executor: candidate, critic, arbiter });
+    return true;
+  } catch {
+    return false;
   }
-  return plan;
-}
+};
 
 // Активация динамического routeTriad (Board #1263). Режим берётся из
-// policy.routing.mode: 'shadow' (дефолт, безопасный) только наблюдает,
-// 'active' выбирает по скоркарду строго поверх политики #1247 (allowlist,
-// 0 zcode, DeepSeek-only в opencode-go, квоты, триада трёх семейств).
-// Любая ошибка или деградация — детерминированный откат к дефолтной
-// триаде с явной причиной; частичная динамическая триада не применяется.
+// policy.routing.mode: 'shadow' (дефолт, безопасный) считает рекомендацию
+// для лога, не меняя назначение; 'active' выбирает по скоркарду строго
+// поверх политики #1247. Единая политика допуска для shadow, fallback и
+// резервов: базовая триада и каждый резерв в plan проверяются по #1247,
+// allowlist и попарной независимости семейств — невалидной базы нет,
+// только явный 'rejected'. Любая деградация скоркарда (недоступен, битые
+// строки corrupt>0, ошибка routeTriad) — детерминированный откат к
+// проверенной базовой триаде с явной причиной; частичная динамическая
+// триада не применяется.
 // Возврат: { outcome, mode, selected: {worker, critic, arbiter}, plan,
 // reason?, steps? } — plan готов для attemptSpawnWithFallback.
 export function resolveTriad({ size, domain, policy, scorecard,
   base = { worker: PRIMARY_WORKER, critic: DEFAULT_CRITIC, arbiter: DEFAULT_ARBITER },
   availability = null, log = null } = {}) {
-  const fallback = (reason, extra = {}) => {
+  const emit = note => {
     if (typeof log === 'function') {
-      try { log({ kind: 'route_fallback', reason }); } catch { /* журнал не ломает маршрут */ }
+      try { log(note); } catch { /* журналирование не ломает выбор */ }
     }
-    return { outcome: 'fallback', mode: 'shadow', reason,
-      selected: base, plan: planFor(base.worker), ...extra };
   };
   let routing;
   try {
     routing = normalizeRoutingPolicy(policy);
   } catch (e) {
-    return fallback(`routing_policy_invalid:${e?.reason ?? e?.message ?? 'invalid'}`);
+    const reason = `routing_policy_invalid:${e?.reason ?? e?.message ?? 'invalid'}`;
+    emit({ kind: 'route_fallback', reason });
+    // Нечитаемая политика: только дефолтный первичный — резервы без
+    // проверенного allowlist не доказаны.
+    return { outcome: 'fallback', mode: 'shadow', reason,
+      selected: base, plan: [base.worker] };
+  }
+  // Базовая триада валидируется в обоих режимах: запрещённые провайдеры,
+  // независимость трёх семейств и — при непустом allowlist роли —
+  // принадлежность ему. Безопасной базы нет → явный rejected.
+  const baseViolation = (() => {
+    for (const spec of [base.worker, base.critic, base.arbiter]) {
+      const v = retiredProviderViolation(spec) ?? opencodeGoPolicyViolation(spec);
+      if (v) return `route_base_invalid:${v}`;
+    }
+    try {
+      assertTriadIndependent({ executor: base.worker, critic: base.critic, arbiter: base.arbiter });
+    } catch (e) {
+      return `route_base_triad_violation:${e?.reason ?? e?.message ?? 'failed'}`;
+    }
+    if ((routing.allowlist.worker.length && !inAllowlist(base.worker, routing.allowlist.worker)) ||
+        (routing.allowlist.critic.length && !inAllowlist(base.critic, routing.allowlist.critic)) ||
+        (routing.allowlist.arbiter.length && !inAllowlist(base.arbiter, routing.allowlist.arbiter))) {
+      return 'route_base_not_in_allowlist';
+    }
+    return null;
+  })();
+  if (baseViolation) {
+    emit({ kind: 'route_fallback', reason: baseViolation });
+    return { outcome: 'rejected', reason: baseViolation, mode: routing.mode,
+      selected: null, plan: [] };
+  }
+  // Резервы под конкретную триаду: только допустимые по #1247/allowlist и
+  // независимые от критика и арбитра ЭТОЙ попытки — резерв вне allowlist
+  // или семейства критика в план не попадает вообще.
+  const safePlan = (worker, critic, arbiter) => {
+    const plan = [worker];
+    for (const reserve of [NARROW_RESERVE_PI, FALLBACK_ANTIGRAVITY_NEON]) {
+      if (modelKey(reserve) === modelKey(worker)) continue;
+      if (!admissible(reserve, routing.allowlist.worker)) continue;
+      if (!independent(reserve, critic, arbiter)) continue;
+      plan.push(reserve);
+    }
+    return plan;
+  };
+  const fallback = (reason, extra = {}) => {
+    emit({ kind: 'route_fallback', reason });
+    return { outcome: 'fallback', mode: 'shadow', reason, selected: base,
+      plan: safePlan(base.worker, base.critic, base.arbiter), ...extra };
+  };
+  // Частично повреждённый скоркард (битые строки журнала) — не основа
+  // для выбора: откат с явной причиной в обоих режимах.
+  if (Number.isSafeInteger(scorecard?.corrupt) && scorecard.corrupt > 0) {
+    return fallback('scorecard_corrupt');
+  }
+  // Рекомендация считается и в shadow (лог/телеметрия), и в active.
+  let routed = null;
+  const scorecardOk = scorecard !== null && typeof scorecard === 'object' &&
+    scorecard.cells !== null && typeof scorecard.cells === 'object';
+  if (scorecardOk) {
+    try {
+      routed = routeTriad({ size, domain, policy, scorecard, base, availability, log });
+    } catch {
+      routed = null;
+    }
   }
   if (routing.mode !== 'active') {
-    return { outcome: 'shadow', mode: 'shadow', selected: base, plan: planFor(base.worker) };
+    return { outcome: 'shadow', mode: 'shadow', selected: base,
+      plan: safePlan(base.worker, base.critic, base.arbiter),
+      recommended: routed?.steps?.worker?.recommended ?? null,
+      steps: routed?.steps };
   }
-  if (scorecard === null || scorecard === undefined ||
-      typeof scorecard !== 'object' || scorecard.cells === null ||
-      typeof scorecard.cells !== 'object') {
-    return fallback('scorecard_unavailable');
-  }
-  let routed;
-  try {
-    routed = routeTriad({ size, domain, policy, scorecard, base, availability, log });
-  } catch (e) {
-    return fallback(`route_triad_error:${e?.reason ?? e?.message ?? 'failed'}`);
-  }
+  if (!scorecardOk) return fallback('scorecard_unavailable');
+  if (routed === null) return fallback('route_triad_error');
   if (routed.outcome !== 'routed' || routed.selected === null ||
       routed.selected.worker === undefined) {
     return fallback(`route_active_rejected:${routed.reason ?? 'no_selection'}`,
@@ -815,7 +879,8 @@ export function resolveTriad({ size, domain, policy, scorecard,
     return fallback(`route_triad_violation:${e?.reason ?? e?.message ?? 'failed'}`);
   }
   return { outcome: 'routed', mode: 'active', selected: routed.selected,
-    plan: planFor(routed.selected.worker), steps: routed.steps };
+    plan: safePlan(routed.selected.worker, routed.selected.critic, routed.selected.arbiter),
+    steps: routed.steps };
 }
 
 // ── Точечный escalation-слот Opus 5.5 (Routing Policy v2) ─────────────────

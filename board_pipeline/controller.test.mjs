@@ -948,3 +948,60 @@ test('allowlist rejects empty or null repoId instead of silently dropping filter
     await assert.rejects(() => x.tick(), /A trusted, enrolled route is required/);
   }
 });
+
+// ── Board #1263: закреплённая триада попытки ───────────────────────────────
+test('pinned triad: одна триада для spawn, L2, арбитража — резолвится один раз', async t => {
+  const x = await lab(t);
+  const PINNED_CRITIC = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const PINNED_ARBITER = { provider: 'openai', model: 'gpt-5.6-sol' };
+  let pins = 0;
+  let arbiterSeen = null;
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => {
+      pins++;
+      return { plan: [ws.PRIMARY_WORKER], critic: PINNED_CRITIC, arbiter: PINNED_ARBITER };
+    },
+    arbitrate: async req => {
+      arbiterSeen = req.arbiter;
+      return { decision: 'escalate_owner', question: 'Развилка?', subject_digest: DIGEST };
+    },
+  });
+  const seen = [];
+  x.cfg.verify = async attempt => {
+    seen.push(structuredClone(attempt.triad));
+    return L2_REWORK([FINDING]);
+  };
+  // Claim + spawn: триада закреплена в записи попытки.
+  assert.equal((await x.tick()).phase, 'working');
+  const spawned = await x.cfg.state.load();
+  assert.deepEqual(spawned.triad, {
+    worker: ws.PRIMARY_WORKER, critic: PINNED_CRITIC, arbiter: PINNED_ARBITER });
+  // Два одинаковых L2 REWORK → repeated_l2_finding → арбитраж на закреплённом
+  // арбитре, а не на дефолтном Sol.
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'arbiter_escalated_to_owner');
+  assert.deepEqual(arbiterSeen, PINNED_ARBITER);
+  // Скоркард резолвится один раз на попытку — не на каждый тик.
+  assert.equal(pins, 1);
+  // Оба раунда L2 видели ту же закреплённую триаду.
+  assert.equal(seen.length, 2);
+  for (const triad of seen) assert.deepEqual(triad, spawned.triad);
+  // «Рестарт»: следующий тик читает triad из записи, pinTriad не вызывается.
+  assert.equal((await x.tick()).phase, 'hold');
+  assert.equal(pins, 1);
+});
+
+test('rejected pinTriad — явный hold без spawn', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => ({ outcome: 'rejected', reason: 'route_base_triad_violation:x' }),
+  });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'route_base_triad_violation:x');
+  assert.equal(x.effects.spawn, 0);
+});

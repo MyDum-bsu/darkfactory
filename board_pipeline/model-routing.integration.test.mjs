@@ -371,21 +371,22 @@ test('acp-zcode-start выведен из обращения: allowlist и пл�
 });
 
 // ── Board #1263: активация routeTriad в active-режиме с безопасным откатом ──
-import { resolveTriad } from './worker-selector.mjs';
+import {
+  FALLBACK_ANTIGRAVITY_NEON,
+  NARROW_RESERVE_PI,
+  resolveTriad,
+} from './worker-selector.mjs';
 
 const allowAll = { worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] };
 
-test('resolveTriad: режим не задан — shadow, дефолтный план', () => {
+test('resolveTriad: режим не задан — shadow, проверенный план', () => {
   const res = resolveTriad({ policy: {}, scorecard: null });
   assert.equal(res.outcome, 'shadow');
   assert.deepEqual(res.selected, { worker: DEVIN, critic: NEON, arbiter: SOL });
-  assert.deepEqual(res.plan, [DEVIN, NARROW_PI_PLAN(), FALLBACK_NEON()]);
+  // FALLBACK_NEON (google) разделяет семейство с критиком NEON — в план не
+  // попадает: резервы валидируются попарной независимостью триады.
+  assert.deepEqual(res.plan, [DEVIN, NARROW_RESERVE_PI]);
 });
-
-// Дефолтные резервы из модуля — для читаемости ассертов.
-import { NARROW_RESERVE_PI, FALLBACK_ANTIGRAVITY_NEON } from './worker-selector.mjs';
-function NARROW_PI_PLAN() { return NARROW_RESERVE_PI; }
-function FALLBACK_NEON() { return FALLBACK_ANTIGRAVITY_NEON; }
 
 test('resolveTriad active: доказанный кандидат вытесняет базу, план — резервы', () => {
   const lines = [...journal(DS, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
@@ -398,9 +399,15 @@ test('resolveTriad active: доказанный кандидат вытесня�
   const fams = new Set([workerFamily(res.selected.worker),
     workerFamily(res.selected.critic), workerFamily(res.selected.arbiter)]);
   assert.equal(fams.size, 3);
-  // План начинается с динамического первичного, резервы без дублей.
+  // План начинается с динамического первичного, резервы без дублей и все —
+  // внутри allowlist и независимые от выбранных критика/арбитра.
   assert.equal(modelKey(res.plan[0]), modelKey(DS));
   assert.equal(new Set(res.plan.map(modelKey)).size, res.plan.length);
+  for (const reserve of res.plan.slice(1)) {
+    assert.ok(allowAll.worker.some(w => modelKey(w) === modelKey(reserve)));
+    assert.notEqual(workerFamily(reserve), workerFamily(res.selected.critic));
+    assert.notEqual(workerFamily(reserve), workerFamily(res.selected.arbiter));
+  }
 });
 
 test('resolveTriad active: деградация скоркарда — откат с явной причиной', () => {
@@ -416,6 +423,21 @@ test('resolveTriad active: деградация скоркарда — отка�
   assert.equal(notes.length, 5);
   assert.equal(notes[0].kind, 'route_fallback');
   assert.equal(notes[0].reason, 'scorecard_unavailable');
+});
+
+test('resolveTriad: битые строки журнала (corrupt>0) — scorecard_corrupt', () => {
+  const lines = [...journal(DS, 6), 'not json at all', '{"broken":'];
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  assert.equal(scorecard.corrupt, 2);
+  for (const mode of ['shadow', 'active']) {
+    const res = resolveTriad({ size: 'S', domain: 'backend',
+      policy: policy(mode, allowAll), scorecard });
+    assert.equal(res.outcome, 'fallback', mode);
+    assert.equal(res.reason, 'scorecard_corrupt');
+    // Откат несёт проверенную базовую триаду и валидный план.
+    assert.deepEqual(res.selected, { worker: DEVIN, critic: NEON, arbiter: SOL });
+    assert.ok(res.plan.length >= 1);
+  }
 });
 
 test('resolveTriad active: нет доказанных кандидатов — откат, не частичная триада', () => {
@@ -436,4 +458,46 @@ test('resolveTriad: битая политика — откат, исключен
   assert.equal(res.outcome, 'fallback');
   assert.match(res.reason, /^routing_policy_invalid:/);
   assert.equal(res.selected.worker, DEVIN);
+  assert.deepEqual(res.plan, [DEVIN]); // резервы без проверенного allowlist не доказаны
+});
+
+test('resolveTriad: невалидная база — явный rejected в обоих режимах', () => {
+  const scorecard = aggregateScorecard(journal(DS, 6), { seed: [] });
+  // Критик и арбитр одного семейства — триада не доказана.
+  const badBase = { worker: DEVIN, critic: NEON,
+    arbiter: { provider: 'google', model: 'gemini-4-neon' } };
+  for (const mode of ['shadow', 'active']) {
+    const res = resolveTriad({ policy: policy(mode, allowAll), scorecard, base: badBase });
+    assert.equal(res.outcome, 'rejected', mode);
+    assert.match(res.reason, /^route_base_triad_violation:/);
+    assert.equal(res.selected, null);
+    assert.deepEqual(res.plan, []);
+  }
+  // База вне непустого allowlist — тоже rejected, а не тихий selected.
+  const res = resolveTriad({ policy: policy('shadow', {
+      worker: [DS], critic: [NEON], arbiter: [SOL] }), scorecard });
+  assert.equal(res.outcome, 'rejected');
+  assert.equal(res.reason, 'route_base_not_in_allowlist');
+});
+
+test('resolveTriad: резерв вне allowlist.worker в план не попадает', () => {
+  // DS доказанно сильнее, но вне allowlist; резервы DeepSeek/Neon тоже вне
+  // allowlist.worker — в план не попадает никто из недопущенных.
+  const scorecard = aggregateScorecard(
+    [...journal(DEVIN, 6), ...journal(DS, 6)], { seed: [] });
+  const res = resolveTriad({ size: 'S', domain: 'backend',
+    policy: policy('active', { worker: [DEVIN], critic: [NEON], arbiter: [SOL] }),
+    scorecard });
+  assert.equal(res.outcome, 'routed');
+  assert.deepEqual(res.plan, [DEVIN]);
+});
+
+test('resolveTriad shadow: рекомендация считается, назначение не меняется', () => {
+  const lines = [...journal(DS, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  const res = resolveTriad({ size: 'S', domain: 'backend',
+    policy: policy('shadow', allowAll), scorecard });
+  assert.equal(res.outcome, 'shadow');
+  assert.equal(res.selected.worker, DEVIN); // назначение не изменилось
+  assert.equal(modelKey(res.recommended), modelKey(DS)); // рекомендация видна
 });

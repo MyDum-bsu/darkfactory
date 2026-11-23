@@ -179,6 +179,10 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
   return {
     observe(subject) { guarded(() => observe(subject), 'observe'); },
 
+    // Фактическая модель роли (динамический роутинг #1263): pinned триада
+    // может отличаться от заявленной в политике — журнал пишет факт.
+    recordModel(role, spec) { guarded(() => model(role, spec), 'record_model'); },
+
     // Длительность шага эффектов: длительность фиксируется и при отказе,
     // сама ошибка шага проходит без изменений (fail-open). Окно работы
     // воркера закрывается в НАЧАЛЕ приёмки — следующий шаг гейта исключает

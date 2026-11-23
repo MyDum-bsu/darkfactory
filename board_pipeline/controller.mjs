@@ -66,6 +66,9 @@ function attemptOf(record, route) {
     bb_thread_id: record.threadId, worktree: route.worktree, base_sha: route.base,
     check_profile: route.checkProfile, finish: route.finish };
   if (record.executor !== undefined) attempt.executor = record.executor;
+  // Закреплённая триада попытки (Board #1263): spawn, L2-критик, арбитраж
+  // и seal работают на одной тройке на всех тиках и после рестарта.
+  if (record.triad !== undefined) attempt.triad = record.triad;
   if (record.contract) {
     attempt.repo_id = record.contract.repo_id;
     attempt.spec_digest = record.contract.spec_digest;
@@ -188,12 +191,15 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     return uncertain(`interrupted_${record.phase}`);
   };
 
-  // Единый фактический критик/арбитр для триады: настроенный селектор важнее
-  // маршрутного; расхождение route.critic с фактическим — отказ до claim.
+  // Единый фактический критик/арбитр для триады: закреплённая триада
+  // попытки важнее всего (одна тройка для spawn/L2/арбитража/seal и
+  // после рестарта), затем настроенный селектор и маршрут; расхождение
+  // route.critic с фактическим — отказ до claim.
+  const pinnedTriad = record?.triad;
   const selCritic = workerSelector
-    ? (workerSelector.critic ?? route.critic ?? workerSelector.DEFAULT_CRITIC) : undefined;
+    ? (pinnedTriad?.critic ?? workerSelector.critic ?? route.critic ?? workerSelector.DEFAULT_CRITIC) : undefined;
   const selArbiter = workerSelector
-    ? (workerSelector.arbiter ?? route.arbiter ?? workerSelector.DEFAULT_ARBITER) : undefined;
+    ? (pinnedTriad?.arbiter ?? workerSelector.arbiter ?? route.arbiter ?? workerSelector.DEFAULT_ARBITER) : undefined;
   const criticMismatch = Boolean(workerSelector && route.critic && workerSelector.critic &&
     (route.critic.provider !== workerSelector.critic.provider ||
      route.critic.model !== workerSelector.critic.model ||
@@ -263,15 +269,34 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       let launched;
       let workerTrail = null;
       if (workerSelector) {
+        // Board #1263: триада резолвится ОДИН раз на попытку (pinTriad —
+        // динамический routeTriad либо проверенный откат) и закрепляется в
+        // записи: те же worker/critic/arbiter обслуживают spawn, L2,
+        // арбитраж и seal на всех тиках и после рестарта. Деградация пина —
+        // дефолтная триада, не повторное сканирование скоркарда.
+        let pinned = null;
+        if (typeof workerSelector.pinTriad === 'function') {
+          try {
+            pinned = await workerSelector.pinTriad({ route, attempt: attemptOf(record, route) });
+          } catch {
+            pinned = null;
+          }
+        }
+        if (pinned?.outcome === 'rejected') {
+          await save({ phase: 'hold', reason: pinned.reason ?? 'route_rejected' });
+          return visible();
+        }
+        const attemptCritic = pinned?.critic ?? selCritic;
+        const attemptArbiter = pinned?.arbiter ?? selArbiter;
+        const attemptPlan = Array.isArray(pinned?.plan) && pinned.plan.length
+          ? pinned.plan : workerSelector.selectWorker({ route });
         // Приоритет acp-devin/swe-2-high; резерв только при подтверждённом
         // отказе, неизвестный исход — карантин без второго писателя.
         const selection = await workerSelector.attemptSpawnWithFallback({
           route, attempt: attemptOf(record, route),
-          critic: selCritic,
-          arbiter: selArbiter,
-          // План даёт тот же selectWorker, но позволяет адаптеру подставить
-          // динамическую триаду (Routing Policy, режим active) — Board #1263.
-          plan: workerSelector.selectWorker({ route }),
+          critic: attemptCritic,
+          arbiter: attemptArbiter,
+          plan: attemptPlan,
           probe: typeof bb.probeAvailability === 'function' ? w => bb.probeAvailability(w) : undefined,
           spawn: envelope => bb.spawn(envelope),
           inspectWorktree: typeof bb.inspectWorktree === 'function'
@@ -290,7 +315,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         }
         launched = { threadId: selection.threadId };
         workerTrail = { executor: selection.worker, fallbackReason: selection.fallbackReason ?? null,
-          attemptedWorkers: selection.attemptedWorkers };
+          attemptedWorkers: selection.attemptedWorkers,
+          // Закреплённая триада: фактический исполнитель плюс критик и
+          // арбитр этой попытки — дальше по записи, не по перечитыванию.
+          triad: { worker: selection.worker, critic: attemptCritic, arbiter: attemptArbiter } };
       } else {
         launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
       }
