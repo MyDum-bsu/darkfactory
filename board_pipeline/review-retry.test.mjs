@@ -34,9 +34,26 @@ const PASS = stream(`{"verdict":"PASS","summary":"ok","subject_digest":"${DIGEST
 const hasGit = await exec('git', ['--version'], { timeout: 10_000 })
   .then(() => true).catch(() => false);
 const gitTest = hasGit ? test : (name, fn) => test(name, { skip: 'git not on PATH' }, fn);
-const hasSh = await exec('sh', ['-c', 'command -v sleep grep cat'])
-  .then(() => true).catch(() => false);
-const shTest = hasSh ? test : (name, fn) => test(name, { skip: 'sh/sleep not on PATH' }, fn);
+// Адаптерные тесты запускают подставной `docker` из tmpdir — в средах с
+// noexec-tmp (проверочный контейнер) исполняемый стаб невозможен, пропуск.
+const canExecStub = await (async () => {
+  try {
+    const dir = await mkdtemp(join(tmpdir(), 'retry-exec-'));
+    try {
+      const stub = join(dir, 'stub');
+      await writeFile(stub, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      await exec(stub, [], { timeout: 10_000 });
+      await exec('sh', ['-c', 'command -v sleep grep cat'], { timeout: 10_000 });
+      return true;
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  } catch {
+    return false;
+  }
+})();
+const shTest = canExecStub ? test
+  : (name, fn) => test(name, { skip: 'no executable stub env' }, fn);
 
 // Счётчик вызовов review без git и без контейнера: сценарий ошибок/квитанций
 // подаётся последовательно, повтор идёт тем же вызовом с теми же аргументами.
