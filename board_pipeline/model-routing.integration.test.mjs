@@ -450,15 +450,17 @@ test('resolveTriad active: нет доказанных кандидатов — 
   assert.equal(res.plan[0], DEVIN);
 });
 
-test('resolveTriad: битая политика — откат, исключение не улетает наружу', () => {
+test('resolveTriad: битая политика — fail-closed rejected, дефолт не подставляется', () => {
   const bad = policy('active', {
     worker: [{ provider: 'mystery', model: 'unknown' }], critic: [NEON], arbiter: [SOL] });
-  const res = resolveTriad({ scorecard: aggregateScorecard([], { seed: [] }),
-    policy: bad });
-  assert.equal(res.outcome, 'fallback');
-  assert.match(res.reason, /^routing_policy_invalid:/);
-  assert.equal(res.selected.worker, DEVIN);
-  assert.deepEqual(res.plan, [DEVIN]); // резервы без проверенного allowlist не доказаны
+  for (const mode of ['shadow', 'active']) {
+    const res = resolveTriad({ scorecard: aggregateScorecard([], { seed: [] }),
+      policy: { ...bad, routing: { ...bad.routing, mode } } });
+    assert.equal(res.outcome, 'rejected');
+    assert.match(res.reason, /^routing_policy_invalid:/);
+    assert.equal(res.selected, null);
+    assert.deepEqual(res.plan, []);
+  }
 });
 
 test('resolveTriad: невалидная база — явный rejected в обоих режимах', () => {

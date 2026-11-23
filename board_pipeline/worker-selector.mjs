@@ -793,10 +793,10 @@ export function resolveTriad({ size, domain, policy, scorecard,
   } catch (e) {
     const reason = `routing_policy_invalid:${e?.reason ?? e?.message ?? 'invalid'}`;
     emit({ kind: 'route_fallback', reason });
-    // Нечитаемая политика: только дефолтный первичный — резервы без
-    // проверенного allowlist не доказаны.
-    return { outcome: 'fallback', mode: 'shadow', reason,
-      selected: base, plan: [base.worker] };
+    // Нечитаемая политика — fail-closed: ни база, ни резервы без
+    // проверенного allowlist не доказаны, дефолт не подставляется.
+    return { outcome: 'rejected', reason, mode: 'shadow',
+      selected: null, plan: [] };
   }
   // Базовая триада валидируется в обоих режимах: запрещённые провайдеры,
   // независимость трёх семейств и — при непустом allowlist роли —

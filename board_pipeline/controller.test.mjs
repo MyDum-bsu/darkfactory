@@ -1005,3 +1005,58 @@ test('rejected pinTriad — явный hold без spawn', async t => {
   assert.equal(out.reason, 'route_base_triad_violation:x');
   assert.equal(x.effects.spawn, 0);
 });
+
+test('исключение pinTriad — fail-closed hold, дефолтный воркер не запускается', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => { throw new Error('scorecard exploded'); },
+  });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'route_pin_failed');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('reconcileSpawn после lost spawn восстанавливает закреплённую триаду', async t => {
+  const x = await lab(t);
+  const PINNED_CRITIC = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const PINNED_ARBITER = { provider: 'openai', model: 'gpt-5.6-sol' };
+  let pins = 0;
+  let seenAtReconcile = null;
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => {
+      pins++;
+      return { plan: [ws.PRIMARY_WORKER], critic: PINNED_CRITIC, arbiter: PINNED_ARBITER };
+    },
+  });
+  // Ответ spawn теряется: запись 'launching' + intent остаётся, триада уже
+  // закреплена в ней ДО внешнего вызова.
+  x.cfg.bb.spawn = async () => { x.effects.spawn++; throw new Error('lost transport response'); };
+  assert.equal((await x.tick()).phase, 'uncertain');
+  assert.equal(x.effects.spawn, 1);
+  const inflight = await x.cfg.state.load();
+  assert.deepEqual(inflight.triad,
+    { worker: ws.PRIMARY_WORKER, critic: PINNED_CRITIC, arbiter: PINNED_ARBITER });
+  // Симулируем обрыв процесса с незакрытым intent(spawn): рестарт видит
+  // 'launching' — сверка идёт через reconcileSpawn с записью триады.
+  await x.cfg.state.save({ ...inflight, phase: 'launching', reason: undefined, receipt: undefined });
+  x.cfg.bb.reconcileSpawn = async attempt => {
+    seenAtReconcile = structuredClone(attempt);
+    return { status: 'matched', threadId: 'thr_found' };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.equal(record.threadId, 'thr_found');
+  assert.deepEqual(record.triad,
+    { worker: ws.PRIMARY_WORKER, critic: PINNED_CRITIC, arbiter: PINNED_ARBITER });
+  // reconcileSpawn получил попытку уже с триадой и известным исполнителем.
+  assert.deepEqual(seenAtReconcile.triad, record.triad);
+  assert.deepEqual(seenAtReconcile.executor, ws.PRIMARY_WORKER);
+  // Повторный pin не требуется — триада читается из записи.
+  assert.equal(pins, 1);
+  // Сдача: попытка в verify несёт ту же закреплённую триаду и исполнителя.
+  x.submit('b'.repeat(40));
+  await x.tick();
+  assert.deepEqual(x.effects.attempts[0].triad, record.triad);
+  assert.deepEqual(x.effects.attempts[0].executor, ws.PRIMARY_WORKER);
+});

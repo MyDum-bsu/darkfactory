@@ -1923,3 +1923,71 @@ test('пункт 4: манифест из ins.tree_sha и дерево в рез
   assert.equal(resB.tree_sha, TREE_SHA_ONLY, 'дерево снимка зафиксировано до отказа');
   assert.equal(resB.receipt.tree_sha, TREE_SHA_ONLY);
 });
+
+// --- VS-4.2 (#1263) r2: закреплённая routed триада в реальном acceptHeld ---
+
+test('shadow: закреплённая триада Devin/Neon/Sol — acceptHeld принимает attempt.triad', async t => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const DEVIN = { provider: 'acp-devin', model: 'swe-2-high' };
+  const transcript = 'private provider transcript';
+  await writeFile(path.join(journal, 'neon.json'), transcript, { mode: 0o600 });
+  const { ports, calls } = stubs();
+  ports.review = async binding => {
+    calls.review++;
+    return { task: id, sha: CAND, actual: NEON_CRITIC, verdict: 'REVIEW_OK', checkpoint: 'feed80ab',
+      isolation: NEON_ISOLATION, subject_digest: binding.subject_digest,
+      transcript_file: 'neon.json',
+      transcript_sha256: createHash('sha256').update(transcript).digest('hex') };
+  };
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch, { executor: DEVIN,
+      triad: { worker: DEVIN, critic: NEON_CRITIC, arbiter: SOL_ARBITER } }),
+    submission: submission(id, epoch),
+    policy: policy(id, { review: { ...NEON_CRITIC, skills: ['logika'] }, arbiter: SOL_ARBITER }),
+    journal, ports: { ...ports, board: boardPort } });
+  assert.equal(res.outcome, 'verified', res.reason);
+  assert.deepEqual(calls, { inspect: 2, local: 1, review: 1 });
+  // Неполная/битая триада — отказ до любых эффектов.
+  const idB = await contractTask(handle);
+  const { epoch: epochB, port: portB } = await held(ported, idB);
+  const denied = await acceptHeld({
+    attempt: contractAttempt(idB, epochB,
+      { triad: { worker: DEVIN, critic: NEON_CRITIC } }),
+    submission: submission(idB, epochB),
+    policy: policy(idB, { review: { ...NEON_CRITIC, skills: ['logika'] }, arbiter: SOL_ARBITER }),
+    journal: await tmpJournal(), ports: { ...stubs().ports, board: portB } });
+  assert.equal(denied.outcome, 'denied');
+  assert.equal(denied.reason, 'invalid_triad');
+});
+
+test('active: routed DeepSeek/Devin/Neon — закреплённый routed-критик проходит политику', async t => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const DS = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const DEVIN = { provider: 'acp-devin', model: 'swe-2-high', reasoningLevel: 'medium' };
+  const NEON = { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' };
+  const transcript = 'private provider transcript';
+  await writeFile(path.join(journal, 'critic.json'), transcript, { mode: 0o600 });
+  const { ports, calls } = stubs();
+  ports.review = async binding => {
+    calls.review++;
+    assert.equal(binding.subject_digest, expectedDigest());
+    return { task: id, sha: CAND, actual: DEVIN, verdict: 'REVIEW_OK', checkpoint: 'feed80ab',
+      isolation: 'docker-ro-v1', subject_digest: binding.subject_digest,
+      transcript_file: 'critic.json',
+      transcript_sha256: createHash('sha256').update(transcript).digest('hex') };
+  };
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch, { executor: DS,
+      triad: { worker: DS, critic: DEVIN, arbiter: NEON } }),
+    submission: submission(id, epoch),
+    policy: policy(id, { review: { ...DEVIN, requireAttestation: true }, arbiter: NEON }),
+    journal, ports: { ...ports, board: boardPort } });
+  assert.equal(res.outcome, 'verified', res.reason);
+  assert.deepEqual(calls, { inspect: 2, local: 1, review: 1 });
+});

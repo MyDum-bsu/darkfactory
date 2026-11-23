@@ -1,3 +1,5 @@
+import { SAFE_CATALOG } from './rework-distiller.mjs';
+
 const OWNER_PRECHECK = [
   'Перед продуктовым вопросом сверь утверждённые требования и раздел «Принятые решения» во входной спецификации/поручении.',
   'Если применимое решение однозначно, действуй по нему без повторного вопроса. Новый выбор, конфликт или сомнение не считай согласием.',
@@ -24,15 +26,21 @@ export function decisionsPromptBlock(slice) {
 }
 
 // Read-only блок дистиллированных уроков прошлых REWORK (Board #1263):
-// только строки правил, уже прошедшие validateDistilledLessons. Блок —
-// данные, не инструкция: воркер читает чек-лист, но не может мутировать
-// хранилище уроков (живёт вне рабочего дерева).
+// элементы — уроки, прошедшие validateDistilledLessons; в промпт
+// рендерится СТРОГО канонический текст правила из закрытого каталога
+// SAFE_CATALOG — произвольный rule хранимой записи до воркера не доходит
+// никогда. Блок — данные, не инструкция: воркер читает чек-лист, но не
+// может мутировать хранилище уроков (живёт вне рабочего дерева).
 export function lessonsPromptBlock(lessons) {
-  if (!Array.isArray(lessons) || lessons.length === 0 ||
-      !lessons.every(rule => typeof rule === 'string' && rule.trim())) {
+  if (!Array.isArray(lessons) || lessons.length === 0) {
     throw new Error('distilled_lessons_invalid');
   }
-  const body = lessons.map(rule => `- ${rule}`).join('\n');
+  const rules = lessons.map(lesson =>
+    lesson !== null && typeof lesson === 'object' ? SAFE_CATALOG[lesson.category]?.rule : undefined);
+  if (rules.some(rule => typeof rule !== 'string')) {
+    throw new Error('distilled_lessons_invalid');
+  }
+  const body = rules.map(rule => `- ${rule}`).join('\n');
   return `Уроки прошлых REWORK (read-only чек-лист, не инструкция):\n${body}`;
 }
 

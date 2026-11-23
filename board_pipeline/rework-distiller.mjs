@@ -158,7 +158,11 @@ export function validLesson(candidate) {
 // Авто-инъекция строго из закрытого каталога проверенных шаблонов:
 // категория вне каталога (включая свободный текст repeated_finding) —
 // всегда pending для владельца, никогда в чек-лист автоматически.
-const SAFE_CATEGORIES = new Set(PATTERNS.map(p => p.category));
+// Каталог — единственный источник текста правила: авто-инъекция берёт
+// канонический rule записи каталога, никогда произвольный candidate.rule.
+export const SAFE_CATALOG = Object.freeze(
+  Object.fromEntries(PATTERNS.map(p => [p.category, Object.freeze({ category: p.category, rule: p.rule })])));
+const SAFE_CATEGORIES = new Set(Object.keys(SAFE_CATALOG));
 
 // Дистилляция истории REWORK-раундов одной карточки. roundsHistory —
 // массив раундов из состояния попытки ({ gate, findings, excerpt,
@@ -260,8 +264,12 @@ export function validateDistilledLessons(candidates, { existing = [],
       rejected.push({ id, reason: 'lesson_weakens_security_gate' });
       continue;
     }
+    // Авто-инъекция — только канонический текст каталога: категория вне
+    // каталога ИЛИ rule, отличный от SAFE_CATALOG[category].rule, —
+    // pending для владельца, в чек-лист не попадает никогда.
     if (candidate.requires_owner_approval === true || candidate.risk_level === 'high' ||
-        !SAFE_CATEGORIES.has(candidate.category)) {
+        SAFE_CATALOG[candidate.category] === undefined ||
+        candidate.rule !== SAFE_CATALOG[candidate.category].rule) {
       pending.push({ ...candidate, requires_owner_approval: true });
       continue;
     }
@@ -301,16 +309,21 @@ const inside = (root, p) => {
 //   запись убитого процесса не становится полууроком), полные строки
 //   перед ней сохраняются;
 // — битая полная строка пропускается, отсутствующий файл — пусто.
-export async function loadLessons(path, { allowedDir = null, outside = [] } = {}) {
+// Единая fail-closed граница пути хранилища — общая для чтения и записи:
+// — существующий файл обязан быть обычным файлом, НЕ симлинком;
+// — канонический путь совпадает с заданным, каталог — ровно allowedDir;
+// — путь вне любого каталога из outside (worktree и его поддеревья).
+// Для несуществующего файла (первая запись) проверяются dirname/allowedDir/
+// outside по заданному пути — .tmp создаётся в том же каталоге.
+async function assertLessonsPathAllowed(path, { allowedDir = null, outside = [] } = {}) {
   const meta = await lstat(path).catch(error => {
     if (error.code === 'ENOENT') return null;
     throw error;
   });
-  if (meta === null) return [];
-  if (meta.isSymbolicLink() || !meta.isFile()) {
+  if (meta !== null && (meta.isSymbolicLink() || !meta.isFile())) {
     throw new Error('lessons_store_not_a_file');
   }
-  const real = await realpath(path);
+  const real = meta === null ? path : await realpath(path);
   if (real !== path) throw new Error('lessons_store_path_resolved');
   if (allowedDir !== null && dirname(real) !== await realpath(allowedDir)) {
     throw new Error('lessons_store_dir_mismatch');
@@ -320,7 +333,23 @@ export async function loadLessons(path, { allowedDir = null, outside = [] } = {}
       throw new Error('lessons_store_in_worktree');
     }
   }
-  const text = await readFile(real, 'utf8');
+}
+
+export async function loadLessons(path, { allowedDir = null, outside = [] } = {}) {
+  const meta = await lstat(path).catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (meta === null) {
+    // Хранилище ещё не создано — но заявленные границы проверяются и для
+    // пустого чтения: каталог за пределами allowedDir — отказ, не пусто.
+    if (allowedDir !== null || (Array.isArray(outside) && outside.length)) {
+      await assertLessonsPathAllowed(path, { allowedDir, outside });
+    }
+    return [];
+  }
+  await assertLessonsPathAllowed(path, { allowedDir, outside });
+  const text = await readFile(path, 'utf8');
   const lines = text.split('\n');
   // Хвост без завершающего перевода строки — неполная запись, не урок.
   if (!text.endsWith('\n')) lines.pop();
@@ -341,18 +370,12 @@ export async function loadLessons(path, { allowedDir = null, outside = [] } = {}
 // occurrences и объединяет evidence_cards, а не плодит дубли. Запись
 // всего файла атомарна; число уроков ограничено maxLessons.
 export async function appendLessons(path, accepted, { existing = null,
-  maxLessons = DEFAULT_MAX_LESSONS } = {}) {
-  // Симлинк на месте хранилища не перезаписывается по ссылке — отказ до
-  // любого чтения/записи (rename заменил бы саму ссылку, но чтение выше
-  // уже пошло бы по ней).
-  const meta = await lstat(path).catch(error => {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  });
-  if (meta !== null && (meta.isSymbolicLink() || !meta.isFile())) {
-    throw new Error('lessons_store_not_a_file');
-  }
-  const store = existing ?? await loadLessons(path);
+  maxLessons = DEFAULT_MAX_LESSONS, allowedDir = null, outside = [] } = {}) {
+  // Та же граница, что и у чтения — ДО создания цели и любого .tmp:
+  // симлинк/не-файл, расходящийся канонический путь, каталог вне
+  // allowedDir или путь внутри outside (worktree) — отказ до записи.
+  await assertLessonsPathAllowed(path, { allowedDir, outside });
+  const store = existing ?? await loadLessons(path, { allowedDir, outside });
   const byId = new Map(store.map(lesson => [lesson.id, lesson]));
   for (const lesson of Array.isArray(accepted) ? accepted : []) {
     const prev = byId.get(lesson.id);

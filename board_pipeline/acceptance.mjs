@@ -7,7 +7,8 @@ import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
 import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter, NEON_ISOLATION } from './review-policy.mjs';
-import { assertTriadIndependent } from './worker-selector.mjs';
+import { assertTriadIndependent, opencodeGoPolicyViolation,
+  retiredProviderViolation, workerFamily } from './worker-selector.mjs';
 
 const HANDOFF_KEYS = [
   'task_id',
@@ -42,6 +43,7 @@ const ATTEMPT_OPTIONAL = [
   'has_ui',
   'executor',
   'arbiter',
+  'triad',
   'fallback_reason',
   'attempted_workers',
 ];
@@ -116,10 +118,24 @@ function validatePolicy(policy, checkProfile, { allowNeon = false } = {}) {
   }
   const legacy = isLegacyPiReview(profile.review);
   const neon = allowNeon && isNeonReview(profile.review) && isReviewSkillList(profile.review.skills);
-  if (!legacy && !neon) {
+  if (!legacy && !neon && !isRoutedReview(profile.review)) {
     throw new Denied('review_profile_not_approved');
   }
   return profile;
+}
+
+// Динамически routed критик (Board #1263): допускается только spec,
+// прошедший политику #1247 — валидная пара provider/model, 0 zcode,
+// DeepSeek-only в opencode-go и аттестованное семейство. Независимость
+// триады проверяется ниже отдельно, как для первичного, так и routed.
+function isRoutedReview(review) {
+  // Neon-критик обслуживается строго только neon-веткой со skills-гейтом —
+  // routed-допуск не должен обходить её.
+  if (isNeonReview(review)) return false;
+  if (!validWorkerSpec(review) || typeof review.model !== 'string' ||
+      review.model.length === 0) return false;
+  if (retiredProviderViolation(review) ?? opencodeGoPolicyViolation(review)) return false;
+  return workerFamily(review) !== null;
 }
 
 function strictKeys(record, allowed, optional = []) {
@@ -198,6 +214,16 @@ function validateAttempt(attempt) {
   }
   if (attempt.arbiter !== undefined && !validWorkerSpec(attempt.arbiter)) {
     throw new Denied('invalid_arbiter');
+  }
+  // Закреплённая триада попытки (#1263): строго три роли, каждая — валидный
+  // spec {provider, model}; независимость семейств проверяется на уровне
+  // executor/critic/arbiter ниже, а не здесь.
+  if (attempt.triad !== undefined) {
+    const triad = attempt.triad;
+    const ok = triad !== null && typeof triad === 'object' && !Array.isArray(triad) &&
+      Object.keys(triad).every(k => ['worker', 'critic', 'arbiter'].includes(k)) &&
+      ['worker', 'critic', 'arbiter'].every(k => validWorkerSpec(triad[k]));
+    if (!ok) throw new Denied('invalid_triad');
   }
   if (attempt.fallback_reason !== undefined && attempt.fallback_reason !== null &&
       typeof attempt.fallback_reason !== 'string') {

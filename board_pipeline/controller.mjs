@@ -65,7 +65,9 @@ function attemptOf(record, route) {
   const attempt = { task_id: record.taskId ?? route.taskId, attempt_id: record.attemptId, epoch: record.epoch,
     bb_thread_id: record.threadId, worktree: route.worktree, base_sha: route.base,
     check_profile: route.checkProfile, finish: route.finish };
-  if (record.executor !== undefined) attempt.executor = record.executor;
+  // Фактический исполнитель — executor; при восстановлении после lost spawn
+  // известна только закреплённая первичная модель триады.
+  attempt.executor = record.executor ?? record.triad?.worker;
   // Закреплённая триада попытки (Board #1263): spawn, L2-критик, арбитраж
   // и seal работают на одной тройке на всех тиках и после рестарта.
   if (record.triad !== undefined) attempt.triad = record.triad;
@@ -279,7 +281,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           try {
             pinned = await workerSelector.pinTriad({ route, attempt: attemptOf(record, route) });
           } catch {
-            pinned = null;
+            // Исключение пина — fail-closed: дефолтный воркер не запускается
+            // на недоказанной триаде (ревью #1263 r2).
+            await save({ phase: 'hold', reason: 'route_pin_failed' });
+            return visible();
           }
         }
         if (pinned?.outcome === 'rejected') {
@@ -290,6 +295,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         const attemptArbiter = pinned?.arbiter ?? selArbiter;
         const attemptPlan = Array.isArray(pinned?.plan) && pinned.plan.length
           ? pinned.plan : workerSelector.selectWorker({ route });
+        // Триада закрепляется в записи ДО внешнего spawn: при потерянном
+        // ответе reconcileSpawn восстанавливает попытку уже с триадой —
+        // worker пишется по факту после выбора исполнителя.
+        await save({ triad: { worker: attemptPlan[0], critic: attemptCritic, arbiter: attemptArbiter } });
         // Приоритет acp-devin/swe-2-high; резерв только при подтверждённом
         // отказе, неизвестный исход — карантин без второго писателя.
         const selection = await workerSelector.attemptSpawnWithFallback({
@@ -316,8 +325,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         launched = { threadId: selection.threadId };
         workerTrail = { executor: selection.worker, fallbackReason: selection.fallbackReason ?? null,
           attemptedWorkers: selection.attemptedWorkers,
-          // Закреплённая триада: фактический исполнитель плюс критик и
-          // арбитр этой попытки — дальше по записи, не по перечитыванию.
+          // Закреплённая триада: worker уточняется по факту (резерв мог
+          // подменить первичного), критик и арбитр — из пина выше.
           triad: { worker: selection.worker, critic: attemptCritic, arbiter: attemptArbiter } };
       } else {
         launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });

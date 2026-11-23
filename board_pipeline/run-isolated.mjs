@@ -224,7 +224,7 @@ async function execute() {
     const existing = await loadLessons(lessonsPath, { allowedDir: root, outside: [tree] });
     if (!existing.length) return [];
     const { accepted } = validateDistilledLessons(existing);
-    return accepted.map(lesson => lesson.rule);
+    return accepted;
   };
   // Скоркард для динамического роутинга: журнал телеметрии того же root.
   // Любая деградация — null → resolveTriad откатывается к дефолтной триаде.
@@ -248,7 +248,10 @@ async function execute() {
       if (!candidates.length) return;
       const existing = await loadLessons(lessonsPath, { allowedDir: root, outside: [tree] });
       const { accepted, pending, rejected } = validateDistilledLessons(candidates, { existing });
-      if (accepted.length) await appendLessons(lessonsPath, accepted, { existing });
+      if (accepted.length) {
+        await appendLessons(lessonsPath, accepted,
+          { existing, allowedDir: root, outside: [tree] });
+      }
       if (pending.length || rejected.length) {
         console.log(JSON.stringify({ kind: 'lessons_gate',
           pending: pending.map(lesson => lesson.id), rejected }));
