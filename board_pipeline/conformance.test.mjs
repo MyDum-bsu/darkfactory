@@ -29,6 +29,7 @@ import { answerBytes, signedAnswerVerifier } from './question-gate.mjs';
 import { loadSdk } from './sdk.mjs';
 import { worktreeInspector } from './runtime.mjs';
 import { tamperGate } from './tamper-gate.mjs';
+import { createTelemetryRecorder } from './telemetry.mjs';
 import * as ws from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -1032,9 +1033,14 @@ async function readPublicArtifact(site) {
   return response.text();
 }
 
-test('VS-2 release: exact signed package, one real publication, version/smoke and native deployed receipt', async t => {
+test('VS-2 release: exact signed package and native deployed receipt with VS-3 telemetry enabled', async t => {
   const f = await releaseLab(t);
   const { x, owner, question } = f;
+  const rec = createTelemetryRecorder({ journal: x.stateDir });
+  const complete = x.port.complete;
+  x.port.complete = (id, epoch, evidence) => complete(id, epoch, rec.embed(evidence));
+  rec.roundStart();
+  rec.recordRound({ outcome: 'verified' });
   assert.equal(question.checkpoint.release.target, LIVE_TARGET);
   assert.equal(question.checkpoint.release.digest, digestBytes(Buffer.from(f.text)));
   assert.equal(question.checkpoint.release.previous.digest, digestBytes(Buffer.from(INITIAL_TEXT)));
@@ -1064,6 +1070,9 @@ test('VS-2 release: exact signed package, one real publication, version/smoke an
   assert.equal(result.subject_digest, expectedSubject);
   assert.equal(result.readback, result.digest);
   assert.equal(result.smoke, 'pass');
+  assert.equal(result.telemetry, undefined, 'release settlement hashes the exact typed receipt');
+  await rec.finish({ outcome: 'done' });
+  assert.match(await readFile(join(x.stateDir, 'telemetry.jsonl'), 'utf8'), /attempt_summary/);
   assert.equal(owner.load().releaseApproval.harm, 10);
   assert.equal((await x.tick()).phase, 'done');
   assert.deepEqual(f.counts(), { promotions: 1, rollbacks: 0 });

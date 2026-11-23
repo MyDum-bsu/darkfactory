@@ -998,7 +998,8 @@ test('Sol arbiter authenticates model effort and subject without mounting the OA
       return { code: 0, stdout: `${reply}\n${settled}` };
     } });
     if (reason) await assert.rejects(runner(req), { reason });
-    else assert.deepEqual(await runner(req), decision);
+    // Решение арбитра несёт usage ходов pi (здесь транскрипт без usage — null).
+    else assert.deepEqual(await runner(req), { ...decision, usage: null });
   }
 });
 

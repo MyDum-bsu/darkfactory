@@ -23,6 +23,7 @@ import { DEFAULT_INTERVAL_MS, RotatingJournal, runDaemon, TERMINAL_PHASES } from
 import { localReleasePort } from './local-release.mjs';
 import { ReleaseDenied } from './release-contract.mjs';
 import { arbiterIntakePrompt, workerIntakePrompt } from './intake-prompt.mjs';
+import { createTelemetryRecorder, threadUsage } from './telemetry.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -138,6 +139,15 @@ async function execute() {
     if (!body.trim()) throw new Error(`Empty operator review skill: ${skill}`);
     return `Operator-selected review skill (${skill}):\n${body}`;
   })].join('\n\n');
+  // VS-3 телеметрия: наблюдатель попытки — фазы, раунды, модели, токены.
+  // Fail-open: сбои телеметрии изолированы в модуле; отсутствие usage у
+  // провайдера остаётся явным null и приёмку не ломает.
+  const newTelemetry = () => createTelemetryRecorder({ journal: root,
+    models: { worker: { provider: p.bb.provider, model: p.bb.model },
+      critic: reviewSetup.critic, arbiter: reviewSetup.arbiter } });
+  let telemetry = newTelemetry();
+  // Фактический источник токенов критика: поток agy (neon) или pi-транскрипт.
+  const criticSource = reviewSetup.neon ? 'agy_stream' : 'pi_stream';
   const route = { ...p.route, policyDigest: pinned.digest,
     zcodeQuota: p.zcodeQuota ?? p.bb?.zcodeQuota };
   // Queue-driven маршрут без route.taskId: карточку берёт board.claimReady по
@@ -162,6 +172,10 @@ async function execute() {
   const assertOpen = activation && (async () => { await assertPinned(); await switchOpen(); });
   const port = nativeBoardPort(board(), { channel: p.channel, isolatedQuestionOwner: Boolean(ownerAnswers),
     pilot: activation && { scope: activation.scope, assertOpen } });
+  // Компактная строка телеметрии в квитанции закрытия карточки: без секретов
+  // и сырых логов; не влезает в лимит 1000 — квитанция уходит без неё.
+  const completeCard = port.complete.bind(port);
+  port.complete = (taskId, epoch, evidence) => completeCard(taskId, epoch, telemetry.embed(evidence));
   const record = join(root, 'attempt.json');
   const git = async (...args) =>
     (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
@@ -226,8 +240,11 @@ async function execute() {
       if (live.epoch !== attempt.epoch) throw new Error('lease_lost_before_bb_call');
       await port.guardTask?.(attempt.task_id, attempt.epoch);
       try {
-        const { stdout } = await exec('bb', argv, { timeout: 60_000 });
-        return { threadId: JSON.parse(stdout).id };
+        const { stdout } = await telemetry.phase('spawn', () => exec('bb', argv, { timeout: 60_000 }),
+          { subject: attempt, worker: execSpec });
+        const spawned = JSON.parse(stdout);
+        telemetry.workerResume({ subject: attempt, worker: execSpec });
+        return { threadId: spawned.id };
       } catch (error) {
         let diagnostic;
         try { diagnostic = JSON.parse(error.stdout).error; } catch { /* A transport failure may have no envelope. */ }
@@ -303,9 +320,12 @@ async function execute() {
       const live = await port.verifyHeld(packet.attempt.task_id, packet.attempt.epoch);
       if (live.epoch !== packet.attempt.epoch) throw new Error('lease_lost_before_bb_feedback');
       await port.guardTask?.(packet.attempt.task_id, packet.attempt.epoch);
-      const { stdout } = await exec('bb', ['thread', 'tell', packet.attempt.bb_thread_id, '--mode', 'queue',
-        '--permission-mode', permissionMode, '--message-file', message, '--json'], { timeout: 50_000 });
-      return { confirmed: ['sent', 'queued'].includes(JSON.parse(stdout).delivery) };
+      const { stdout } = await telemetry.phase('worker_feedback', () => exec('bb',
+        ['thread', 'tell', packet.attempt.bb_thread_id, '--mode', 'queue',
+        '--permission-mode', permissionMode, '--message-file', message, '--json'], { timeout: 50_000 }));
+      const confirmed = ['sent', 'queued'].includes(JSON.parse(stdout).delivery);
+      if (confirmed) telemetry.workerResume({ subject: packet.attempt });
+      return { confirmed };
     },
   };
   async function observedTurn(threadId, after) {
@@ -320,6 +340,8 @@ async function execute() {
     const terminal = JSON.parse(log.stdout).findLast(event =>
       ['client/turn/requested', 'turn/started', 'turn/completed'].includes(event.type));
     if (terminal?.type !== 'turn/completed' || terminal.threadId !== thread.id || terminal.seq <= after) return;
+    // VS-3: usage воркера из снимка bb, если провайдер его отдал; иначе null.
+    telemetry.recordUsage('worker', threadUsage({ thread, event: terminal.data }), 'bb_thread');
     return { turnSeq: terminal.seq, completed: thread.status === 'idle' && terminal.data?.status === 'completed' };
   }
   const submissions = { async read(attempt, after) {
@@ -383,9 +405,14 @@ async function execute() {
         .catch(() => { lost = true; });
     }, 20_000);
     try {
-      return await acceptHeld({ attempt, submission, policy, journal: root, ports: {
-        board: port, inspect: worktreeInspector(policy), local: offlineProfileRunner(root, { beforeEffect }),
-        tamper: tamperGate, visual: offlineVisualRunner(root, { beforeEffect }),
+      // VS-3: фазы приёмки (L1 local, tamper, L3 visual, L2 critic) замеряются
+      // вокруг портов; usage критика — из квитанции ревью, иначе null.
+      telemetry.roundStart();
+      const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
+        board: port, inspect: telemetry.port('inspect', worktreeInspector(policy)),
+        local: telemetry.port('l1_local', offlineProfileRunner(root, { beforeEffect })),
+        tamper: telemetry.port('tamper', tamperGate),
+        visual: telemetry.port('l3_visual', offlineVisualRunner(root, { beforeEffect })),
         // Смена брифа/файлов политики во время проверок останавливает кандидата до complete.
         verifyPinned: assertPinned,
         review: async (handoff, trusted) => {
@@ -393,9 +420,13 @@ async function execute() {
           if (lost) throw new Error('Lease lost');
           await assertPinned();
           await beforeEffect?.();
-          return review(handoff, trusted);
+          const receipt = await telemetry.phase('l2_critic', () => review(handoff, trusted));
+          telemetry.recordUsage('critic', receipt?.usage, criticSource);
+          return receipt;
         },
       } });
+      telemetry.recordRound({ outcome: result.outcome, reason: result.reason, sha: submission.candidate_sha });
+      return result;
     } finally {
       clearInterval(timer);
       await renewal;
@@ -413,13 +444,33 @@ async function execute() {
     await beforeEffect?.();
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
       prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '') });
-    return arbiterRunner(req);
+    const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
+    telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
+    telemetry.recordArbitration();
+    return decision;
   };
+  let lastResult = null;
+  let previous;
+  let recheck = values['recheck-rejected-handoff'];
+  const tick = guardedEffect(assertOpen, advanceWithProjection);
+  const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
+    release: releasePort, recheckRejectedHandoff: recheck,
+    workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter, arbitrate } });
+  const observeTick = result => {
+    recheck = false;
+    lastResult = result;
+    const summary = telemetry.summaryLine();
+    const line = JSON.stringify({
+      ...(activation && result.reason ? { ...result, reason: 'see_private_attempt' } : result),
+      ...(summary ? { telemetry: summary } : {}),
+    });
+    if (line !== previous) console.log(line);
+    previous = line;
+  };
+  const finishTelemetry = () => telemetry.finish(lastResult && TERMINAL_PHASES.has(lastResult.phase)
+    ? { outcome: lastResult.phase, reason: lastResult.reason ?? null, open: false }
+    : { outcome: lastResult?.phase ?? 'unknown', reason: 'attempt_not_terminal', open: true });
   try {
-    const deadline = Date.now() + p.waitMs;
-    let previous;
-    let recheck = values['recheck-rejected-handoff'];
-    const tick = guardedEffect(assertOpen, advanceWithProjection);
     if (values.daemon) {
       // Фоновый режим 24/7: тот же тик, но без deadline — стоп по kill-switch
       // (файл 'run' в приватном каталоге) или SIGTERM/SIGINT от systemd.
@@ -436,15 +487,9 @@ async function execute() {
       const journal = new RotatingJournal({ directory: root });
       await runDaemon({
         intervalMs, journal, diskPath: tree, assertOpen: daemonOpen,
-        tick: () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
-          release: releasePort, recheckRejectedHandoff: recheck,
-          workerSelector: { ...workerSelector, critic: reviewSetup.critic,
-            arbiter: reviewSetup.arbiter, arbitrate } }),
+        tick: runTick,
         onTick: async result => {
-          recheck = false;
-          const line = JSON.stringify(activation && result.reason ? { ...result, reason: 'see_private_attempt' } : result);
-          if (line !== previous) console.log(line);
-          previous = line;
+          observeTick(result);
           if (result.phase === 'release_ready' && !releasePort) return 'stop';
           if (!TERMINAL_PHASES.has(result.phase)) return;
           // Закреплённая карточка: терминал завершает демон. Очередь: done/hold
@@ -454,7 +499,11 @@ async function execute() {
             return 'stop';
           }
           if (result.phase === 'done' || result.phase === 'hold') {
+            // Иначе сводка следующей карточки унаследует счётчики предыдущей.
+            await finishTelemetry();
             await state.save(null);
+            telemetry = newTelemetry();
+            lastResult = null;
             return;
           }
           process.exitCode = 1;
@@ -463,21 +512,12 @@ async function execute() {
       });
       return;
     }
+    const deadline = Date.now() + p.waitMs;
     while (Date.now() <= deadline) {
-      const result = await tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate, release: releasePort,
-        recheckRejectedHandoff: recheck,
-        // Фактические критик/арбитр из профиля проверки и политики; порт
-        // арбитра подключается из конфига, когда задан.
-        workerSelector: { ...workerSelector,
-          critic: reviewSetup.critic,
-          arbiter: reviewSetup.arbiter,
-          arbitrate } });
-      recheck = false;
-      const line = JSON.stringify(activation && result.reason ? { ...result, reason: 'see_private_attempt' } : result);
-      if (line !== previous) console.log(line);
-      previous = line;
+      const result = await runTick();
+      observeTick(result);
       if (result.phase === 'release_ready' && !releasePort) return;
-      if (['done', 'hold', 'uncertain', 'lease_lost'].includes(result.phase)) {
+      if (TERMINAL_PHASES.has(result.phase)) {
         if (result.phase !== 'done') process.exitCode = 1;
         return;
       }
@@ -487,7 +527,8 @@ async function execute() {
     }
     throw new Error('Pilot wait elapsed; current attempt is preserved');
   } finally {
-    await release();
+    try { await finishTelemetry(); }
+    finally { await release(); }
   }
 }
 

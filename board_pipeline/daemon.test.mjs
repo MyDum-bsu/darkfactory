@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFileSync, spawn as spawnProcess } from 'node:child_process';
+import { generateKeyPairSync } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { RotatingJournal, runDaemon } from './daemon.mjs';
@@ -282,11 +283,11 @@ async function daemonFixture(t, url, { pilot = false } = {}) {
     brief: join(ops, 'brief.md'), reviewPrompt: join(ops, 'review.md'),
     reviewGate: join(gate, 'gate.json'), handoffDir: inbox,
   }));
-  const spawn = () => {
+  const spawn = (env = {}) => {
     const child = spawnProcess(process.execPath,
       [join(repoRoot, 'board_pipeline', 'run-isolated.mjs'), '--execute', '--daemon',
         '--policy', policy, '--state', state, '--interval-ms', '300', '--switch', switchFile],
-      { env: { ...process.env, XDG_STATE_HOME: xdg }, stdio: ['ignore', 'pipe', 'pipe'] });
+      { env: { ...process.env, ...env, XDG_STATE_HOME: xdg }, stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     child.stdout.on('data', d => { output += String(d); });
     child.stderr.on('data', d => { output += String(d); });
@@ -295,9 +296,13 @@ async function daemonFixture(t, url, { pilot = false } = {}) {
     return child;
   };
   const journal = join(state, 'daemon.jsonl');
-  const waitTicks = async (count, ms = 20_000) => {
-    const deadline = Date.now() + ms;
+  const waitTicks = async (count, { timeoutMs = 20_000, child } = {}) => {
+    const deadline = Date.now() + timeoutMs;
     for (;;) {
+      if (child && (child.exitCode !== null || child.signalCode !== null)) {
+        const { output } = await child.done;
+        throw new Error(`daemon exited before idle: ${output}`);
+      }
       const log = await readFile(journal, 'utf8').catch(() => '');
       const events = log.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
       if (events.filter(e => e.event === 'tick' && e.phase === 'idle').length >= count) return events;
@@ -306,7 +311,7 @@ async function daemonFixture(t, url, { pilot = false } = {}) {
     }
   };
   const stop = child => child.done;
-  return { base, tree, state, inbox, switchDir, switchFile, xdg, spawn, journal, waitTicks, stop };
+  return { base, tree, state, inbox, switchDir, switchFile, xdg, policy, spawn, journal, waitTicks, stop };
 }
 
 test('run-isolated --daemon: empty ticks, kill-switch stop and SIGTERM (real child)', async t => {
@@ -370,6 +375,71 @@ test('run-isolated --daemon: starting under stop switch exits 0 without ticks', 
   assert.equal(events.at(-1).event, 'daemon_stop');
   assert.equal(events.at(-1).reason, 'kill_switch');
   assert.equal(events.filter(e => e.event === 'tick').length, 0);
+});
+
+test('run-isolated --daemon: pinned intake and separate telemetry for two cards', { timeout: 35_000 }, async t => {
+  const { url } = await startBoard(boardCli(), t);
+  process.env.BOARD_URL = url;
+  const handle = loadSdk().board();
+  await handle.createChannel('pilot');
+  const fx = await daemonFixture(t, url);
+  const cfg = JSON.parse(await readFile(fx.policy, 'utf8'));
+  cfg.owner = (await handle.me()).principal;
+  const answers = join(fx.base, 'answers');
+  await mkdir(answers, { mode: 0o700 });
+  cfg.questionGate = { exclusiveBoardOwner: true, inbox: answers, ttlMs: 60_000,
+    publicKey: generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }) };
+  await writeFile(fx.policy, JSON.stringify(cfg));
+  const decision = 'Принятые решения: ручная выгрузка — CSV.';
+  await writeFile(cfg.brief, decision);
+
+  const labels = { queue: 'daemon-it', repo_id: 'repo-daemon-it', profile_id: 'pilot',
+    finish: 'verified', spec_digest: 'a'.repeat(64), policy_digest: 'b'.repeat(64) };
+  const first = (await handle.tasks.create('pilot', { text: 'Fixture 1', labels })).task.id;
+  const second = (await handle.tasks.create('pilot', { text: 'Fixture 2', labels })).task.id;
+  const bin = join(fx.base, 'bin');
+  await mkdir(bin, { mode: 0o700 });
+  const prompts = join(fx.base, 'prompts.jsonl');
+  await writeFile(join(bin, 'bb'), `#!${process.execPath}
+const { appendFileSync, readFileSync } = require('node:fs');
+const [group, action, id] = process.argv.slice(2);
+const out = value => console.log(JSON.stringify(value));
+if (group !== 'thread') process.exit(86);
+if (action === 'spawn') {
+  const prompt = readFileSync(process.argv[process.argv.indexOf('--prompt-file') + 1], 'utf8');
+  appendFileSync(${JSON.stringify(prompts)}, JSON.stringify(prompt) + '\\n');
+  out({ id: 'thr_fixture' });
+} else if (action === 'show') {
+  out({ thread: { id, status: 'idle', activeBackgroundAgentCount: 0, queuedMessageCount: 0 },
+    environment: { path: ${JSON.stringify(fx.tree)} } });
+} else if (action === 'log') {
+  out([{ type: 'turn/completed', threadId: id, seq: 10, data: { status: 'completed' } }]);
+} else process.exit(86);
+`, { mode: 0o700 });
+  await writeFile(fx.switchFile, 'run\n', { mode: 0o600 });
+  const child = fx.spawn({ PATH: bin + delimiter + process.env.PATH });
+  t.after(() => child.kill('SIGKILL'));
+  await fx.waitTicks(1, { child });
+  await writeFile(fx.switchFile, 'stop\n', { mode: 0o600 });
+  const stopped = await fx.stop(child);
+  assert.equal(stopped.code, 0, stopped.output);
+
+  const journal = await readFile(join(fx.state, 'telemetry.jsonl'), 'utf8');
+  const attempts = journal.trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(attempts.map(entry => entry.task_id), [first, second]);
+  assert.ok(attempts.every(entry => entry.open === false && entry.outcome === 'hold'));
+  assert.notEqual(attempts[0].attempt_id, attempts[1].attempt_id);
+  for (const id of [first, second]) {
+    assert.equal((await handle.thread(id)).message.task.state, 'blocked');
+  }
+
+  const observed = (await readFile(prompts, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(observed.length, 2);
+  for (const [index, id] of [first, second].entries()) {
+    assert.ok(observed[index].startsWith(decision));
+    assert.ok(observed[index].includes(`"task_id":"${id}"`));
+    assert.match(observed[index], /без повторного вопроса/);
+  }
 });
 
 test('run-isolated --daemon: pilot scope under stop switch also exits 0', async t => {

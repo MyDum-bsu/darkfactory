@@ -59,6 +59,7 @@ function monitorAgy(cwd, { snapshotTools = false } = {}) {
   const reader = trackSnapshotReads(cwd, snapshotTools);
   let conversation;
   let result;
+  let usage = null;
   let prompts = 0;
   let answered = false;
   return {
@@ -108,6 +109,9 @@ function monitorAgy(cwd, { snapshotTools = false } = {}) {
               reply.status !== 'SUCCESS' || reply.num_turns !== 1 ||
               typeof reply.response !== 'string' || !reply.response.trim()) throw error('agy_incomplete_turn');
           result = reply.response;
+          // VS-3: usage провайдера проходит ту же валидацию RESULT_FIELDS;
+          // его отсутствие остаётся явным null (fail-open телеметрии).
+          usage = reply.usage ?? null;
           break;
         }
         default:
@@ -117,7 +121,7 @@ function monitorAgy(cwd, { snapshotTools = false } = {}) {
     finish() {
       if (!result) throw error('agy_incomplete_turn');
       return { text: result, ...reader.finish(), actual: { provider: 'google', model: MODEL, reasoningLevel: EFFORT },
-        evidence: { model: 'agy_stream_init', effort: 'agy_cli_request' } };
+        evidence: { model: 'agy_stream_init', effort: 'agy_cli_request' }, usage };
     },
   };
 }
