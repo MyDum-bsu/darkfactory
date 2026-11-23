@@ -68,6 +68,21 @@ function transcriptDisqualifying(ndjson, critic) {
         (effort !== undefined && effort !== critic.reasoningLevel)) {
       return 'review_model_mismatch';
     }
+    // Уже изданный вердикт без agent_settled — не обрыв, а зафиксированный
+    // исход: второй вызов не должен стирать записанный REWORK/ESCALATE/PASS.
+    // Парсится текст хода; любой распознанный вердикт (или вердиктоподобный
+    // контент: ambiguous, objection_missing) дисквалифицирует transient.
+    const parts = Array.isArray(message.content) ? message.content : [];
+    const text = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
+    try {
+      parseReviewVerdict(text);
+      return 'review_verdict_emitted';
+    } catch (verdictError) {
+      if (!(verdictError instanceof ReviewDenied) ||
+          verdictError.reason !== 'review_verdict_missing') {
+        return 'review_verdict_emitted';
+      }
+    }
   }
   return null;
 }
@@ -654,8 +669,13 @@ export function l2ReviewRetryGuard({ port, taskId, epoch, owner, label, contract
       // Дополнительные required-метки маршрута — тот же допуск, что у
       // claimReady на первичном захвате: метка, снятая во время первой
       // попытки, делает карточку непригодной для повтора.
+      // Тот же допуск, что у claimReady/admits: метка обязана быть
+      // НЕПУСТОЙ строкой — снятая и опустошённая метки одинаково закрывают
+      // карточку для повтора.
       for (const key of required ?? []) {
-        if (live[key] === undefined) throw new Error(`required_label_missing:${key}`);
+        if (typeof live[key] !== 'string' || !live[key]) {
+          throw new Error(`required_label_missing:${key}`);
+        }
       }
     }
     await port.guardTask?.(taskId, epoch);
@@ -683,6 +703,10 @@ export async function l2ReviewWithTransientRetry({ review, binding, profile, bef
     // не должен пропустить второй вызов под устаревшей авторизацией.
     await verifySubject(binding);
     await beforeRetry?.();
+    // Дрейф за время живых гейтов: субъект сверяется повторно непосредственно
+    // перед dispatch — смена HEAD/чистоты во время ожидания lease/daemon
+    // проверок не должна пропустить экспорт другого коммита второму читателю.
+    await verifySubject(binding);
     log?.({ kind: 'l2_review_retry', task: binding?.task_id ?? null,
       sha: binding?.candidate_sha ?? null, reason: error.reason });
     return await review(binding, profile);

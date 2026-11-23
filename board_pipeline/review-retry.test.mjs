@@ -215,9 +215,10 @@ test('guard: production retry guard — subject сначала, живые ге�
   assert.equal(calls(), 2);
   assert.equal(receipt.verdict, 'REVIEW_OK');
   // Порядок: subject → lease → допуск → контракт → guardTask → daemon switch
-  // → пины/switch → beforeEffect — живые проверки непосредственно перед вызовом.
+  // → пины/switch → beforeEffect → повторный subject непосредственно перед
+  // dispatch — дрейф worktree во время живых гейтов не пропускает запуск.
   assert.deepEqual(seen, ['subject', 'verifyHeld', 'matches', 'labels',
-    'guardTask', 'daemonOpen', 'assertPinned', 'beforeEffect']);
+    'guardTask', 'daemonOpen', 'assertPinned', 'beforeEffect', 'subject']);
 });
 
 test('guard: дрейф контрактных меток до повтора — ноль доп. вызовов', async () => {
@@ -253,21 +254,23 @@ test('guard: дрейф контрактных меток до повтора �
 });
 
 test('guard: снятие required-метки маршрута до повтора — ноль доп. вызовов', async () => {
-  // Тот же допуск, что claimReady на первичном захвате: метка из
-  // route.required, снятая во время первой попытки, запрещает повтор.
-  const live = { ...CONTRACT }; // ui_e2e снята
-  const { review, calls } = scriptedReview([
-    timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
-  const { guard } = guardFixture({ required: ['ui_e2e'],
-    port: {
-      verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true,
-      labels: async () => live, guardTask: async () => {} } });
-  await assert.rejects(
-    l2ReviewWithTransientRetry({ review, binding: BINDING,
-      profile: { review: CRITIC }, beforeRetry: guard,
-      verifySubject: async () => {} }),
-    (e) => e.message === 'required_label_missing:ui_e2e');
-  assert.equal(calls(), 1);
+  // Тот же допуск, что claimReady/admits на первичном захвате: метка из
+  // route.required обязана быть НЕПУСТОЙ строкой — и снятая, и опустошённая
+  // закрывают карточку для повтора.
+  for (const live of [{ ...CONTRACT }, { ...CONTRACT, ui_e2e: '' }]) {
+    const { review, calls } = scriptedReview([
+      timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
+    const { guard } = guardFixture({ required: ['ui_e2e'],
+      port: {
+        verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true,
+        labels: async () => live, guardTask: async () => {} } });
+    await assert.rejects(
+      l2ReviewWithTransientRetry({ review, binding: BINDING,
+        profile: { review: CRITIC }, beforeRetry: guard,
+        verifySubject: async () => {} }),
+      (e) => e.message === 'required_label_missing:ui_e2e');
+    assert.equal(calls(), 1, JSON.stringify(live));
+  }
   // Метка на месте — повтор допускается.
   const { review: review2, calls: calls2 } = scriptedReview([
     timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
@@ -630,7 +633,16 @@ gitTest('runner: незавершённый, но дисквалифицирую
     { stdout: ['{"type":"error"', JSON.stringify({ type: 'error', message: 'refused' })].join('\n'),
       reason: 'review_runner_reported_error' },
     // Assistant-сообщение чужой модели без settled: mismatch, не transient.
-    { stdout: msg({ model: 'gpt-6.2-astra' }), reason: 'review_model_mismatch' }]) {
+    { stdout: msg({ model: 'gpt-6.2-astra' }), reason: 'review_model_mismatch' },
+    // Целое message_end с subject-bound REWORK, но до agent_settled:
+    // вердикт уже издан — потеря settlement-события не открывает повтор.
+    { stdout: msg({ content: [{ type: 'text', text: JSON.stringify({
+        verdict: 'REWORK', summary: 'bad', subject_digest: DIGEST,
+        findings: [{ file: 'b.txt', line: 1, expected: 'x', actual: 'y' }] }) }] }),
+      reason: 'review_verdict_emitted' },
+    // Маркер legacy-вердикта в тексте хода без settled — тот же исход.
+    { stdout: msg({ content: [{ type: 'text', text: 'REVIEW_BLOCKED\nreasons' }] }),
+      reason: 'review_verdict_emitted' }]) {
     const { review, binding, profile, calls } = await fixture(t, [
       { code: 143, stdout, stderr: '' },
       { code: 0, stdout: PASS, stderr: '' }]);
