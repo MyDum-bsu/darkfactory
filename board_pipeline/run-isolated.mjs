@@ -19,6 +19,7 @@ import { MAX_QUESTION_TTL_MS, readSignedAnswer, signedAnswerVerifier } from './q
 import { tamperGate } from './tamper-gate.mjs';
 import { reconcileFeedbackFromBb, reconcileSpawnFromBb } from './bb-reconcile.mjs';
 import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.mjs';
+import { DEFAULT_INTERVAL_MS, RotatingJournal, runDaemon, TERMINAL_PHASES } from './daemon.mjs';
 import { localReleasePort } from './local-release.mjs';
 import { ReleaseDenied } from './release-contract.mjs';
 import { arbiterIntakePrompt, workerIntakePrompt } from './intake-prompt.mjs';
@@ -88,7 +89,8 @@ async function releaseSetup(policy, { tree, inbox, root }) {
 async function execute() {
   const { values } = parseArgs({ options: { execute: { type: 'boolean' }, policy: { type: 'string' },
     state: { type: 'string' }, 'recheck-rejected-handoff': { type: 'boolean' },
-    'stop-on-idle': { type: 'boolean' }, 'allow-live-pilot': { type: 'boolean' } } });
+    'stop-on-idle': { type: 'boolean' }, 'allow-live-pilot': { type: 'boolean' },
+    daemon: { type: 'boolean' }, 'interval-ms': { type: 'string' }, switch: { type: 'string' } } });
   if (!values.execute || !values.policy || !values.state) throw new Error('Use --execute --policy FILE --state DIR');
   const policyFile = await realpath(values.policy);
   const policyBytes = await readFile(policyFile);
@@ -115,7 +117,10 @@ async function execute() {
   const switchOpen = activation && await createPilotSwitch(activation.killSwitch, {
     permitDirectory: dir => [tree, inbox, root].every(path => !inside(path, dir) && !inside(dir, path)),
   });
-  await switchOpen?.();
+  // В daemon-режиме eager-проверка пропускается: остановленный на старте
+  // kill-switch ловит первый тик runDaemon и завершает процесс чисто (exit 0,
+  // kill_switch в журнале), а не PilotDenied -> restart-луп под systemd.
+  if (!values.daemon) await switchOpen?.();
   const brief = await realpath(p.brief);
   const reviewPrompt = await realpath(p.reviewPrompt);
   const reviewGate = await realpath(p.reviewGate);
@@ -415,6 +420,49 @@ async function execute() {
     let previous;
     let recheck = values['recheck-rejected-handoff'];
     const tick = guardedEffect(assertOpen, advanceWithProjection);
+    if (values.daemon) {
+      // Фоновый режим 24/7: тот же тик, но без deadline — стоп по kill-switch
+      // (файл 'run' в приватном каталоге) или SIGTERM/SIGINT от systemd.
+      const intervalMs = values['interval-ms'] === undefined ? DEFAULT_INTERVAL_MS
+        : Number(values['interval-ms']);
+      const switchPath = values.switch ?? p.pilot?.killSwitch;
+      // Демон без kill-switch не стартует: операторский стоп обязан существовать.
+      if (!switchPath) throw new Error('Daemon mode requires --switch or pilot.killSwitch');
+      const daemonOpen = await createPilotSwitch(switchPath, {
+        permitDirectory: dir => [tree, inbox, root].every(path => !inside(path, dir) && !inside(dir, path)),
+      });
+      // Стартовый 'stop' не отказ: цикл сам зафиксирует kill_switch в журнале
+      // и выйдет с кодом 0 — Restart=on-failure под systemd не зациклится.
+      const journal = new RotatingJournal({ directory: root });
+      await runDaemon({
+        intervalMs, journal, diskPath: tree, assertOpen: daemonOpen,
+        tick: () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
+          release: releasePort, recheckRejectedHandoff: recheck,
+          workerSelector: { ...workerSelector, critic: reviewSetup.critic,
+            arbiter: reviewSetup.arbiter, arbitrate } }),
+        onTick: async result => {
+          recheck = false;
+          const line = JSON.stringify(activation && result.reason ? { ...result, reason: 'see_private_attempt' } : result);
+          if (line !== previous) console.log(line);
+          previous = line;
+          if (result.phase === 'release_ready' && !releasePort) return 'stop';
+          if (!TERMINAL_PHASES.has(result.phase)) return;
+          // Закреплённая карточка: терминал завершает демон. Очередь: done/hold
+          // освобождают слот для следующей карточки; неопределённый исход стопит.
+          if (route.taskId !== undefined) {
+            if (result.phase !== 'done') process.exitCode = 1;
+            return 'stop';
+          }
+          if (result.phase === 'done' || result.phase === 'hold') {
+            await state.save(null);
+            return;
+          }
+          process.exitCode = 1;
+          return 'stop';
+        },
+      });
+      return;
+    }
     while (Date.now() <= deadline) {
       const result = await tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate, release: releasePort,
         recheckRejectedHandoff: recheck,
