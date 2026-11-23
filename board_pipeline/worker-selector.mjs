@@ -58,6 +58,17 @@ export function workerFamily(worker) {
 // нестроковый model и похожие префиксы ('deepseek-fake') не проходят гейт.
 // Для харнесса 'pi' правило применяется к вложенной модели 'opencode-go/...'.
 export function opencodeGoPolicyViolation(spec) {
+  // Строковый id 'provider/model' (включая вложенный 'pi/opencode-go/...'):
+  // та же проверка по аттестованному семейству.
+  if (typeof spec === 'string') {
+    const i = spec.indexOf('/');
+    const head = (i < 0 ? spec : spec.slice(0, i)).toLowerCase();
+    const nested = i >= 0 ? spec.slice(i + 1).toLowerCase() : '';
+    if (head !== 'opencode-go' &&
+        !(head === 'pi' && nested.startsWith('opencode-go/'))) return null;
+    return workerFamily(spec) === 'deepseek'
+      ? null : 'opencode_go_non_deepseek_disallowed';
+  }
   if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) return null;
   const provider = typeof spec.provider === 'string' ? spec.provider.toLowerCase() : '';
   const viaHarness = provider === 'pi' && typeof spec.model === 'string' &&
@@ -75,6 +86,13 @@ export function opencodeGoPolicyViolation(spec) {
 // Причина — 'zcode_provider_retired'.
 export function retiredProviderViolation(spec) {
   const retired = id => typeof id === 'string' && id.toLowerCase() === 'acp-zcode-start';
+  // Строковый id 'provider/model': каждый сегмент проверяется — вложенный
+  // 'pi/acp-zcode-start/...' отклоняется так же, как и верхний провайдер.
+  const scanId = id => {
+    const i = id.indexOf('/');
+    return i < 0 ? retired(id) : retired(id.slice(0, i)) || scanId(id.slice(i + 1));
+  };
+  if (typeof spec === 'string') return scanId(spec) ? 'zcode_provider_retired' : null;
   const scan = entry => {
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
     if (retired(entry.provider)) return true;
@@ -177,8 +195,9 @@ export async function attemptSpawnWithFallback({
           attemptedWorkers: [],
         };
       }
-      attemptedWorkers.push({ ...worker, family: workerFamily(worker),
-        verdict: 'skipped',
+      attemptedWorkers.push({
+        ...(typeof worker === 'object' && worker !== null ? { ...worker } : { id: worker }),
+        family: workerFamily(worker), verdict: 'skipped',
         reason: e.reason === violation ? violation : `triad_violation:${e.reason ?? e.message}` });
     }
   }

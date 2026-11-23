@@ -753,11 +753,12 @@ test('opencodeGoPolicyViolation: deepseek допущены, прочие opencod
     { provider: 'opencode-go', model: 'kimi-k2' },
     { provider: 'opencode-go', model: 'deepseek' }, // голое имя без версии
     { provider: 'pi', model: 'opencode-go/qwen3-coder' },
+    'opencode-go/qwen',
   ]) assert.equal(opencodeGoPolicyViolation(spec), 'opencode_go_non_deepseek_disallowed',
     JSON.stringify(spec));
   // Не opencode-go — политика не применяется.
   for (const spec of [PRIMARY_WORKER, DEFAULT_CRITIC,
-      { provider: 'pi', model: 'openai/gpt-6.2-sol' }, null, 'opencode-go/qwen']) {
+      { provider: 'pi', model: 'openai/gpt-6.2-sol' }, null, 'openai/gpt-6.2-sol']) {
     assert.equal(opencodeGoPolicyViolation(spec), null);
   }
 });
@@ -993,4 +994,63 @@ test('retiredProviderViolation рекурсивен: pi/acp-zcode-start в allow
   assert.equal(retired.verdict, 'skipped');
   assert.equal(retired.reason, 'zcode_provider_retired');
   assert.equal(calls.length, 1);
+});
+
+test('строковые id в plan: zcode и не-DeepSeek opencode-go отклоняются', async () => {
+  const refused = { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
+  const ZCODE_STR = 'acp-zcode-start/builtin:zai-start-plan\\GLM-5.3-Flash';
+  // Строковый zcode-резерв — пропуск с zcode_provider_retired.
+  const { calls, spawn } = spawnLog([{ threadId: 'thr_ds11' }]);
+  const sel = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn, inspectWorktree: cleanTree,
+    plan: [PRIMARY_WORKER, ZCODE_STR, 'pi/opencode-go/deepseek-v4.1-flash'],
+    probe: async w => (w === PRIMARY_WORKER ? refused : QUOTA_OK),
+  });
+  assert.equal(sel.outcome, 'spawned');
+  assert.equal(calls.length, 1);
+  const retired = sel.attemptedWorkers.find(w => w.id === ZCODE_STR);
+  assert.equal(retired.verdict, 'skipped');
+  assert.equal(retired.reason, 'zcode_provider_retired');
+  // Строковый zcode-первичный — отказ маршрута до spawn.
+  const x = spawnLog([{ threadId: 'thr_never' }]);
+  const rej = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn: x.spawn, plan: [ZCODE_STR],
+    probe: async () => QUOTA_OK, inspectWorktree: cleanTree,
+  });
+  assert.equal(rej.outcome, 'rejected');
+  assert.equal(rej.reason, 'zcode_provider_retired');
+  assert.equal(x.calls.length, 0);
+  // Строковый не-DeepSeek opencode-go — первичный отказ и пропуск резерва.
+  const y = spawnLog([{ threadId: 'thr_never2' }]);
+  const rej2 = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn: y.spawn, plan: ['opencode-go/glm-5'],
+    probe: async () => QUOTA_OK, inspectWorktree: cleanTree,
+  });
+  assert.equal(rej2.outcome, 'rejected');
+  assert.equal(rej2.reason, 'opencode_go_non_deepseek_disallowed');
+  const z = spawnLog([{ threadId: 'thr_ds12' }]);
+  const sel2 = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn: z.spawn, inspectWorktree: cleanTree,
+    plan: [PRIMARY_WORKER, 'opencode-go/glm-5', NARROW_RESERVE_PI],
+    probe: async w => (w === PRIMARY_WORKER ? refused : QUOTA_OK),
+  });
+  assert.equal(sel2.outcome, 'spawned');
+  assert.equal(sel2.worker.provider, 'pi');
+  const banned = sel2.attemptedWorkers.find(w => w.id === 'opencode-go/glm-5');
+  assert.equal(banned.reason, 'opencode_go_non_deepseek_disallowed');
+  // Легальная строка deepseek — запускается.
+  const ok = spawnLog([{ threadId: 'thr_str1' }]);
+  const sel3 = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn: ok.spawn, inspectWorktree: cleanTree,
+    plan: [PRIMARY_WORKER, 'opencode-go/deepseek-v4'],
+    probe: async w => (w === PRIMARY_WORKER ? refused : QUOTA_OK),
+  });
+  assert.equal(sel3.outcome, 'spawned');
+  // И прямые вызовы предикатов со строками.
+  assert.equal(retiredProviderViolation(ZCODE_STR), 'zcode_provider_retired');
+  assert.equal(retiredProviderViolation('pi/acp-zcode-start/x'), 'zcode_provider_retired');
+  assert.equal(opencodeGoPolicyViolation('opencode-go/glm-5'), 'opencode_go_non_deepseek_disallowed');
+  assert.equal(opencodeGoPolicyViolation('pi/opencode-go/qwen3'), 'opencode_go_non_deepseek_disallowed');
+  assert.equal(opencodeGoPolicyViolation('opencode-go/deepseek-v4'), null);
+  assert.equal(opencodeGoPolicyViolation('pi/opencode-go/deepseek-v4'), null);
 });
