@@ -19,7 +19,7 @@ const ARTIFACTS = {
 };
 
 export const PLAYBOOK_TRIAD = Object.freeze({
-  executor: { provider: 'acp-devin', model: 'swe-2-high' },
+  worker: { provider: 'acp-devin', model: 'swe-2-high' },
   critic: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' },
   arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' },
 });

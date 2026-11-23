@@ -1,3 +1,5 @@
+import { parseDocument } from 'yaml';
+
 const HEX = /^[a-f0-9]{64}$/;
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const positive = value => count(value) && value > 0;
@@ -30,8 +32,14 @@ export function artifactVerdict(verifier, bytes) {
     throw new Error('stage_artifact_invalid');
   }
   let artifact;
-  try { artifact = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
-  catch (cause) { throw new Error('stage_artifact_invalid', { cause }); }
+  try {
+    const json = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    artifact = JSON.parse(json);
+    // JSON.parse checks syntax but discards duplicate keys. The JSON-schema
+    // document parser detects them before schema and verdict checks.
+    const doc = parseDocument(json, { schema: 'json', uniqueKeys: true, merge: false });
+    if (doc.errors.length || doc.warnings.length) throw new Error('ambiguous JSON');
+  } catch (cause) { throw new Error('stage_artifact_invalid', { cause }); }
   const [fields, passes] = CHECKS[verifier];
   if (!artifact || artifact.type !== verifier || Object.keys(artifact).length !== Object.keys(fields).length + 1 ||
       !Object.entries(fields).every(([key, check]) => Object.hasOwn(artifact, key) && check(artifact[key]))) {

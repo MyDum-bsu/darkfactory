@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { cp, mkdtemp, rename, rm, symlink, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,8 +11,8 @@ import { PLAYBOOK_TRIAD, stageObservation } from './playbook-test-fixture.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const attempt = { task_id: '101', attempt_id: 'attempt-01', epoch: 2, worktree: '/fixture/worktree',
-  candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) };
-const proven = binding => ({ ...binding, held: true, clean: true, switchOpen: true, baseAncestor: true });
+  candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64), triad: PLAYBOOK_TRIAD };
+const proven = binding => ({ ...binding, held: true, clean: true, switchOpen: true, baseAncestor: true, triad: PLAYBOOK_TRIAD });
 
 async function copyCatalog(t) {
   const tree = await mkdtemp(join(tmpdir(), 'df-factory-catalog-'));
@@ -45,6 +46,9 @@ test('registry rejects loops, unenrolled capabilities, key injection and YAML al
   const { tree, yaml, original } = await copyCatalog(t);
   for (const [text, code] of [
     [original.replace('pass: build, rework: hold', 'pass: intake, rework: hold'), /factory_cycle/],
+    [original.replace('pass: build, rework: hold', 'pass: build, rework: build'), /factory_rework_writer/],
+    [original.replace('pass: hold, rework: hold', 'pass: ready, rework: hold'), /factory_rework_handoff/],
+    [original.replace('kind: analyst', 'kind: [analyst]'), /factory_role_invalid/],
     [original.replace('tools: [snapshot-read]', 'tools: [shell-exec]'), /factory_role_invalid/],
     [original.replace('tools: [snapshot-read]', 'tools: [snapshot-read, worktree-edit]'), /factory_role_invalid/],
     [original.replace('skills: [materials-intake]', 'skills: ["../outside"]'), /factory_role_invalid/],
@@ -60,7 +64,7 @@ test('registry rejects loops, unenrolled capabilities, key injection and YAML al
 test('visual report selects corrective sparring but cannot turn REWORK into acceptance', async () => {
   const registry = await loadRoleRegistry(root);
   const pinned = { ...attempt, playbook: 'ui', registry_digest: registry.digest };
-  const result = await runPlaybook({ registry, playbook: 'ui', attempt: pinned, triad: PLAYBOOK_TRIAD }, {
+  const result = await runPlaybook({ registry, playbook: 'ui', attempt: pinned }, {
     assertKernel: proven,
     observeStage: req => req.stage === 'visual'
       ? stageObservation(req, { verdict: 'REWORK', changes: { consoleErrors: 1 } })
@@ -75,7 +79,7 @@ test('visual report selects corrective sparring but cannot turn REWORK into acce
 test('mismatched pins, scope, model or switch prevent progression', async () => {
   const registry = await loadRoleRegistry(root);
   const pinned = { ...attempt, playbook: 'ui', registry_digest: registry.digest };
-  const bound = { registry, playbook: 'ui', attempt: pinned, triad: PLAYBOOK_TRIAD };
+  const bound = { registry, playbook: 'ui', attempt: pinned };
   const reason = key => new RegExp(key);
   let observed = 0;
   const observeStage = req => { observed++; return stageObservation(req); };
@@ -86,11 +90,12 @@ test('mismatched pins, scope, model or switch prevent progression', async () => 
   await assert.rejects(runPlaybook(bound, {
     assertKernel: b => ({ ...proven(b), epoch: b.epoch + 1 }), observeStage,
   }), reason('playbook_kernel_unconfirmed'));
-  await assert.rejects(runPlaybook({ ...bound, triad: { ...PLAYBOOK_TRIAD, critic: PLAYBOOK_TRIAD.executor } },
-    { assertKernel: proven, observeStage }), reason('review_same_family'));
-  await assert.rejects(runPlaybook({ ...bound, triad: { ...PLAYBOOK_TRIAD,
-    critic: { ...PLAYBOOK_TRIAD.critic, reasoningLevel: 'high' } } }, { assertKernel: proven, observeStage }),
-  reason('playbook_reasoning_not_enrolled'));
+  await assert.rejects(runPlaybook({ ...bound, attempt: { ...pinned,
+    triad: { ...PLAYBOOK_TRIAD, critic: PLAYBOOK_TRIAD.worker } } },
+  { assertKernel: proven, observeStage }), reason('review_same_family'));
+  await assert.rejects(runPlaybook({ ...bound, attempt: { ...pinned, triad: { ...PLAYBOOK_TRIAD,
+    critic: { ...PLAYBOOK_TRIAD.critic, reasoningLevel: 'high' } } } },
+  { assertKernel: proven, observeStage }), reason('playbook_reasoning_not_enrolled'));
   assert.equal(observed, 0);
 
   for (const [replace, code] of [
@@ -100,6 +105,10 @@ test('mismatched pins, scope, model or switch prevent progression', async () => 
     [receipt => ({ ...receipt, binding: { ...receipt.binding, subject_digest: 'a'.repeat(64) } }), 'playbook_receipt_unbound'],
     [receipt => ({ ...receipt, artifactDigest: 'c'.repeat(64) }), 'playbook_artifact_unconfirmed'],
     [receipt => ({ ...receipt, verdict: 'REWORK' }), 'playbook_verdict_mismatch'],
+    [receipt => {
+      const artifact = Buffer.from(receipt.artifact.toString().replace('"unresolved":0', '"unresolved":1,"unresolved":0'));
+      return { ...receipt, artifact, artifactDigest: createHash('sha256').update(artifact).digest('hex') };
+    }, 'stage_artifact_invalid'],
   ]) {
     observed = 0;
     await assert.rejects(runPlaybook(bound, {

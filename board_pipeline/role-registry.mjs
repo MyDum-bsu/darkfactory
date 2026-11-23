@@ -52,7 +52,7 @@ function named(value, compile) {
 
 function compileRole(role) {
   if (!keys(role, ['kind', 'model', 'reasoning', 'verifier', 'tools', 'skills']) ||
-      !Object.hasOwn(MODELS, role.kind) || !MODELS[role.kind].includes(role.model) ||
+      typeof role.kind !== 'string' || !Object.hasOwn(MODELS, role.kind) || !MODELS[role.kind].includes(role.model) ||
       !EFFORTS.has(role.reasoning) || !isStageVerifier(role.verifier) || !list(role.tools, tool => TOOLS.has(tool)) ||
       !list(role.skills, id) || role.tools.includes('worktree-edit') !== (role.kind === 'writer')) {
     throw new Error('factory_role_invalid');
@@ -81,6 +81,20 @@ function validateGraph(entry, stages) {
   if (green !== 'ready') throw new Error('factory_no_handoff');
 }
 
+function validateDiagnosticPaths(stages, roles) {
+  const seen = new Set();
+  function visit(name) {
+    if (name === 'hold' || seen.has(name)) return;
+    if (name === 'ready') throw new Error('factory_rework_handoff');
+    seen.add(name);
+    const stage = stages[name];
+    if (roles[stage.role].kind === 'writer') throw new Error('factory_rework_writer');
+    visit(stage.next.pass);
+    visit(stage.next.rework);
+  }
+  for (const stage of Object.values(stages)) visit(stage.next.rework);
+}
+
 function compilePlaybook(graph, roles) {
   if (!keys(graph, ['entry', 'stages']) || !id(graph.entry) || TERMINALS.has(graph.entry) ||
       !Array.isArray(graph.stages) || graph.stages.length < 1 || graph.stages.length > 32) {
@@ -95,6 +109,7 @@ function compilePlaybook(graph, roles) {
     stages[stage.id] = Object.freeze({ id: stage.id, role: stage.role, next: Object.freeze({ ...stage.next }) });
   }
   validateGraph(graph.entry, stages);
+  validateDiagnosticPaths(stages, roles);
   return Object.freeze({ entry: graph.entry, stages: Object.freeze(stages) });
 }
 

@@ -23,10 +23,13 @@ function boundSubject(attempt) {
   return Object.freeze(Object.fromEntries(SUBJECT.map(key => [key, attempt[key]])));
 }
 
+const slotSpec = (triad, slot) => triad?.[slot === 'executor' ? 'worker' : slot];
+const reasoningOf = spec => spec?.reasoningLevel ?? spec?.effort ?? null;
+
 function enrolledModels(selected) {
   const entries = SLOTS.map(slot => {
-    const spec = selected?.[slot];
-    const reasoning = spec?.reasoningLevel ?? spec?.effort ?? null;
+    const spec = slotSpec(selected, slot);
+    const reasoning = reasoningOf(spec);
     if (typeof spec?.provider !== 'string' || !spec.provider || typeof spec.model !== 'string' || !spec.model ||
         (reasoning !== null && !EFFORTS.has(reasoning)) || retiredProviderViolation(spec)) {
       throw new Error('playbook_model_not_enrolled');
@@ -38,10 +41,13 @@ function enrolledModels(selected) {
   return models;
 }
 
-async function guard(assertKernel, binding) {
+async function guard(assertKernel, binding, models) {
   const proof = await assertKernel(binding);
   if (!same(binding, proof, SUBJECT) || proof.held !== true || proof.switchOpen !== true ||
-      proof.clean !== true || proof.baseAncestor !== true) throw new Error('playbook_kernel_unconfirmed');
+      proof.clean !== true || proof.baseAncestor !== true || !SLOTS.every(slot => {
+        const actual = slotSpec(proof.triad, slot);
+        return same(models[slot], actual, ['provider', 'model']) && reasoningOf(actual) === models[slot].reasoning;
+      })) throw new Error('playbook_kernel_unconfirmed');
 }
 
 function inspectReceipt(request, receipt) {
@@ -62,12 +68,12 @@ function inspectReceipt(request, receipt) {
 
 // Beta: the caller owns the existing Trust Kernel and read-only observation
 // ports. The outcome is workflow evidence; only native acceptance may settle.
-export async function runPlaybook({ registry, playbook, attempt, triad }, { assertKernel, observeStage }) {
+export async function runPlaybook({ registry, playbook, attempt }, { assertKernel, observeStage }) {
   if (!isRoleRegistry(registry) || typeof playbook !== 'string' || !Object.hasOwn(registry.playbooks, playbook) ||
       typeof assertKernel !== 'function' || typeof observeStage !== 'function') throw new Error('playbook_not_enrolled');
   const binding = boundSubject(attempt);
   if (binding.registry_digest !== registry.digest || binding.playbook !== playbook) throw new Error('playbook_pin_mismatch');
-  const models = enrolledModels(triad);
+  const models = enrolledModels(attempt.triad);
   const graph = registry.playbooks[playbook];
   const plan = Object.fromEntries(Object.values(graph.stages).map(stage => {
     const role = registry.roles[stage.role];
@@ -80,10 +86,10 @@ export async function runPlaybook({ registry, playbook, attempt, triad }, { asse
   let green = true;
   const history = [];
   while (next !== 'ready' && next !== 'hold') {
-    await guard(assertKernel, binding);
+    await guard(assertKernel, binding, models);
     const request = Object.freeze({ ...plan[next], inputArtifactDigest: history.at(-1)?.digest ?? null });
     const observation = inspectReceipt(request, await observeStage(request));
-    await guard(assertKernel, binding);
+    await guard(assertKernel, binding, models);
     history.push({ stage: next, role: request.role, ...observation });
     if (observation.verdict === 'BLOCKED') return { status: 'hold', history };
     const pass = observation.verdict === 'PASS';

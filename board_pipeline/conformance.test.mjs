@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { execFile, execFileSync, spawn as spawnProcess } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { createServer, request as httpRequest } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
@@ -117,7 +117,7 @@ async function enrollPilotFixture({ root, handle, url, channel, owner, pilotScop
 // Полный лабораторный стенд: живая Board, git worktree, слот-бронь, порты со
 // счётчиками и хранилище записи попытки — всё как в run-isolated, но под тестом.
 async function lab(t, { finish = 'verified', lease = 900, mutants, questions = false,
-  pilot = false, pilotScope = {}, hasUi = false } = {}) {
+  pilot = false, pilotScope = {}, hasUi = false, reviewVerdict = 'REVIEW_OK' } = {}) {
   const { url, dir } = await startBoard(boardCli(), t);
   const channel = pilot ? 'fixture-pilot' : 'pilot';
   process.env.BOARD_URL = url;
@@ -234,7 +234,8 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
         await beforeReview?.(binding, attempt);
         effects.reviewCalls++;
         return { task: binding.task_id, sha: binding.candidate_sha,
-          actual: REVIEW, verdict: 'REVIEW_OK', checkpoint: 'feed80ab' }; },
+          actual: REVIEW, verdict: reviewVerdict, checkpoint: 'feed80ab',
+          ...(reviewVerdict === 'REVIEW_BLOCKED' ? { excerpt: 'check.mjs: required case does not pass' } : {}) }; },
       ...(typeof unsafePorts === 'function' ? unsafePorts(journal) : unsafePorts),
     } });
   };
@@ -274,25 +275,47 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
   };
 }
 
-async function enrollBetaPlaybook(x, registry, playbook, observeStage = stageObservation) {
+async function enrollBetaPlaybook(x, registry, playbook, {
+  observeStage = stageObservation, currentRegistry = () => registry, chooseTriad = triad => triad,
+} = {}) {
   const stopDir = join(x.root, 'beta-switch');
   await mkdir(stopDir, { mode: 0o700 });
   const stop = join(stopDir, 'switch');
   await writeFile(stop, 'run\n', { mode: 0o600 });
   const assertOpen = await createPilotSwitch(stop);
+  const pinPath = join(x.stateDir, 'beta-pin.json');
+  await writeFile(pinPath, JSON.stringify({ task_id: x.taskId, playbook, registry_digest: registry.digest }),
+    { mode: 0o600, flag: 'wx' });
+  const readPin = async () => JSON.parse(await readFile(pinPath, 'utf8'));
+  const wal = join(x.stateDir, 'beta-attempt.json');
+  x.cfg.state = {
+    async load() {
+      try { return JSON.parse(await readFile(wal, 'utf8')); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    },
+    save: value => saveState(wal, value),
+  };
+  x.workerSelector({ pinTriad: async () => ({ plan: [PLAYBOOK_TRIAD.worker],
+    critic: PLAYBOOK_TRIAD.critic, arbiter: PLAYBOOK_TRIAD.arbiter }) });
   x.setBeforeReview(async (handoff, attempt) => {
     const policy = { profiles: { pilot: { task: x.taskId, worker: handoff.worker_thread_id,
       worktree: x.tree, branch: 'pilot', base: x.base } } };
     const inspect = worktreeInspector(policy);
-    const subject = { ...handoff, attempt_id: attempt.attempt_id, epoch: attempt.epoch,
-      playbook, registry_digest: registry.digest };
-    const result = await runPlaybook({ registry, playbook, attempt: subject, triad: PLAYBOOK_TRIAD }, {
+    const pin = await readPin();
+    if (pin.task_id !== handoff.task_id) throw new Error('beta_pin_task_mismatch');
+    const subject = { ...handoff, ...pin, attempt_id: attempt.attempt_id, epoch: attempt.epoch,
+      triad: chooseTriad(attempt.triad) };
+    const result = await runPlaybook({ registry: await currentRegistry(), playbook, attempt: subject }, {
       async assertKernel(binding) {
         await assertOpen();
-        const live = await x.port.verifyHeld(binding.task_id, binding.epoch);
+        const saved = await x.cfg.state.load();
+        const readback = await readPin();
+        if (readback.task_id !== saved.taskId) throw new Error('beta_pin_task_mismatch');
+        const live = await x.port.verifyHeld(saved.taskId, saved.epoch);
         const tree = await inspect(handoff);
         await assertOpen();
-        return { ...binding, held: live.epoch === binding.epoch && Date.parse(live.until) > Date.now(),
+        return { ...handoff, ...readback, task_id: saved.taskId, attempt_id: saved.attemptId, epoch: saved.epoch,
+          triad: saved.triad, held: live.epoch === binding.epoch && Date.parse(live.until) > Date.now(),
           switchOpen: true, clean: tree.clean && tree.head === binding.candidate_sha, baseAncestor: tree.baseAncestor };
       },
       observeStage,
@@ -322,7 +345,7 @@ test('VS-5 beta: four role DAGs on native Board and exact Git subject before ind
     const roles = [];
     const subjects = new Set();
     let previousArtifact = null;
-    await enrollBetaPlaybook(x, registry, pack, request => {
+    await enrollBetaPlaybook(x, registry, pack, { observeStage: request => {
       assert.equal(request.binding.task_id, x.taskId);
       assert.equal(request.binding.candidate_sha, x.candidate);
       assert.equal(request.binding.worktree, x.tree);
@@ -335,7 +358,7 @@ test('VS-5 beta: four role DAGs on native Board and exact Git subject before ind
       const receipt = stageObservation(request);
       previousArtifact = receipt.artifactDigest;
       return receipt;
-    });
+    } });
     assert.equal((await x.tick()).phase, 'working');
     x.submit(x.candidate, 10);
     const final = await x.tick();
@@ -355,11 +378,11 @@ test('VS-5 beta: losing the switch during an observation prevents L2 and native 
   const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
   const x = await lab(t);
   let stageCalls = 0;
-  const stop = await enrollBetaPlaybook(x, registry, 'math-lean', async request => {
+  const stop = await enrollBetaPlaybook(x, registry, 'math-lean', { observeStage: async request => {
     stageCalls++;
     await writeFile(stop, 'stop\n');
     return stageObservation(request);
-  });
+  } });
   assert.equal((await x.tick()).phase, 'working');
   x.submit(x.candidate, 10);
   assert.equal((await x.tick()).phase, 'hold');
@@ -367,6 +390,55 @@ test('VS-5 beta: losing the switch during an observation prevents L2 and native 
   assert.equal(x.effects.reviewCalls, 0);
   assert.equal(x.effects.completeCalls, 0);
   assert.equal(stageCalls, 1);
+});
+
+test('VS-5 beta: stale catalog, substituted triad and missing receipt cannot reach native L2', { timeout: 45_000 }, async t => {
+  const checkout = fileURLToPath(new URL('..', import.meta.url));
+  const registry = await loadRoleRegistry(checkout);
+  const faults = { catalog: 'playbook_pin_mismatch', triad: 'playbook_kernel_unconfirmed', missing: 'playbook_receipt_unbound' };
+  for (const [fault, reason] of Object.entries(faults)) {
+    const x = await lab(t);
+    let calls = 0;
+    let reloaded = registry;
+    await enrollBetaPlaybook(x, registry, 'writer-course', {
+      currentRegistry: () => reloaded,
+      chooseTriad: triad => fault === 'triad' ? { ...triad,
+        worker: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } } : triad,
+      observeStage() { calls++; return undefined; },
+    });
+    assert.equal((await x.tick()).phase, 'working');
+    if (fault === 'catalog') {
+      await cp(join(checkout, '.darkfactory'), join(x.root, '.darkfactory'), { recursive: true });
+      await writeFile(join(x.root, '.darkfactory/stage-skills/materials-intake.md'), 'Changed after enrollment.\n');
+      reloaded = await loadRoleRegistry(x.root);
+      assert.notEqual(reloaded.digest, registry.digest);
+    }
+    x.submit(x.candidate, 10);
+    const result = await x.tick();
+    assert.equal(result.phase, 'hold');
+    assert.equal(result.reason, `review_error:${reason}`);
+    assert.equal(x.effects.reviewCalls, 0);
+    assert.equal(x.effects.completeCalls, 0);
+    assert.equal(calls, fault === 'missing' ? 1 : 0);
+    assert.equal((await x.card()).state, 'blocked');
+  }
+});
+
+test('VS-5 beta: green role DAG does not override the independent L2 verdict', { timeout: 30_000 }, async t => {
+  const x = await lab(t, { reviewVerdict: 'REVIEW_BLOCKED' });
+  const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+  let calls = 0;
+  await enrollBetaPlaybook(x, registry, 'writer-course', {
+    observeStage(request) { calls++; return stageObservation(request); },
+  });
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.card()).state, 'claimed');
+  assert.equal(calls, 4);
+  assert.equal(x.effects.reviewCalls, 1);
+  assert.equal(x.effects.feedbackCalls, 1);
+  assert.equal(x.effects.completeCalls, 0);
 });
 
 // ---------------------------------------------------------------------------
