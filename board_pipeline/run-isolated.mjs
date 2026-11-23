@@ -432,7 +432,7 @@ async function execute() {
         const { stdout } = await telemetry.phase('spawn', () => exec('bb', argv, { timeout: 60_000 }),
           { subject: attempt, worker: execSpec });
         const spawned = JSON.parse(stdout);
-        telemetry.workerResume({ subject: attempt, worker: execSpec });
+        telemetry.workerResume({ subject: { ...attempt, bb_thread_id: spawned.id }, worker: execSpec });
         return { threadId: spawned.id };
       } catch (error) {
         let diagnostic;
@@ -534,6 +534,7 @@ async function execute() {
     return { turnSeq: terminal.seq, completed: thread.status === 'idle' && terminal.data?.status === 'completed' };
   }
   const submissions = { async read(attempt, after) {
+    telemetry.observe(attempt);
     const observed = await observedTurn(attempt.bb_thread_id, after);
     if (!observed) return;
     const { turnSeq, completed } = observed;
