@@ -36,6 +36,42 @@ const TRUNCATED_TRANSCRIPT = new Set([
   'review_transcript_empty', 'review_transcript_corrupt', 'review_incomplete_turn',
 ]);
 
+// Незавершённый поток может быть уже дисквалифицирующим, а не оборванным:
+// явный error/auto_retry_end со сбросом либо assistant-сообщение с
+// провайдером/моделью/effort, противоречащими закреплённому критику. Такой
+// ответ — hold, а не transient: повтор не должен стирать зафиксированный
+// отказ или mismatch. Возвращает причину отказа либо null.
+function transcriptDisqualifying(ndjson, critic) {
+  for (const line of String(ndjson).split('\n')) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue; // битая строка — сама по себе признак обрыва
+    }
+    if (event?.type === 'error' ||
+        (event?.type === 'auto_retry_end' && event.success === false)) {
+      return 'review_runner_reported_error';
+    }
+    if (event?.type !== 'message_end') continue;
+    const message = event.message ?? event.data?.message;
+    if (message?.role !== 'assistant') continue;
+    const responseModel = message.responseModel ?? message.actualModel ??
+      message.usage?.responseModel ?? message.metadata?.responseModel;
+    const effort = message.providerThinkingLevel ?? message.reasoningEffort ??
+      message.usage?.providerThinkingLevel ?? message.metadata?.reasoningEffort;
+    if ((message.provider !== undefined && message.provider !== critic.provider) ||
+        (message.model !== undefined && message.model !== critic.model) ||
+        (responseModel !== undefined && responseModel !== critic.model) ||
+        (message.thinkingLevel !== undefined && message.thinkingLevel !== critic.reasoningLevel) ||
+        (effort !== undefined && effort !== critic.reasoningLevel)) {
+      return 'review_model_mismatch';
+    }
+  }
+  return null;
+}
+
 // Монтируются только каталоги кода; конфиги идут через /pi-cfg копией в tmpfs.
 const PI_MOUNT_DIRS = ['bin', 'install', 'npm'];
 const PI_CONFIG_FILES = ['settings.json', 'models.json', 'models-store.json'];
@@ -812,13 +848,18 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         // чтобы повтор не стёр содержательный исход. Структурные и
         // аттестационные отказы парсера (mismatch модели/effort) сохраняются
         // как есть — повтор по ним запрещён; transient-классификация только
-        // для действительно оборванного потока.
+        // для действительно оборванного потока: даже незавершённый поток с
+        // явным error-событием или чужой закреплённой моделью — отказ, не retry.
         try {
           parseReviewTranscript(run.stdout);
         } catch (error) {
           if (error instanceof ReviewDenied && !TRUNCATED_TRANSCRIPT.has(error.reason)) {
             throw error;
           }
+          const disqualified = error instanceof ReviewDenied &&
+            error.reason === 'review_incomplete_turn' &&
+            transcriptDisqualifying(run.stdout, critic);
+          if (disqualified) throw new ReviewDenied(disqualified);
           throw reviewRunnerExitFailure(run);
         }
       }
@@ -844,11 +885,13 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         throw new ReviewDenied('review_verdict_subject_mismatch');
       }
 
-      // Ненулевой выход с завершённым потоком не даёт квитанции приёмки:
-      // содержательный REWORK/ESCALATE сохраняется, а PASS по грязному
-      // выходу (включая 143) — обычный hold, не повтор и не accepted.
-      if (dirtyExit && verdict.status === 'PASS') {
-        throw new ReviewDenied(`review_runner_exit:${run.code}`);
+      // Ненулевой выход с завершённым потоком не даёт квитанции приёмки и
+      // не повторяется. Только по доказанному transient-выходу (143 или
+      // host-timeout) содержательный REWORK/ESCALATE сохраняет свой исход;
+      // PASS по грязному выходу и любой нетранзиентный код — обычный hold.
+      const transientExit = run.code === 143 || run.timedOut === true;
+      if (dirtyExit && !(transientExit && verdict.status !== 'PASS')) {
+        throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
       }
 
       // После завершения: снимок и worktree обязаны быть побайтово неизменны.

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -10,6 +10,7 @@ import {
   assertRetrySubjectUnchanged, classifySandboxExit, isolatedPiReviewRunner,
   l2CriticSpec, l2ReviewRetryGuard, l2ReviewWithTransientRetry,
   reviewRunnerExitFailure, ReviewDenied, ReviewRunnerTimeout,
+  runInReadOnlySandbox,
 } from './review-runner.mjs';
 import { isNeonReview, isSolArbiter } from './review-policy.mjs';
 import { operatorReviewSetup } from './review-setup.mjs';
@@ -33,6 +34,9 @@ const PASS = stream(`{"verdict":"PASS","summary":"ok","subject_digest":"${DIGEST
 const hasGit = await exec('git', ['--version'], { timeout: 10_000 })
   .then(() => true).catch(() => false);
 const gitTest = hasGit ? test : (name, fn) => test(name, { skip: 'git not on PATH' }, fn);
+const hasSh = await exec('sh', ['-c', 'command -v sleep grep cat'])
+  .then(() => true).catch(() => false);
+const shTest = hasSh ? test : (name, fn) => test(name, { skip: 'sh/sleep not on PATH' }, fn);
 
 // Счётчик вызовов review без git и без контейнера: сценарий ошибок/квитанций
 // подаётся последовательно, повтор идёт тем же вызовом с теми же аргументами.
@@ -367,7 +371,8 @@ async function fixture(t, results) {
     task_id: '1', candidate_sha: sha, base_sha: base, worktree: dir,
     executor: 'acp-devin/swe-2-high', subject_digest: DIGEST,
   };
-  return { review, binding, profile: { review: CRITIC }, calls: () => calls, git, dir };
+  return { review, binding, profile: { review: CRITIC }, calls: () => calls,
+    git, dir, journal, piRoot };
 }
 
 gitTest('runner: реальный адаптер типирует 143 и повторяет до квитанции', async (t) => {
@@ -418,6 +423,83 @@ gitTest('runner: валидный PASS при коде 143 — hold без по�
   assert.equal(calls(), 1);
 });
 
+// Реальный адаптер через подставной `docker` на PATH: первый `docker run`
+// спит и добивается host-timeout (killed+SIGTERM → timedOut), `docker rm -f`
+// фиксирует cleanup; второй запуск отдаёт готовый транскрипт. Файл событий
+// доказывает порядок run→rm→run: второй вызов только после cleanup.
+async function dockerStub(t, { rmExit = 0 } = {}) {
+  const bin = await mkdtemp(join(tmpdir(), 'retry-docker-'));
+  const log = join(bin, 'calls.log');
+  const passFile = join(bin, 'pass.ndjson');
+  await writeFile(passFile, PASS);
+  const script = ['#!/bin/sh',
+    'echo "$1" >> "$DOCKER_STUB_LOG"',
+    'case "$1" in',
+    'info) printf \'["name=rootless"]\\n\' ;;',
+    'run) if [ "$(grep -c "^run$" "$DOCKER_STUB_LOG")" -ge 2 ]; then cat "$DOCKER_STUB_PASS"; exit 0; fi; sleep 5 ;;',
+    `rm) echo cleanup >&2; exit ${rmExit} ;;`,
+    'esac', 'exit 0', ''].join('\n');
+  await writeFile(join(bin, 'docker'), script, { mode: 0o755 });
+  const prevPath = process.env.PATH;
+  process.env.PATH = `${bin}:${prevPath}`;
+  process.env.DOCKER_STUB_LOG = log;
+  process.env.DOCKER_STUB_PASS = passFile;
+  t.after(async () => {
+    process.env.PATH = prevPath;
+    delete process.env.DOCKER_STUB_LOG;
+    delete process.env.DOCKER_STUB_PASS;
+    await rm(bin, { recursive: true, force: true });
+  });
+  const calls = async () => (await readFile(log, 'utf8').catch(() => ''))
+    .split('\n').filter(Boolean);
+  return { calls };
+}
+
+shTest('adapter: host-timeout через реальный sandbox, cleanup до второго вызова', async (t) => {
+  const { calls } = await dockerStub(t);
+  // Прямой вызов адаптера: docker run спит, хостовый timeout (300 мс) добивает
+  // его SIGTERM — числового кода нет, есть доказанный timedOut.
+  const run = await runInReadOnlySandbox({ snapshot: tmpdir(), argv: ['true'],
+    timeoutMs: 300 });
+  assert.equal(run.code, null);
+  assert.equal(run.timedOut, true);
+  // Cleanup (`docker rm -f`) выполнен до возврата результата.
+  assert.deepEqual(await calls(), ['info', 'run', 'rm']);
+});
+
+shTest('adapter: сбой cleanup — ReviewDenied, не transient', async (t) => {
+  await dockerStub(t, { rmExit: 1 });
+  await assert.rejects(
+    runInReadOnlySandbox({ snapshot: tmpdir(), argv: ['true'], timeoutMs: 300 }),
+    (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout) &&
+      e.reason === 'sandbox_cleanup_failed');
+});
+
+gitTest('runner: host-timeout через адаптер → повтор только после cleanup', async (t) => {
+  const { calls } = await dockerStub(t);
+  const { binding, profile, journal, piRoot } = await fixture(t, []);
+  const runner = isolatedPiReviewRunner({ journal, piRoot,
+    sandbox: runInReadOnlySandbox, timeoutMs: 300 });
+  const receipt = await l2ReviewWithTransientRetry({ review: runner,
+    binding, profile, beforeRetry: async () => {} });
+  assert.equal(receipt.verdict, 'REVIEW_OK');
+  // Порядок вызовов docker: второй `run` начался только после `rm` первого
+  // (info — preflight каждого вызова адаптера).
+  assert.deepEqual(await calls(), ['info', 'run', 'rm', 'info', 'run', 'rm']);
+});
+
+gitTest('runner: сбой cleanup первого читателя — повтора нет', async (t) => {
+  const { calls } = await dockerStub(t, { rmExit: 1 });
+  const { binding, profile, journal, piRoot } = await fixture(t, []);
+  const runner = isolatedPiReviewRunner({ journal, piRoot,
+    sandbox: runInReadOnlySandbox, timeoutMs: 300 });
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review: runner, binding, profile,
+      beforeRetry: async () => { throw new Error('no retry expected'); } }),
+    (e) => e.reason === 'sandbox_cleanup_failed');
+  assert.deepEqual(await calls(), ['info', 'run', 'rm']);
+});
+
 gitTest('runner: завершённый REWORK при коде 143 — один вызов, вердикт сохранён', async (t) => {
   const rework = stream(JSON.stringify({ verdict: 'REWORK', summary: 'bad',
     subject_digest: DIGEST,
@@ -446,6 +528,52 @@ gitTest('runner: завершённый, но misattested ответ при 143 
         beforeRetry: async () => { throw new Error('no retry expected'); } }),
       (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout));
     assert.equal(calls(), 1);
+  }
+});
+
+gitTest('runner: незавершённый, но дисквалифицирующий поток при 143 — без повтора', async (t) => {
+  for (const { stdout, reason } of [
+    // Явный error-event провайдера: отказ зафиксирован, не обрыв.
+    { stdout: [JSON.stringify({ type: 'error', message: 'refused' }), msg()].join('\n'),
+      reason: 'review_runner_reported_error' },
+    // Assistant-сообщение чужой модели без settled: mismatch, не transient.
+    { stdout: msg({ model: 'gpt-6.2-astra' }), reason: 'review_model_mismatch' }]) {
+    const { review, binding, profile, calls } = await fixture(t, [
+      { code: 143, stdout, stderr: '' },
+      { code: 0, stdout: PASS, stderr: '' }]);
+    await assert.rejects(
+      l2ReviewWithTransientRetry({ review, binding, profile,
+        beforeRetry: async () => { throw new Error('no retry expected'); } }),
+      (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout) &&
+        e.reason === reason);
+    assert.equal(calls(), 1, reason);
+  }
+  // А действительно оборванный поток (ни одного хода, обрыв mid-message) —
+  // transient, повтор допустим.
+  for (const truncated of ['', msg().slice(0, 40)]) {
+    const { review, binding, profile, calls } = await fixture(t, [
+      { code: 143, stdout: truncated, stderr: '' },
+      { code: 0, stdout: PASS, stderr: '' }]);
+    const receipt = await l2ReviewWithTransientRetry({ review, binding, profile,
+      beforeRetry: async () => {} });
+    assert.equal(calls(), 2, JSON.stringify(truncated));
+    assert.equal(receipt.verdict, 'REVIEW_OK');
+  }
+});
+
+gitTest('runner: REWORK при нетранзиентном выходе — hold, как раньше', async (t) => {
+  const rework = stream(JSON.stringify({ verdict: 'REWORK', summary: 'bad',
+    subject_digest: DIGEST,
+    findings: [{ file: 'b.txt', line: 1, expected: 'x', actual: 'y' }] }));
+  for (const code of [1, 137]) {
+    const { review, binding, profile, calls } = await fixture(t, [
+      { code, stdout: rework, stderr: '' },
+      { code: 0, stdout: PASS, stderr: '' }]);
+    await assert.rejects(
+      l2ReviewWithTransientRetry({ review, binding, profile,
+        beforeRetry: async () => { throw new Error('no retry expected'); } }),
+      (e) => e.reason === `review_runner_exit:${code}`);
+    assert.equal(calls(), 1, `exit ${code}`);
   }
 });
 

@@ -616,7 +616,10 @@ async function execute() {
     telemetry.recordModel('critic', attempt.triad?.critic ?? reviewSetup.critic);
     telemetry.recordModel('arbiter', attempt.triad?.arbiter ?? reviewSetup.arbiter);
     const review = (neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner)(
-      { journal: root, prompt: criticPrompt, beforeEffect });
+      { journal: root, prompt: criticPrompt,
+        // Пре-эффект читателя включает daemon kill-switch: второй вызов
+        // после повторных гейтов тоже обязан упереться в действующий стоп.
+        beforeEffect: async () => { await beforeEffect?.(); await daemonOpen?.(); } });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
     // сверяется с доверенным значением, а не сам с собой.
