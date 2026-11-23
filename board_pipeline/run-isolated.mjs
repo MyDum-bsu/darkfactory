@@ -22,9 +22,12 @@ import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.
 import { DEFAULT_INTERVAL_MS, RotatingJournal, runDaemon, TERMINAL_PHASES } from './daemon.mjs';
 import { localReleasePort } from './local-release.mjs';
 import { ReleaseDenied } from './release-contract.mjs';
-import { arbiterIntakePrompt, decisionsPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
+import { arbiterIntakePrompt, decisionsPromptBlock, projectMemoryPromptBlock,
+  workerIntakePrompt } from './intake-prompt.mjs';
 import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
   resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
+import { DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS, memoryPolicyConfig, pinProjectMemory,
+  resolveMemoryStoreDir, resolveProjectMemory } from './project-memory.mjs';
 import { createTelemetryRecorder, threadUsage } from './telemetry.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
@@ -201,6 +204,15 @@ async function execute() {
   // кандидата проверяют идентичный закреплённый срез/digest, а не журнал,
   // перечитанный в разные моменты.
   const pinnedDecisions = pinDecisions(currentDecisions, { persistDir: root });
+  // Project Memory (Board #1265): компактная память проекта в операторском
+  // каталоге вне worktree. Воркер, критик и арбитр читают строго read-only
+  // закреплённый срез; запись в память из контекста воркера запрещена.
+  const memoryCfg = memoryPolicyConfig(p.projectMemory);
+  const memoryStoreDir = resolveMemoryStoreDir({ policy: p.projectMemory });
+  const currentProjectMemory = async () => memoryStoreDir === null ? null : resolveProjectMemory({
+    storeDir: memoryStoreDir, projectId: p.bb.project, worktree: tree,
+    maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS });
+  const pinnedProjectMemory = pinProjectMemory(currentProjectMemory, { persistDir: root });
   const decisionLedger = ledgerPath !== null && ledgerCfg.recordAnswers === true
     ? ({ answer, question }) => recordDecision({ ledgerPath, scope: decisionScope, rule: answer,
         sourceCard: question.task_id, recordedBy: ledgerCfg.recordedBy ?? 'question-resume',
@@ -262,7 +274,8 @@ async function execute() {
         worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' };
       const prompt = workerIntakePrompt({ brief: pinned.inputs.get(brief).toString('utf8'), tree,
         handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers),
-        decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined });
+        decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined,
+        projectMemory: await pinnedProjectMemory(`${attempt.task_id}:${attempt.epoch}`) ?? undefined });
       await writeFile(initial, prompt, { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
         '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
@@ -423,8 +436,9 @@ async function execute() {
     if (!profile) throw new Error('Missing approved checks');
     const beforeEffect = activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
     const decisionSlice = await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`);
-    const criticPrompt = decisionSlice ? [reviewText, decisionsPromptBlock(decisionSlice)].join('\n\n')
-      : reviewText;
+    const memorySlice = await pinnedProjectMemory(`${attempt.task_id}:${attempt.epoch}`);
+    const criticPrompt = [reviewText, decisionSlice && decisionsPromptBlock(decisionSlice),
+      memorySlice && projectMemoryPromptBlock(memorySlice)].filter(Boolean).join('\n\n');
     const review = reviewRunner({ journal: root, prompt: criticPrompt, beforeEffect });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
@@ -481,7 +495,8 @@ async function execute() {
     await beforeEffect?.();
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
       prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
-        await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined) });
+        await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined,
+        await pinnedProjectMemory(`${req.task_id}:${req.epoch}`) ?? undefined) });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
     telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
     telemetry.recordArbitration();

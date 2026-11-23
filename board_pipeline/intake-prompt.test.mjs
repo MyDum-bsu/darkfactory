@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { arbiterIntakePrompt, decisionsPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
+import { arbiterIntakePrompt, decisionsPromptBlock, projectMemoryPromptBlock,
+  workerIntakePrompt } from './intake-prompt.mjs';
 
 const spec = 'Принятые решения: CSV для ручной выгрузки, потому что оператор сверяет таблицу (D-01).';
 const handoff = { task_id: '492', epoch: 1, attempt_id: 'attempt', worker_thread_id: '<BB_THREAD_ID>',
@@ -80,4 +81,40 @@ test('a partially truncated slice keeps its entries and flags the cut', () => {
   assert.match(block, /- \[global\] CSV для выгрузки \(dec-1\)/);
   assert.match(block, /срез усечён: показано 1 из 5/);
   assert.doesNotMatch(block, /нет активных решений/);
+});
+
+const memorySlice = {
+  projectId: 'proj_a',
+  text: '[invariants]\n- Board is single source of truth (inv-1, #1265, aaaaaaaa)',
+  digest: 'b'.repeat(64),
+  ids: ['inv-1'],
+  truncated: false,
+  total: 1,
+};
+
+test('worker and arbiter receive pinned read-only project memory block', () => {
+  const wPrompt = workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice, projectMemory: memorySlice });
+  const decIdx = wPrompt.indexOf('Принятые решения владельца');
+  const memIdx = wPrompt.indexOf('Память проекта (read-only, срез digest');
+  const checkIdx = wPrompt.indexOf('Перед продуктовым вопросом');
+  assert.ok(decIdx > 0 && memIdx > decIdx && checkIdx > memIdx);
+  assert.match(wPrompt, /digest b{64}/);
+  assert.match(wPrompt, /Board is single source of truth/);
+  assert.match(wPrompt, /прямая запись воркером запрещена/);
+
+  const aPrompt = arbiterIntakePrompt(spec, 'Operator rules.', slice, memorySlice);
+  assert.match(aPrompt, /Память проекта \(read-only, срез digest b{64}\)/);
+  assert.ok(aPrompt.indexOf('Принятые решения владельца') < aPrompt.indexOf('Память проекта'));
+});
+
+test('projectMemoryPromptBlock is fail-closed on unpinned or zero-shown truncated slices', () => {
+  assert.throws(() => projectMemoryPromptBlock(null), /project_memory_slice_invalid/);
+  assert.throws(() => projectMemoryPromptBlock({ text: 'x', digest: 'short', ids: [] }),
+    /project_memory_slice_invalid/);
+  assert.throws(() => projectMemoryPromptBlock({ ...memorySlice, text: '', ids: [], truncated: true, total: 2 }),
+    /project_memory_slice_truncated/);
+  const empty = projectMemoryPromptBlock({ ...memorySlice, text: '', ids: [], total: 0 });
+  assert.match(empty, /память проекта пуста/);
+  const partial = projectMemoryPromptBlock({ ...memorySlice, truncated: true, total: 4 });
+  assert.match(partial, /срез усечён: показано 1 из 4/);
 });
