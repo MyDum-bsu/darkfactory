@@ -43,6 +43,31 @@ const PROVIDER_FAILURE_REASON_RE =
   /(provider|timeout|rate_limit|quota|unavailable|crash|spawn_failed|review_failed|critic_failed|arbiter_failed|model_error|api_error)/i;
 const SAFE_DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T_-][0-9]{2}-[0-9]{2}-[0-9]{2})?$/;
 const SAFE_FILENAME_RE = /^[A-Za-z0-9._-]+$/;
+const SNAPSHOT_FILE_RE = /^snapshot-(\d{4}-\d{2}-\d{2}(?:[T_-]\d{2}-\d{2}-\d{2})?)(?:-(\d+))?\.json$/;
+
+export function compareSnapshotFilenames(a, b) {
+  const ma = SNAPSHOT_FILE_RE.exec(a);
+  const mb = SNAPSHOT_FILE_RE.exec(b);
+  if (ma && mb) {
+    if (ma[1] !== mb[1]) return ma[1] < mb[1] ? -1 : 1;
+    const seqA = ma[2] ? Number.parseInt(ma[2], 10) : 1;
+    const seqB = mb[2] ? Number.parseInt(mb[2], 10) : 1;
+    if (seqA !== seqB) return seqA - seqB;
+  }
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+function attemptTimestampMs(entry) {
+  for (const key of ['finished_at', 'ended_at', 'completed_at', 'updated_at', 'started_at', 'created_at']) {
+    const raw = entry?.[key];
+    if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+    if (typeof raw === 'string' && raw.trim()) {
+      const ts = Date.parse(raw);
+      if (Number.isFinite(ts)) return ts;
+    }
+  }
+  return null;
+}
 
 const finiteNonNeg = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 
@@ -384,6 +409,7 @@ export async function collectTelemetry({
         closed_attempts: 0,
         any_attempt_passed: false,
         last_attempt_outcome: null,
+        last_attempt_ts: null,
         models: new Set(),
         usages: [],
         costs: [],
@@ -486,12 +512,19 @@ export async function collectTelemetry({
         taskRec.has_attempt_rounds = true;
       }
       if (!isOpen && isSuccessOutcome(outcome)) taskRec.any_attempt_passed = true;
-      if (!isOpen && outcome !== 'unknown') taskRec.last_attempt_outcome = outcome;
-      if (!taskRec.has_board_status) {
-        if (isOpen) taskRec.status = 'in_progress';
-        else if (outcome !== 'unknown') taskRec.status = outcome;
-      } else if (taskRec.status === 'unknown' && outcome !== 'unknown') {
-        taskRec.status = outcome;
+      const entryTs = attemptTimestampMs(entry);
+      const isNewerAttempt = taskRec.attempts === 1 ||
+        (entryTs !== null && (taskRec.last_attempt_ts === null || entryTs >= taskRec.last_attempt_ts)) ||
+        (entryTs === null && taskRec.last_attempt_ts === null);
+      if (isNewerAttempt) {
+        if (entryTs !== null) taskRec.last_attempt_ts = entryTs;
+        if (!isOpen && outcome !== 'unknown') taskRec.last_attempt_outcome = outcome;
+        if (!taskRec.has_board_status) {
+          if (isOpen) taskRec.status = 'in_progress';
+          else if (outcome !== 'unknown') taskRec.status = outcome;
+        } else if (taskRec.status === 'unknown' && outcome !== 'unknown') {
+          taskRec.status = outcome;
+        }
       }
     }
 
@@ -1448,16 +1481,28 @@ export async function runCli(argv = process.argv.slice(2), io = { stdout: consol
     const outPath = values.out ?? (dir ? join(dir, 'dashboard.html') : null);
     let snapshotPath = values.snapshot ?? null;
 
-    if (!snapshotPath && dir) {
-      const files = await readdir(dir).catch(() => []);
-      const snaps = files.filter(f => f.startsWith('snapshot-') && f.endsWith('.json')).sort();
-      if (snaps.length) snapshotPath = join(dir, snaps[snaps.length - 1]);
-    }
     if (!outPath) {
       io.stderr('Usage: node board_pipeline/telemetry-collector.mjs dashboard --out-dir <dir> [--out <file.html>]');
       return 1;
     }
     const history = historyPath ? await readHistory(historyPath) : [];
+    if (!snapshotPath && dir) {
+      const lastEntryFile = history.length ? history[history.length - 1]?.snapshot_file : null;
+      if (typeof lastEntryFile === 'string' && lastEntryFile) {
+        try {
+          const candidate = join(dir, sanitizeHistoryFile(lastEntryFile));
+          const st = await lstat(candidate).catch(() => null);
+          if (st?.isFile()) snapshotPath = candidate;
+        } catch {
+          // Игнорируем невалидное имя snapshot_file и переходим к fallback по каталогу.
+        }
+      }
+      if (!snapshotPath) {
+        const files = await readdir(dir).catch(() => []);
+        const snaps = files.filter(f => f.startsWith('snapshot-') && f.endsWith('.json')).sort(compareSnapshotFilenames);
+        if (snaps.length) snapshotPath = join(dir, snaps[snaps.length - 1]);
+      }
+    }
     const latestSnapshot = snapshotPath ? JSON.parse(await readFile(snapshotPath, 'utf8')) : null;
     await writeFile(outPath, renderTelemetryDashboardHtml(history, latestSnapshot), 'utf8');
     io.stdout(`Dashboard written: ${outPath}`);

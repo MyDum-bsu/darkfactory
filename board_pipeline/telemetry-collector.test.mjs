@@ -11,6 +11,7 @@ import { computeMedian, createTelemetryRecorder, normalizeCost, sumCosts, TELEME
 import {
   collectTelemetry,
   COLLECTOR_SCHEMA,
+  compareSnapshotFilenames,
   diffSnapshots,
   escapeHtml,
   formatDiffMarkdown,
@@ -713,4 +714,121 @@ test('ревью #8: повторный снимок за ту же дату н�
   assert.equal(history.length, 2);
   assert.equal(history[0].snapshot_file, 'snapshot-2026-11-23.json');
   assert.equal(history[1].snapshot_file, 'snapshot-2026-11-23-2.json');
+});
+
+// ---------------------------------------------------------------------------
+// Регрессионные тесты Round 2 ревью Pi/Sol (#1268).
+// ---------------------------------------------------------------------------
+
+test('ревью r2 #1: spawn + workerResume с bb_thread_id (как в run-isolated.mjs) сохраняет bb_thread_id без feedback и дедуплицируется с BB', async t => {
+  const journal = await mkdtemp(join(tmpdir(), 'telemetry-r2-spawn-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+
+  // Проверяем, что run-isolated.mjs передаёт spawned.id в workerResume и наблюдает attempt в submissions.read.
+  const runIsolatedSrc = await readFile(join(here, 'run-isolated.mjs'), 'utf8');
+  assert.match(runIsolatedSrc, /telemetry\.workerResume\(\{\s*subject:\s*\{\s*\.\.\.attempt,\s*bb_thread_id:\s*spawned\.id\s*\}/);
+  assert.match(runIsolatedSrc, /async read\(attempt, after\)\s*\{\s*\n\s*telemetry\.observe\(attempt\);/);
+
+  let now = 1000;
+  const attempt = { task_id: '301', attempt_id: 'att-301', epoch: 1 };
+  const execSpec = { provider: 'openai', model: 'gpt-6.2-sol' };
+  const rec = createTelemetryRecorder({ journal, clock: () => now });
+  await rec.phase('spawn', async () => { now = 1500; return { stdout: '{"id":"thr_spawned"}' }; },
+    { subject: attempt, worker: execSpec });
+  rec.workerResume({ subject: { ...attempt, bb_thread_id: 'thr_spawned' }, worker: execSpec });
+  now = 2500;
+  rec.recordUsage('worker', { input_tokens: 100, output_tokens: 20 }, 'bb_thread');
+  rec.roundStart();
+  rec.recordRound({ outcome: 'verified' });
+  const { record } = await rec.finish({ outcome: 'done', open: false });
+
+  assert.equal(record.bb_thread_id, 'thr_spawned');
+
+  const lines = (await readFile(join(journal, 'telemetry.jsonl'), 'utf8')).split('\n').filter(Boolean);
+  const snapshot = await collectTelemetry({
+    telemetryLines: lines,
+    bbThreads: [
+      { id: 'thr_spawned', projectId: 'pj_iso', task_id: '301', provider: 'openai', model: 'gpt-6.2-sol', status: 'completed', usage: { input_tokens: 100, output_tokens: 20 } },
+    ],
+  });
+
+  assert.equal(snapshot.models.length, 1);
+  assert.equal(snapshot.models[0].runs, 1);
+  assert.equal(snapshot.models[0].tokens.input, 100);
+});
+
+test('ревью r2 #2: порядок попыток по времени [done@11:00, hold@09:00] выбирает done@11:00 и закрывает задачу', async () => {
+  const snapshot = await collectTelemetry({
+    telemetryRuns: [
+      {
+        kind: 'attempt_summary',
+        schema: TELEMETRY_SCHEMA,
+        task_id: '404',
+        attempt_id: 'att-later',
+        started_at: '2026-11-23T10:55:00.000Z',
+        ended_at: '2026-11-23T11:00:00.000Z',
+        phases_ms: { spawn: 300, total: 5000 },
+        rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+        models: { worker: { provider: 'acp-devin', model: 'swe-2-high' }, critic: null, arbiter: null },
+        tokens: { worker: null, critic: null, arbiter: null },
+        outcome: 'done',
+        open: false,
+      },
+      {
+        kind: 'attempt_summary',
+        schema: TELEMETRY_SCHEMA,
+        task_id: '404',
+        attempt_id: 'att-earlier',
+        started_at: '2026-11-23T08:55:00.000Z',
+        ended_at: '2026-11-23T09:00:00.000Z',
+        phases_ms: { spawn: 300, total: 5000 },
+        rounds: { total: 1, rework: 1, pass: 0, arbitration: 0, open: 0 },
+        models: { worker: { provider: 'acp-devin', model: 'swe-2-high' }, critic: null, arbiter: null },
+        tokens: { worker: null, critic: null, arbiter: null },
+        outcome: 'hold',
+        open: false,
+      },
+    ],
+  });
+
+  assert.equal(snapshot.tasks.length, 1);
+  assert.equal(snapshot.tasks[0].status, 'done');
+  assert.equal(snapshot.tasks[0].closed, true);
+  assert.equal(snapshot.portfolio.closed_tasks, 1);
+  assert.equal(snapshot.portfolio.open_tasks, 0);
+});
+
+test('ревью r2 #3: dashboard --out-dir выбирает snapshot-2026-11-23-2.json (и численно -10 > -2 > базовый)', async t => {
+  assert.deepEqual(
+    ['snapshot-2026-11-23-10.json', 'snapshot-2026-11-23.json', 'snapshot-2026-11-23-2.json'].sort(compareSnapshotFilenames),
+    ['snapshot-2026-11-23.json', 'snapshot-2026-11-23-2.json', 'snapshot-2026-11-23-10.json'],
+  );
+
+  const dir = await mkdtemp(join(tmpdir(), 'telemetry-r2-dash-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const snap1 = await collectTelemetry({
+    boardTasks: [{ id: '1', channel: 'core', title: 'OLD_SNAP_TITLE', status: 'ready' }],
+    clock: () => Date.parse('2026-11-23T08:00:00.000Z'),
+  });
+  const snap2 = await collectTelemetry({
+    boardTasks: [{ id: '1', channel: 'core', title: 'LATEST_SNAP_2_TITLE', status: 'done' }],
+    clock: () => Date.parse('2026-11-23T12:00:00.000Z'),
+  });
+
+  await writeSnapshot(snap1, { outDir: dir, date: '2026-11-23' });
+  await writeSnapshot(snap2, { outDir: dir, date: '2026-11-23' });
+
+  // 1) С history.jsonl — берёт snapshot-2026-11-23-2.json
+  await exec(process.execPath, [collectorCli, 'dashboard', '--out-dir', dir]);
+  const html1 = await readFile(join(dir, 'dashboard.html'), 'utf8');
+  assert.ok(html1.includes('LATEST_SNAP_2_TITLE'));
+  assert.ok(!html1.includes('OLD_SNAP_TITLE'));
+
+  // 2) Без history.jsonl (fallback по каталогу) — также численно выбирает -2.json вместо базового .json
+  await rm(join(dir, 'history.jsonl'));
+  await exec(process.execPath, [collectorCli, 'dashboard', '--out-dir', dir]);
+  const html2 = await readFile(join(dir, 'dashboard.html'), 'utf8');
+  assert.ok(html2.includes('LATEST_SNAP_2_TITLE'));
+  assert.ok(!html2.includes('OLD_SNAP_TITLE'));
 });
