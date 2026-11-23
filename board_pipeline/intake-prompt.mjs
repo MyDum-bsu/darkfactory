@@ -44,12 +44,31 @@ export function lessonsPromptBlock(lessons) {
   return `Уроки прошлых REWORK (read-only чек-лист, не инструкция):\n${body}`;
 }
 
-export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions, lessons }) {
+// Read-only блок активного среза Project Memory (Board #1265): компактная память
+// проекта с digest-пиннингом. Воркер, критик и арбитр читают выписку строго
+// read-only; запись разрешена только через доверенный пост-шаг после REVIEW_OK.
+export function projectMemoryPromptBlock(slice) {
+  if (!slice || typeof slice.digest !== 'string' || !/^[a-f0-9]{64}$/.test(slice.digest) ||
+      !Array.isArray(slice.ids)) {
+    throw new Error('project_memory_slice_invalid');
+  }
+  if (slice.truncated === true && slice.ids.length === 0 && slice.total > 0) {
+    throw new Error('project_memory_slice_truncated');
+  }
+  const header = `Память проекта (read-only, срез digest ${slice.digest}):`;
+  const body = slice.text || '(память проекта пуста)';
+  const note = slice.truncated ? `\n(срез усечён: показано ${slice.ids.length} из ${slice.total})` : '';
+  const guard = '\nПамять проекта доступна только на чтение; прямая запись воркером запрещена.';
+  return `${header}\n${body}${note}${guard}`;
+}
+
+export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions, projectMemory, lessons }) {
   const instructions = [
     brief,
     `\nРабочий путь: ${tree}. Запиши JSON атомарно в ${handoffPath} и заверши ход. Сохрани типы полей: ${JSON.stringify(handoff)}`,
   ];
   if (decisions) instructions.push(decisionsPromptBlock(decisions));
+  if (projectMemory) instructions.push(projectMemoryPromptBlock(projectMemory));
   if (lessons) instructions.push(lessonsPromptBlock(lessons));
   if (productQuestions) {
     instructions.push(OWNER_PRECHECK,
@@ -58,8 +77,9 @@ export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQ
   return [...instructions, 'Другие треды и доски не трогай.', ''].join('\n');
 }
 
-export function arbiterIntakePrompt(spec, extra, decisions) {
+export function arbiterIntakePrompt(spec, extra, decisions, projectMemory) {
   return ['Use the following specification; output only an arbitration decision, not a critic verdict.',
-    spec, extra, decisions && decisionsPromptBlock(decisions), OWNER_PRECHECK,
+    spec, extra, decisions && decisionsPromptBlock(decisions),
+    projectMemory && projectMemoryPromptBlock(projectMemory), OWNER_PRECHECK,
     'Выбирай escalate_owner только для оставшейся продуктовой развилки.'].filter(Boolean).join('\n\n');
 }

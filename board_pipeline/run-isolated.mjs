@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { parseArgs, promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import { acceptHeld } from './acceptance.mjs';
 import { reserveWorktree, saveState } from './slot.mjs';
 import { advanceWithProjection } from './controller.mjs';
@@ -23,9 +24,13 @@ import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.
 import { DEFAULT_INTERVAL_MS, RotatingJournal, runDaemon, TERMINAL_PHASES } from './daemon.mjs';
 import { localReleasePort } from './local-release.mjs';
 import { ReleaseDenied } from './release-contract.mjs';
-import { arbiterIntakePrompt, decisionsPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
+import { arbiterIntakePrompt, decisionsPromptBlock, projectMemoryPromptBlock,
+  workerIntakePrompt } from './intake-prompt.mjs';
 import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
   resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
+import { createProjectMemoryWriter, DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS,
+  extractPostReviewMemoryUpdates, memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir,
+  resolveProjectMemory, writeTrustedReviewReceipt } from './project-memory.mjs';
 import { createTelemetryRecorder, readTelemetryLines, threadUsage } from './telemetry.mjs';
 import { aggregateScorecard } from './model-scorecard.mjs';
 import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
@@ -102,6 +107,77 @@ async function releaseSetup(policy, { tree, inbox, root }) {
   }
   return localReleasePort({ root: target, target: config.target, repo: policy.route.repoId,
     url: config.url, worktree: tree, artifact: config.artifact, smokePrefix: config.smokePrefix });
+}
+
+const ACCEPTED_MEMORY_OUTCOMES = new Set(['done', 'accepted', 'verified']);
+
+// Доверенный пост-шаг записи в Project Memory после подтверждённого REVIEW_OK:
+// при rework/hold/отсутствии REVIEW_OK квитанция не выписывается и память не
+// обновляется. При успехе выписывает HMAC-подписанную квитанцию в
+// trustedReceiptDir и вызывает закреплённый writer.recordUpdate(...).
+export async function recordPostReviewMemory({
+  writer,
+  trustedReceiptDir,
+  hmacKey,
+  projectId,
+  worktree,
+  result,
+  outcome,
+  reviewReceipt,
+  attempt,
+  submission,
+  worker,
+  reviewer,
+  updates,
+}) {
+  if (!writer) return { recorded: false, reason: 'writer_not_configured' };
+  const res = result ?? outcome;
+  const finalStatus = res?.outcome ?? res?.status;
+  const receipt = reviewReceipt ?? res?.review;
+  if (!ACCEPTED_MEMORY_OUTCOMES.has(finalStatus) || receipt?.verdict !== 'REVIEW_OK') {
+    return { recorded: false, reason: 'not_review_ok' };
+  }
+  const verifiedSha = submission?.candidate_sha ?? res?.sha ?? receipt?.sha;
+  if (typeof verifiedSha !== 'string' || !/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(verifiedSha)) {
+    return { recorded: false, reason: 'invalid_sha' };
+  }
+  if (receipt?.sha !== undefined && receipt.sha !== verifiedSha) {
+    return { recorded: false, reason: 'sha_mismatch' };
+  }
+  const resolvedUpdates = Array.isArray(updates) && updates.length > 0
+    ? updates
+    : extractPostReviewMemoryUpdates({ result: res, attempt, reviewReceipt: receipt, verifiedSha });
+  if (!Array.isArray(resolvedUpdates) || resolvedUpdates.length === 0) {
+    return { recorded: false, reason: 'no_updates' };
+  }
+  const receiptPath = join(
+    trustedReceiptDir,
+    `review-${attempt.task_id}-${attempt.attempt_id}-${verifiedSha.slice(0, 12)}.receipt.json`,
+  );
+  try {
+    await writeTrustedReviewReceipt({
+      receiptPath,
+      trustedReceiptDir,
+      hmacKey,
+      worktree,
+      receipt: {
+        role: 'controller',
+        verdict: 'REVIEW_OK',
+        sha: verifiedSha,
+        worker,
+        reviewer,
+        sourceCard: String(attempt.task_id),
+      },
+    });
+    const saved = await writer.recordUpdate({ projectId, receiptPath, updates: resolvedUpdates });
+    return { recorded: true, receiptPath, result: saved };
+  } catch (error) {
+    return {
+      recorded: false,
+      reason: 'post_review_memory_write_failed',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 async function execute() {
@@ -203,6 +279,34 @@ async function execute() {
   // кандидата проверяют идентичный закреплённый срез/digest, а не журнал,
   // перечитанный в разные моменты.
   const pinnedDecisions = pinDecisions(currentDecisions, { persistDir: root });
+  // Project Memory (Board #1265): компактная память проекта в операторском
+  // каталоге вне worktree. Воркер, критик и арбитр читают строго read-only
+  // закреплённый срез; запись в память из контекста воркера запрещена.
+  const memoryCfg = memoryPolicyConfig(p.projectMemory);
+  const memoryStoreDir = resolveMemoryStoreDir({ policy: p.projectMemory });
+  const currentProjectMemory = async () => memoryStoreDir === null ? null : resolveProjectMemory({
+    storeDir: memoryStoreDir, projectId: p.bb.project, worktree: tree,
+    maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS });
+  // Всегда создаём/читаем pin в root (даже при выключенной памяти: enabled:false),
+  // чтобы смена DF_PROJECT_MEMORY_DIR при рестарте не подменила срез той же попытки.
+  const pinnedProjectMemory = pinProjectMemory(currentProjectMemory,
+    { persistDir: root, projectId: p.bb.project });
+  const activeProjectMemory = async key => {
+    const slice = await pinnedProjectMemory(key);
+    return slice && slice.enabled !== false ? slice : undefined;
+  };
+  const projectMemoryWriter = memoryStoreDir !== null &&
+      (memoryCfg.trustedReceiptDir !== undefined || memoryCfg.hmacKey !== undefined)
+    ? createProjectMemoryWriter({
+        storeDir: memoryStoreDir,
+        trustedReceiptDir: memoryCfg.trustedReceiptDir,
+        hmacKey: memoryCfg.hmacKey,
+        worktree: tree,
+        maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS,
+        ...(memoryCfg.maxEntriesPerSection !== undefined
+          ? { maxEntriesPerSection: memoryCfg.maxEntriesPerSection } : {}),
+      })
+    : undefined;
   const decisionLedger = ledgerPath !== null && ledgerCfg.recordAnswers === true
     ? ({ answer, question }) => recordDecision({ ledgerPath, scope: decisionScope, rule: answer,
         sourceCard: question.task_id, recordedBy: ledgerCfg.recordedBy ?? 'question-resume',
@@ -312,6 +416,7 @@ async function execute() {
       const prompt = workerIntakePrompt({ brief: pinned.inputs.get(brief).toString('utf8'), tree,
         handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers),
         decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined,
+        projectMemory: await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`),
         lessons: lessonRules.length ? lessonRules : undefined });
       await writeFile(initial, prompt, { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
@@ -472,8 +577,9 @@ async function execute() {
     if (!profile) throw new Error('Missing approved checks');
     const beforeEffect = activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
     const decisionSlice = await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`);
-    const criticPrompt = decisionSlice ? [reviewText, decisionsPromptBlock(decisionSlice)].join('\n\n')
-      : reviewText;
+    const memorySlice = await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`);
+    const criticPrompt = [reviewText, decisionSlice && decisionsPromptBlock(decisionSlice),
+      memorySlice && projectMemoryPromptBlock(memorySlice)].filter(Boolean).join('\n\n');
     // Фактический критик L2 и арбитр — закреплённая триада попытки
     // (#1263), иначе проверенный дефолт. Спек нормализуется к провайдеру,
     // реально исполняемому L2-раннером ('pi/openai/…' → 'openai',
@@ -517,6 +623,7 @@ async function execute() {
       // VS-3: фазы приёмки (L1 local, tamper, L3 visual, L2 critic) замеряются
       // вокруг портов; usage критика — из квитанции ревью, иначе null.
       telemetry.roundStart();
+      let lastReviewReceipt = null;
       const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', worktreeInspector(policy)),
         local: telemetry.port('l1_local', offlineProfileRunner(root, { beforeEffect })),
@@ -530,11 +637,35 @@ async function execute() {
           await assertPinned();
           await beforeEffect?.();
           const receipt = await telemetry.phase('l2_critic', () => review(handoff, trusted));
+          lastReviewReceipt = receipt ?? null;
           telemetry.recordUsage('critic', receipt?.usage, neon ? 'agy_stream' : 'pi_stream');
           return receipt;
         },
       } });
       telemetry.recordRound({ outcome: result.outcome, reason: result.reason, sha: submission.candidate_sha });
+      // Запись памяти идёт уже после приёмки/закрытия карточки: отказ записи
+      // памяти никогда не должен ронять verify() и переводить попытку в uncertain.
+      try {
+        const memResult = await recordPostReviewMemory({
+          writer: projectMemoryWriter,
+          trustedReceiptDir: memoryCfg.trustedReceiptDir,
+          hmacKey: memoryCfg.hmacKey,
+          projectId: p.bb.project,
+          worktree: tree,
+          result,
+          reviewReceipt: lastReviewReceipt,
+          attempt,
+          submission,
+          worker: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
+          reviewer: attemptCritic,
+          updates: result.memoryUpdates ?? lastReviewReceipt?.memoryUpdates,
+        });
+        if (memResult.reason === 'post_review_memory_write_failed') {
+          console.error(`project-memory post-review write failed: ${memResult.error}`);
+        }
+      } catch (error) {
+        console.error(`project-memory post-review write failed: ${error?.message ?? String(error)}`);
+      }
       return result;
     } finally {
       clearInterval(timer);
@@ -553,7 +684,8 @@ async function execute() {
     await beforeEffect?.();
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
       prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
-        await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined) });
+        await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined,
+        await activeProjectMemory(`${req.task_id}:${req.attempt_id}:${req.epoch}`)) });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
     telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
     telemetry.recordArbitration();
@@ -667,7 +799,9 @@ async function execute() {
   }
 }
 
-try { await execute(); } catch (error) {
-  console.error(`isolated-pilot: ${error.message.split('\n')[0]}`);
-  process.exitCode = 1;
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  try { await execute(); } catch (error) {
+    console.error(`isolated-pilot: ${error.message.split('\n')[0]}`);
+    process.exitCode = 1;
+  }
 }

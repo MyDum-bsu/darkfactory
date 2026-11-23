@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { arbiterIntakePrompt, decisionsPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
+import { arbiterIntakePrompt, decisionsPromptBlock, lessonsPromptBlock, projectMemoryPromptBlock,
+  workerIntakePrompt } from './intake-prompt.mjs';
 
 const spec = 'Принятые решения: CSV для ручной выгрузки, потому что оператор сверяет таблицу (D-01).';
 const handoff = { task_id: '492', epoch: 1, attempt_id: 'attempt', worker_thread_id: '<BB_THREAD_ID>',
@@ -83,8 +84,6 @@ test('a partially truncated slice keeps its entries and flags the cut', () => {
 });
 
 // ── Board #1263: read-only блок дистиллированных уроков ──
-import { lessonsPromptBlock } from './intake-prompt.mjs';
-
 const lessons = [
   { category: 'host_path_leak' },
   { category: 'missed_edge_case' },
@@ -122,4 +121,48 @@ test('lessonsPromptBlock is fail-closed on a malformed list', () => {
     rule: 'looks fine' }]), /distilled_lessons_invalid/);
   assert.throws(() => lessonsPromptBlock([{ category: 'unknown_cat' }]),
     /distilled_lessons_invalid/);
+});
+
+const memorySlice = {
+  projectId: 'proj_a',
+  text: '[invariants]\n- Board is single source of truth (inv-1, #1265, aaaaaaaa)',
+  digest: 'b'.repeat(64),
+  ids: ['inv-1'],
+  truncated: false,
+  total: 1,
+};
+
+test('worker and arbiter receive pinned read-only project memory block', () => {
+  const wPrompt = workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice, projectMemory: memorySlice });
+  const decIdx = wPrompt.indexOf('Принятые решения владельца');
+  const memIdx = wPrompt.indexOf('Память проекта (read-only, срез digest');
+  const checkIdx = wPrompt.indexOf('Перед продуктовым вопросом');
+  assert.ok(decIdx > 0 && memIdx > decIdx && checkIdx > memIdx);
+  assert.match(wPrompt, /digest b{64}/);
+  assert.match(wPrompt, /Board is single source of truth/);
+  assert.match(wPrompt, /прямая запись воркером запрещена/);
+
+  const aPrompt = arbiterIntakePrompt(spec, 'Operator rules.', slice, memorySlice);
+  assert.match(aPrompt, /Память проекта \(read-only, срез digest b{64}\)/);
+  assert.ok(aPrompt.indexOf('Принятые решения владельца') < aPrompt.indexOf('Память проекта'));
+});
+
+test('worker sees decisions, pinned project memory and canonical lessons together before questions', () => {
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice,
+    projectMemory: memorySlice, lessons });
+  const markers = ['Принятые решения владельца (read-only', 'Память проекта (read-only',
+    'Уроки прошлых REWORK (read-only', 'Перед продуктовым вопросом'];
+  assert.ok(markers.map(text => prompt.indexOf(text)).every((at, i, all) => at >= 0 && (!i || at > all[i - 1])));
+});
+
+test('projectMemoryPromptBlock is fail-closed on unpinned or zero-shown truncated slices', () => {
+  assert.throws(() => projectMemoryPromptBlock(null), /project_memory_slice_invalid/);
+  assert.throws(() => projectMemoryPromptBlock({ text: 'x', digest: 'short', ids: [] }),
+    /project_memory_slice_invalid/);
+  assert.throws(() => projectMemoryPromptBlock({ ...memorySlice, text: '', ids: [], truncated: true, total: 2 }),
+    /project_memory_slice_truncated/);
+  const empty = projectMemoryPromptBlock({ ...memorySlice, text: '', ids: [], total: 0 });
+  assert.match(empty, /память проекта пуста/);
+  const partial = projectMemoryPromptBlock({ ...memorySlice, truncated: true, total: 4 });
+  assert.match(partial, /срез усечён: показано 1 из 4/);
 });
