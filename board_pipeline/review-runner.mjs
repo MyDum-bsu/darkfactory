@@ -7,7 +7,7 @@
 
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -515,11 +515,10 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
     stdout = run.stdout;
     stderr = run.stderr;
   } catch (error) {
-    code = typeof error.code === 'number' ? error.code : null;
     // Доказательство хостового таймаута: execFile добил дочерний процесс по
     // истечении timeout (killed + SIGTERM). Нечисловой код без этого
     // признака — обычный сбой exec (spawn/ENOENT), не доказанный таймаут.
-    timedOut = error.killed === true && error.signal === 'SIGTERM';
+    ({ code, timedOut } = classifySandboxExit(error));
     stdout = error.stdout ?? '';
     stderr = error.stderr ?? '';
   } finally {
@@ -534,6 +533,16 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   return { code, stdout, stderr, timedOut };
 }
 
+// Хостовое доказательство завершения child_process.execFile: числовой код —
+// выход процесса; timedOut — только когда хост добил процесс по timeout
+// (killed + SIGTERM). SIGKILL/SIGINT и spawn-ошибки таймаутом не являются.
+export function classifySandboxExit(error) {
+  return {
+    code: typeof error?.code === 'number' ? error.code : null,
+    timedOut: error?.killed === true && error?.signal === 'SIGTERM',
+  };
+}
+
 // Классификация ненулевого выхода read-only раннера: только числовой код 143
 // (SIGTERM процесса контейнера) или доказанный хостовый таймаут exec дают
 // transient ReviewRunnerTimeout. Произвольный null, строка «143» в stderr,
@@ -546,22 +555,46 @@ export function reviewRunnerExitFailure(run) {
   return new ReviewDenied(reason);
 }
 
-// Перед единственным повтором L2: тот же чистый зачисленный worktree на том же
-// candidate_sha, с тем же base-предком. Смена HEAD, грязное дерево или
-// невозможность проверить — отказ, повторного вызова нет.
+// Перед единственным повтором L2: тот же зачисленный worktree на той же
+// ветке — чистый HEAD на candidate_sha, прежний base-предок, а при заданном
+// binding.branch именно эта ветка (detached HEAD и подмена ветки на тот же
+// коммит отклоняются). Невозможность проверить — отказ, повторного вызова нет.
 export async function assertRetrySubjectUnchanged(binding) {
   if (!isAbsolute(binding?.worktree ?? '') || !SHA.test(binding?.candidate_sha ?? '')) {
     throw new ReviewDenied('review_retry_subject_unverified');
   }
+  const toplevel = await git(binding.worktree, 'rev-parse', '--show-toplevel');
   const head = await git(binding.worktree, 'rev-parse', 'HEAD');
+  const branch = await git(binding.worktree, 'branch', '--show-current');
   const status = await git(binding.worktree, 'status', '--porcelain=v1', '--untracked-files=all');
-  if (head !== binding.candidate_sha || status !== '') {
+  if (toplevel !== await realpath(binding.worktree) || head !== binding.candidate_sha ||
+      status === undefined || status !== '' || branch === '' ||
+      (nonEmpty(binding.branch) && branch !== binding.branch)) {
     throw new ReviewDenied('review_retry_subject_changed');
   }
   if (SHA.test(binding.base_sha ?? '')) {
     await git(binding.worktree, 'merge-base', '--is-ancestor',
       binding.base_sha, binding.candidate_sha);
   }
+}
+
+// Контроллерские гейты перед единственным повтором: доказательство ТЕКУЩЕГО
+// lease/эпохи свежим verifyHeld (native renew + допуск 'claimed'), повторный
+// допуск карточки (владелец/метка), guardTask там, где сконфигурирован,
+// закреплённые входы оператора и kill-switch, передэффектные гейты пилота.
+// Ничего не берётся из кэшированного флага — каждая проверка живая.
+export function l2ReviewRetryGuard({ port, taskId, epoch, owner, label,
+  assertPinned, beforeEffect, assertOpen }) {
+  return async () => {
+    const live = await port.verifyHeld(taskId, epoch);
+    if (live?.epoch !== epoch) throw new Error('Lease lost');
+    if (owner && label && await port.matches?.(taskId, { owner, label, state: 'claimed' }) === false) {
+      throw new Error('Task no longer authorized');
+    }
+    await port.guardTask?.(taskId, epoch);
+    if (assertOpen) await assertOpen(); else await assertPinned?.();
+    await beforeEffect?.();
+  };
 }
 
 // Один повторный вызов L2-критика внутри review-порта — только по
@@ -746,7 +779,14 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           await writeFile(join(journal, `${name}.stderr`),
             String(run.stderr || run.stdout || ''), { flag: 'wx', mode: 0o600 });
         } catch { /* журнал недоступен — не маскируем исходную ошибку */ }
-        throw reviewRunnerExitFailure(run);
+        // Завершённый транскрипт при ненулевом выходе — не «чистый» transient:
+        // ответ проходит обычную валидацию (модель, tools, verdict, REWORK),
+        // чтобы повтор не стёр содержательный исход или сбой аттестации.
+        try {
+          parseReviewTranscript(run.stdout);
+        } catch {
+          throw reviewRunnerExitFailure(run);
+        }
       }
 
       // Приватный сырой транскрипт: контроллер владеет каталогом журнала.

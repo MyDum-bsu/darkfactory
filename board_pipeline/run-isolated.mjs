@@ -13,10 +13,12 @@ import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
-import { isolatedArbiterRunner, isolatedPiReviewRunner,
-  l2CriticSpec, l2ReviewWithTransientRetry, runnerReviewSpec } from './review-runner.mjs';
+import { assertRetrySubjectUnchanged, isolatedArbiterRunner, isolatedPiReviewRunner,
+  l2CriticSpec, l2ReviewRetryGuard, l2ReviewWithTransientRetry,
+  runnerReviewSpec } from './review-runner.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
-import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter } from './review-policy.mjs';
+import { isNeonReview } from './review-policy.mjs';
+import { operatorReviewSetup } from './review-setup.mjs';
 import { MAX_QUESTION_TTL_MS, readSignedAnswer, signedAnswerVerifier } from './question-gate.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 import { reconcileFeedbackFromBb, reconcileSpawnFromBb } from './bb-reconcile.mjs';
@@ -56,25 +58,6 @@ const isApprovedWorker = bb =>
   (bb?.provider === 'pi' && typeof bb.model === 'string' &&
     /^opencode-go\//i.test(bb.model) &&
     workerSelector.workerFamily(bb) === 'deepseek');
-
-async function operatorReviewSetup(policy) {
-  const critic = policy.profiles?.[policy.route.checkProfile]?.review;
-  const arbiter = policy.arbiter ?? workerSelector.DEFAULT_ARBITER;
-  const neon = isNeonReview(critic);
-  if (!neon && !isLegacyPiReview(critic)) throw new Error('Review profile is not approved');
-  if (neon && (!isSolArbiter(arbiter) || policy.route.taskId !== undefined || policy.policyDigest !== undefined)) {
-    throw new Error('Neon requires a subject-bound queue route, fingerprinted policy and Sol arbiter');
-  }
-  const skills = critic.skills;
-  if ((neon || skills !== undefined) && !isReviewSkillList(skills)) throw new Error('Invalid review skill binding');
-  const skillPaths = await Promise.all((skills ?? []).map(skill => {
-    const path = policy.reviewSkillFiles?.[skill];
-    if (!isAbsolute(path ?? '')) throw new Error(`Missing operator review skill: ${skill}`);
-    return realpath(path);
-  }));
-  workerSelector.assertTriadIndependent({ executor: policy.bb, critic, arbiter });
-  return { critic, arbiter, neon, skills: skills ?? [], skillPaths };
-}
 
 async function readOperatorInputs(paths) {
   const inputs = new Map(await Promise.all(paths.map(async path => [path, await readFile(path)])));
@@ -673,17 +656,18 @@ async function execute() {
           }
           // Один повтор того же критика/субъекта только по доказанному
           // таймауту раннера (exit 143 / host timeout). Перед повтором —
-          // текущий lease/epoch, допуск карточки и kill-switch,
-          // закреплённые входы оператора и неизменный чистый worktree на
-          // candidate_sha; неуспех гейта или второй сбой — обычный hold.
+          // свежее доказательство lease/epoch и допуска карточки
+          // (verifyHeld + matches + guardTask, не кэш флага), kill-switch,
+          // закреплённые входы оператора и тот же зачисленный worktree на
+          // той же ветке с candidate_sha; неуспех гейта или второй сбой —
+          // обычный hold.
           const receipt = await telemetry.phase('l2_critic', () => l2ReviewWithTransientRetry({
             review, binding: handoff, profile: trusted,
-            beforeRetry: async () => {
-              await renewal;
-              if (lost) throw new Error('Lease lost');
-              await assertPinned();
-              await beforeEffect?.();
-            },
+            beforeRetry: l2ReviewRetryGuard({ port, taskId: attempt.task_id,
+              epoch: attempt.epoch, owner: p.owner, label: p.label,
+              assertPinned, beforeEffect, assertOpen }),
+            verifySubject: b => assertRetrySubjectUnchanged({ ...b, worktree: tree,
+              branch: profile.branch }),
             log: note => console.log(JSON.stringify(note)),
           }));
           lastReviewReceipt = receipt ?? null;

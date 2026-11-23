@@ -7,11 +7,12 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 import {
-  assertRetrySubjectUnchanged, isolatedPiReviewRunner, l2CriticSpec,
-  l2ReviewWithTransientRetry, reviewRunnerExitFailure, ReviewDenied,
-  ReviewRunnerTimeout,
+  assertRetrySubjectUnchanged, classifySandboxExit, isolatedPiReviewRunner,
+  l2CriticSpec, l2ReviewRetryGuard, l2ReviewWithTransientRetry,
+  reviewRunnerExitFailure, ReviewDenied, ReviewRunnerTimeout,
 } from './review-runner.mjs';
-import { isNeonReview } from './review-policy.mjs';
+import { isNeonReview, isSolArbiter } from './review-policy.mjs';
+import { operatorReviewSetup } from './review-setup.mjs';
 
 const exec = promisify(execFile);
 
@@ -66,6 +67,25 @@ test('classification: только 143 и host-timeout — typed transient', () 
     assert.ok(e instanceof ReviewDenied, JSON.stringify(run));
     assert.ok(!(e instanceof ReviewRunnerTimeout), JSON.stringify(run));
   }
+});
+
+test('classification: host exec evidence — только killed+SIGTERM', () => {
+  // Реальная классификация хостового сбоя execFile в адаптере: timeout хоста
+  // добивает child сигналом SIGTERM (killed=true). Всё прочее — не таймаут.
+  assert.deepEqual(classifySandboxExit({ killed: true, signal: 'SIGTERM' }),
+    { code: null, timedOut: true });
+  assert.deepEqual(classifySandboxExit({ killed: true, signal: 'SIGTERM', code: null }),
+    { code: null, timedOut: true });
+  for (const error of [
+      { code: 143 }, { code: 1 }, { code: 'ENOENT' }, { code: 'EACCES' },
+      { killed: true, signal: 'SIGKILL' }, { killed: true, signal: 'SIGINT' },
+      { killed: false, signal: 'SIGTERM' }, { signal: 'SIGTERM' }, {}]) {
+    const { timedOut } = classifySandboxExit(error);
+    assert.equal(timedOut, false, JSON.stringify(error));
+  }
+  // Числовой код пробрасывается как есть, вне зависимости от killed.
+  assert.deepEqual(classifySandboxExit({ code: 143, killed: false }),
+    { code: 143, timedOut: false });
 });
 
 test('retry: первый 143 затем успех — ровно два вызова раннера', async () => {
@@ -135,16 +155,78 @@ test('retry: обычный REWORK — один вызов, вердикт пр�
   assert.equal(receipt.status, 'REWORK');
 });
 
-test('retry: отказ гейтов контроллера (lease/switch/пины) — ноль доп. вызовов', async () => {
+// Продукционный гейт l2ReviewRetryGuard: свежий verifyHeld (не кэш флага),
+// допуск карточки (owner/label), guardTask, закреплённые входы и kill-switch.
+function guardFixture(over = {}) {
+  const seen = [];
+  const port = {
+    verifyHeld: async (taskId, epoch) => { seen.push('verifyHeld'); return { epoch }; },
+    matches: async () => { seen.push('matches'); return true; },
+    guardTask: async () => { seen.push('guardTask'); },
+    ...over.port,
+  };
+  const args = { port, taskId: '1', epoch: 1, owner: 'local:user:t',
+    label: { key: 'queue', value: 'x' },
+    assertPinned: async () => { seen.push('assertPinned'); },
+    beforeEffect: async () => { seen.push('beforeEffect'); },
+    ...over };
+  return { guard: l2ReviewRetryGuard(args), seen };
+}
+
+test('guard: production retry guard — каждая проверка живая и заново', async () => {
   const { review, calls } = scriptedReview([
     timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
-  await assert.rejects(
-    l2ReviewWithTransientRetry({ review, binding: BINDING,
-      profile: { review: CRITIC },
-      beforeRetry: async () => { throw new Error('Lease lost'); },
-      verifySubject: async () => {} }),
-    (e) => e.message === 'Lease lost');
-  assert.equal(calls(), 1);
+  const { guard, seen } = guardFixture();
+  const receipt = await l2ReviewWithTransientRetry({ review, binding: BINDING,
+    profile: { review: CRITIC }, beforeRetry: guard,
+    verifySubject: async () => {} });
+  assert.equal(calls(), 2);
+  assert.equal(receipt.verdict, 'REVIEW_OK');
+  // Порядок: lease → допуск карточки → guardTask → пины/switch → beforeEffect.
+  assert.deepEqual(seen, ['verifyHeld', 'matches', 'guardTask', 'assertPinned', 'beforeEffect']);
+});
+
+test('guard: дрейф lease/epoch до повтора — ноль доп. вызовов', async () => {
+  for (const port of [
+      { verifyHeld: async () => { const e = new Error('claim_lost'); e.code = 'claim_lost'; throw e; } },
+      { verifyHeld: async () => ({ epoch: 2 }) }]) {
+    const { review, calls } = scriptedReview([
+      timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
+    const { guard } = guardFixture({ port: { matches: async () => true, guardTask: async () => {}, ...port } });
+    await assert.rejects(
+      l2ReviewWithTransientRetry({ review, binding: BINDING,
+        profile: { review: CRITIC }, beforeRetry: guard,
+        verifySubject: async () => {} }),
+      (e) => e.code === 'claim_lost' || e.message === 'Lease lost');
+    assert.equal(calls(), 1);
+  }
+});
+
+test('guard: смена владельца/метки, отказ guardTask и пинов — ноль доп. вызовов', async () => {
+  const cases = [
+    { port: { verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => false, guardTask: async () => {} },
+      check: (e) => e.message === 'Task no longer authorized' },
+    { port: { verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true,
+        guardTask: async () => { throw new Error('task_denied'); } },
+      check: (e) => e.message === 'task_denied' },
+    { port: { verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true, guardTask: async () => {} },
+      assertPinned: async () => { throw new Error('Operator inputs changed'); },
+      check: (e) => e.message === 'Operator inputs changed' },
+    { port: { verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true, guardTask: async () => {} },
+      assertOpen: async () => { throw new Error('kill_switch'); },
+      check: (e) => e.message === 'kill_switch' },
+  ];
+  for (const { check, ...over } of cases) {
+    const { review, calls } = scriptedReview([
+      timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
+    const { guard } = guardFixture(over);
+    await assert.rejects(
+      l2ReviewWithTransientRetry({ review, binding: BINDING,
+        profile: { review: CRITIC }, beforeRetry: guard,
+        verifySubject: async () => {} }),
+      check);
+    assert.equal(calls(), 1);
+  }
 });
 
 test('retry: отказ проверки субъекта до повтора — ноль доп. вызовов', async () => {
@@ -158,17 +240,32 @@ test('retry: отказ проверки субъекта до повтора �
   assert.equal(calls(), 1);
 });
 
-test('retry: Neon-профиль допускается существующей политикой', async () => {
-  // Существующий операторский путь: google/gemini-4-neon получает наследуемый
-  // medium через l2CriticSpec и признаётся isNeonReview — нового парсера нет.
-  const neonSpec = l2CriticSpec({ provider: 'google', model: 'gemini-4-neon',
-    skills: ['logika'] });
-  assert.ok(isNeonReview(neonSpec));
+test('retry: Neon-профиль допускается реальным operatorReviewSetup', async (t) => {
+  // Полный операторский путь без модели: документированный Neon medium со
+  // скиллами на subject-bound очереди и Sol-арбитре — реальный
+  // operatorReviewSetup проверяет профиль, скилл-файлы и триаду.
+  const dir = await mkdtemp(join(tmpdir(), 'retry-skills-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const skillFile = join(dir, 'logika.md');
+  await writeFile(skillFile, 'review skill\n');
+  const policy = {
+    bb: { provider: 'acp-devin', model: 'swe-2-high' },
+    profiles: { code: { review: { provider: 'google', model: 'gemini-4-neon',
+      reasoningLevel: 'medium', skills: ['logika'] } } },
+    arbiter: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' },
+    route: { checkProfile: 'code' },
+    reviewSkillFiles: { logika: skillFile },
+  };
+  const setup = await operatorReviewSetup(policy);
+  assert.equal(setup.neon, true);
+  assert.ok(isNeonReview(l2CriticSpec(setup.critic)));
+  assert.ok(isSolArbiter(setup.arbiter));
+  assert.deepEqual(setup.skillPaths, [skillFile]);
   // Повтор runner-агностик: любой read-only раннер с typed timeout.
   const { review, calls } = scriptedReview([
     timeout('review_runner_exit:143'), { status: 'PASS' }]);
   const receipt = await l2ReviewWithTransientRetry({ review, binding: BINDING,
-    profile: { review: neonSpec }, beforeRetry: async () => {},
+    profile: { review: l2CriticSpec(setup.critic) }, beforeRetry: async () => {},
     verifySubject: async () => {} });
   assert.equal(calls(), 2);
   assert.equal(receipt.status, 'PASS');
@@ -209,6 +306,7 @@ async function fixture(t, results) {
   const sandbox = async () => {
     calls++;
     const next = queue.length > 1 ? queue.shift() : queue[0];
+    if (next instanceof Error) throw next;
     if (typeof next === 'function') return next();
     return next;
   };
@@ -254,6 +352,54 @@ gitTest('runner: security-отказ (запрещённый tool) — один 
   assert.equal(calls(), 1);
 });
 
+gitTest('runner: завершённый ответ при коде 143 валидируется, а не повторяется', async (t) => {
+  // PASS-транскрипт при ненулевом выходе — обычная валидация, не transient.
+  const { review, binding, profile, calls } = await fixture(t, [
+    { code: 143, stdout: PASS, stderr: 'killed at teardown' },
+    { code: 0, stdout: PASS, stderr: '' }]);
+  const receipt = await l2ReviewWithTransientRetry({ review, binding, profile,
+    beforeRetry: async () => { throw new Error('no retry expected'); } });
+  assert.equal(calls(), 1);
+  assert.equal(receipt.verdict, 'REVIEW_OK');
+});
+
+gitTest('runner: завершённый REWORK при коде 143 — один вызов, вердикт сохранён', async (t) => {
+  const rework = stream(JSON.stringify({ verdict: 'REWORK', summary: 'bad',
+    subject_digest: DIGEST,
+    findings: [{ file: 'b.txt', line: 1, expected: 'x', actual: 'y' }] }));
+  const { review, binding, profile, calls } = await fixture(t, [
+    { code: 143, stdout: rework, stderr: '' },
+    { code: 0, stdout: PASS, stderr: '' }]);
+  const receipt = await l2ReviewWithTransientRetry({ review, binding, profile,
+    beforeRetry: async () => { throw new Error('no retry expected'); } });
+  assert.equal(calls(), 1);
+  assert.equal(receipt.status, 'REWORK');
+});
+
+gitTest('runner: завершённый, но misattested ответ при 143 — отказ без повтора', async (t) => {
+  const wrongModel = stream('REVIEW_OK', { model: 'gpt-6.2-astra' });
+  const { review, binding, profile, calls } = await fixture(t, [
+    { code: 143, stdout: wrongModel, stderr: '' },
+    { code: 0, stdout: PASS, stderr: '' }]);
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review, binding, profile,
+      beforeRetry: async () => { throw new Error('no retry expected'); } }),
+    (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout));
+  assert.equal(calls(), 1);
+});
+
+gitTest('runner: sandbox cleanup failure — typed ReviewDenied, без повтора', async (t) => {
+  const { review, binding, profile, calls } = await fixture(t, [
+    new ReviewDenied('sandbox_cleanup_failed'),
+    { code: 0, stdout: PASS, stderr: '' }]);
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review, binding, profile,
+      beforeRetry: async () => { throw new Error('no retry expected'); } }),
+    (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout) &&
+      e.reason === 'sandbox_cleanup_failed');
+  assert.equal(calls(), 1);
+});
+
 gitTest('runner: смена HEAD до повтора — отказ, повторного вызова нет', async (t) => {
   const { review, binding, profile, calls, git, dir } = await fixture(t, [
     async () => {
@@ -282,14 +428,28 @@ gitTest('runner: грязный worktree до повтора — отказ, п�
   assert.equal(calls(), 1);
 });
 
-gitTest('subject: проверка требует worktree, SHA и чистое дерево на candidate', async (t) => {
+gitTest('subject: worktree, ветка, SHA и чистое дерево на candidate', async (t) => {
   const { dir, git, base, sha } = await repo();
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const binding = { worktree: dir, candidate_sha: sha, base_sha: base };
+  const binding = { worktree: dir, candidate_sha: sha, base_sha: base, branch: 'pilot' };
   await assertRetrySubjectUnchanged(binding);
+  // Без заданной ветки — HEAD обязан быть attached (зачисленная ветка есть).
+  await assertRetrySubjectUnchanged({ ...binding, branch: undefined });
   await assert.rejects(assertRetrySubjectUnchanged({ ...binding, worktree: '/no' }));
   await assert.rejects(assertRetrySubjectUnchanged({ ...binding, candidate_sha: 'x' }),
     (e) => e.reason === 'review_retry_subject_unverified');
+  // Другая ветка на том же коммите — не тот субъект.
+  await assert.rejects(assertRetrySubjectUnchanged({ ...binding, branch: 'other' }),
+    (e) => e.reason === 'review_retry_subject_changed');
+  await git('checkout', '-qb', 'other');
+  await assert.rejects(assertRetrySubjectUnchanged(binding),
+    (e) => e.reason === 'review_retry_subject_changed');
+  // Detached HEAD на том же SHA — отказ.
+  await git('checkout', '-q', '--detach', 'HEAD');
+  await assert.rejects(assertRetrySubjectUnchanged({ ...binding, branch: undefined }),
+    (e) => e.reason === 'review_retry_subject_changed');
+  await git('checkout', '-q', 'pilot');
+  // Грязное дерево и смена HEAD — отказ.
   await writeFile(join(dir, 'd.txt'), 'd\n');
   await assert.rejects(assertRetrySubjectUnchanged(binding),
     (e) => e.reason === 'review_retry_subject_changed');
