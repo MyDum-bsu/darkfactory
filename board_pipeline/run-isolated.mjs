@@ -40,7 +40,9 @@ const approved = [
 ];
 const isApprovedWorker = bb =>
   approved.some(e => e.provider === bb?.provider && e.model === bb?.model) ||
-  (bb?.provider === 'pi' && /^opencode-go\/deepseek-/i.test(bb?.model ?? ''));
+  (bb?.provider === 'pi' && typeof bb.model === 'string' &&
+    /^opencode-go\//i.test(bb.model) &&
+    workerSelector.workerFamily(bb) === 'deepseek');
 
 async function operatorReviewSetup(policy) {
   const critic = policy.profiles?.[policy.route.checkProfile]?.review;

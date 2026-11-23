@@ -52,23 +52,29 @@ export function workerFamily(worker) {
   return executorFamily(worker);
 }
 
-// Политика opencode-go: допускаются строго модели DeepSeek
-// ('opencode-go/deepseek-*'). Любая другая модель opencode-go — явный отказ
-// 'opencode_go_non_deepseek_disallowed'. Для харнесса 'pi' правило
-// применяется к вложенной модели вида 'provider/model'.
+// Политика opencode-go: допускаются строго модели DeepSeek, аттестованные
+// строгой таблицей MODEL_FAMILY (workerFamily(spec) === 'deepseek'). Любая
+// другая модель opencode-go — явный отказ 'opencode_go_non_deepseek_disallowed';
+// нестроковый model и похожие префиксы ('deepseek-fake') не проходят гейт.
+// Для харнесса 'pi' правило применяется к вложенной модели 'opencode-go/...'.
 export function opencodeGoPolicyViolation(spec) {
   if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) return null;
-  const check = model =>
-    /^deepseek-/i.test(model ?? '') ? null : 'opencode_go_non_deepseek_disallowed';
-  if (typeof spec.provider === 'string' && spec.provider.toLowerCase() === 'opencode-go') {
-    return check(spec.model);
-  }
-  if (typeof spec.provider === 'string' && spec.provider.toLowerCase() === 'pi' &&
-      typeof spec.model === 'string' && spec.model.includes('/')) {
-    const i = spec.model.indexOf('/');
-    if (spec.model.slice(0, i).toLowerCase() === 'opencode-go') return check(spec.model.slice(i + 1));
-  }
-  return null;
+  const provider = typeof spec.provider === 'string' ? spec.provider.toLowerCase() : '';
+  const viaHarness = provider === 'pi' && typeof spec.model === 'string' &&
+    spec.model.includes('/') &&
+    spec.model.slice(0, spec.model.indexOf('/')).toLowerCase() === 'opencode-go';
+  if (provider !== 'opencode-go' && !viaHarness) return null;
+  return typeof spec.model === 'string' && workerFamily(spec) === 'deepseek'
+    ? null : 'opencode_go_non_deepseek_disallowed';
+}
+
+// Полный запрет выбывшего провайдера: acp-zcode-start отклоняется в любом
+// списке кандидатов (явный plan, allowlist политики), не только в дефолтном
+// плане. Причина — 'zcode_provider_retired'.
+export function retiredProviderViolation(spec) {
+  return typeof spec?.provider === 'string' &&
+    spec.provider.toLowerCase() === 'acp-zcode-start'
+    ? 'zcode_provider_retired' : null;
 }
 
 // Упорядоченный план исполнителей маршрута: первичный acp-devin/swe-2-high,
@@ -145,7 +151,7 @@ export async function attemptSpawnWithFallback({
   const attemptedWorkers = [];
   const order2 = [];
   for (const [index, worker] of order.entries()) {
-    const violation = opencodeGoPolicyViolation(worker);
+    const violation = retiredProviderViolation(worker) ?? opencodeGoPolicyViolation(worker);
     try {
       if (violation) throw new ReviewDenied(violation);
       assertTriadIndependent({ executor: worker, critic, arbiter });
@@ -565,7 +571,7 @@ export function normalizeRoutingPolicy(policy) {
       const spec = { provider: entry?.provider, model: entry?.model,
         ...(entry?.effort !== undefined ? { effort: entry.effort } : {}),
         ...(entry?.reasoningLevel !== undefined ? { reasoningLevel: entry.reasoningLevel } : {}) };
-      const violation = opencodeGoPolicyViolation(spec);
+      const violation = retiredProviderViolation(spec) ?? opencodeGoPolicyViolation(spec);
       if (violation) throw new ReviewDenied(violation);
       if (workerFamily(spec) === null) throw new ReviewDenied('route_allowlist_unknown_family');
       return spec;
@@ -746,17 +752,15 @@ function escalationTriggerActive(trigger) {
   return HIGH_STAKES_TRIGGERS.has(trigger.kind ?? trigger.name ?? trigger.trigger);
 }
 
-// Доступная квота Opus: status 'available', remaining >= 1 и — при заданном
-// жёстком cap — used строго меньше cap. Что-либо недоказано — недоступно.
+// Доступная квота Opus: status 'available', remaining — целое >= 1, а cap и
+// used — обязательные целые: cap >= 1, used >= 0 и used строго меньше cap.
+// Что-либо недоказано — недоступно.
 function opusQuotaAvailable(quota) {
   if (quota === null || typeof quota !== 'object' || Array.isArray(quota)) return false;
-  if (quota.status !== 'available') return false;
-  if (!Number.isSafeInteger(quota.remaining) || quota.remaining < 1) return false;
-  if (quota.cap !== undefined) {
-    if (!Number.isSafeInteger(quota.cap) || !Number.isSafeInteger(quota.used) ||
-        quota.used >= quota.cap) return false;
-  }
-  return true;
+  return quota.status === 'available' &&
+    Number.isSafeInteger(quota.remaining) && quota.remaining > 0 &&
+    Number.isSafeInteger(quota.cap) && quota.cap >= 1 &&
+    Number.isSafeInteger(quota.used) && quota.used >= 0 && quota.used < quota.cap;
 }
 
 // Детерминированный выбор escalation-ревьюера.
@@ -772,8 +776,13 @@ function opusQuotaAvailable(quota) {
 export function selectEscalationReviewer({ trigger, quota, triad } = {}) {
   const workerFam = workerFamily(triad?.worker ?? triad?.executor);
   const criticFam = workerFamily(triad?.critic);
+  // Попарная проверка триады: оба семейства аттестованы и различны — до
+  // выбора Opus 5.5 и до любого fallback. Совпавшая или неизвестная пара не
+  // доказывает независимость — отказ.
+  if (workerFam === null || criticFam === null || workerFam === criticFam) {
+    return { outcome: 'rejected', reason: 'escalation_triad_invalid', reviewer: null };
+  }
   const independent = spec => {
-    if (workerFam === null || criticFam === null) return false;
     const family = workerFamily(spec);
     return family !== null && family !== workerFam && family !== criticFam;
   };

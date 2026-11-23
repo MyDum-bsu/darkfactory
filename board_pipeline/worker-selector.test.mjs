@@ -17,6 +17,7 @@ import {
   opencodeGoPolicyViolation,
   PRIMARY_WORKER,
   resolveArbitration,
+  retiredProviderViolation,
   roundSignature,
   selectEscalationReviewer,
   selectWorker,
@@ -858,4 +859,114 @@ test('selectEscalationReviewer: ни один вариант не сохраня
     triad: { worker: { provider: 'mystery', model: 'x' }, critic: DEFAULT_CRITIC },
   });
   assert.equal(unknown.outcome, 'rejected');
+});
+
+// ── Routing Policy v2 rev.2: полный запрет acp-zcode-start ─────────────────
+test('retiredProviderViolation: acp-zcode-start отклоняется в любом списке', () => {
+  assert.equal(retiredProviderViolation(PRIMARY_WORKER), null);
+  assert.equal(retiredProviderViolation({ provider: 'pi', model: 'opencode-go/deepseek-v4' }), null);
+  assert.equal(retiredProviderViolation({
+    provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }),
+    'zcode_provider_retired');
+});
+
+test('явный plan с acp-zcode-start: резерв пропускается, первичный — отказ', async () => {
+  const refused = { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
+  const zcode = { provider: 'acp-zcode-start',
+    model: 'builtin:zai-start-plan\\GLM-5.3-Flash', effort: 'max' };
+  // Резерв zcode — пропуск с явной причиной, маршрут продолжается.
+  const { calls, spawn } = spawnLog([{ threadId: 'thr_ds9' }]);
+  const sel = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn, inspectWorktree: cleanTree,
+    plan: [PRIMARY_WORKER, zcode, NARROW_RESERVE_PI],
+    probe: async w => w.provider === 'acp-devin' ? refused : QUOTA_OK,
+  });
+  assert.equal(sel.outcome, 'spawned');
+  assert.equal(sel.worker.provider, 'pi');
+  const retired = sel.attemptedWorkers.find(w => w.provider === 'acp-zcode-start');
+  assert.equal(retired.verdict, 'skipped');
+  assert.equal(retired.reason, 'zcode_provider_retired');
+  // Первичный zcode — отказ маршрута до spawn.
+  const x = spawnLog([{ threadId: 'thr_never' }]);
+  const rej = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn: x.spawn, plan: [zcode, NARROW_RESERVE_PI],
+    probe: async () => QUOTA_OK, inspectWorktree: cleanTree,
+  });
+  assert.equal(rej.outcome, 'rejected');
+  assert.equal(rej.reason, 'zcode_provider_retired');
+  assert.equal(x.calls.length, 0);
+});
+
+test('allowlist.worker с acp-zcode-start — отказ политики', () => {
+  assert.throws(() => normalizeRoutingPolicy({
+    routing: { allowlist: { worker: [
+      { provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }] } },
+  }), e => e instanceof ReviewDenied && e.reason === 'zcode_provider_retired');
+});
+
+// ── Rev.2: строгий DeepSeek-only — аттестованное семейство, не префикс ─────
+test('opencodeGoPolicyViolation: только аттестованные deepseek из MODEL_FAMILY', () => {
+  // Похожий префикс и голое имя не проходят: семейство обязано быть 'deepseek'.
+  for (const spec of [
+    { provider: 'opencode-go', model: 'deepseek-fake' },
+    { provider: 'opencode-go', model: 'deepseek' },
+    { provider: 'opencode-go', model: 'deepseek-v9' }, // не из таблицы
+    { provider: 'opencode-go', model: ['deepseek-v4'] }, // нестроковый model
+    { provider: 'opencode-go' },
+    { provider: 'pi', model: 'opencode-go/deepseek-fake' },
+    { provider: 'pi', model: 'opencode-go/deepseek-v9' },
+  ]) assert.equal(opencodeGoPolicyViolation(spec), 'opencode_go_non_deepseek_disallowed',
+    JSON.stringify(spec));
+  for (const spec of [
+    { provider: 'opencode-go', model: 'deepseek-v4' },
+    { provider: 'opencode-go', model: 'deepseek-reasoner' },
+    { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
+  ]) assert.equal(opencodeGoPolicyViolation(spec), null, JSON.stringify(spec));
+});
+
+// ── Rev.2: строгая квота Opus — обязательные cap/used, целые и разумные ────
+test('opus-квота: без cap/used или с мусором — opus_quota_exhausted', () => {
+  for (const quota of [
+    { status: 'available', remaining: 1 }, // нет cap/used
+    { status: 'available', remaining: 1, cap: -1, used: -2 },
+    { status: 'available', remaining: 1, cap: 0, used: -1 },
+    { status: 'available', remaining: 1, cap: 3, used: -1 },
+    { status: 'available', remaining: 1, cap: 3, used: 3 },
+    { status: 'available', remaining: 1, cap: 3 },
+    { status: 'available', remaining: 1, used: 0 },
+    { status: 'available', remaining: 1, cap: 'x', used: 0 },
+    { status: 'available', remaining: 1, cap: 2.5, used: 0 },
+    { status: 'available', remaining: 1, cap: 3, used: 1.5 },
+  ]) {
+    const sel = selectEscalationReviewer({ trigger: 'security_gate', quota,
+      triad: { worker: PRIMARY_WORKER, critic: DEFAULT_CRITIC } });
+    assert.equal(sel.outcome, 'fallback', JSON.stringify(quota));
+    assert.equal(sel.reason, 'opus_quota_exhausted');
+  }
+  // Корректная квота — выбор.
+  const ok = selectEscalationReviewer({ trigger: 'security_gate',
+    quota: { status: 'available', remaining: 1, cap: 3, used: 2 },
+    triad: { worker: PRIMARY_WORKER, critic: DEFAULT_CRITIC } });
+  assert.equal(ok.outcome, 'selected');
+});
+
+// ── Rev.2: попарная проверка триады — совпавшая пара не допускает выбор ────
+test('selectEscalationReviewer: worker и critic одного семейства — отказ', () => {
+  for (const triad of [
+    { worker: PRIMARY_WORKER, critic: { provider: 'acp-devin', model: 'swe-2-medium' } },
+    { worker: DEFAULT_CRITIC, critic: DEFAULT_CRITIC },
+    { worker: { provider: 'mystery', model: 'x' }, critic: DEFAULT_CRITIC },
+    { worker: PRIMARY_WORKER }, // нет критика
+    {},
+  ]) {
+    const sel = selectEscalationReviewer({ trigger: 'security_gate',
+      quota: { status: 'available', remaining: 1, cap: 3, used: 0 }, triad });
+    assert.equal(sel.outcome, 'rejected', JSON.stringify(triad));
+    assert.equal(sel.reason, 'escalation_triad_invalid');
+    assert.equal(sel.reviewer, null);
+    // И без триггера та же невалидная пара не даёт fallback.
+    const fb = selectEscalationReviewer({ trigger: null, quota: null, triad });
+    assert.equal(fb.outcome, 'rejected');
+    assert.equal(fb.reason, 'escalation_triad_invalid');
+  }
 });
