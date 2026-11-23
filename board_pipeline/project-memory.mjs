@@ -648,7 +648,7 @@ export async function resolveProjectMemory({
   };
 }
 
-export async function recordProjectMemoryUpdate({
+async function recordProjectMemoryUpdate({
   storeDir,
   projectId,
   updates,

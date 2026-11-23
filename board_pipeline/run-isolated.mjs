@@ -26,8 +26,8 @@ import { arbiterIntakePrompt, decisionsPromptBlock, projectMemoryPromptBlock,
   workerIntakePrompt } from './intake-prompt.mjs';
 import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
   resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
-import { DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS, memoryPolicyConfig, pinProjectMemory,
-  resolveMemoryStoreDir, resolveProjectMemory } from './project-memory.mjs';
+import { createProjectMemoryWriter, DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS,
+  memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir, resolveProjectMemory } from './project-memory.mjs';
 import { createTelemetryRecorder, threadUsage } from './telemetry.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
@@ -220,6 +220,18 @@ async function execute() {
     const slice = await pinnedProjectMemory(key);
     return slice && slice.enabled !== false ? slice : undefined;
   };
+  const projectMemoryWriter = memoryStoreDir !== null &&
+      (memoryCfg.trustedReceiptDir !== undefined || memoryCfg.hmacKey !== undefined)
+    ? createProjectMemoryWriter({
+        storeDir: memoryStoreDir,
+        trustedReceiptDir: memoryCfg.trustedReceiptDir,
+        hmacKey: memoryCfg.hmacKey,
+        worktree: tree,
+        maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS,
+        ...(memoryCfg.maxEntriesPerSection !== undefined
+          ? { maxEntriesPerSection: memoryCfg.maxEntriesPerSection } : {}),
+      })
+    : undefined;
   const decisionLedger = ledgerPath !== null && ledgerCfg.recordAnswers === true
     ? ({ answer, question }) => recordDecision({ ledgerPath, scope: decisionScope, rule: answer,
         sourceCard: question.task_id, recordedBy: ledgerCfg.recordedBy ?? 'question-resume',
@@ -516,7 +528,7 @@ async function execute() {
   const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
     release: releasePort, recheckRejectedHandoff: recheck,
     workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter, arbitrate },
-    decisionLedger });
+    decisionLedger, projectMemoryWriter });
   const observeTick = result => {
     recheck = false;
     lastResult = result;
