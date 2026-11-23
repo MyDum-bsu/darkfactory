@@ -751,6 +751,73 @@ export function routeTriad({ size, domain, policy, scorecard,
     mode: steps.worker.mode, selected, steps };
 }
 
+// План исполнителей по выбранной триаде: динамический первичный, затем
+// дефолтные резервы без дублей — попытка сама отфильтрует нарушителей
+// триады и запрещённые модели на каждом шаге.
+function planFor(worker) {
+  const key = w => `${w?.provider}/${w?.model}`;
+  const plan = [worker];
+  for (const reserve of [NARROW_RESERVE_PI, FALLBACK_ANTIGRAVITY_NEON]) {
+    if (key(reserve) !== key(worker)) plan.push(reserve);
+  }
+  return plan;
+}
+
+// Активация динамического routeTriad (Board #1263). Режим берётся из
+// policy.routing.mode: 'shadow' (дефолт, безопасный) только наблюдает,
+// 'active' выбирает по скоркарду строго поверх политики #1247 (allowlist,
+// 0 zcode, DeepSeek-only в opencode-go, квоты, триада трёх семейств).
+// Любая ошибка или деградация — детерминированный откат к дефолтной
+// триаде с явной причиной; частичная динамическая триада не применяется.
+// Возврат: { outcome, mode, selected: {worker, critic, arbiter}, plan,
+// reason?, steps? } — plan готов для attemptSpawnWithFallback.
+export function resolveTriad({ size, domain, policy, scorecard,
+  base = { worker: PRIMARY_WORKER, critic: DEFAULT_CRITIC, arbiter: DEFAULT_ARBITER },
+  availability = null, log = null } = {}) {
+  const fallback = (reason, extra = {}) => {
+    if (typeof log === 'function') {
+      try { log({ kind: 'route_fallback', reason }); } catch { /* журнал не ломает маршрут */ }
+    }
+    return { outcome: 'fallback', mode: 'shadow', reason,
+      selected: base, plan: planFor(base.worker), ...extra };
+  };
+  let routing;
+  try {
+    routing = normalizeRoutingPolicy(policy);
+  } catch (e) {
+    return fallback(`routing_policy_invalid:${e?.reason ?? e?.message ?? 'invalid'}`);
+  }
+  if (routing.mode !== 'active') {
+    return { outcome: 'shadow', mode: 'shadow', selected: base, plan: planFor(base.worker) };
+  }
+  if (scorecard === null || scorecard === undefined ||
+      typeof scorecard !== 'object' || scorecard.cells === null ||
+      typeof scorecard.cells !== 'object') {
+    return fallback('scorecard_unavailable');
+  }
+  let routed;
+  try {
+    routed = routeTriad({ size, domain, policy, scorecard, base, availability, log });
+  } catch (e) {
+    return fallback(`route_triad_error:${e?.reason ?? e?.message ?? 'failed'}`);
+  }
+  if (routed.outcome !== 'routed' || routed.selected === null ||
+      routed.selected.worker === undefined) {
+    return fallback(`route_active_rejected:${routed.reason ?? 'no_selection'}`,
+      { steps: routed.steps });
+  }
+  // Инвариант трёх независимых семейств подтверждается ещё раз на
+  // финальной триаде — сбой проверки не может выдать частичный выбор.
+  try {
+    assertTriadIndependent({ executor: routed.selected.worker,
+      critic: routed.selected.critic, arbiter: routed.selected.arbiter });
+  } catch (e) {
+    return fallback(`route_triad_violation:${e?.reason ?? e?.message ?? 'failed'}`);
+  }
+  return { outcome: 'routed', mode: 'active', selected: routed.selected,
+    plan: planFor(routed.selected.worker), steps: routed.steps };
+}
+
 // ── Точечный escalation-слот Opus 5.5 (Routing Policy v2) ─────────────────
 // «Хирургический» сторонний ревьюер для high-stakes ситуаций: активируется
 // ТОЛЬКО при одновременном выполнении (а) явного high-stakes триггера,

@@ -81,3 +81,31 @@ test('a partially truncated slice keeps its entries and flags the cut', () => {
   assert.match(block, /срез усечён: показано 1 из 5/);
   assert.doesNotMatch(block, /нет активных решений/);
 });
+
+// ── Board #1263: read-only блок дистиллированных уроков ──
+import { lessonsPromptBlock } from './intake-prompt.mjs';
+
+const rules = [
+  'В коде и тестах нет путей вида /home/<user>/... — только параметры и env.',
+  'Перед сдачей проверь граничные случаи: пустой вход, границы, null.',
+];
+
+test('worker gets the read-only distilled lessons block', () => {
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: false, lessons: rules });
+  const block = prompt.indexOf('Уроки прошлых REWORK (read-only');
+  assert.ok(block > 0);
+  assert.match(prompt, /- В коде и тестах нет путей вида/);
+  assert.match(prompt, /не инструкция/);
+});
+
+test('no lessons — no lessons block', () => {
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: false });
+  assert.doesNotMatch(prompt, /Уроки прошлых REWORK/);
+});
+
+test('lessonsPromptBlock is fail-closed on a malformed list', () => {
+  assert.throws(() => lessonsPromptBlock('not a list'), /distilled_lessons_invalid/);
+  assert.throws(() => lessonsPromptBlock([]), /distilled_lessons_invalid/);
+  assert.throws(() => lessonsPromptBlock(['ok', 42]), /distilled_lessons_invalid/);
+  assert.throws(() => lessonsPromptBlock(['  ']), /distilled_lessons_invalid/);
+});

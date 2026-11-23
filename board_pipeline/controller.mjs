@@ -269,6 +269,9 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           route, attempt: attemptOf(record, route),
           critic: selCritic,
           arbiter: selArbiter,
+          // План даёт тот же selectWorker, но позволяет адаптеру подставить
+          // динамическую триаду (Routing Policy, режим active) — Board #1263.
+          plan: workerSelector.selectWorker({ route }),
           probe: typeof bb.probeAvailability === 'function' ? w => bb.probeAvailability(w) : undefined,
           spawn: envelope => bb.spawn(envelope),
           inspectWorktree: typeof bb.inspectWorktree === 'function'

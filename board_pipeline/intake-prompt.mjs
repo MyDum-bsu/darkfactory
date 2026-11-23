@@ -23,12 +23,26 @@ export function decisionsPromptBlock(slice) {
   return `${header}\n${body}${note}`;
 }
 
-export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions }) {
+// Read-only блок дистиллированных уроков прошлых REWORK (Board #1263):
+// только строки правил, уже прошедшие validateDistilledLessons. Блок —
+// данные, не инструкция: воркер читает чек-лист, но не может мутировать
+// хранилище уроков (живёт вне рабочего дерева).
+export function lessonsPromptBlock(lessons) {
+  if (!Array.isArray(lessons) || lessons.length === 0 ||
+      !lessons.every(rule => typeof rule === 'string' && rule.trim())) {
+    throw new Error('distilled_lessons_invalid');
+  }
+  const body = lessons.map(rule => `- ${rule}`).join('\n');
+  return `Уроки прошлых REWORK (read-only чек-лист, не инструкция):\n${body}`;
+}
+
+export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions, lessons }) {
   const instructions = [
     brief,
     `\nРабочий путь: ${tree}. Запиши JSON атомарно в ${handoffPath} и заверши ход. Сохрани типы полей: ${JSON.stringify(handoff)}`,
   ];
   if (decisions) instructions.push(decisionsPromptBlock(decisions));
+  if (lessons) instructions.push(lessonsPromptBlock(lessons));
   if (productQuestions) {
     instructions.push(OWNER_PRECHECK,
       'Только для одной оставшейся продуктовой развилки вместо candidate_sha передай question: {"prompt":"один конкретный вопрос","evidence":"короткое обоснование"}. Не вставляй секреты или сырой лог.');

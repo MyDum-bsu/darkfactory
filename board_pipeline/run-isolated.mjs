@@ -25,7 +25,10 @@ import { ReleaseDenied } from './release-contract.mjs';
 import { arbiterIntakePrompt, decisionsPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
 import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
   resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
-import { createTelemetryRecorder, threadUsage } from './telemetry.mjs';
+import { createTelemetryRecorder, readTelemetryLines, threadUsage } from './telemetry.mjs';
+import { aggregateScorecard } from './model-scorecard.mjs';
+import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
+  loadLessons, validateDistilledLessons } from './rework-distiller.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -213,6 +216,48 @@ async function execute() {
   // и сырых логов; не влезает в лимит 1000 — квитанция уходит без неё.
   const completeCard = port.complete.bind(port);
   port.complete = (taskId, epoch, evidence) => completeCard(taskId, epoch, telemetry.embed(evidence));
+  // VS-4.2 Self-Learning Review Loop (#1263): уроки REWORK живут в
+  // приватном каталоге состояния, вне дерева воркера. При инъекции
+  // хранилище проходит повторный fail-closed гейт — ослабляющий урок
+  // в промпт не попадает никогда.
+  const lessonsPath = join(root, 'lessons.jsonl');
+  const currentLessons = async () => {
+    const existing = await loadLessons(lessonsPath);
+    if (!existing.length) return [];
+    const { accepted } = validateDistilledLessons(existing);
+    return accepted.map(lesson => lesson.rule);
+  };
+  // Скоркард для динамического роутинга: журнал телеметрии того же root.
+  // Любая деградация — null → resolveTriad откатывается к дефолтной триаде.
+  const currentScorecard = async () => {
+    try {
+      const lines = await readTelemetryLines(join(root, 'telemetry.jsonl'));
+      return aggregateScorecard(lines);
+    } catch {
+      return null;
+    }
+  };
+  // Дистилляция после закрытия карточки с >=2 раундами REWORK. Fail-open:
+    // урок не может сломать приёмку — ошибка только журналируется.
+  const distillClosedAttempt = async () => {
+    try {
+      const record = await state.load();
+      const rounds = Array.isArray(record?.roundsHistory) ? record.roundsHistory : [];
+      if (rounds.length < DEFAULT_MIN_REWORK_ROUNDS) return;
+      const candidates = distillReworkLessons(rounds,
+        { cardId: String(record.taskId ?? route.taskId ?? 'unknown') });
+      if (!candidates.length) return;
+      const existing = await loadLessons(lessonsPath);
+      const { accepted, pending, rejected } = validateDistilledLessons(candidates, { existing });
+      if (accepted.length) await appendLessons(lessonsPath, accepted, { existing });
+      if (pending.length || rejected.length) {
+        console.log(JSON.stringify({ kind: 'lessons_gate',
+          pending: pending.map(lesson => lesson.id), rejected }));
+      }
+    } catch (error) {
+      console.error(`rework-distiller: ${String(error?.message ?? error).split('\n')[0]}`);
+    }
+  };
   const record = join(root, 'attempt.json');
   const git = async (...args) =>
     (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
@@ -260,9 +305,11 @@ async function execute() {
       const initial = join(root, `worker-${attempt.attempt_id}-${randomUUID()}.md`);
       const handoff = { task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
         worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' };
+      const lessonRules = await currentLessons().catch(() => []);
       const prompt = workerIntakePrompt({ brief: pinned.inputs.get(brief).toString('utf8'), tree,
         handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers),
-        decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined });
+        decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined,
+        lessons: lessonRules.length ? lessonRules : undefined });
       await writeFile(initial, prompt, { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
         '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
@@ -491,10 +538,26 @@ async function execute() {
   let previous;
   let recheck = values['recheck-rejected-handoff'];
   const tick = guardedEffect(assertOpen, advanceWithProjection);
-  const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
-    release: releasePort, recheckRejectedHandoff: recheck,
-    workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter, arbitrate },
-    decisionLedger });
+  const runTick = async () => {
+    // VS-4.2 (#1263): routing.mode 'active' выбирает триаду по скоркарду
+    // строго поверх политики #1247; любая деградация — детерминированный
+    // откат к дефолтной триаде с причиной, журналируемой в stdout-тик.
+    const routed = workerSelector.resolveTriad({
+      policy: p,
+      scorecard: await currentScorecard(),
+      base: { worker: workerSelector.PRIMARY_WORKER,
+        critic: reviewSetup.critic, arbiter: reviewSetup.arbiter },
+      log: note => console.log(JSON.stringify(note)),
+    });
+    return tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
+      release: releasePort, recheckRejectedHandoff: recheck,
+      workerSelector: { ...workerSelector,
+        critic: routed.selected.critic ?? reviewSetup.critic,
+        arbiter: routed.selected.arbiter ?? reviewSetup.arbiter,
+        selectWorker: () => routed.plan,
+        arbitrate },
+      decisionLedger });
+  };
   const observeTick = result => {
     recheck = false;
     lastResult = result;
@@ -538,6 +601,8 @@ async function execute() {
             return 'stop';
           }
           if (result.phase === 'done' || result.phase === 'hold') {
+            // Дистилляция уроков ревью до сброса записи попытки (#1263).
+            await distillClosedAttempt();
             // Иначе сводка следующей карточки унаследует счётчики предыдущей.
             await finishTelemetry();
             await state.save(null);
@@ -566,7 +631,11 @@ async function execute() {
     }
     throw new Error('Pilot wait elapsed; current attempt is preserved');
   } finally {
-    try { await finishTelemetry(); }
+    try {
+      // Закрытая карточка с историей REWORK — источник уроков (#1263).
+      if (['done', 'hold'].includes(lastResult?.phase)) await distillClosedAttempt();
+      await finishTelemetry();
+    }
     finally { await release(); }
   }
 }
