@@ -5,7 +5,7 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { aggregateScorecard, bucketKey, modelKey } from './model-scorecard.mjs';
+import { aggregateScorecard, bucketKey, modelKey, rankCandidates } from './model-scorecard.mjs';
 import {
   attemptSpawnWithFallback,
   DEFAULT_ARBITER,
@@ -522,7 +522,8 @@ test('критик L2 только на провайдерах с реальны
     arbiter: [SOL, { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' }] }));
   assert.equal(ok.allowlist.critic.length, 3);
   // Активный выбор критика: routed pi-критик исполняем раннером —
-  // 'pi/opencode-go/deepseek-…' нормализуется к 'deepseek' с egress.
+  // 'pi/opencode-go/deepseek-…' нормализуется к реальному pi-провайдеру
+  // 'opencode-go' (штатный egress opencode.ai, имя не переименовывается).
   const critic = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
   const lines = Array.from({ length: 6 }, () => JSON.stringify({
     kind: 'attempt_summary', schema: 1,
@@ -537,4 +538,69 @@ test('критик L2 только на провайдерах с реальны
     base: { worker: DEVIN, critic: NEON, arbiter: SOL } });
   assert.equal(res.outcome, 'routed');
   assert.deepEqual(res.selected.critic, critic);
+});
+
+test('телеметрия раннера матчит allowlist: runner-форма и pi-форма — один ключ (#1263 r4)', () => {
+  // Реальный раннер пишет в телеметрию нормализованный спек
+  // {provider:'opencode-go', model:'deepseek-…'}; allowlist несёт worker-
+  // форму 'pi/opencode-go/deepseek-…' — canonical modelKey сводит обе к
+  // 'opencode-go/deepseek-…': записи раннера дают кандидатов при ранжировании.
+  const runnerCritic = { provider: 'opencode-go', model: 'deepseek-v4.1-flash' };
+  const allowlistCritic = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  assert.equal(modelKey(runnerCritic), 'opencode-go/deepseek-v4.1-flash');
+  assert.equal(modelKey(allowlistCritic), 'opencode-go/deepseek-v4.1-flash');
+  // Шесть записей в форме раннера → кандидаты есть (раньше было 0).
+  const lines = Array.from({ length: 6 }, () => JSON.stringify({
+    kind: 'attempt_summary', schema: 1,
+    models: { worker: DEVIN, critic: runnerCritic, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+    phases_ms: { total: 60000 }, outcome: 'done', open: false }));
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  const ranked = rankCandidates(scorecard, { role: 'critic',
+    domain: 'backend', size: 'S', models: [NEON, allowlistCritic] });
+  assert.equal(ranked.length, 1);
+  // И сам выбор active-триады находит кандидата из телеметрии раннера.
+  const res = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+    policy: policy('active', { worker: [DEVIN], critic: [NEON, allowlistCritic],
+      arbiter: [SOL] }),
+    base: { worker: DEVIN, critic: NEON, arbiter: SOL } });
+  assert.equal(res.outcome, 'routed');
+  assert.deepEqual(res.selected.critic, allowlistCritic);
+});
+
+test('Neon-критик без Sol-арбитра несовместим с acceptHeld — фильтрация и fallback (#1263 r4)', () => {
+  // Allowlist допускает Neon-критика и DeepSeek-арбитра, но acceptHeld
+  // требует Neon ⇒ Sol. Devin/Neon/DeepSeek не должен выходить из resolveTriad.
+  const dsArbiter = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const solCritic = { provider: 'pi', model: 'openai/gpt-6.2-sol' };
+  const lines = [
+    ...journal(DEVIN, 6),
+    // Наблюдения за Neon-критиком и DS-арбитром в форме раннера.
+    ...Array.from({ length: 6 }, () => JSON.stringify({
+      kind: 'attempt_summary', schema: 1,
+      models: { worker: DEVIN, critic: NEON, arbiter: dsArbiter },
+      labels: { size: 'S', domain: 'backend' },
+      rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+      phases_ms: { total: 60000 }, outcome: 'done', open: false })),
+  ];
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  // Действующая база (Devin/Sol-критик/DS-арбитр) допустима и совместима —
+  // откат есть куда, но несовместимая routed-триада не выходит.
+  const res = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+    policy: policy('active', { worker: [DEVIN], critic: [NEON, solCritic],
+      arbiter: [dsArbiter] }),
+    base: { worker: DEVIN, critic: solCritic, arbiter: dsArbiter } });
+  // Кандидат-критик Neon доказан, но DS-арбитр с ним несовместим:
+  // безопасный откат, а не Devin/Neon/DeepSeek.
+  assert.equal(res.outcome, 'fallback', res.reason);
+  assert.match(res.reason, /^route_active_rejected:/);
+  assert.notDeepEqual(res.selected, { worker: DEVIN, critic: NEON, arbiter: dsArbiter });
+
+  // Несовместимая база (Neon + не-Sol арбитр) — явный rejected.
+  const bad = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+    policy: policy('active', { worker: [DEVIN], critic: [NEON], arbiter: [dsArbiter] }),
+    base: { worker: DEVIN, critic: NEON, arbiter: dsArbiter } });
+  assert.equal(bad.outcome, 'rejected');
+  assert.equal(bad.reason, 'route_base_acceptance_incompatible');
 });

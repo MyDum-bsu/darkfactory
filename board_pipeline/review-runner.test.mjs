@@ -1063,12 +1063,13 @@ test('runner: routed-критик с egress исполняется, acp-devin �
     const sha = await git('rev-parse', 'HEAD');
     const digest = 'f'.repeat(64);
     // Закреплённый критик в worker-форме pi-харнесса — нормализуется к
-    // 'deepseek' (есть в PROVIDER_EGRESS) и доходит до контейнера.
-    await writeFile(join(piRoot, 'auth.json'), '{"deepseek":{"k":"v"}}');
+    // реальному pi-провайдеру 'opencode-go' (штатный egress opencode.ai,
+    // провайдер НЕ переименовывается) и доходит до контейнера.
+    await writeFile(join(piRoot, 'auth.json'), '{"opencode-go":{"k":"v"}}');
     const routed = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash',
       reasoningLevel: 'medium' };
     const stream = [
-      msg({ provider: 'deepseek', model: 'deepseek-v4.1-flash',
+      msg({ provider: 'opencode-go', model: 'deepseek-v4.1-flash',
         content: [{ type: 'text',
           text: `{"verdict":"PASS","subject_digest":"${digest}"}` }] }), settled,
     ].join('\n');
@@ -1082,7 +1083,7 @@ test('runner: routed-критик с egress исполняется, acp-devin �
       { task_id: '1', candidate_sha: sha, worktree: repo,
         executor: 'acp-devin/swe-2-high', subject_digest: digest },
       { review: routed });
-    assert.equal(receipt.actual.provider, 'deepseek');
+    assert.equal(receipt.actual.provider, 'opencode-go');
     assert.equal(receipt.actual.model, 'deepseek-v4.1-flash');
     assert.ok(allow.length > 0, 'egress allowlist заполнен — нет model_proxy_allowlist_invalid');
 

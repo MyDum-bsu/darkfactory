@@ -8,8 +8,8 @@
 // чистый worktree и HEAD === base_sha. Неизвестный исход — uncertain без
 // второго писателя.
 
-import { executorFamily, l2RunnableSpec, ReviewDenied } from './review-runner.mjs';
-import { NEON_CRITIC, SOL_ARBITER } from './review-policy.mjs';
+import { executorFamily, l2RunnableSpec, runnerReviewSpec, ReviewDenied } from './review-runner.mjs';
+import { NEON_CRITIC, SOL_ARBITER, isNeonReview, isSolArbiter } from './review-policy.mjs';
 import {
   DEFAULT_MIN_OBSERVATIONS,
   modelKey,
@@ -662,14 +662,25 @@ export function routeRole({ role, size, domain, policy, scorecard,
     return reject('route_base_not_in_allowlist');
   }
   const skipped = [];
+  // Полная совместимость с acceptHeld ДО запуска воркера: помимо трёх
+  // семейств, критик Neon допустим только с арбитром Sol — иначе
+  // acceptHeld отклонит триаду vs2_review_triad_not_approved уже после
+  // spawn. Несовместимые комбинации отфильтровываются здесь.
   const triadOk = candidate => {
     const families = { ...fixed };
     families[role === 'worker' ? 'executor' : role] = candidate;
+    const critic = families.critic ?? (role === 'critic' ? candidate : undefined);
+    const arbiter = families.arbiter ?? (role === 'arbiter' ? candidate : undefined);
+    // Neon может прийти в worker-форме 'acp-antigravity-acp/gemini-4-neon' —
+    // acceptHeld видит runner-форму {provider:'google'}, поэтому и здесь
+    // сверка идёт по нормализованному спеку.
+    if (isNeonReview(runnerReviewSpec(critic) ?? critic) && !isSolArbiter(arbiter)) {
+      return false;
+    }
     try {
       assertTriadIndependent({
         executor: families.executor ?? (role === 'worker' ? candidate : undefined),
-        critic: families.critic ?? (role === 'critic' ? candidate : undefined),
-        arbiter: families.arbiter ?? (role === 'arbiter' ? candidate : undefined),
+        critic, arbiter,
       });
       return true;
     } catch {
@@ -688,9 +699,10 @@ export function routeRole({ role, size, domain, policy, scorecard,
   let recommended = null;
   for (const candidate of ranked) {
     // Выбор — объект из allowlist со всеми полями (effort, reasoningLevel),
-    // а не восстановленный из ключа скоркарда {provider, model}.
-    const spec = list.find(entry => entry.provider === candidate.model?.provider &&
-      entry.model === candidate.model?.model);
+    // а не восстановленный из ключа скоркарда {provider, model}. Сверка по
+    // каноническому ключу: runner-форма 'opencode-go/…' и allowlist-форма
+    // 'pi/opencode-go/…' — один и тот же кандидат.
+    const spec = list.find(entry => modelKey(entry) === modelKey(candidate.model));
     if (spec === undefined) continue; // страховка, rankCandidates уже фильтрует
     const status = availabilityOf(spec, availability);
     if (status !== 'available') {
@@ -826,6 +838,12 @@ export function resolveTriad({ size, domain, policy, scorecard,
     } catch (e) {
       return `route_base_triad_violation:${e?.reason ?? e?.message ?? 'failed'}`;
     }
+    // Совместимость с acceptHeld: Neon-критик требует арбитра Sol — иначе
+    // триада отвалится на приёмке уже после spawn (#1263 r4).
+    if (isNeonReview(runnerReviewSpec(base.critic) ?? base.critic) &&
+        !isSolArbiter(base.arbiter)) {
+      return 'route_base_acceptance_incompatible';
+    }
     if ((routing.allowlist.worker.length && !inAllowlist(base.worker, routing.allowlist.worker)) ||
         (routing.allowlist.critic.length && !inAllowlist(base.critic, routing.allowlist.critic)) ||
         (routing.allowlist.arbiter.length && !inAllowlist(base.arbiter, routing.allowlist.arbiter))) {
@@ -898,6 +916,12 @@ export function resolveTriad({ size, domain, policy, scorecard,
   if (!l2RunnableSpec(routed.selected.critic) ||
       !l2RunnableSpec(routed.selected.arbiter)) {
     return fallback('route_role_not_runnable');
+  }
+  // Полная совместимость с acceptHeld на финальной триаде: Neon без
+  // Sol-арбитра не выходит — безопасный fallback на проверенную базу.
+  if (isNeonReview(runnerReviewSpec(routed.selected.critic) ?? routed.selected.critic) &&
+      !isSolArbiter(routed.selected.arbiter)) {
+    return fallback('route_acceptance_incompatible');
   }
   return { outcome: 'routed', mode: 'active', selected: routed.selected,
     plan: safePlan(routed.selected.worker, routed.selected.critic, routed.selected.arbiter),

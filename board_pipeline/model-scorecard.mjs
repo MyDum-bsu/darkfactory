@@ -67,9 +67,16 @@ export function normalizeDomain(raw) {
 const sizeOf = entry => normalizeSize(entry?.labels?.size ?? entry?.size);
 const domainOf = entry => normalizeDomain(entry?.labels?.domain ?? entry?.domain);
 
+// Канонический ключ сопоставления телеметрии и allowlist: спек харнесса
+// 'pi/inner/model' ключуется по реальному pi-провайдеру 'inner/model' —
+// записи раннера ({provider:'opencode-go', model:'deepseek-…'}) и allowlist
+// ({provider:'pi', model:'opencode-go/deepseek-…'}) дают один ключ.
 export const modelKey = model =>
   typeof model?.provider === 'string' && typeof model?.model === 'string' &&
-  model.provider && model.model ? `${model.provider}/${model.model}` : null;
+  model.provider && model.model
+    ? (model.provider === 'pi' && model.model.includes('/')
+      ? model.model : `${model.provider}/${model.model}`)
+    : null;
 
 export const bucketKey = (model, role, domain, size) =>
   `${modelKey(model)}|${role}|${domain}|${size}`;

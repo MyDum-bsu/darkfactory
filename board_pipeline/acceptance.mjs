@@ -105,7 +105,7 @@ function validateHandoff(handoff) {
   if (!SHA_RE.test(handoff.base_sha)) throw new Denied('base_sha_not_full');
 }
 
-function validatePolicy(policy, checkProfile, { allowNeon = false } = {}) {
+function validatePolicy(policy, checkProfile, { allowNeon = false, pinned = false } = {}) {
   if (policy === null || typeof policy !== 'object') throw new Denied('policy_not_object');
   if (typeof policy.version !== 'string' && typeof policy.version !== 'number') {
     throw new Denied('policy_version_missing');
@@ -119,7 +119,10 @@ function validatePolicy(policy, checkProfile, { allowNeon = false } = {}) {
   }
   const legacy = isLegacyPiReview(profile.review);
   const neon = allowNeon && isNeonReview(profile.review) && isReviewSkillList(profile.review.skills);
-  if (!legacy && !neon && !isRoutedReview(profile.review)) {
+  // Routed-допуск только при закреплённой триаде попытки: без пина
+  // routed-профиль не подтверждён маршрутом и не допускается.
+  const routed = pinned && isRoutedReview(profile.review);
+  if (!legacy && !neon && !routed) {
     throw new Denied('review_profile_not_approved');
   }
   return profile;
@@ -136,6 +139,10 @@ function isRoutedReview(review) {
   if (workerFamily(review) === 'google') return false;
   if (!validWorkerSpec(review) || typeof review.model !== 'string' ||
       review.model.length === 0) return false;
+  // Строго аттестованная модель из MODEL_FAMILY: egress у провайдера сам
+  // по себе не допускает — синтетическая модель 'openai' без записи в
+  // таблице семейств отклоняется.
+  if (workerFamily(review) === null) return false;
   if (retiredProviderViolation(review) ?? opencodeGoPolicyViolation(review)) return false;
   // Routed-критик обязан быть исполняем реальным L2-раннером: провайдер
   // с egress-allowlist, иначе срыв model_proxy_allowlist_invalid позже.
@@ -896,7 +903,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   try {
     validateAttempt(attempt);
     validateSubmission(submission, attempt);
-    profile = validatePolicy(policy, attempt.check_profile, { allowNeon: true });
+    profile = validatePolicy(policy, attempt.check_profile,
+      { allowNeon: true, pinned: attempt.triad !== undefined });
     validateEnrolled(attempt, profile);
     // Исполнитель из доверенной попытки (или профиля) и критик — разные семейства.
     // При настроенном арбитре проверяется вся триада: арбитр обязан быть из

@@ -744,19 +744,24 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
 }
 
 // Публичные egress-endpoint'ы провайдеров моделей для allowlist pi-guard.
+// Ключ — реальный pi-провайдер из auth.json (pi --list-models): 'opencode-go'
+// обслуживает DeepSeek через свой штатный endpoint, провайдер не
+// переименовывается — иначе телеметрия и auth.json теряют сопоставление.
 const PROVIDER_EGRESS = new Map([
   ['openai', ['api.openai.com:443', 'chatgpt.com:443']],
   ['google', ['generativelanguage.googleapis.com:443']],
   ['deepseek', ['api.deepseek.com:443']],
   ['glm', ['open.bigmodel.cn:443']],
   ['cognition', ['api.cognition.ai:443']],
+  ['opencode-go', ['opencode.ai:443']],
 ]);
 
 // Спек критика/арбитра в форме, реально исполняемой L2-раннером, либо
 // null, когда у раннера нет для него разрешённых адресов:
-// — харнесс 'pi' берёт pi-провайдера вложения 'pi/inner/model'; у вложения
-//   без собственного egress берётся его семейство
-//   ('pi/opencode-go/deepseek-…' → 'deepseek', 'pi/openai/…' → 'openai');
+// — харнесс 'pi' берёт pi-провайдера вложения 'pi/inner/model' как есть,
+//   когда у вложения есть собственный egress ('pi/opencode-go/deepseek-…'
+//   → 'opencode-go', 'pi/openai/…' → 'openai'); провайдер НЕ подменяется —
+//   канонический ключ сопоставления телеметрии и allowlist сохраняется;
 // — 'acp-antigravity-acp' → 'google' (Neon/agy-транспорт);
 // — прямые pi-провайдеры из PROVIDER_EGRESS — как есть.
 // 'acp-devin' и прочие → null: адреса для них не выдумываются.
@@ -768,6 +773,9 @@ export function runnerReviewSpec(spec) {
   } else if (provider === 'pi' && typeof model === 'string' && model.includes('/')) {
     const i = model.indexOf('/');
     const inner = model.slice(0, i).toLowerCase();
+    // Вложение с собственным egress — как есть (auth.json ключ и
+    // телеметрия совпадают с исходным pi-провайдером); без egress —
+    // семейство вложения, если у семейства есть endpoint.
     provider = PROVIDER_EGRESS.has(inner)
       ? inner : (PROVIDER_FAMILY.get(inner) ?? inner);
     model = model.slice(i + 1);

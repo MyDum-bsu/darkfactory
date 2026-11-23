@@ -1970,9 +1970,10 @@ test('active: routed Devin/DeepSeek/Neon — закреплённый routed-к�
   const journal = await tmpJournal();
   const DEVIN = { provider: 'acp-devin', model: 'swe-2-high' };
   // Закреплённый критик — worker-формат pi-харнесса; ревью-профиль несёт
-  // runner-форму {provider:'deepseek'}, как в verify run-isolated.
+  // runner-форму {provider:'opencode-go'}, как в verify run-isolated:
+  // реальный pi-провайдер сохраняется, подмены на 'deepseek' нет.
   const DS_CRITIC = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
-  const RUNNER_CRITIC = { provider: 'deepseek', model: 'deepseek-v4.1-flash',
+  const RUNNER_CRITIC = { provider: 'opencode-go', model: 'deepseek-v4.1-flash',
     reasoningLevel: 'medium' };
   const NEON = { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' };
   const transcript = 'private provider transcript';
@@ -2038,4 +2039,43 @@ test('Neon с нестандартным reasoningLevel не обходит skil
     journal: await tmpJournal(), ports: { ...ports, board: boardPort } });
   assert.equal(res.outcome, 'denied');
   assert.equal(res.reason, 'review_profile_not_approved');
+});
+
+test('routed-профиль без закреплённой триады и с неаттестованной моделью — отказ (#1263 r4)', async t => {
+  const { handle, ported } = await isolated(t);
+  const { ports } = stubs();
+  const DS_CRITIC = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const RUNNER_CRITIC = { provider: 'opencode-go', model: 'deepseek-v4.1-flash',
+    reasoningLevel: 'medium' };
+  const DEVIN = { provider: 'acp-devin', model: 'swe-2-high' };
+  const NEON = { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' };
+
+  // (а) Валидный routed-критик, но attempt.triad отсутствует — без пина
+  // routed-профиль не подтверждён маршрутом и не допускается.
+  const idA = await contractTask(handle);
+  const { epoch: eA, port: pA } = await held(ported, idA);
+  const unpinned = await acceptHeld({
+    attempt: contractAttempt(idA, eA, { executor: DEVIN }),
+    submission: submission(idA, eA),
+    policy: policy(idA, { review: { ...RUNNER_CRITIC, requireAttestation: true },
+      arbiter: NEON }),
+    journal: await tmpJournal(), ports: { ...ports, board: pA } });
+  assert.equal(unpinned.outcome, 'denied');
+  assert.equal(unpinned.reason, 'review_profile_not_approved');
+
+  // (б) Пин есть, но модель неаттестована — у провайдера 'openai' есть
+  // egress, однако 'gpt-9-synthetic' нет в MODEL_FAMILY: egress сам по
+  // себе допуск не даёт.
+  const idB = await contractTask(handle);
+  const { epoch: eB, port: pB } = await held(ported, idB);
+  const SYNTH = { provider: 'pi', model: 'openai/gpt-9-synthetic' };
+  const unattested = await acceptHeld({
+    attempt: contractAttempt(idB, eB, { executor: DEVIN,
+      triad: { worker: DEVIN, critic: SYNTH, arbiter: NEON } }),
+    submission: submission(idB, eB),
+    policy: policy(idB, { review: { provider: 'openai', model: 'gpt-9-synthetic',
+      reasoningLevel: 'medium', requireAttestation: true }, arbiter: NEON }),
+    journal: await tmpJournal(), ports: { ...ports, board: pB } });
+  assert.equal(unattested.outcome, 'denied');
+  assert.equal(unattested.reason, 'review_profile_not_approved');
 });

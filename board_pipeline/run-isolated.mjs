@@ -486,8 +486,10 @@ async function execute() {
     if (attemptCritic === null) throw new Error('route_critic_not_runnable');
     if (attemptArbiter === null) throw new Error('route_arbiter_not_runnable');
     const neon = isNeonReview(attemptCritic);
-    telemetry.recordModel('critic', attemptCritic);
-    telemetry.recordModel('arbiter', attemptArbiter);
+    // В телеметрию пишется закреплённый спек (worker-форма 'pi/opencode-go/…'),
+    // как в allowlist, — canonical modelKey сопоставляет обе формы.
+    telemetry.recordModel('critic', attempt.triad?.critic ?? reviewSetup.critic);
+    telemetry.recordModel('arbiter', attempt.triad?.arbiter ?? reviewSetup.arbiter);
     const review = (neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner)(
       { journal: root, prompt: criticPrompt, beforeEffect });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
