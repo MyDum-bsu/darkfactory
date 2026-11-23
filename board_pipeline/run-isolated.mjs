@@ -613,6 +613,20 @@ async function execute() {
     const neon = isNeonReview(attemptCritic);
     let lost = false;
     let renewal = Promise.resolve();
+    // Те же живые гейты повтора применяются и на границе запуска читателя:
+    // lease/допуск/контракт/политика/пины сверяются заново в beforeEffect
+    // самого раннера, а не только кэшем renewal-цикла.
+    const retryContract = attempt.repo_id === undefined && attempt.policy_digest === undefined
+      ? undefined
+      : { repo_id: attempt.repo_id, spec_digest: attempt.spec_digest,
+          policy_digest: attempt.policy_digest, profile_id: attempt.check_profile,
+          fixtures_digest: attempt.fixtures_digest ?? null,
+          has_ui: attempt.has_ui, finish: route.finish };
+    const retryGuard = l2ReviewRetryGuard({ port, taskId: attempt.task_id,
+      epoch: attempt.epoch, owner: p.owner, label: p.label,
+      contract: retryContract, required: route.allowlist?.required,
+      assertPinned, beforeEffect, assertOpen, daemonOpen });
+    let launchBinding = null;
     // В телеметрию пишется закреплённый спек (worker-форма 'pi/opencode-go/…'),
     // как в allowlist, — canonical modelKey сопоставляет обе формы.
     telemetry.recordModel('critic', attempt.triad?.critic ?? reviewSetup.critic);
@@ -628,6 +642,13 @@ async function execute() {
           await daemonOpen?.();
           await renewal;
           if (lost) throw new Error('Lease lost');
+          // Граница запуска: свежее доказательство lease/допуска/контракта/
+          // пинов и чистый закреплённый checkout — дрейф между retry-гейтами
+          // и docker run закрывается здесь, а не снимком минутной давности.
+          if (launchBinding) {
+            await retryGuard();
+            await assertRetrySubjectUnchanged(launchBinding);
+          }
         } });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
@@ -681,18 +702,13 @@ async function execute() {
           // закреплённые входы оператора и тот же зачисленный worktree на
           // той же ветке с candidate_sha; неуспех гейта или второй сбой —
           // обычный hold.
+          // Граница запуска читателя получает тот же живой контракт: binding
+          // публикуется до вызова — beforeEffect раннера проверяет гейты и
+          // субъект заново непосредственно перед docker run каждого вызова.
+          launchBinding = { ...handoff, worktree: tree, branch: profile.branch };
           const receipt = await telemetry.phase('l2_critic', () => l2ReviewWithTransientRetry({
             review, binding: handoff, profile: trusted,
-            beforeRetry: l2ReviewRetryGuard({ port, taskId: attempt.task_id,
-              epoch: attempt.epoch, owner: p.owner, label: p.label,
-              contract: attempt.repo_id === undefined && attempt.policy_digest === undefined
-                ? undefined
-                : { repo_id: attempt.repo_id, spec_digest: attempt.spec_digest,
-                    policy_digest: attempt.policy_digest, profile_id: attempt.check_profile,
-                    fixtures_digest: attempt.fixtures_digest ?? null,
-                    has_ui: attempt.has_ui, finish: route.finish },
-              required: route.allowlist?.required,
-              assertPinned, beforeEffect, assertOpen, daemonOpen }),
+            beforeRetry: retryGuard,
             verifySubject: b => assertRetrySubjectUnchanged({ ...b, worktree: tree,
               branch: profile.branch }),
             log: note => console.log(JSON.stringify(note)),

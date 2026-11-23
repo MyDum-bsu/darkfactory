@@ -42,6 +42,12 @@ const TRUNCATED_TRANSCRIPT = new Set([
 // ответ — hold, а не transient: повтор не должен стирать зафиксированный
 // отказ или mismatch. Возвращает причину отказа либо null.
 function transcriptDisqualifying(ndjson, critic) {
+  const tools = new Set();
+  const noteTools = (list) => {
+    if (Array.isArray(list)) {
+      for (const t of list) tools.add(typeof t === 'string' ? t : t?.name);
+    }
+  };
   for (const line of String(ndjson).split('\n')) {
     if (!line.trim()) continue;
     let event;
@@ -49,6 +55,15 @@ function transcriptDisqualifying(ndjson, critic) {
       event = JSON.parse(line);
     } catch {
       continue; // битая строка — сама по себе признак обрыва
+    }
+    // Нарушение политики инструментов зафиксировано потоком — hold, не
+    // transient: пропуск session_info/message с запрещённым toolsAdded
+    // позволил бы второму вызову стереть зафиксированное нарушение.
+    noteTools(event?.toolsAdded);
+    noteTools(event?.message?.toolsAdded);
+    if (event?.type === 'session_info') noteTools(event.data?.toolsAdded);
+    if (Array.isArray(event?.messages)) {
+      for (const m of event.messages) noteTools(m?.toolsAdded);
     }
     if (event?.type === 'error' ||
         (event?.type === 'auto_retry_end' && event.success === false)) {
@@ -70,10 +85,22 @@ function transcriptDisqualifying(ndjson, critic) {
     }
     // Уже изданный вердикт без agent_settled — не обрыв, а зафиксированный
     // исход: второй вызов не должен стирать записанный REWORK/ESCALATE/PASS.
-    // Парсится текст хода; любой распознанный вердикт (или вердиктоподобный
-    // контент: ambiguous, objection_missing) дисквалифицирует transient.
+    // Дисквалифицирует и ЛЮБОЙ объект с ключом verdict (даже malformed —
+    // {"verdict":42}), и маркер legacy-вердикта в тексте хода.
     const parts = Array.isArray(message.content) ? message.content : [];
     const text = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
+    for (const chunk of extractJsonObjects(text)) {
+      let parsed;
+      try {
+        parsed = JSON.parse(chunk);
+      } catch {
+        continue;
+      }
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) &&
+          'verdict' in parsed) {
+        return 'review_verdict_emitted';
+      }
+    }
     try {
       parseReviewVerdict(text);
       return 'review_verdict_emitted';
@@ -83,6 +110,9 @@ function transcriptDisqualifying(ndjson, critic) {
         return 'review_verdict_emitted';
       }
     }
+  }
+  for (const tool of tools) {
+    if (!READ_ONLY_TOOLS.includes(tool)) return `review_forbidden_tool:${tool}`;
   }
   return null;
 }
@@ -596,7 +626,13 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
 export function classifySandboxExit(error) {
   return {
     code: typeof error?.code === 'number' ? error.code : null,
-    timedOut: error?.killed === true && error?.signal === 'SIGTERM',
+    // Доказательство deadline хоста — killed: execFile сам послал
+    // kill-сигнал (наш killSignal — SIGTERM) по таймауту. Дочерний процесс
+    // мог погибнуть им (signal = 'SIGTERM') либо обработать и выйти числом
+    // (signal = null, code = 1 и т.п.) — оба случая доказанный таймаут.
+    // Любой другой сигнал — не хостовый deadline (SIGKILL/SIGINT и т.п.).
+    timedOut: error?.killed === true &&
+      (error?.signal === 'SIGTERM' || error?.signal == null),
   };
 }
 

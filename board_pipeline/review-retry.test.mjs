@@ -95,13 +95,18 @@ test('classification: только 143 и host-timeout — typed transient', () 
   }
 });
 
-test('classification: host exec evidence — только killed+SIGTERM', () => {
+test('classification: host exec evidence — killed + SIGTERM или числовой выход', () => {
   // Реальная классификация хостового сбоя execFile в адаптере: timeout хоста
-  // добивает child сигналом SIGTERM (killed=true). Всё прочее — не таймаут.
+  // шлёт kill-сигнал (killed=true); child может погибнуть SIGTERM'ом либо
+  // обработать его и выйти числом — оба случая доказанный таймаут.
   assert.deepEqual(classifySandboxExit({ killed: true, signal: 'SIGTERM' }),
     { code: null, timedOut: true });
   assert.deepEqual(classifySandboxExit({ killed: true, signal: 'SIGTERM', code: null }),
     { code: null, timedOut: true });
+  // Deadline сработал, но дочерний процесс обработал SIGTERM и вышел числом:
+  // killed + signal null при любом коде — тоже доказанный host-timeout.
+  assert.deepEqual(classifySandboxExit({ killed: true, signal: null, code: 1 }),
+    { code: 1, timedOut: true });
   for (const error of [
       { code: 143 }, { code: 1 }, { code: 'ENOENT' }, { code: 'EACCES' },
       { killed: true, signal: 'SIGKILL' }, { killed: true, signal: 'SIGINT' },
@@ -554,22 +559,28 @@ dockerTest('runner: сбой cleanup первого читателя — пов�
   assert.deepEqual(await calls(), ['info', 'run', 'rm']);
 });
 
-dockerTest('runner: lease потерян в окне запуска — второго reader нет', async (t) => {
-  // Между успешным beforeRetry и docker run второго читателя renewal-цикл
-  // потерял lease: beforeEffect раннера обязан взорваться на границе эффекта,
-  // и контейнер не стартует (второго `run` в журнале нет).
-  const { calls } = await dockerStub(t);
-  const { binding, profile, journal, piRoot } = await fixture(t, []);
-  let lost = false;
-  const runner = isolatedPiReviewRunner({ journal, piRoot,
-    sandbox: runInReadOnlySandbox, timeoutMs: 300,
-    beforeEffect: async () => { if (lost) throw new Error('Lease lost'); } });
-  await assert.rejects(
-    l2ReviewWithTransientRetry({ review: runner, binding, profile,
-      beforeRetry: async () => { lost = true; } }),
-    (e) => e.message === 'Lease lost');
-  // Второй docker info — host-side preflight перед beforeEffect; `run` нет.
-  assert.deepEqual(await calls(), ['info', 'run', 'rm', 'info']);
+dockerTest('runner: живые гейты на границе запуска — второго reader нет', async (t) => {
+  // Между успешным beforeRetry и docker run второго читателя меняется ЖИВОЕ
+  // состояние (lease отпущен / renewal-флаг): beforeEffect раннера обязан
+  // заново доказать гейт на границе эффекта, и контейнер не стартует.
+  for (const mode of ['flag', 'live']) {
+    const { calls } = await dockerStub(t);
+    const { binding, profile, journal, piRoot } = await fixture(t, []);
+    let held = true;
+    const runner = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: runInReadOnlySandbox, timeoutMs: 300,
+      // 'flag' — кэш lost-флага renewal-цикла; 'live' — свежая проверка
+      // удержания на самой границе запуска (тот же retry-guard).
+      beforeEffect: mode === 'flag'
+        ? async () => { if (!held) throw new Error('Lease lost'); }
+        : async () => { if (!(await Promise.resolve(held))) throw new Error('claim_lost'); } });
+    await assert.rejects(
+      l2ReviewWithTransientRetry({ review: runner, binding, profile,
+        beforeRetry: async () => { held = false; } }),
+      (e) => /Lease lost|claim_lost/.test(e.message), mode);
+    // Второй docker info — host-side preflight перед beforeEffect; `run` нет.
+    assert.deepEqual(await calls(), ['info', 'run', 'rm', 'info'], mode);
+  }
 });
 
 gitTest('runner: завершённый REWORK при коде 143 — hold, как и любой грязный выход', async (t) => {
@@ -642,7 +653,16 @@ gitTest('runner: незавершённый, но дисквалифицирую
       reason: 'review_verdict_emitted' },
     // Маркер legacy-вердикта в тексте хода без settled — тот же исход.
     { stdout: msg({ content: [{ type: 'text', text: 'REVIEW_BLOCKED\nreasons' }] }),
-      reason: 'review_verdict_emitted' }]) {
+      reason: 'review_verdict_emitted' },
+    // Malformed-вердикт {"verdict":42} в целом assistant-сообщении без
+    // settled: вердиктоподобный объект уже издан — hold, не повтор.
+    { stdout: msg({ content: [{ type: 'text', text: '{"verdict":42}' }] }),
+      reason: 'review_verdict_emitted' },
+    // session_info с запрещённым tool без assistant-хода: нарушение политики
+    // инструментов зафиксировано потоком — потеря settlement его не стирает.
+    { stdout: JSON.stringify({ type: 'session_info',
+        data: { toolsAdded: ['read', 'bash'] } }),
+      reason: 'review_forbidden_tool:bash' }]) {
     const { review, binding, profile, calls } = await fixture(t, [
       { code: 143, stdout, stderr: '' },
       { code: 0, stdout: PASS, stderr: '' }]);
