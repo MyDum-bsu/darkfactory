@@ -8,8 +8,8 @@
 // чистый worktree и HEAD === base_sha. Неизвестный исход — uncertain без
 // второго писателя.
 
-import { executorFamily, l2RunnableSpec, runnerReviewSpec, ReviewDenied } from './review-runner.mjs';
-import { NEON_CRITIC, SOL_ARBITER, isNeonReview, isSolArbiter } from './review-policy.mjs';
+import { executorFamily, l2RunnableSpec, ReviewDenied } from './review-runner.mjs';
+import { NEON_CRITIC, SOL_ARBITER, isSolArbiter } from './review-policy.mjs';
 import {
   DEFAULT_MIN_OBSERVATIONS,
   modelKey,
@@ -674,7 +674,11 @@ export function routeRole({ role, size, domain, policy, scorecard,
     // Neon может прийти в worker-форме 'acp-antigravity-acp/gemini-4-neon' —
     // acceptHeld видит runner-форму {provider:'google'}, поэтому и здесь
     // сверка идёт по нормализованному спеку.
-    if (isNeonReview(runnerReviewSpec(critic) ?? critic) && !isSolArbiter(arbiter)) {
+    // Любой критик google-семейства (Neon в любой форме — 'google',
+    // 'acp-antigravity-acp', 'pi/google/…', независимо от reasoningLevel)
+    // требует арбитра Sol: acceptHeld отклонит Neon+не-Sol на приёмке
+    // уже после spawn (#1263 r5).
+    if (workerFamily(critic) === 'google' && !isSolArbiter(arbiter)) {
       return false;
     }
     try {
@@ -838,10 +842,9 @@ export function resolveTriad({ size, domain, policy, scorecard,
     } catch (e) {
       return `route_base_triad_violation:${e?.reason ?? e?.message ?? 'failed'}`;
     }
-    // Совместимость с acceptHeld: Neon-критик требует арбитра Sol — иначе
-    // триада отвалится на приёмке уже после spawn (#1263 r4).
-    if (isNeonReview(runnerReviewSpec(base.critic) ?? base.critic) &&
-        !isSolArbiter(base.arbiter)) {
+    // Совместимость с acceptHeld: любой критик google-семейства требует
+    // арбитра Sol — иначе триада отвалится на приёмке уже после spawn.
+    if (workerFamily(base.critic) === 'google' && !isSolArbiter(base.arbiter)) {
       return 'route_base_acceptance_incompatible';
     }
     if ((routing.allowlist.worker.length && !inAllowlist(base.worker, routing.allowlist.worker)) ||
@@ -917,9 +920,10 @@ export function resolveTriad({ size, domain, policy, scorecard,
       !l2RunnableSpec(routed.selected.arbiter)) {
     return fallback('route_role_not_runnable');
   }
-  // Полная совместимость с acceptHeld на финальной триаде: Neon без
-  // Sol-арбитра не выходит — безопасный fallback на проверенную базу.
-  if (isNeonReview(runnerReviewSpec(routed.selected.critic) ?? routed.selected.critic) &&
+  // Полная совместимость с acceptHeld на финальной триаде: критик
+  // google-семейства без Sol-арбитра не выходит — безопасный fallback на
+  // проверенную базу.
+  if (workerFamily(routed.selected.critic) === 'google' &&
       !isSolArbiter(routed.selected.arbiter)) {
     return fallback('route_acceptance_incompatible');
   }

@@ -604,3 +604,41 @@ test('Neon-критик без Sol-арбитра несовместим с acce
   assert.equal(bad.outcome, 'rejected');
   assert.equal(bad.reason, 'route_base_acceptance_incompatible');
 });
+
+test('Neon без reasoningLevel в allowlist тоже требует Sol — Devin/Neon/DeepSeek не выходит (#1263 r5)', () => {
+  // Критик google-семейства БЕЗ reasoningLevel: isNeonReview его не видит,
+  // но runner позже наследует 'medium' из профиля и acceptHeld отклонит
+  // триаду. Селектор считает Neon-shaped ЛЮБОЙ google-семейный критик.
+  const neonNoLevel = { provider: 'google', model: 'gemini-4-neon' };
+  const agyNeon = { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' };
+  const dsArbiter = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const solCritic = { provider: 'pi', model: 'openai/gpt-6.2-sol' };
+  for (const critic of [neonNoLevel, agyNeon]) {
+    const lines = [
+      ...journal(DEVIN, 6),
+      ...Array.from({ length: 6 }, () => JSON.stringify({
+        kind: 'attempt_summary', schema: 1,
+        models: { worker: DEVIN, critic, arbiter: dsArbiter },
+        labels: { size: 'S', domain: 'backend' },
+        rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+        phases_ms: { total: 60000 }, outcome: 'done', open: false })),
+    ];
+    const scorecard = aggregateScorecard(lines, { seed: [] });
+    const res = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+      policy: policy('active', { worker: [DEVIN], critic: [critic, solCritic],
+        arbiter: [dsArbiter] }),
+      base: { worker: DEVIN, critic: solCritic, arbiter: dsArbiter } });
+    assert.equal(res.outcome, 'fallback', `${critic.provider}: ${res.reason}`);
+    assert.match(res.reason, /^route_active_rejected:/);
+    assert.notDeepEqual(res.selected,
+      { worker: DEVIN, critic, arbiter: dsArbiter });
+
+    // Несовместимая база — явный rejected, без reasoningLevel тоже.
+    const bad = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+      policy: policy('active', { worker: [DEVIN], critic: [critic],
+        arbiter: [dsArbiter] }),
+      base: { worker: DEVIN, critic, arbiter: dsArbiter } });
+    assert.equal(bad.outcome, 'rejected');
+    assert.equal(bad.reason, 'route_base_acceptance_incompatible');
+  }
+});
