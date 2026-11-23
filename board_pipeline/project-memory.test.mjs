@@ -678,19 +678,17 @@ test('regression R3/R4/R5: no raw write or capability export; only pinned create
   } finally { await cleanup(); }
 });
 
-test('regression R6: run-isolated recordPostReviewMemory writes memory after REVIEW_OK and skips on REWORK/hold', async () => {
+test('regression R6/R7: run-isolated recordPostReviewMemory extracts updates from real acceptHeld shape without manual memoryUpdates', async () => {
   const { tree, storeDir, receiptDir, writer, cleanup } = await sandbox();
   const attempt = { task_id: '1265', attempt_id: 'att-r6', epoch: 1 };
-  const submission = { candidate_sha: SHA_A };
   const worker = { provider: 'openai', model: 'gpt-6.2-sol' };
   const reviewer = { provider: 'google', model: 'gemini-4-neon' };
-  const updates = [{ id: 'r6-inv', section: 'invariants', text: 'Post-review steward persists verified memory' }];
   try {
     // On REWORK or hold (or non-REVIEW_OK verdict), nothing is written to receipts or memory
     for (const bad of [
-      { result: { outcome: 'rework' }, reviewReceipt: { verdict: 'REVIEW_REWORK', sha: SHA_A } },
-      { result: { outcome: 'hold' }, reviewReceipt: { verdict: 'REVIEW_BLOCKED', sha: SHA_A } },
-      { result: { outcome: 'done' }, reviewReceipt: { verdict: 'REVIEW_REWORK', sha: SHA_A } },
+      { result: { outcome: 'rework', sha: SHA_A, review: { verdict: 'REVIEW_REWORK', sha: SHA_A } } },
+      { result: { status: 'hold', sha: SHA_A, review: { verdict: 'REVIEW_BLOCKED', sha: SHA_A } } },
+      { result: { status: 'verified', sha: SHA_A, review: { verdict: 'REVIEW_REWORK', sha: SHA_A } } },
     ]) {
       const skipped = await recordPostReviewMemory({
         writer,
@@ -699,10 +697,8 @@ test('regression R6: run-isolated recordPostReviewMemory writes memory after REV
         projectId: 'proj_r6',
         worktree: tree,
         attempt,
-        submission,
         worker,
         reviewer,
-        updates,
         ...bad,
       });
       assert.equal(skipped.recorded, false);
@@ -711,26 +707,43 @@ test('regression R6: run-isolated recordPostReviewMemory writes memory after REV
     assert.equal((await resolveProjectMemory({ storeDir, projectId: 'proj_r6', worktree: tree })).total, 0);
     assert.equal((await readdir(receiptDir)).length, 0);
 
-    // On confirmed REVIEW_OK + done outcome, writes HMAC-signed receipt and calls writer.recordUpdate
-    const written = await recordPostReviewMemory({
+    // Real acceptHeld shape WITHOUT manual memoryUpdates (with review.summary)
+    const writtenSummary = await recordPostReviewMemory({
       writer,
       trustedReceiptDir: receiptDir,
       hmacKey: TEST_HMAC_KEY,
       projectId: 'proj_r6',
       worktree: tree,
-      result: { outcome: 'done' },
-      reviewReceipt: { verdict: 'REVIEW_OK', sha: SHA_A },
+      result: {
+        status: 'verified',
+        sha: SHA_A,
+        review: { verdict: 'REVIEW_OK', sha: SHA_A, summary: 'Project memory writer pins HMAC key in closure' },
+      },
       attempt,
-      submission,
       worker,
       reviewer,
-      updates,
     });
-    assert.equal(written.recorded, true);
-    assert.equal(written.result.total, 1);
+    assert.equal(writtenSummary.recorded, true);
+    assert.equal(writtenSummary.result.total, 1);
+
+    // Real acceptHeld shape WITHOUT manual memoryUpdates and WITHOUT summary -> fallback Verified task record
+    const writtenFallback = await recordPostReviewMemory({
+      writer,
+      trustedReceiptDir: receiptDir,
+      hmacKey: TEST_HMAC_KEY,
+      projectId: 'proj_r6',
+      worktree: tree,
+      result: { status: 'verified', sha: SHA_B, review: { verdict: 'REVIEW_OK', sha: SHA_B } },
+      attempt: { task_id: '1266', attempt_id: 'att-r7', epoch: 1 },
+      worker,
+      reviewer,
+    });
+    assert.equal(writtenFallback.recorded, true);
+    assert.equal(writtenFallback.result.total, 2);
 
     const slice = await resolveProjectMemory({ storeDir, projectId: 'proj_r6', worktree: tree });
-    assert.deepEqual(slice.ids, ['r6-inv']);
-    assert.match(slice.text, /Post-review steward persists verified memory/);
+    assert.equal(slice.total, 2);
+    assert.match(slice.text, /Project memory writer pins HMAC key in closure/);
+    assert.match(slice.text, new RegExp(`Verified task #1266 \\(${SHA_B.slice(0, 12)}\\)`));
   } finally { await cleanup(); }
 });

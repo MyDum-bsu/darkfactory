@@ -28,8 +28,8 @@ import { arbiterIntakePrompt, decisionsPromptBlock, projectMemoryPromptBlock,
 import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
   resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
 import { createProjectMemoryWriter, DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS,
-  memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir, resolveProjectMemory,
-  writeTrustedReviewReceipt } from './project-memory.mjs';
+  extractPostReviewMemoryUpdates, memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir,
+  resolveProjectMemory, writeTrustedReviewReceipt } from './project-memory.mjs';
 import { createTelemetryRecorder, threadUsage } from './telemetry.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
@@ -118,6 +118,7 @@ export async function recordPostReviewMemory({
   projectId,
   worktree,
   result,
+  outcome,
   reviewReceipt,
   attempt,
   submission,
@@ -126,17 +127,23 @@ export async function recordPostReviewMemory({
   updates,
 }) {
   if (!writer) return { recorded: false, reason: 'writer_not_configured' };
-  if (!ACCEPTED_MEMORY_OUTCOMES.has(result?.outcome) || reviewReceipt?.verdict !== 'REVIEW_OK') {
+  const res = result ?? outcome;
+  const finalStatus = res?.outcome ?? res?.status;
+  const receipt = reviewReceipt ?? res?.review;
+  if (!ACCEPTED_MEMORY_OUTCOMES.has(finalStatus) || receipt?.verdict !== 'REVIEW_OK') {
     return { recorded: false, reason: 'not_review_ok' };
   }
-  const verifiedSha = submission?.candidate_sha;
+  const verifiedSha = submission?.candidate_sha ?? res?.sha ?? receipt?.sha;
   if (typeof verifiedSha !== 'string' || !/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(verifiedSha)) {
     return { recorded: false, reason: 'invalid_sha' };
   }
-  if (reviewReceipt?.sha !== undefined && reviewReceipt.sha !== verifiedSha) {
+  if (receipt?.sha !== undefined && receipt.sha !== verifiedSha) {
     return { recorded: false, reason: 'sha_mismatch' };
   }
-  if (!Array.isArray(updates) || updates.length === 0) {
+  const resolvedUpdates = Array.isArray(updates) && updates.length > 0
+    ? updates
+    : extractPostReviewMemoryUpdates({ result: res, attempt, reviewReceipt: receipt, verifiedSha });
+  if (!Array.isArray(resolvedUpdates) || resolvedUpdates.length === 0) {
     return { recorded: false, reason: 'no_updates' };
   }
   const receiptPath = join(
@@ -157,7 +164,7 @@ export async function recordPostReviewMemory({
       sourceCard: String(attempt.task_id),
     },
   });
-  const saved = await writer.recordUpdate({ projectId, receiptPath, updates });
+  const saved = await writer.recordUpdate({ projectId, receiptPath, updates: resolvedUpdates });
   return { recorded: true, receiptPath, result: saved };
 }
 

@@ -64,6 +64,51 @@ const inside = (root, p) => {
 const emptySections = () => Object.fromEntries(PROJECT_MEMORY_SECTIONS.map(s => [s, []]));
 
 const normalizeText = text => text.trim().replace(/\s+/g, ' ').toLowerCase();
+const sanitizeSnippet = (text, maxLen = 240) => {
+  if (typeof text !== 'string') return '';
+  const clean = text.replace(/\s+/g, ' ').trim();
+  return clean.length > maxLen ? `${clean.slice(0, maxLen - 1)}…` : clean;
+};
+
+// Автоматическое извлечение компактных записей памяти из реального результата
+// acceptHeld / квитанции ревью, когда явный список memoryUpdates не передан.
+export function extractPostReviewMemoryUpdates({
+  outcome,
+  result,
+  attempt,
+  reviewReceipt,
+  verifiedSha,
+}) {
+  const res = result ?? outcome;
+  const explicit = res?.memoryUpdates ?? reviewReceipt?.memoryUpdates;
+  if (Array.isArray(explicit) && explicit.length > 0) return explicit;
+
+  const updates = [];
+  const summary = sanitizeSnippet(
+    reviewReceipt?.summary ?? res?.review?.summary ?? res?.summary,
+  );
+  if (summary) {
+    updates.push({ section: 'invariants', text: summary });
+  }
+  const notes = reviewReceipt?.notes ?? res?.review?.notes;
+  if (Array.isArray(notes)) {
+    for (const rawNote of notes.slice(0, 3)) {
+      const note = sanitizeSnippet(typeof rawNote === 'string' ? rawNote : rawNote?.text);
+      if (note) updates.push({ section: 'conventions', text: note });
+    }
+  }
+  if (updates.length === 0) {
+    const card = String(attempt?.task_id ?? res?.task_id ?? '').trim();
+    const sha = typeof verifiedSha === 'string' ? verifiedSha : (res?.sha ?? reviewReceipt?.sha ?? '');
+    if (CARD.test(card) && GIT_SHA.test(sha)) {
+      updates.push({
+        section: 'invariants',
+        text: `Verified task #${card} (${sha.slice(0, 12)})`,
+      });
+    }
+  }
+  return updates;
+}
 
 export function entryDigest(entry) {
   const { sha256, ...body } = entry;
