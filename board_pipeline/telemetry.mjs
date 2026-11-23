@@ -66,6 +66,55 @@ export function sumUsages(raws) {
   return totals;
 }
 
+// Стоимость в USD: принимаются только конечные неотрицательные числа;
+// отсутствие данных от провайдера — строго null, никогда не выдуманный 0.
+export function normalizeCost(raw) {
+  if (typeof raw === 'number') return token(raw);
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const direct = pick(raw, ['cost_usd', 'costUsd', 'total_cost_usd', 'totalCostUsd', 'cost']);
+  if (direct !== null) return direct;
+  if (raw.usage !== null && typeof raw.usage === 'object' && !Array.isArray(raw.usage)) {
+    return pick(raw.usage, ['cost_usd', 'costUsd', 'total_cost_usd', 'totalCostUsd', 'cost']);
+  }
+  return null;
+}
+
+// Суммирование стоимости: null остаётся null, пока не появится хотя бы одно число.
+export function sumCosts(values) {
+  if (!Array.isArray(values)) return null;
+  let total = null;
+  for (const raw of values) {
+    const cost = normalizeCost(raw);
+    if (cost === null) continue;
+    total = (total ?? 0) + cost;
+  }
+  return total;
+}
+
+// Медиана конечных числовых значений; пустой набор — null.
+export function computeMedian(values) {
+  if (!Array.isArray(values)) return null;
+  const sorted = values.filter(v => typeof v === 'number' && Number.isFinite(v)).sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Разбор JSONL-строк журнала телеметрии с подсчётом битых строк.
+export function parseTelemetryLines(lines) {
+  const entries = [];
+  let corrupt = 0;
+  if (!Array.isArray(lines)) return { entries, corrupt };
+  for (const line of lines) {
+    if (typeof line !== 'string' || !line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { corrupt += 1; continue; }
+    if (entry?.kind !== 'attempt_summary' || entry?.schema !== TELEMETRY_SCHEMA) continue;
+    entries.push(entry);
+  }
+  return { entries, corrupt };
+}
+
 // usage из снимков bb/pi: защита от неизвестных форм — ищем usage в известных
 // местах снимка потока/треда; нет — провайдер не отдал, остаётся null.
 export function threadUsage(snapshot) {
