@@ -8,6 +8,7 @@ import { collectTelemetry, diffSnapshots } from '../board_pipeline/telemetry-col
 import { normalizeCost, normalizeUsage, sumUsages } from '../board_pipeline/telemetry.mjs';
 import { canonicalDigest } from '../board_pipeline/subject.mjs';
 import { loadRoleRegistry } from '../board_pipeline/role-registry.mjs';
+import { matchesNativeStageWitness } from '../board_pipeline/bb-stage-adapter.mjs';
 
 const ARMS = ['linear', 'foreman'];
 const exec = promisify(execFile);
@@ -36,11 +37,15 @@ async function readBb(run, threadId, policy, taskId, role, workspace) {
   const cost = normalizeCost(usageEvent?.data?.tokenUsage?.total);
   const complete = requested.length === 1 && terminals.length === 1 && terminals[0].data?.status === 'completed' &&
     usageEvent?.seq > requested[0].seq && thread.status === 'idle';
+  const terminal = complete ? terminals[0] : null;
+  const native = terminal?.scope?.kind === 'turn' ? { eventSeq: terminal.seq,
+    session: terminal.data.providerThreadId, checkpoint: terminal.data.providerCheckpointId } : null;
   return { id: threadId, task_id: taskId, channel: 'ab-pilot', status: complete ? 'completed' : 'interrupted',
-    provider: thread.providerId, model: requested[0]?.data?.execution?.model ?? null, role, usage, cost_usd: cost, complete };
+    provider: thread.providerId, model: requested[0]?.data?.execution?.model ?? null, role, usage, cost_usd: cost, complete, native };
 }
 
-async function stagesCovered(run, policy, stages, accepted) {
+async function stagesCovered(run, policy, stages, accepted, threads) {
+  const native = new Map(threads.filter(row => row.role === 'stage').map(row => [row.id, row.native]));
   const registry = await loadRoleRegistry(policy.abPilot.catalog);
   const graph = registry.playbooks[policy.abPilot.playbook];
   if (!graph || registry.digest !== policy.abPilot.registryDigest) return false;
@@ -57,8 +62,7 @@ async function stagesCovered(run, policy, stages, accepted) {
       return stage === stages[i].stage && stage === row.stage && row.threadId === stages[i].threadId &&
         row.verdict === 'PASS' && trace.history[i].stage === stage && trace.history[i].verdict === 'PASS' &&
         row.artifactDigest === trace.history[i].digest && /^[a-f0-9]{64}$/.test(row.artifactDigest ?? '') &&
-        Number.isSafeInteger(row.eventSeq) && row.eventSeq > 0 && typeof row.checkpoint === 'string' && !!row.checkpoint &&
-        typeof row.session === 'string' && !!row.session;
+        matchesNativeStageWitness(row, native.get(row.threadId));
     });
 }
 
@@ -99,7 +103,7 @@ async function readCell(root, name, arm) {
     ...(attempt.tokens?.arbiter ? [attempt.tokens.arbiter] : []), ...bb.filter(item => item.role === 'stage').map(item => item.usage)];
   const fragment = sumUsages(modelUsages);
   // A truncated turn or aggregate L2 receipt cannot prove complete coverage of a cell.
-  const allStages = arm === 'linear' ? stages.length === 0 : first && await stagesCovered(run, policy, stages, accepted);
+  const allStages = arm === 'linear' ? stages.length === 0 : first && await stagesCovered(run, policy, stages, accepted, bb);
   const completeRoles = first && attempt.rounds.arbitration === 0 && allStages && bb.length > 0 && bb.every(row => row.complete);
   const coverage = completeRoles &&
     modelUsages.every(usage => usage && usage.input !== null && usage.output !== null && usage.cached !== null);

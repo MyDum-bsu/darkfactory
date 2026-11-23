@@ -34,6 +34,12 @@ async function durableIntent(dir, key, text) {
   return path;
 }
 
+export function matchesNativeStageWitness(witness, native) {
+  return Number.isSafeInteger(native?.eventSeq) && native.eventSeq > 0 &&
+    typeof native.session === 'string' && !!native.session && typeof native.checkpoint === 'string' && !!native.checkpoint &&
+    witness?.eventSeq === native.eventSeq && witness.session === native.session && witness.checkpoint === native.checkpoint;
+}
+
 export function pilotWriterWorkspaceReady(snapshot, { threadId, parentThread, project, workspace }) {
   const { thread, environment } = snapshot ?? {};
   if (thread?.id !== threadId || thread.parentThreadId !== parentThread || thread.projectId !== project) {

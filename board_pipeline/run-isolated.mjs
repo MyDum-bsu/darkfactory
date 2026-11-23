@@ -36,7 +36,7 @@ import { aggregateScorecard } from './model-scorecard.mjs';
 import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
   loadLessons, validateDistilledLessons } from './rework-distiller.mjs';
 import * as workerSelector from './worker-selector.mjs';
-import { enrollAbPilot, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
+import { abEffectGuard, enrollAbPilot, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
 import { pilotWriterWorkspaceReady } from './bb-stage-adapter.mjs';
 
 const exec = promisify(execFile);
@@ -589,15 +589,14 @@ async function execute() {
       return await stableCheckpoint(threadId, question.checkpoint.turn_seq) === question.checkpoint.sha;
     },
   };
+  const beforeAttemptEffect = (taskId, epoch) => ab
+    ? abEffectGuard(ab, { verifyHeld: port.verifyHeld, assertPinned }, taskId, epoch)
+    : activation && (() => port.guardTask(taskId, epoch));
   const verify = async (attempt, submission) => {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
-    const beforeEffect = ab ? async () => {
-      const live = await port.verifyHeld(attempt.task_id, attempt.epoch);
-      if (live.epoch !== attempt.epoch) throw new Error('ab_pilot_lease_lost');
-      await assertPinned();
-    } : activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
+    const beforeEffect = beforeAttemptEffect(attempt.task_id, attempt.epoch);
     const decisionSlice = await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`);
     const memorySlice = await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`);
     const criticPrompt = [reviewText, decisionSlice && decisionsPromptBlock(decisionSlice),
@@ -716,7 +715,7 @@ async function execute() {
   // rootless Docker read-only контуре, что и критик. Создаётся лениво —
   // только когда арбитраж действительно запрошен.
   const arbitrate = async (req) => {
-    const beforeEffect = activation && (() => port.guardTask(req.task_id, req.epoch));
+    const beforeEffect = beforeAttemptEffect(req.task_id, req.epoch);
     await beforeEffect?.();
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
       prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',

@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createBbStageObserver, pilotWriterWorkspaceReady, verifyBbStageTurn } from './bb-stage-adapter.mjs';
-import { enrollAbPilot, inspectPilotDiff, pilotArtifacts, CASES } from './ab-pilot.mjs';
+import { createBbStageObserver, matchesNativeStageWitness, pilotWriterWorkspaceReady, verifyBbStageTurn } from './bb-stage-adapter.mjs';
+import { abEffectGuard, enrollAbPilot, inspectPilotDiff, pilotArtifacts, CASES } from './ab-pilot.mjs';
 
 const parentThread = 'thr_parent';
 const threadId = 'thr_fixture';
@@ -45,6 +45,27 @@ test('native stage proof binds only the single requested turn and rejects foreig
   const badNonce = structuredClone(valid);
   badNonce.events[3].data.item.text = 'b'.repeat(64) + ' PASS';
   assert.throws(() => verifyBbStageTurn(badNonce), /stage_verdict_unconfirmed/);
+});
+
+test('a shaped but different stage witness cannot cover native usage', () => {
+  const native = { session: 'p', checkpoint: 'checkpoint-live', eventSeq: 137 };
+  assert.equal(matchesNativeStageWitness({ ...native }, native), true);
+  for (const modified of [{ session: 'other' }, { checkpoint: 'other' }, { eventSeq: 138 }]) {
+    assert.equal(matchesNativeStageWitness({ ...native, ...modified }, native), false);
+  }
+  assert.equal(matchesNativeStageWitness(native, null), false);
+});
+
+test('the same attempt effect guard rejects arbitration after the cutoff', async () => {
+  let renews = 0, effects = 0;
+  const expired = { assertOpen() { throw new Error('ab_pilot_dispatch_deadline'); } };
+  const guard = abEffectGuard(expired, {
+    verifyHeld: () => { renews++; return { epoch: 1 }; }, assertPinned: () => {},
+  }, '1', 1);
+  const arbitrate = async () => { await guard(); effects++; };
+  await assert.rejects(arbitrate(), /ab_pilot_dispatch_deadline/);
+  assert.equal(renews, 0);
+  assert.equal(effects, 0);
 });
 
 test('writer provision is wait-only; wrong ready environment or parent stays denied', () => {

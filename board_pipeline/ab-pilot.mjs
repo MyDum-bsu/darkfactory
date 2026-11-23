@@ -64,6 +64,15 @@ export async function enrollAbPilot(config, { policy, tree, root, inbox, daemon,
     } };
 }
 
+export function abEffectGuard(ab, { verifyHeld, assertPinned }, taskId, epoch) {
+  return async () => {
+    await ab.assertOpen();
+    const live = await verifyHeld(taskId, epoch);
+    if (live.epoch !== epoch) throw new Error('ab_pilot_lease_lost');
+    await assertPinned();
+  };
+}
+
 export async function inspectPilotDiff(ab, { git, base, candidate }) {
   const changes = (await git('diff', '--no-renames', '--name-status', '-z', base, candidate)).split('\0');
   if (changes.pop() !== '' || changes.length % 2 || changes.some((value, i) => i % 2 === 0 && value !== 'A')) {
