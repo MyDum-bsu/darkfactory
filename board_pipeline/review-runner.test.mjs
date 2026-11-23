@@ -10,8 +10,9 @@ import { promisify } from 'node:util';
 import {
   executorFamily, assertCrossFamily, parseReviewTranscript, parseReviewVerdict,
   hasValidFinding, isolatedArbiterRunner, isolatedPiReviewRunner, runInReadOnlySandbox, snapshotDigest,
-  worktreeFingerprint, assertToolsAllowed, ReviewDenied, REVIEW_IMAGE,
+  worktreeFingerprint, assertToolsAllowed, ReviewDenied, REVIEW_IMAGE, l2CriticSpec,
 } from './review-runner.mjs';
+import { isNeonReview } from './review-policy.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
 import { acceptHeld } from './acceptance.mjs';
 
@@ -1104,4 +1105,36 @@ test('runner: routed-критик с egress исполняется, acp-devin �
     await rm(journal, { recursive: true, force: true });
     await rm(piRoot, { recursive: true, force: true });
   }
+});
+
+test('l2CriticSpec: google-критик без reasoningLevel наследует его и идёт в Neon-раннер (#1263 r6)', () => {
+  // Neon без reasoningLevel + Sol: наследование 'medium' до проверки —
+  // выбирается Neon-раннер (isNeonReview), а не Pi-раннер, иначе acceptHeld
+  // отклонил бы квитанцию review_isolation_missing.
+  const noLevel = l2CriticSpec({ provider: 'google', model: 'gemini-4-neon' });
+  assert.equal(noLevel.reasoningLevel, 'medium');
+  assert.equal(isNeonReview(noLevel), true);
+
+  // agy-форма нормализуется к 'google' с наследованием из профиля.
+  const agy = l2CriticSpec(
+    { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' },
+    { defaultReasoningLevel: 'high' });
+  assert.equal(agy.provider, 'google');
+  assert.equal(agy.reasoningLevel, 'high');
+
+  // Явный уровень закреплённого критика сильнее наследства.
+  const explicit = l2CriticSpec(
+    { provider: 'acp-antigravity-acp', model: 'gemini-4-neon',
+      reasoningLevel: 'high' },
+    { defaultReasoningLevel: 'medium' });
+  assert.equal(explicit.reasoningLevel, 'high');
+
+  // Не-google критик — без наследования.
+  const ds = l2CriticSpec({ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' });
+  assert.equal(ds.provider, 'opencode-go');
+  assert.equal(ds.reasoningLevel, undefined);
+  assert.equal(isNeonReview(ds), false);
+
+  // Неисполняемый спек — null.
+  assert.equal(l2CriticSpec({ provider: 'acp-devin', model: 'swe-2-high' }), null);
 });

@@ -13,7 +13,7 @@ import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
 import { isolatedArbiterRunner, isolatedPiReviewRunner,
-  runnerReviewSpec } from './review-runner.mjs';
+  l2CriticSpec, runnerReviewSpec } from './review-runner.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter } from './review-policy.mjs';
 import { MAX_QUESTION_TTL_MS, readSignedAnswer, signedAnswerVerifier } from './question-gate.mjs';
@@ -479,7 +479,12 @@ async function execute() {
     // реально исполняемому L2-раннером ('pi/openai/…' → 'openai',
     // 'acp-antigravity-acp' → 'google'): без egress-адресов раннер
     // не запускается вообще. Раннер следует за типом критика.
-    const attemptCritic = runnerReviewSpec(attempt.triad?.critic ?? reviewSetup.critic);
+    // reasoningLevel наследуется в l2CriticSpec ДО выбора раннера: критик
+    // google-семейства без него получает наследство из профиля (или
+    // 'medium') — иначе Neon ушёл бы в Pi-раннер, а acceptHeld отклонил бы
+    // квитанцию review_isolation_missing (#1263 r6).
+    const attemptCritic = l2CriticSpec(attempt.triad?.critic ?? reviewSetup.critic,
+      { defaultReasoningLevel: profile.review?.reasoningLevel });
     const attemptArbiter = runnerReviewSpec(attempt.triad?.arbiter ?? reviewSetup.arbiter);
     // Закреплённый, но неисполняемый провайдер — fail-closed, а не тихая
     // подмена дефолтом: такой пин не доходит до контейнера.

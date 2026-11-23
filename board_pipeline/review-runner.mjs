@@ -790,6 +790,21 @@ export function l2RunnableSpec(spec) {
   return runnerReviewSpec(spec) !== null;
 }
 
+// Закреплённый критик L2 к виду, по которому выбирается раннер: спек
+// нормализуется runnerReviewSpec, а у критика google-семейства наследуется
+// reasoningLevel (явный > defaultReasoningLevel из профиля > 'medium') ДО
+// решения Neon vs Pi — Neon без reasoningLevel не должен уходить в
+// Pi-раннер, иначе acceptHeld отклонит квитанцию (#1263 r6).
+// null — спек неисполняем (нет egress).
+export function l2CriticSpec(spec, { defaultReasoningLevel = 'medium' } = {}) {
+  const critic = runnerReviewSpec(spec);
+  if (critic === null) return null;
+  if (executorFamily(critic) === 'google') {
+    return { reasoningLevel: defaultReasoningLevel, ...critic };
+  }
+  return critic;
+}
+
 function parseArbiterDecision(text) {
   const body = String(text ?? '').trim();
   const json = /^```(?:json)?\s+([\s\S]*?)```$/i.exec(body)?.[1] ?? body;
