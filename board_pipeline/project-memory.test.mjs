@@ -39,14 +39,19 @@ async function sandbox() {
   return { dir, tree, storeDir, cleanup: () => rm(dir, { recursive: true, force: true }) };
 }
 
-const trustedAttestation = (overrides = {}) => ({
-  review_verdict: 'REVIEW_OK',
-  verified_sha: SHA_A,
-  worker_family: 'openai',
-  reviewer_family: 'google',
-  source_card: '1265',
-  ...overrides,
-});
+const trustedAttestation = (overrides = {}) => {
+  const verifiedSha = overrides.verified_sha ?? SHA_A;
+  return {
+    role: 'post_review_steward',
+    review_verdict: 'REVIEW_OK',
+    verified_sha: verifiedSha,
+    worker_family: 'openai/gpt-6.2-sol',
+    reviewer_family: 'google/gemini-4-neon',
+    source_card: '1265',
+    receipt: { verdict: 'REVIEW_OK', sha: verifiedSha },
+    ...overrides,
+  };
+};
 
 test('records all 4 typed sections with hashes and resolves read-only slice', async () => {
   const { tree, storeDir, cleanup } = await sandbox();
@@ -334,7 +339,7 @@ test('fail-closed on worktree paths, relative paths, and symlink escapes (includ
         storeDir, projectId: 'proj_evil', worktree: tree,
         attestation: trustedAttestation(), updates,
       }),
-      /project_memory_inside_worker_paths/,
+      /project_memory_symlink_disallowed/,
     );
   } finally { await cleanup(); }
 });
@@ -390,25 +395,28 @@ test('pinProjectMemory persists atomic snapshot with pin_sha256 and detects tamp
     const pinned1 = pinProjectMemory(async () => {
       calls += 1;
       return resolveProjectMemory({ storeDir, projectId: 'proj_p', worktree: tree });
-    }, { persistDir });
+    }, { persistDir, projectId: 'proj_p' });
 
-    const s1 = await pinned1('1265:1');
-    const s2 = await pinned1('1265:1');
+    const s1 = await pinned1('1265:att-1:1');
+    const s2 = await pinned1('1265:att-1:1');
     assert.deepEqual(s1, s2);
     assert.equal(calls, 1);
 
     // Restart: reads persisted pin without invoking resolver
-    const pinned2 = pinProjectMemory(async () => { throw new Error('must not resolve'); }, { persistDir });
-    const s3 = await pinned2('1265:1');
+    const pinned2 = pinProjectMemory(async () => { throw new Error('must not resolve'); },
+      { persistDir, projectId: 'proj_p' });
+    const s3 = await pinned2('1265:att-1:1');
     assert.deepEqual(s3, s1);
 
     // Tamper persisted pin -> fail-closed
-    const pinName = `project-memory-${createHash('sha256').update('1265:1').digest('hex').slice(0, 32)}.json`;
+    const pinName = `project-memory-${createHash('sha256').update('proj_p\x001265:att-1:1').digest('hex').slice(0, 32)}.json`;
     const pinFile = join(persistDir, pinName);
     const saved = JSON.parse(await readFile(pinFile, 'utf8'));
+    assert.equal(saved.project_id, 'proj_p');
+    assert.equal(saved.pin_key, '1265:att-1:1');
     await writeFile(pinFile, JSON.stringify({ ...saved, text: 'forged' }));
-    const pinned3 = pinProjectMemory(async () => s1, { persistDir });
-    await assert.rejects(() => pinned3('1265:1'), /project_memory_pin_invalid/);
+    const pinned3 = pinProjectMemory(async () => s1, { persistDir, projectId: 'proj_p' });
+    await assert.rejects(() => pinned3('1265:att-1:1'), /project_memory_pin_invalid/);
   } finally { await cleanup(); }
 });
 
@@ -490,5 +498,151 @@ test('integration: worker, critic, and arbiter prompts embed pinned read-only pr
       assert.match(text, /Never bypass tamper gate/);
       assert.match(text, /прямая запись воркером запрещена/);
     }
+  } finally { await cleanup(); }
+});
+
+test('regression #1: canonical cross-family, trusted role allowlist, strict SHA (40/64), and receipt binding', async () => {
+  const { tree, storeDir, cleanup } = await sandbox();
+  const updates = [{ section: 'invariants', text: 'Verified invariant' }];
+  try {
+    // Missing role or non-allowlisted role fails closed
+    for (const badRole of [undefined, '', 'critic', 'arbiter', 'worker', 'random_actor']) {
+      await assert.rejects(
+        () => recordProjectMemoryUpdate({
+          storeDir, projectId: 'proj_r1', worktree: tree, updates,
+          attestation: trustedAttestation({ role: badRole }),
+        }),
+        /project_memory_untrusted_write/,
+      );
+    }
+    // Aliased same-family pairs (acp-antigravity-acp vs google; gpt-6.2-sol vs codex) rejected
+    for (const pair of [
+      { worker_family: 'acp-antigravity-acp/gemini-4-neon', reviewer_family: 'google/gemini-4-neon' },
+      { worker_family: 'openai/gpt-6.2-sol', reviewer_family: 'openai/codex' },
+      { worker_family: 'pi/opencode-go/deepseek-v4.1-flash', reviewer_family: 'deepseek' },
+      // Unknown families fail closed
+      { worker_family: 'mystery_a', reviewer_family: 'mystery_b' },
+      { worker_family: 'openai/gemini-4-neon', reviewer_family: 'google/gemini-4-neon' },
+    ]) {
+      await assert.rejects(
+        () => recordProjectMemoryUpdate({
+          storeDir, projectId: 'proj_r1', worktree: tree, updates,
+          attestation: trustedAttestation(pair),
+        }),
+        /project_memory_untrusted_write/,
+      );
+    }
+    // Invalid SHA lengths (41..63) rejected
+    const sha41 = 'a'.repeat(41);
+    const sha63 = 'a'.repeat(63);
+    for (const badSha of [sha41, sha63]) {
+      await assert.rejects(
+        () => recordProjectMemoryUpdate({
+          storeDir, projectId: 'proj_r1', worktree: tree, updates,
+          attestation: trustedAttestation({ verified_sha: badSha, receipt: { verdict: 'REVIEW_OK', sha: badSha } }),
+        }),
+        /project_memory_untrusted_write/,
+      );
+    }
+    // Missing receipt, mismatched receipt sha, or non-REVIEW_OK receipt verdict rejected
+    for (const badReceipt of [
+      undefined,
+      null,
+      { verdict: 'REVIEW_REWORK', sha: SHA_A },
+      { verdict: 'REVIEW_OK', sha: SHA_B },
+    ]) {
+      await assert.rejects(
+        () => recordProjectMemoryUpdate({
+          storeDir, projectId: 'proj_r1', worktree: tree, updates,
+          attestation: trustedAttestation({ receipt: badReceipt }),
+        }),
+        /project_memory_untrusted_write/,
+      );
+    }
+    // Valid 64-char SHA + real aliased cross-family specs + allowlisted role succeeds
+    const sha64 = 'f'.repeat(64);
+    const ok = await recordProjectMemoryUpdate({
+      storeDir, projectId: 'proj_r1', worktree: tree, updates,
+      attestation: trustedAttestation({
+        role: 'controller',
+        verified_sha: sha64,
+        receipt: { verdict: 'REVIEW_OK', sha: sha64 },
+        worker_family: 'acp-devin/swe-2-high',
+        reviewer_family: 'acp-antigravity-acp/gemini-4-neon',
+      }),
+    });
+    assert.equal(ok.total, 1);
+  } finally { await cleanup(); }
+});
+
+test('regression #2: dangling symlink on project memory file cannot write into another project slot', async () => {
+  const { tree, storeDir, cleanup } = await sandbox();
+  try {
+    // proj_victim.memory.json does not exist yet; proj_attacker.memory.json is a dangling symlink to it
+    await symlink(join(storeDir, 'proj_victim.memory.json'), join(storeDir, 'proj_attacker.memory.json'));
+    await assert.rejects(
+      () => recordProjectMemoryUpdate({
+        storeDir, projectId: 'proj_attacker', worktree: tree,
+        attestation: trustedAttestation(),
+        updates: [{ section: 'invariants', text: 'Poisoned victim slot' }],
+      }),
+      /project_memory_symlink_disallowed/,
+    );
+    await assert.rejects(
+      () => resolveProjectMemory({ storeDir, projectId: 'proj_attacker', worktree: tree }),
+      /project_memory_symlink_disallowed/,
+    );
+    // Victim slot remains untouched and non-existent
+    const files = await readdir(storeDir);
+    assert.ok(!files.includes('proj_victim.memory.json'));
+  } finally { await cleanup(); }
+});
+
+test('regression #3: pin binds project_id + pin_key and persists empty memory across restarts', async () => {
+  const { dir, tree, storeDir, cleanup } = await sandbox();
+  const persistDir = join(dir, 'pins');
+  await mkdir(persistDir, { recursive: true });
+  try {
+    // Project starts with empty memory; pin persists the empty slice
+    const pinEmpty1 = pinProjectMemory(
+      () => resolveProjectMemory({ storeDir, projectId: 'proj_empty', worktree: tree }),
+      { persistDir, projectId: 'proj_empty' },
+    );
+    const initial = await pinEmpty1('1265:att-empty:1');
+    assert.equal(initial.total, 0);
+    assert.deepEqual(initial.ids, []);
+    assert.equal(initial.text, '');
+
+    // Later, new memory is added to proj_empty, and the process restarts for the same attempt
+    await recordProjectMemoryUpdate({
+      storeDir, projectId: 'proj_empty', worktree: tree,
+      attestation: trustedAttestation(),
+      updates: [{ id: 'late-1', section: 'pitfalls', text: 'Added after attempt started' }],
+    });
+    const pinEmpty2 = pinProjectMemory(
+      () => resolveProjectMemory({ storeDir, projectId: 'proj_empty', worktree: tree }),
+      { persistDir, projectId: 'proj_empty' },
+    );
+    const afterRestart = await pinEmpty2('1265:att-empty:1');
+    assert.deepEqual(afterRestart, initial);
+    assert.equal(afterRestart.total, 0);
+
+    // Substituting a valid pin file from another project/key into this pin's path fails closed
+    const otherPin = pinProjectMemory(
+      () => resolveProjectMemory({ storeDir, projectId: 'proj_other', worktree: tree }),
+      { persistDir, projectId: 'proj_other' },
+    );
+    await otherPin('1265:att-other:1');
+    const otherFile = join(persistDir,
+      `project-memory-${createHash('sha256').update('proj_other\x001265:att-other:1').digest('hex').slice(0, 32)}.json`);
+    const targetFile = join(persistDir,
+      `project-memory-${createHash('sha256').update('proj_empty\x001265:att-swap:1').digest('hex').slice(0, 32)}.json`);
+    await writeFile(targetFile, await readFile(otherFile, 'utf8'));
+
+    const swapped = pinProjectMemory(
+      () => resolveProjectMemory({ storeDir, projectId: 'proj_empty', worktree: tree }),
+      { persistDir, projectId: 'proj_empty' },
+    );
+    await assert.rejects(() => swapped('1265:att-swap:1'), /project_memory_pin_invalid/);
   } finally { await cleanup(); }
 });

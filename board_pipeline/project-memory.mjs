@@ -6,12 +6,14 @@
 // подтверждённым REVIEW_OK + verified_sha + независимой парой семейств.
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import { link, lstat, mkdir, open, readFile, readlink, realpath, rename, rm,
   unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { assertCrossFamily, executorFamily } from './review-runner.mjs';
 import { canonicalJson } from './subject.mjs';
 
 export const PROJECT_MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
@@ -22,16 +24,29 @@ export const PROJECT_MEMORY_SECTIONS = Object.freeze([
   'dead_ends',
   'conventions',
 ]);
+export const TRUSTED_WRITE_ROLES = Object.freeze([
+  'post_review_steward',
+  'operator',
+  'controller',
+]);
 export const DEFAULT_MAX_CHARS = 4000;
 export const DEFAULT_MAX_ENTRIES_PER_SECTION = 25;
 
 const SECTION_SET = new Set(PROJECT_MEMORY_SECTIONS);
+const TRUSTED_ROLE_SET = new Set(TRUSTED_WRITE_ROLES);
+const CANONICAL_FAMILY_SPEC = new Map([
+  ['cognition', 'acp-devin/swe-2-high'],
+  ['glm', 'acp-zcode-start/glm-5.3-flash'],
+  ['deepseek', 'opencode-go/deepseek-v4'],
+  ['openai', 'openai/gpt-6.2-sol'],
+  ['google', 'google/gemini-4-neon'],
+  ['anthropic', 'agy/claude-opus-5.5'],
+]);
 const ID = /^[a-z0-9-]{1,64}$/;
 const PROJECT = /^[a-z0-9_-]{1,64}$/;
 const CARD = /^[0-9]{1,15}$/;
-const GIT_SHA = /^[a-f0-9]{40,64}$/;
+const GIT_SHA = /^([a-f0-9]{40}|[a-f0-9]{64})$/;
 const DIGEST = /^[a-f0-9]{64}$/;
-const FAMILY = /^[a-z0-9_.-]{1,64}$/i;
 const MAX_ENTRY_CHARS = 500;
 const MAX_MEMORY_BYTES = 4 * 1024 * 1024;
 const MAX_SYMLINK_HOPS = 40;
@@ -164,20 +179,29 @@ async function resolveProjectFile(storeDir, projectId, worktree) {
     throw new Error('project_memory_project_invalid');
   }
   const dir = await assertStoreOutside(storeDir, worktree);
-  const file = join(dir, `${projectId}.memory.json`);
-  const fileTarget = await resolveLoose(file);
+  const expectedFileName = `${projectId}.memory.json`;
+  const expectedFile = join(dir, expectedFileName);
+  // Запрещаем любые симлинки на сам файл памяти проекта (включая dangling
+  // symlink на ещё не созданный файл другого проекта).
+  try {
+    const st = lstatSync(expectedFile);
+    if (st.isSymbolicLink()) throw new Error('project_memory_symlink_disallowed');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const resolvedTarget = await resolveLoose(expectedFile);
   if (worktree !== undefined) {
     const tree = await resolveExisting(worktree);
     if (tree === null) throw new Error('project_memory_worktree_missing');
-    if (inside(tree, fileTarget) || inside(fileTarget, tree) ||
-        inside(tree, dirname(fileTarget)) || inside(dirname(fileTarget), tree)) {
+    if (inside(tree, resolvedTarget) || inside(resolvedTarget, tree) ||
+        inside(tree, dirname(resolvedTarget)) || inside(dirname(resolvedTarget), tree)) {
       throw new Error('project_memory_inside_worker_paths');
     }
   }
-  if (!inside(dir, fileTarget) || !inside(dir, dirname(fileTarget))) {
-    throw new Error('project_memory_symlink_escape');
+  if (resolvedTarget !== expectedFile) {
+    throw new Error('project_memory_symlink_disallowed');
   }
-  return { dir, file: fileTarget };
+  return { dir, file: resolvedTarget };
 }
 
 async function readStoreDoc(file, projectId) {
@@ -329,19 +353,39 @@ function compactSections(sections, { maxChars, maxEntriesPerSection }) {
   return next;
 }
 
-// Жёсткая граница доверия на запись: невалидированный воркер, любой вердикт
-// отличный от REVIEW_OK, отсутствие verified_sha или самоприёмка одного
-// семейства моделей — fail-closed project_memory_untrusted_write.
+function toCanonicalFamilySpec(spec) {
+  if (spec === null || spec === undefined) return null;
+  if (executorFamily(spec) !== null) return spec;
+  if (typeof spec === 'string') {
+    const mapped = CANONICAL_FAMILY_SPEC.get(spec.trim().toLowerCase());
+    if (mapped !== undefined) return mapped;
+  }
+  return null;
+}
+
+// Жёсткая граница доверия на запись:
+// - явный allowlist доверенного post-review контекста (post_review_steward / operator / controller);
+// - подтверждённая квитанция ревью (receipt.verdict === 'REVIEW_OK' и receipt.sha === verified_sha);
+// - строгий формат Git SHA (40 или 64 hex-символа);
+// - каноническое кросс-семейство через executorFamily/assertCrossFamily из review-runner.mjs.
 function assertTrustedAttestation(attestation, explicitSourceCard) {
   if (attestation === null || typeof attestation !== 'object' || Array.isArray(attestation)) {
     throw new Error('project_memory_untrusted_write');
   }
-  for (const field of ['actor', 'role', 'source', 'caller']) {
-    const val = typeof attestation[field] === 'string' ? attestation[field].trim().toLowerCase() : '';
-    if (val === 'worker') throw new Error('project_memory_untrusted_write');
-  }
   if (attestation.untrusted === true) {
     throw new Error('project_memory_untrusted_write');
+  }
+  const roleCandidates = [attestation.trusted_role, attestation.role, attestation.actor]
+    .filter(v => v !== undefined);
+  if (roleCandidates.length === 0 ||
+      roleCandidates.some(v => typeof v !== 'string' || !TRUSTED_ROLE_SET.has(v.trim().toLowerCase()))) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  for (const field of ['source', 'caller']) {
+    if (attestation[field] !== undefined) {
+      const val = typeof attestation[field] === 'string' ? attestation[field].trim().toLowerCase() : '';
+      if (!TRUSTED_ROLE_SET.has(val)) throw new Error('project_memory_untrusted_write');
+    }
   }
   if (attestation.review_verdict !== 'REVIEW_OK') {
     throw new Error('project_memory_untrusted_write');
@@ -349,23 +393,68 @@ function assertTrustedAttestation(attestation, explicitSourceCard) {
   if (typeof attestation.verified_sha !== 'string' || !GIT_SHA.test(attestation.verified_sha)) {
     throw new Error('project_memory_untrusted_write');
   }
-  const workerFamily = typeof attestation.worker_family === 'string'
-    ? attestation.worker_family.trim().toLowerCase() : '';
-  const reviewerFamily = typeof attestation.reviewer_family === 'string'
-    ? attestation.reviewer_family.trim().toLowerCase() : '';
-  if (!FAMILY.test(workerFamily) || !FAMILY.test(reviewerFamily) || workerFamily === reviewerFamily) {
+  const receipt = attestation.receipt;
+  if (receipt === null || typeof receipt !== 'object' || Array.isArray(receipt) ||
+      receipt.verdict !== 'REVIEW_OK' ||
+      typeof receipt.sha !== 'string' || !GIT_SHA.test(receipt.sha) ||
+      receipt.sha !== attestation.verified_sha) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  const workerExecSpec = attestation.worker_executor !== undefined
+    ? toCanonicalFamilySpec(attestation.worker_executor) : null;
+  const workerFamSpec = attestation.worker_family !== undefined
+    ? toCanonicalFamilySpec(attestation.worker_family) : null;
+  if (attestation.worker_executor !== undefined && workerExecSpec === null) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  if (attestation.worker_family !== undefined && workerFamSpec === null) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  if (workerExecSpec !== null && workerFamSpec !== null &&
+      executorFamily(workerExecSpec) !== executorFamily(workerFamSpec)) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  const reviewerExecSpec = attestation.reviewer_executor !== undefined
+    ? toCanonicalFamilySpec(attestation.reviewer_executor) : null;
+  const reviewerFamSpec = attestation.reviewer_family !== undefined
+    ? toCanonicalFamilySpec(attestation.reviewer_family) : null;
+  if (attestation.reviewer_executor !== undefined && reviewerExecSpec === null) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  if (attestation.reviewer_family !== undefined && reviewerFamSpec === null) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  if (reviewerExecSpec !== null && reviewerFamSpec !== null &&
+      executorFamily(reviewerExecSpec) !== executorFamily(reviewerFamSpec)) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  const workerSpec = workerExecSpec ?? workerFamSpec;
+  const reviewerSpec = reviewerExecSpec ?? reviewerFamSpec;
+  let families;
+  try {
+    families = assertCrossFamily(workerSpec, reviewerSpec);
+  } catch {
     throw new Error('project_memory_untrusted_write');
   }
   const attCard = attestation.source_card !== undefined ? String(attestation.source_card) : undefined;
   const paramCard = explicitSourceCard !== undefined ? String(explicitSourceCard) : undefined;
+  const receiptCard = receipt.source_card !== undefined ? String(receipt.source_card) : undefined;
   if (attCard !== undefined && paramCard !== undefined && attCard !== paramCard) {
     throw new Error('project_memory_untrusted_write');
   }
-  const card = attCard ?? paramCard ?? '';
+  if (receiptCard !== undefined && (attCard ?? paramCard) !== undefined && receiptCard !== (attCard ?? paramCard)) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  const card = attCard ?? paramCard ?? receiptCard ?? '';
   if (!CARD.test(card)) {
     throw new Error('project_memory_source_card_invalid');
   }
-  return { verifiedSha: attestation.verified_sha, sourceCard: card, workerFamily, reviewerFamily };
+  return {
+    verifiedSha: attestation.verified_sha,
+    sourceCard: card,
+    workerFamily: families.executor,
+    reviewerFamily: families.critic,
+  };
 }
 
 export async function resolveProjectMemory({
@@ -593,7 +682,8 @@ const isSlice = s => s !== null && typeof s === 'object' && !Array.isArray(s) &&
   typeof s.text === 'string' && typeof s.truncated === 'boolean' && Number.isSafeInteger(s.total);
 
 const pinIntegrity = s => createHash('sha256').update(canonicalJson({
-  projectId: s.projectId,
+  project_id: s.project_id,
+  pin_key: s.pin_key,
   digest: s.digest,
   ids: s.ids,
   items: s.items,
@@ -612,46 +702,72 @@ const isSliceContent = s => isSlice(s) && Array.isArray(s.items) &&
   s.truncated === (s.total > s.ids.length) &&
   sliceDigest(s.projectId, s.items) === s.digest;
 
-const isPin = s => isSliceContent(s) &&
+const isPin = (s, expectedKey, expectedProjectId) => isSliceContent(s) &&
+  typeof s.project_id === 'string' && s.project_id === s.projectId &&
+  (expectedProjectId === undefined || s.project_id === expectedProjectId) &&
+  typeof s.pin_key === 'string' && s.pin_key.length > 0 && s.pin_key === expectedKey &&
   DIGEST.test(s.pin_sha256 ?? '') && pinIntegrity(s) === s.pin_sha256;
 
-// Закрепление read-only среза памяти проекта за попыткой (task_id:epoch):
+const emptySlice = projectId => ({
+  projectId,
+  text: '',
+  digest: sliceDigest(projectId, []),
+  ids: [],
+  truncated: false,
+  total: 0,
+  items: [],
+});
+
+// Закрепление read-only среза памяти проекта за попыткой (task_id:attempt_id:epoch):
 // воркер, критик и арбитр одного кандидата видят один и тот же snapshot/digest.
-// При persistDir публикация атомарна через tmp + link с pin_sha256.
-export function pinProjectMemory(resolve_, { persistDir } = {}) {
+// При persistDir публикация атомарна через tmp + link с pin_sha256, привязанным
+// к project_id + pin_key; отсутствие памяти (пустой срез) также персистится.
+export function pinProjectMemory(resolve_, { persistDir, projectId: expectedProjectId } = {}) {
+  if (expectedProjectId !== undefined && (typeof expectedProjectId !== 'string' || !PROJECT.test(expectedProjectId))) {
+    throw new Error('project_memory_project_invalid');
+  }
   const pins = new Map();
   const fileFor = key => join(persistDir,
-    `project-memory-${createHash('sha256').update(key).digest('hex').slice(0, 32)}.json`);
-  const readPinned = async file => {
+    `project-memory-${createHash('sha256').update(`${expectedProjectId ?? ''}\x00${key}`).digest('hex').slice(0, 32)}.json`);
+  const readPinned = async (file, expectedKey) => {
     let saved;
     try { saved = JSON.parse(await readFile(file, 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
-    if (!isPin(saved)) throw new Error('project_memory_pin_invalid');
+    if (!isPin(saved, expectedKey, expectedProjectId)) throw new Error('project_memory_pin_invalid');
     const { projectId, text, digest, ids, truncated, total, items } = saved;
     return { projectId, text, digest, ids, truncated, total, items };
   };
   return key => {
+    if (typeof key !== 'string' || !key) throw new Error('project_memory_pin_key_invalid');
     let pin = pins.get(key);
     if (pin === undefined) {
       pin = (async () => {
         const file = persistDir === undefined ? null : fileFor(key);
         if (file !== null) {
-          const saved = await readPinned(file);
+          const saved = await readPinned(file, key);
           if (saved !== undefined) return saved;
         }
-        const slice = (await resolve_()) ?? null;
+        let slice = (await resolve_()) ?? null;
+        if (slice === null && expectedProjectId !== undefined) {
+          slice = emptySlice(expectedProjectId);
+        }
         if (file !== null && slice !== null) {
           if (!isSliceContent(slice)) throw new Error('project_memory_slice_invalid');
+          if (expectedProjectId !== undefined && slice.projectId !== expectedProjectId) {
+            throw new Error('project_memory_pin_invalid');
+          }
           const { projectId, text, digest, ids, truncated, total, items } = slice;
           const payload = { projectId, text, digest, ids, truncated, total, items };
+          const stored = { project_id: projectId, pin_key: key, ...payload };
+          stored.pin_sha256 = pinIntegrity(stored);
           const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
           try {
-            await writeFile(tmp, JSON.stringify({ ...payload, pin_sha256: pinIntegrity(payload) }), { mode: 0o600 });
+            await writeFile(tmp, JSON.stringify(stored), { mode: 0o600 });
             try {
               await link(tmp, file);
             } catch (error) {
               if (error.code !== 'EEXIST') throw error;
-              const saved = await readPinned(file);
+              const saved = await readPinned(file, key);
               if (saved === undefined) throw new Error('project_memory_pin_invalid');
               return saved;
             }
