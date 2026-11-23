@@ -10,8 +10,9 @@ import { promisify } from 'node:util';
 import {
   executorFamily, assertCrossFamily, parseReviewTranscript, parseReviewVerdict,
   hasValidFinding, isolatedArbiterRunner, isolatedPiReviewRunner, runInReadOnlySandbox, snapshotDigest,
-  worktreeFingerprint, assertToolsAllowed, ReviewDenied, REVIEW_IMAGE,
+  worktreeFingerprint, assertToolsAllowed, ReviewDenied, REVIEW_IMAGE, l2CriticSpec,
 } from './review-runner.mjs';
+import { isNeonReview } from './review-policy.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
 import { acceptHeld } from './acceptance.mjs';
 
@@ -31,6 +32,8 @@ test('family: строгая таблица provider/model без подстро
   assert.equal(executorFamily('openai/gpt-6.2-sol'), 'openai');
   assert.equal(executorFamily({ provider: 'openai', model: 'gpt-6.2-astra' }), 'openai');
   assert.equal(executorFamily({ provider: 'acp-antigravity-acp', model: 'gemini-4-neon' }), 'google');
+  // Routing Policy v2: escalation-слот Opus 5.5 — семейство anthropic.
+  assert.equal(executorFamily({ provider: 'agy', model: 'claude-opus-5.5' }), 'anthropic');
   // Провайдер без модели и модель без провайдера — отказ.
   assert.equal(executorFamily({ provider: 'openai' }), null);
   assert.equal(executorFamily({ model: 'gpt-6.2-sol' }), null);
@@ -1043,4 +1046,95 @@ test('runner: ошибка host OAuth refresh отклоняет ревью до
     await rm(journal, { recursive: true, force: true });
     await rm(piRoot, { recursive: true, force: true });
   }
+});
+
+test('runner: routed-критик с egress исполняется, acp-devin — отказ до sandbox (#1263 r3)', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'runner-repo-'));
+  const journal = await mkdtemp(join(tmpdir(), 'runner-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'runner-pi-'));
+  try {
+    const git = async (...args) =>
+      (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
+    await git('init', '-q', '-b', 'pilot');
+    await git('config', 'user.email', 't@l');
+    await git('config', 'user.name', 't');
+    await writeFile(join(repo, 'a.txt'), 'x\n');
+    await git('add', 'a.txt');
+    await git('commit', '-qm', 'cand');
+    const sha = await git('rev-parse', 'HEAD');
+    const digest = 'f'.repeat(64);
+    // Закреплённый критик в worker-форме pi-харнесса — нормализуется к
+    // реальному pi-провайдеру 'opencode-go' (штатный egress opencode.ai,
+    // провайдер НЕ переименовывается) и доходит до контейнера.
+    await writeFile(join(piRoot, 'auth.json'), '{"opencode-go":{"k":"v"}}');
+    const routed = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash',
+      reasoningLevel: 'medium' };
+    const stream = [
+      msg({ provider: 'opencode-go', model: 'deepseek-v4.1-flash',
+        content: [{ type: 'text',
+          text: `{"verdict":"PASS","subject_digest":"${digest}"}` }] }), settled,
+    ].join('\n');
+    let allow = null;
+    const runner = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async (opts) => {
+        allow = opts.allow;
+        return { code: 0, stdout: stream, stderr: '' };
+      } });
+    const receipt = await runner(
+      { task_id: '1', candidate_sha: sha, worktree: repo,
+        executor: 'acp-devin/swe-2-high', subject_digest: digest },
+      { review: routed });
+    assert.equal(receipt.actual.provider, 'opencode-go');
+    assert.equal(receipt.actual.model, 'deepseek-v4.1-flash');
+    assert.ok(allow.length > 0, 'egress allowlist заполнен — нет model_proxy_allowlist_invalid');
+
+    // 'acp-devin' как критик — у раннера адресов нет: отказ ДО sandbox,
+    // не model_proxy_allowlist_invalid внутри контейнера.
+    let calls = 0;
+    const unrunnable = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async () => { calls++; return { code: 0, stdout: '', stderr: '' }; } });
+    await assert.rejects(
+      () => unrunnable({ task_id: '1', candidate_sha: sha, worktree: repo,
+        executor: 'acp-devin/swe-2-high' },
+        { review: { provider: 'acp-devin', model: 'swe-2-high',
+          reasoningLevel: 'medium' } }),
+      (e) => e instanceof ReviewDenied && e.reason === 'review_profile_not_approved');
+    assert.equal(calls, 0);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+  }
+});
+
+test('l2CriticSpec: google-критик без reasoningLevel наследует его и идёт в Neon-раннер (#1263 r6)', () => {
+  // Neon без reasoningLevel + Sol: наследование 'medium' до проверки —
+  // выбирается Neon-раннер (isNeonReview), а не Pi-раннер, иначе acceptHeld
+  // отклонил бы квитанцию review_isolation_missing.
+  const noLevel = l2CriticSpec({ provider: 'google', model: 'gemini-4-neon' });
+  assert.equal(noLevel.reasoningLevel, 'medium');
+  assert.equal(isNeonReview(noLevel), true);
+
+  // agy-форма нормализуется к 'google' с наследованием из профиля.
+  const agy = l2CriticSpec(
+    { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' },
+    { defaultReasoningLevel: 'high' });
+  assert.equal(agy.provider, 'google');
+  assert.equal(agy.reasoningLevel, 'high');
+
+  // Явный уровень закреплённого критика сильнее наследства.
+  const explicit = l2CriticSpec(
+    { provider: 'acp-antigravity-acp', model: 'gemini-4-neon',
+      reasoningLevel: 'high' },
+    { defaultReasoningLevel: 'medium' });
+  assert.equal(explicit.reasoningLevel, 'high');
+
+  // Не-google критик — без наследования.
+  const ds = l2CriticSpec({ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' });
+  assert.equal(ds.provider, 'opencode-go');
+  assert.equal(ds.reasoningLevel, undefined);
+  assert.equal(isNeonReview(ds), false);
+
+  // Неисполняемый спек — null.
+  assert.equal(l2CriticSpec({ provider: 'acp-devin', model: 'swe-2-high' }), null);
 });

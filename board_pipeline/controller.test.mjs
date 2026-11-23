@@ -382,27 +382,29 @@ test('queue mode does not admit a card whose profile_id differs from the route p
 test('worker selector spawns the agreed fallback only on a confirmed refusal and records the trail', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector();
-  x.cfg.route.zcodeQuota = 'available';
   x.cfg.bb.probeAvailability = async w => w.provider === 'acp-devin'
     ? { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 }
-    : { status: 'available', activeBackgroundAgentCount: 0, zcodeQuota: 'available' };
+    : { status: 'available', activeBackgroundAgentCount: 0 };
   x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
   x.cfg.bb.spawn = async env => {
     x.effects.spawn++;
-    assert.equal(env.executor.provider, 'acp-zcode-start');
-    assert.equal(env.executor.model, 'builtin:zai-start-plan\\GLM-5.3-Flash');
-    return { threadId: 'thr_glm1' };
+    assert.equal(env.executor.provider, 'pi');
+    assert.equal(env.executor.model, 'opencode-go/deepseek-v4.1-flash');
+    return { threadId: 'thr_ds1' };
   };
   assert.equal((await x.tick()).phase, 'working');
   const record = await x.cfg.state.load();
-  assert.equal(record.executor.provider, 'acp-zcode-start');
+  assert.equal(record.executor.provider, 'pi');
   assert.equal(record.fallbackReason, 'confirmed_refusal:acp-devin');
-  assert.equal(record.attemptedWorkers.length, 2);
+  // google-критик по умолчанию исключает antigravity/gemini — он записан
+  // пропущенным до подтверждённого отказа первичного и spawn резерва.
+  assert.equal(record.attemptedWorkers.length, 3);
+  assert.equal(record.attemptedWorkers[0].verdict, 'skipped');
   assert.equal(x.effects.spawn, 1, 'первичный не спаунился после probe confirmed_refusal');
   x.submit('c');
   assert.equal((await x.tick()).phase, 'done');
   const attempt = x.effects.attempts.at(-1);
-  assert.equal(attempt.executor.provider, 'acp-zcode-start',
+  assert.equal(attempt.executor.provider, 'pi',
     'доверенная попытка несёт фактического исполнителя');
 });
 
@@ -415,14 +417,13 @@ test('worker selector quarantines an unknown launch outcome without a second wri
   assert.equal((await x.tick()).reason, 'worker_launch_outcome_unknown');
   assert.equal(x.effects.spawn, 0);
   const record = await x.cfg.state.load();
-  assert.equal(record.attemptedWorkers[0].verdict, 'unknown_outcome');
+  assert.equal(record.attemptedWorkers.find(w => w.provider === 'acp-devin').verdict, 'unknown_outcome');
 });
 
 // Пункт 3: отказ первичного при грязном worktree — карантин без второго писателя.
 test('worker selector quarantines a confirmed refusal on a dirty worktree', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector();
-  x.cfg.route.zcodeQuota = 'available';
   x.cfg.bb.probeAvailability = async () =>
     ({ status: 'confirmed_refusal', activeBackgroundAgentCount: 0 });
   x.cfg.bb.inspectWorktree = async () => ({ clean: false, head: 'a'.repeat(40) });
@@ -441,17 +442,30 @@ test('a triad violation rejects the route before any claim or spawn', async t =>
   assert.equal(x.effects.spawn, 0);
 });
 
-// Пункт 4: триада проверяется для ВСЕХ кандидатов — резерв ZCode семейства glm
-// конфликтует с критиком glm, маршрут отклоняется до claim.
-test('a fallback violating the triad rejects the route before claim', async t => {
+// Пункт 4: нарушение триады первичным отклоняет маршрут до claim; нарушение
+// резервом — пропуск резерва, маршрут продолжается со следующим кандидатом.
+test('a fallback violating the triad is skipped, the route continues', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector();
-  x.cfg.route.zcodeQuota = 'available';
-  x.cfg.route.critic = { provider: 'acp-zcode-start',
-    model: 'builtin:zai-start-plan\\GLM-5.3-Flash' };
-  assert.equal((await x.tick()).reason, 'route_triad_violation:review_same_family');
-  assert.equal((await x.inspect()).state, 'ready');
-  assert.equal(x.effects.spawn, 0);
+  // Критик deepseek: резерв pi/deepseek ломает триаду и пропускается,
+  // antigravity/gemini остаётся допустимым резервом.
+  x.cfg.route.critic = { provider: 'opencode-go', model: 'deepseek-v4' };
+  x.cfg.bb.probeAvailability = async w => w.provider === 'acp-devin'
+    ? { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 }
+    : { status: 'available', activeBackgroundAgentCount: 0 };
+  x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
+  x.cfg.bb.spawn = async env => {
+    x.effects.spawn++;
+    assert.equal(env.executor.provider, 'acp-antigravity-acp');
+    return { threadId: 'thr_neon1' };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.equal(record.executor.provider, 'acp-antigravity-acp');
+  const skipped = record.attemptedWorkers.find(w => w.provider === 'pi');
+  assert.equal(skipped.verdict, 'skipped');
+  assert.match(skipped.reason, /^triad_violation:/);
+  assert.equal(x.effects.spawn, 1);
 });
 
 test('three converging rework rounds complete without a round cap', async t => {
@@ -933,4 +947,163 @@ test('allowlist rejects empty or null repoId instead of silently dropping filter
     };
     await assert.rejects(() => x.tick(), /A trusted, enrolled route is required/);
   }
+});
+
+// ── Board #1263: закреплённая триада попытки ───────────────────────────────
+test('pinned triad: одна триада для spawn, L2, арбитража — резолвится один раз', async t => {
+  const x = await lab(t);
+  const PINNED_CRITIC = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const PINNED_ARBITER = { provider: 'openai', model: 'gpt-5.6-sol' };
+  let pins = 0;
+  let arbiterSeen = null;
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => {
+      pins++;
+      return { plan: [ws.PRIMARY_WORKER], critic: PINNED_CRITIC, arbiter: PINNED_ARBITER };
+    },
+    arbitrate: async req => {
+      arbiterSeen = req.arbiter;
+      return { decision: 'escalate_owner', question: 'Развилка?', subject_digest: DIGEST };
+    },
+  });
+  const seen = [];
+  x.cfg.verify = async attempt => {
+    seen.push(structuredClone(attempt.triad));
+    return L2_REWORK([FINDING]);
+  };
+  // Claim + spawn: триада закреплена в записи попытки.
+  assert.equal((await x.tick()).phase, 'working');
+  const spawned = await x.cfg.state.load();
+  assert.deepEqual(spawned.triad, {
+    worker: ws.PRIMARY_WORKER, critic: PINNED_CRITIC, arbiter: PINNED_ARBITER });
+  // Два одинаковых L2 REWORK → repeated_l2_finding → арбитраж на закреплённом
+  // арбитре, а не на дефолтном Sol.
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'arbiter_escalated_to_owner');
+  assert.deepEqual(arbiterSeen, PINNED_ARBITER);
+  // Скоркард резолвится один раз на попытку — не на каждый тик.
+  assert.equal(pins, 1);
+  // Оба раунда L2 видели ту же закреплённую триаду.
+  assert.equal(seen.length, 2);
+  for (const triad of seen) assert.deepEqual(triad, spawned.triad);
+  // «Рестарт»: следующий тик читает triad из записи, pinTriad не вызывается.
+  assert.equal((await x.tick()).phase, 'hold');
+  assert.equal(pins, 1);
+});
+
+test('rejected pinTriad — явный hold без spawn', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => ({ outcome: 'rejected', reason: 'route_base_triad_violation:x' }),
+  });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'route_base_triad_violation:x');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('исключение pinTriad — fail-closed hold, дефолтный воркер не запускается', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => { throw new Error('scorecard exploded'); },
+  });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'route_pin_failed');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('reconcileSpawn после lost spawn восстанавливает закреплённую триаду', async t => {
+  const x = await lab(t);
+  const PINNED_CRITIC = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const PINNED_ARBITER = { provider: 'openai', model: 'gpt-5.6-sol' };
+  let pins = 0;
+  let seenAtReconcile = null;
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => {
+      pins++;
+      return { plan: [ws.PRIMARY_WORKER], critic: PINNED_CRITIC, arbiter: PINNED_ARBITER };
+    },
+  });
+  // Ответ spawn теряется: запись 'launching' + intent остаётся, триада уже
+  // закреплена в ней ДО внешнего вызова.
+  x.cfg.bb.spawn = async () => { x.effects.spawn++; throw new Error('lost transport response'); };
+  assert.equal((await x.tick()).phase, 'uncertain');
+  assert.equal(x.effects.spawn, 1);
+  const inflight = await x.cfg.state.load();
+  assert.deepEqual(inflight.triad,
+    { worker: ws.PRIMARY_WORKER, critic: PINNED_CRITIC, arbiter: PINNED_ARBITER });
+  // Симулируем обрыв процесса с незакрытым intent(spawn): рестарт видит
+  // 'launching' — сверка идёт через reconcileSpawn с записью триады.
+  await x.cfg.state.save({ ...inflight, phase: 'launching', reason: undefined, receipt: undefined });
+  x.cfg.bb.reconcileSpawn = async attempt => {
+    seenAtReconcile = structuredClone(attempt);
+    return { status: 'matched', threadId: 'thr_found' };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.equal(record.threadId, 'thr_found');
+  assert.deepEqual(record.triad,
+    { worker: ws.PRIMARY_WORKER, critic: PINNED_CRITIC, arbiter: PINNED_ARBITER });
+  // reconcileSpawn получил попытку уже с триадой и известным исполнителем.
+  assert.deepEqual(seenAtReconcile.triad, record.triad);
+  assert.deepEqual(seenAtReconcile.executor, ws.PRIMARY_WORKER);
+  // Повторный pin не требуется — триада читается из записи.
+  assert.equal(pins, 1);
+  // Сдача: попытка в verify несёт ту же закреплённую триаду и исполнителя.
+  x.submit('b'.repeat(40));
+  await x.tick();
+  assert.deepEqual(x.effects.attempts[0].triad, record.triad);
+  assert.deepEqual(x.effects.attempts[0].executor, ws.PRIMARY_WORKER);
+});
+
+test('reconcileSpawn после потери ответа резервного кандидата восстанавливает его, а не первичного', async t => {
+  const x = await lab(t);
+  const PINNED_CRITIC = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const PINNED_ARBITER = { provider: 'openai', model: 'gpt-5.6-sol' };
+  // Резерв — третье независимое семейство (критик deepseek, арбитр openai).
+  const RESERVE = { provider: 'agy', model: 'claude-opus-5.5' };
+  let seenAtReconcile = null;
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () =>
+      ({ plan: [ws.PRIMARY_WORKER, RESERVE], critic: PINNED_CRITIC, arbiter: PINNED_ARBITER }),
+  });
+  // Первичный — подтверждённый отказ; у резервного ответ spawn теряется.
+  x.cfg.bb.probeAvailability = async w => w.provider === 'acp-devin'
+    ? { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 }
+    : { status: 'available', activeBackgroundAgentCount: 0 };
+  x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
+  x.cfg.bb.spawn = async env => {
+    x.effects.spawn++;
+    assert.equal(env.executor.provider, 'agy');
+    throw new Error('lost transport response');
+  };
+  assert.equal((await x.tick()).phase, 'uncertain');
+  assert.equal(x.effects.spawn, 1);
+  const inflight = await x.cfg.state.load();
+  // До внешнего spawn запись уже несёт РЕЗЕРВНОГО кандидата как
+  // worker триады и executor — reconcile не «откатит» её к первичному.
+  assert.deepEqual(inflight.triad,
+    { worker: RESERVE, critic: PINNED_CRITIC, arbiter: PINNED_ARBITER });
+  assert.deepEqual(inflight.executor, RESERVE);
+  await x.cfg.state.save({ ...inflight, phase: 'launching', reason: undefined, receipt: undefined });
+  x.cfg.bb.reconcileSpawn = async attempt => {
+    seenAtReconcile = structuredClone(attempt);
+    return { status: 'matched', threadId: 'thr_reserve' };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.equal(record.threadId, 'thr_reserve');
+  assert.deepEqual(record.triad.worker, RESERVE);
+  assert.deepEqual(record.executor, RESERVE);
+  assert.deepEqual(seenAtReconcile.triad, record.triad);
+  assert.deepEqual(seenAtReconcile.executor, RESERVE);
+  x.submit('b'.repeat(40));
+  await x.tick();
+  assert.deepEqual(x.effects.attempts[0].executor, RESERVE);
+  assert.deepEqual(x.effects.attempts[0].triad, record.triad);
 });

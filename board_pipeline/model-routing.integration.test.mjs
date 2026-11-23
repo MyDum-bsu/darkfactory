@@ -5,20 +5,23 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { aggregateScorecard, bucketKey, modelKey } from './model-scorecard.mjs';
+import { aggregateScorecard, bucketKey, modelKey, rankCandidates } from './model-scorecard.mjs';
 import {
+  attemptSpawnWithFallback,
   DEFAULT_ARBITER,
   DEFAULT_CRITIC,
   normalizeRoutingPolicy,
+  opencodeGoPolicyViolation,
   PRIMARY_WORKER,
   routeRole,
   routeTriad,
+  selectEscalationReviewer,
   workerFamily,
 } from './worker-selector.mjs';
 import { ReviewDenied } from './review-runner.mjs';
 
 const DEVIN = PRIMARY_WORKER; // cognition
-const GLM = { provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash', effort: 'max' };
+const DS = { provider: 'opencode-go', model: 'deepseek-v4' };
 const NEON = DEFAULT_CRITIC; // google
 const SOL = DEFAULT_ARBITER; // openai
 const DEEPSEEK = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
@@ -45,34 +48,34 @@ const policy = (mode, allowlist) => ({
 });
 
 test('shadow: рекомендация журналируется, выбор не меняется', () => {
-  // GLM доказанно сильнее DEVIN в клетке backend/S.
-  const lines = [...journal(GLM, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
+  // DS доказанно сильнее DEVIN в клетке backend/S.
+  const lines = [...journal(DS, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
   const scorecard = aggregateScorecard(lines, { seed: [] });
   const notes = [];
   const step = routeRole({
     role: 'worker', size: 'S', domain: 'backend',
-    policy: policy('shadow', { worker: [DEVIN, GLM], critic: [NEON], arbiter: [SOL] }),
+    policy: policy('shadow', { worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] }),
     scorecard, base: DEVIN, others: { critic: NEON, arbiter: SOL },
     log: note => notes.push(note),
   });
   assert.equal(step.outcome, 'shadow');
   assert.equal(step.selected, DEVIN); // выбор не изменился
-  assert.equal(modelKey(step.recommended), modelKey(GLM)); // рекомендация — GLM
+  assert.equal(modelKey(step.recommended), modelKey(DS)); // рекомендация — DS
   assert.equal(notes.length, 1);
   assert.equal(notes[0].kind, 'route_recommendation');
-  assert.equal(modelKey(notes[0].recommended), modelKey(GLM));
+  assert.equal(modelKey(notes[0].recommended), modelKey(DS));
 });
 
 test('active: доказанный кандидат вытесняет базу строго внутри allowlist', () => {
-  const lines = [...journal(GLM, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
+  const lines = [...journal(DS, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
   const scorecard = aggregateScorecard(lines, { seed: [] });
   const step = routeRole({
     role: 'worker', size: 'S', domain: 'backend',
-    policy: policy('active', { worker: [DEVIN, GLM], critic: [NEON], arbiter: [SOL] }),
+    policy: policy('active', { worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] }),
     scorecard, base: DEVIN, others: { critic: NEON, arbiter: SOL },
   });
   assert.equal(step.outcome, 'routed');
-  assert.equal(modelKey(step.selected), modelKey(GLM));
+  assert.equal(modelKey(step.selected), modelKey(DS));
 });
 
 test('active: кандидат того же семейства, что критик, пропускается; все — отказ', () => {
@@ -98,7 +101,7 @@ test('allowlist — жёсткая граница: доказанная моде
   const scorecard = aggregateScorecard(lines, { seed: [] });
   const step = routeRole({
     role: 'worker', size: 'S', domain: 'backend',
-    policy: policy('active', { worker: [DEVIN, GLM], critic: [NEON], arbiter: [SOL] }),
+    policy: policy('active', { worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] }),
     scorecard, base: DEVIN, others: { critic: NEON, arbiter: SOL },
   });
   assert.equal(step.outcome, 'rejected');
@@ -106,7 +109,7 @@ test('allowlist — жёсткая граница: доказанная моде
   // И в shadow вне allowlist рекомендации нет — журналируется null.
   const shadow = routeRole({
     role: 'worker', size: 'S', domain: 'backend',
-    policy: policy('shadow', { worker: [DEVIN, GLM], critic: [NEON], arbiter: [SOL] }),
+    policy: policy('shadow', { worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] }),
     scorecard, base: DEVIN,
   });
   assert.equal(shadow.outcome, 'shadow');
@@ -120,7 +123,7 @@ test('политика: allowlist с неизвестным семейством
   }), ReviewDenied);
   const step = routeRole({
     role: 'worker', size: 'S', domain: 'backend',
-    policy: policy('shadow', { worker: [GLM], critic: [NEON], arbiter: [SOL] }),
+    policy: policy('shadow', { worker: [DS], critic: [NEON], arbiter: [SOL] }),
     scorecard: aggregateScorecard([], { seed: [] }),
     base: DEVIN, // база вне allowlist — противоречивая политика
   });
@@ -129,11 +132,11 @@ test('политика: allowlist с неизвестным семейством
 });
 
 test('гистерезис в active: недоказанный кандидат базу не вытесняет', () => {
-  const lines = journal(GLM, 2); // 2 < min_observations
+  const lines = journal(DS, 2); // 2 < min_observations
   const scorecard = aggregateScorecard(lines, { seed: [] });
   const step = routeRole({
     role: 'worker', size: 'S', domain: 'backend',
-    policy: policy('active', { worker: [DEVIN, GLM], critic: [NEON], arbiter: [SOL] }),
+    policy: policy('active', { worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] }),
     scorecard, base: DEVIN, others: { critic: NEON, arbiter: SOL },
   });
   assert.equal(step.outcome, 'rejected');
@@ -150,11 +153,11 @@ test('routeTriad: три роли разных семейств, частичн�
     rounds: { total: 2, rework: 1, pass: 1, arbitration: 0, open: 0, gates: { l2: 1 } },
     phases_ms: { total: 60000 }, outcome: 'done', open: false,
   }));
-  const scorecard = aggregateScorecard([...journal(GLM, 6), ...badCriticJournal], { seed: [] });
+  const scorecard = aggregateScorecard([...journal(DS, 6), ...badCriticJournal], { seed: [] });
   const res = routeTriad({
     size: 'S', domain: 'backend',
     policy: policy('active', {
-      worker: [DEVIN, GLM], critic: [NEON, openaiCritic], arbiter: [SOL] }),
+      worker: [DEVIN, DS], critic: [NEON, openaiCritic], arbiter: [SOL] }),
     scorecard,
     base: { worker: DEVIN, critic: NEON, arbiter: SOL },
   });
@@ -170,11 +173,11 @@ test('routeTriad: три роли разных семейств, частичн�
 });
 
 test('routeTriad shadow: выборы неизменны, рекомендации видны', () => {
-  const scorecard = aggregateScorecard(journal(GLM, 6), { seed: [] });
+  const scorecard = aggregateScorecard(journal(DS, 6), { seed: [] });
   const res = routeTriad({
     size: 'S', domain: 'backend',
     policy: policy('shadow', {
-      worker: [DEVIN, GLM], critic: [NEON], arbiter: [SOL] }),
+      worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] }),
     scorecard,
     base: { worker: DEVIN, critic: NEON, arbiter: SOL },
   });
@@ -182,17 +185,17 @@ test('routeTriad shadow: выборы неизменны, рекомендаци
   assert.equal(res.selected.worker, DEVIN);
   assert.equal(res.selected.critic, NEON);
   assert.equal(res.selected.arbiter, SOL);
-  assert.equal(modelKey(res.steps.worker.recommended), modelKey(GLM));
+  assert.equal(modelKey(res.steps.worker.recommended), modelKey(DS));
 });
 
 test('availability/квота: недоступная и исчерпавшая квоту модель пропускается', () => {
-  // GLM сильнее DEVIN, но квота исчерпана; DEEPSEEK недоступен.
-  const lines = [...journal(GLM, 6), ...journal(DEVIN, 6, { failEvery: 2 }),
+  // DS сильнее DEVIN, но квота исчерпана; DEEPSEEK недоступен.
+  const lines = [...journal(DS, 6), ...journal(DEVIN, 6, { failEvery: 2 }),
     ...journal(DEEPSEEK, 6)];
   const scorecard = aggregateScorecard(lines, { seed: [] });
-  const allow = { worker: [DEVIN, GLM, DEEPSEEK], critic: [NEON], arbiter: [SOL] };
+  const allow = { worker: [DEVIN, DS, DEEPSEEK], critic: [NEON], arbiter: [SOL] };
   const availability = {
-    [modelKey(GLM)]: 'quota_exhausted',
+    [modelKey(DS)]: 'quota_exhausted',
     [modelKey(DEEPSEEK)]: 'unavailable',
     [modelKey(DEVIN)]: 'available',
   };
@@ -220,7 +223,7 @@ test('availability/квота: недоступная и исчерпавшая 
     others: { critic: NEON, arbiter: SOL },
     availability: spec => spec.provider === 'acp-devin' ? 'weird' : 'available',
   });
-  // DEVIN помечен неизвестным статусом → 'unavailable'; GLM/DEEPSEEK available
+  // DEVIN помечен неизвестным статусом → 'unavailable'; DS/DEEPSEEK available
   // → лучший из них выбирается.
   assert.equal(pred.outcome, 'routed');
   assert.notEqual(modelKey(pred.selected), modelKey(DEVIN));
@@ -244,17 +247,16 @@ test('триада для base: невалидный по семействам b
 });
 
 test('routeTriad: worker-шаг видит переданные base.critic/base.arbiter', () => {
-  // Кастомный base.critic — glm-семейство: кандидат-executor GLM легален
+  // Кастомный base.critic — deepseek-семейство: кандидат-executor DS легален
   // против дефолтного NEON (google), но ломает триаду против этого base.
-  const glmCritic = { provider: 'acp-zcode-start',
-    model: 'builtin:zai-start-plan\\GLM-5.3-Flash', effort: 'max' };
-  const scorecard = aggregateScorecard(journal(GLM, 6), { seed: [] });
+  const dsCritic = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const scorecard = aggregateScorecard(journal(DS, 6), { seed: [] });
   const res = routeTriad({
     size: 'S', domain: 'backend',
     policy: policy('active', {
-      worker: [DEVIN, GLM], critic: [glmCritic], arbiter: [SOL] }),
+      worker: [DEVIN, DS], critic: [dsCritic], arbiter: [SOL] }),
     scorecard,
-    base: { worker: DEVIN, critic: glmCritic, arbiter: SOL },
+    base: { worker: DEVIN, critic: dsCritic, arbiter: SOL },
   });
   assert.equal(res.outcome, 'rejected');
   assert.equal(res.role, 'worker');
@@ -263,14 +265,14 @@ test('routeTriad: worker-шаг видит переданные base.critic/base
 });
 
 test('routeRole нормализует метки: size=\'s\', domain=\'Backend\' находят клетку', () => {
-  const scorecard = aggregateScorecard(journal(GLM, 6), { seed: [] });
+  const scorecard = aggregateScorecard(journal(DS, 6), { seed: [] });
   const step = routeRole({
     role: 'worker', size: 's', domain: 'Backend',
-    policy: policy('active', { worker: [DEVIN, GLM], critic: [NEON], arbiter: [SOL] }),
+    policy: policy('active', { worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] }),
     scorecard, base: DEVIN, others: { critic: NEON, arbiter: SOL },
   });
   assert.equal(step.outcome, 'routed');
-  assert.equal(modelKey(step.selected), modelKey(GLM));
+  assert.equal(modelKey(step.selected), modelKey(DS));
   assert.equal(step.note.size, 'S');
   assert.equal(step.note.domain, 'backend');
 });
@@ -278,17 +280,17 @@ test('routeRole нормализует метки: size=\'s\', domain=\'Backend\
 test('end-to-end: реальный журнал на диске → отчёт и роутинг', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'scorecard-'));
   try {
-    const lines = [...journal(GLM, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
+    const lines = [...journal(DS, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
     await writeFile(join(dir, 'telemetry.jsonl'), lines.join('\n') + '\n', { mode: 0o600 });
     const text = await readFile(join(dir, 'telemetry.jsonl'), 'utf8');
     const scorecard = aggregateScorecard(text.split('\n').filter(l => l.trim()), { seed: [] });
     assert.equal(scorecard.entries, 12);
-    const cell = scorecard.cells[bucketKey(GLM, 'worker', 'backend', 'S')];
+    const cell = scorecard.cells[bucketKey(DS, 'worker', 'backend', 'S')];
     assert.equal(cell.observations, 6);
     assert.equal(cell.first_pass_rate, 1);
     const step = routeRole({
       role: 'worker', size: 'S', domain: 'backend',
-      policy: policy('active', { worker: [DEVIN, GLM], critic: [NEON], arbiter: [SOL] }),
+      policy: policy('active', { worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] }),
       scorecard, base: DEVIN, others: { critic: NEON, arbiter: SOL },
     });
     assert.equal(step.outcome, 'routed');
@@ -297,5 +299,346 @@ test('end-to-end: реальный журнал на диске → отчёт �
     assert.equal(fams.size, 3);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Routing Policy v2 интеграция: opencode-go и Opus 5.5 escalation ────────
+test('opencode-go: не-DeepSeek модель в allowlist — явный отказ политики', () => {
+  // DeepSeek допускается и маршрутизируется.
+  const ok = normalizeRoutingPolicy(policy('active', {
+    worker: [DEVIN, DEEPSEEK], critic: [NEON], arbiter: [SOL] }));
+  assert.equal(ok.allowlist.worker.length, 2);
+  // Не-DeepSeek opencode-go — отказ с причиной политики, в т.ч. через pi-харнесс.
+  for (const spec of [{ provider: 'opencode-go', model: 'deepseek-v4' },
+      { provider: 'pi', model: 'opencode-go/kimi-k2' }]) {
+    const violation = opencodeGoPolicyViolation(spec);
+    const expected = spec.model.endsWith('kimi-k2')
+      ? 'opencode_go_non_deepseek_disallowed' : null;
+    assert.equal(violation, expected, JSON.stringify(spec));
+  }
+  assert.throws(() => normalizeRoutingPolicy(policy('active', {
+    worker: [DEVIN, { provider: 'pi', model: 'opencode-go/qwen3-coder' }],
+    critic: [NEON], arbiter: [SOL] })),
+    e => e instanceof ReviewDenied && e.reason === 'opencode_go_non_deepseek_disallowed');
+});
+
+test('Opus 5.5 escalation: все три условия → anthropic; иначе graceful fallback', () => {
+  const triad = { worker: DEVIN, critic: NEON };
+  const quota = { status: 'available', remaining: 1, used: 0, cap: 3 };
+  // High-stakes триггер + квота + инвариант → слот Opus 5.5.
+  const opus = selectEscalationReviewer({ trigger: 'release_gate', quota, triad });
+  assert.equal(opus.outcome, 'selected');
+  assert.equal(opus.reviewer.provider, 'agy');
+  assert.equal(opus.family, 'anthropic');
+  // Семейство ревьюера независимо от воркера и критика триады.
+  const fams = new Set([opus.family, workerFamily(DEVIN), workerFamily(NEON)]);
+  assert.equal(fams.size, 3);
+  // Исчерпанная квота → детерминированный fallback Pi/Sol с явной причиной.
+  const fb = selectEscalationReviewer({
+    trigger: { dispute_rounds: 3 }, quota: { status: 'available', remaining: 0 }, triad });
+  assert.equal(fb.outcome, 'fallback');
+  assert.equal(fb.reason, 'opus_quota_exhausted');
+  assert.equal(fb.reviewer.provider, 'pi');
+  // Без триггера — тот же детерминированный fallback, другая причина.
+  const noTrig = selectEscalationReviewer({ trigger: 'local_checks_failed', quota, triad });
+  assert.equal(noTrig.outcome, 'fallback');
+  assert.equal(noTrig.reason, 'no_escalation_trigger');
+});
+
+test('acp-zcode-start выведен из обращения: allowlist и план его отклоняют', async () => {
+  const zcode = { provider: 'acp-zcode-start',
+    model: 'builtin:zai-start-plan\\GLM-5.3-Flash', effort: 'max' };
+  // В allowlist.worker — явный отказ политики.
+  assert.throws(() => normalizeRoutingPolicy(policy('active', {
+    worker: [DEVIN, zcode], critic: [NEON], arbiter: [SOL] })),
+    e => e instanceof ReviewDenied && e.reason === 'zcode_provider_retired');
+  // В явном плане попытки — резерв пропускается с той же причиной, маршрут
+  // идёт по DeepSeek/Neon.
+  const selection = await attemptSpawnWithFallback({
+    attempt: { task_id: '9', epoch: 1, attempt_id: 'a1', base_sha: 'a'.repeat(40) },
+    plan: [PRIMARY_WORKER, zcode, { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' }],
+    probe: async w => w.provider === 'acp-devin'
+      ? { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 }
+      : { status: 'available', activeBackgroundAgentCount: 0 },
+    spawn: async () => ({ threadId: 'thr_ok' }),
+    inspectWorktree: async () => ({ clean: true, head: 'a'.repeat(40) }),
+  });
+  assert.equal(selection.outcome, 'spawned');
+  assert.equal(selection.worker.provider, 'pi');
+  const retired = selection.attemptedWorkers.find(w => w.provider === 'acp-zcode-start');
+  assert.equal(retired.verdict, 'skipped');
+  assert.equal(retired.reason, 'zcode_provider_retired');
+});
+
+// ── Board #1263: активация routeTriad в active-режиме с безопасным откатом ──
+import {
+  FALLBACK_ANTIGRAVITY_NEON,
+  NARROW_RESERVE_PI,
+  resolveTriad,
+} from './worker-selector.mjs';
+
+const allowAll = { worker: [DEVIN, DS], critic: [NEON], arbiter: [SOL] };
+
+test('resolveTriad: режим не задан — shadow, проверенный план', () => {
+  const res = resolveTriad({ policy: {}, scorecard: null });
+  assert.equal(res.outcome, 'shadow');
+  assert.deepEqual(res.selected, { worker: DEVIN, critic: NEON, arbiter: SOL });
+  // FALLBACK_NEON (google) разделяет семейство с критиком NEON — в план не
+  // попадает: резервы валидируются попарной независимостью триады.
+  assert.deepEqual(res.plan, [DEVIN, NARROW_RESERVE_PI]);
+});
+
+test('resolveTriad active: доказанный кандидат вытесняет базу, план — резервы', () => {
+  const lines = [...journal(DS, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  const res = resolveTriad({ size: 'S', domain: 'backend',
+    policy: policy('active', allowAll), scorecard });
+  assert.equal(res.outcome, 'routed');
+  assert.equal(modelKey(res.selected.worker), modelKey(DS));
+  // Инвариант трёх независимых семейств выполнен на выбранной триаде.
+  const fams = new Set([workerFamily(res.selected.worker),
+    workerFamily(res.selected.critic), workerFamily(res.selected.arbiter)]);
+  assert.equal(fams.size, 3);
+  // План начинается с динамического первичного, резервы без дублей и все —
+  // внутри allowlist и независимые от выбранных критика/арбитра.
+  assert.equal(modelKey(res.plan[0]), modelKey(DS));
+  assert.equal(new Set(res.plan.map(modelKey)).size, res.plan.length);
+  for (const reserve of res.plan.slice(1)) {
+    assert.ok(allowAll.worker.some(w => modelKey(w) === modelKey(reserve)));
+    assert.notEqual(workerFamily(reserve), workerFamily(res.selected.critic));
+    assert.notEqual(workerFamily(reserve), workerFamily(res.selected.arbiter));
+  }
+});
+
+test('resolveTriad active: деградация скоркарда — откат с явной причиной', () => {
+  const notes = [];
+  for (const scorecard of [null, undefined, {}, { cells: null }, 'junk']) {
+    const res = resolveTriad({ size: 'S', domain: 'backend',
+      policy: policy('active', allowAll), scorecard,
+      log: note => notes.push(note) });
+    assert.equal(res.outcome, 'fallback', JSON.stringify(scorecard));
+    assert.equal(res.reason, 'scorecard_unavailable');
+    assert.deepEqual(res.selected, { worker: DEVIN, critic: NEON, arbiter: SOL });
+  }
+  assert.equal(notes.length, 5);
+  assert.equal(notes[0].kind, 'route_fallback');
+  assert.equal(notes[0].reason, 'scorecard_unavailable');
+});
+
+test('resolveTriad: битые строки журнала (corrupt>0) — scorecard_corrupt', () => {
+  const lines = [...journal(DS, 6), 'not json at all', '{"broken":'];
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  assert.equal(scorecard.corrupt, 2);
+  for (const mode of ['shadow', 'active']) {
+    const res = resolveTriad({ size: 'S', domain: 'backend',
+      policy: policy(mode, allowAll), scorecard });
+    assert.equal(res.outcome, 'fallback', mode);
+    assert.equal(res.reason, 'scorecard_corrupt');
+    // Откат несёт проверенную базовую триаду и валидный план.
+    assert.deepEqual(res.selected, { worker: DEVIN, critic: NEON, arbiter: SOL });
+    assert.ok(res.plan.length >= 1);
+  }
+});
+
+test('resolveTriad active: нет доказанных кандидатов — откат, не частичная триада', () => {
+  const scorecard = aggregateScorecard(journal(DS, 2), { seed: [] }); // < min_obs
+  const res = resolveTriad({ size: 'S', domain: 'backend',
+    policy: policy('active', allowAll), scorecard });
+  assert.equal(res.outcome, 'fallback');
+  assert.match(res.reason, /^route_active_rejected:/);
+  assert.equal(res.selected.worker, DEVIN);
+  assert.equal(res.plan[0], DEVIN);
+});
+
+test('resolveTriad: битая политика — fail-closed rejected, дефолт не подставляется', () => {
+  const bad = policy('active', {
+    worker: [{ provider: 'mystery', model: 'unknown' }], critic: [NEON], arbiter: [SOL] });
+  for (const mode of ['shadow', 'active']) {
+    const res = resolveTriad({ scorecard: aggregateScorecard([], { seed: [] }),
+      policy: { ...bad, routing: { ...bad.routing, mode } } });
+    assert.equal(res.outcome, 'rejected');
+    assert.match(res.reason, /^routing_policy_invalid:/);
+    assert.equal(res.selected, null);
+    assert.deepEqual(res.plan, []);
+  }
+});
+
+test('resolveTriad: невалидная база — явный rejected в обоих режимах', () => {
+  const scorecard = aggregateScorecard(journal(DS, 6), { seed: [] });
+  // Критик и арбитр одного семейства — триада не доказана.
+  const badBase = { worker: DEVIN, critic: NEON,
+    arbiter: { provider: 'google', model: 'gemini-4-neon' } };
+  for (const mode of ['shadow', 'active']) {
+    const res = resolveTriad({ policy: policy(mode, allowAll), scorecard, base: badBase });
+    assert.equal(res.outcome, 'rejected', mode);
+    assert.match(res.reason, /^route_base_triad_violation:/);
+    assert.equal(res.selected, null);
+    assert.deepEqual(res.plan, []);
+  }
+  // База вне непустого allowlist — тоже rejected, а не тихий selected.
+  const res = resolveTriad({ policy: policy('shadow', {
+      worker: [DS], critic: [NEON], arbiter: [SOL] }), scorecard });
+  assert.equal(res.outcome, 'rejected');
+  assert.equal(res.reason, 'route_base_not_in_allowlist');
+});
+
+test('resolveTriad: резерв вне allowlist.worker в план не попадает', () => {
+  // DS доказанно сильнее, но вне allowlist; резервы DeepSeek/Neon тоже вне
+  // allowlist.worker — в план не попадает никто из недопущенных.
+  const scorecard = aggregateScorecard(
+    [...journal(DEVIN, 6), ...journal(DS, 6)], { seed: [] });
+  const res = resolveTriad({ size: 'S', domain: 'backend',
+    policy: policy('active', { worker: [DEVIN], critic: [NEON], arbiter: [SOL] }),
+    scorecard });
+  assert.equal(res.outcome, 'routed');
+  assert.deepEqual(res.plan, [DEVIN]);
+});
+
+test('resolveTriad shadow: рекомендация считается, назначение не меняется', () => {
+  const lines = [...journal(DS, 6), ...journal(DEVIN, 6, { failEvery: 2 })];
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  const res = resolveTriad({ size: 'S', domain: 'backend',
+    policy: policy('shadow', allowAll), scorecard });
+  assert.equal(res.outcome, 'shadow');
+  assert.equal(res.selected.worker, DEVIN); // назначение не изменилось
+  assert.equal(modelKey(res.recommended), modelKey(DS)); // рекомендация видна
+});
+
+test('критик L2 только на провайдерах с реальным egress (#1263 r3)', () => {
+  // 'acp-devin' у L2-раннера адресов нет — его нельзя выбрать критиком,
+  // иначе реальный раннер упадёт model_proxy_allowlist_invalid.
+  for (const role of ['critic', 'arbiter']) {
+    assert.throws(() => normalizeRoutingPolicy(policy('active', {
+      worker: [DEVIN], critic: role === 'critic' ? [DEVIN] : [NEON],
+      arbiter: role === 'arbiter' ? [DEVIN] : [SOL] })),
+      e => e instanceof ReviewDenied && e.reason === `route_${role}_not_runnable`);
+  }
+  // Исполняемые формы: прямой pi-провайдер, pi-харнесс с вложением,
+  // acp-antigravity-acp (Neon-транспорт).
+  const ok = normalizeRoutingPolicy(policy('active', {
+    worker: [DEVIN],
+    critic: [NEON, { provider: 'pi', model: 'openai/gpt-6.2-sol' },
+      { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' }],
+    arbiter: [SOL, { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' }] }));
+  assert.equal(ok.allowlist.critic.length, 3);
+  // Активный выбор критика: routed pi-критик исполняем раннером —
+  // 'pi/opencode-go/deepseek-…' нормализуется к реальному pi-провайдеру
+  // 'opencode-go' (штатный egress opencode.ai, имя не переименовывается).
+  const critic = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const lines = Array.from({ length: 6 }, () => JSON.stringify({
+    kind: 'attempt_summary', schema: 1,
+    models: { worker: DEVIN, critic, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+    phases_ms: { total: 60000 }, outcome: 'done', open: false }));
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  const res = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+    policy: policy('active', { worker: [DEVIN], critic: [NEON, critic],
+      arbiter: [SOL] }),
+    base: { worker: DEVIN, critic: NEON, arbiter: SOL } });
+  assert.equal(res.outcome, 'routed');
+  assert.deepEqual(res.selected.critic, critic);
+});
+
+test('телеметрия раннера матчит allowlist: runner-форма и pi-форма — один ключ (#1263 r4)', () => {
+  // Реальный раннер пишет в телеметрию нормализованный спек
+  // {provider:'opencode-go', model:'deepseek-…'}; allowlist несёт worker-
+  // форму 'pi/opencode-go/deepseek-…' — canonical modelKey сводит обе к
+  // 'opencode-go/deepseek-…': записи раннера дают кандидатов при ранжировании.
+  const runnerCritic = { provider: 'opencode-go', model: 'deepseek-v4.1-flash' };
+  const allowlistCritic = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  assert.equal(modelKey(runnerCritic), 'opencode-go/deepseek-v4.1-flash');
+  assert.equal(modelKey(allowlistCritic), 'opencode-go/deepseek-v4.1-flash');
+  // Шесть записей в форме раннера → кандидаты есть (раньше было 0).
+  const lines = Array.from({ length: 6 }, () => JSON.stringify({
+    kind: 'attempt_summary', schema: 1,
+    models: { worker: DEVIN, critic: runnerCritic, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+    phases_ms: { total: 60000 }, outcome: 'done', open: false }));
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  const ranked = rankCandidates(scorecard, { role: 'critic',
+    domain: 'backend', size: 'S', models: [NEON, allowlistCritic] });
+  assert.equal(ranked.length, 1);
+  // И сам выбор active-триады находит кандидата из телеметрии раннера.
+  const res = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+    policy: policy('active', { worker: [DEVIN], critic: [NEON, allowlistCritic],
+      arbiter: [SOL] }),
+    base: { worker: DEVIN, critic: NEON, arbiter: SOL } });
+  assert.equal(res.outcome, 'routed');
+  assert.deepEqual(res.selected.critic, allowlistCritic);
+});
+
+test('Neon-критик без Sol-арбитра несовместим с acceptHeld — фильтрация и fallback (#1263 r4)', () => {
+  // Allowlist допускает Neon-критика и DeepSeek-арбитра, но acceptHeld
+  // требует Neon ⇒ Sol. Devin/Neon/DeepSeek не должен выходить из resolveTriad.
+  const dsArbiter = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const solCritic = { provider: 'pi', model: 'openai/gpt-6.2-sol' };
+  const lines = [
+    ...journal(DEVIN, 6),
+    // Наблюдения за Neon-критиком и DS-арбитром в форме раннера.
+    ...Array.from({ length: 6 }, () => JSON.stringify({
+      kind: 'attempt_summary', schema: 1,
+      models: { worker: DEVIN, critic: NEON, arbiter: dsArbiter },
+      labels: { size: 'S', domain: 'backend' },
+      rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+      phases_ms: { total: 60000 }, outcome: 'done', open: false })),
+  ];
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  // Действующая база (Devin/Sol-критик/DS-арбитр) допустима и совместима —
+  // откат есть куда, но несовместимая routed-триада не выходит.
+  const res = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+    policy: policy('active', { worker: [DEVIN], critic: [NEON, solCritic],
+      arbiter: [dsArbiter] }),
+    base: { worker: DEVIN, critic: solCritic, arbiter: dsArbiter } });
+  // Кандидат-критик Neon доказан, но DS-арбитр с ним несовместим:
+  // безопасный откат, а не Devin/Neon/DeepSeek.
+  assert.equal(res.outcome, 'fallback', res.reason);
+  assert.match(res.reason, /^route_active_rejected:/);
+  assert.notDeepEqual(res.selected, { worker: DEVIN, critic: NEON, arbiter: dsArbiter });
+
+  // Несовместимая база (Neon + не-Sol арбитр) — явный rejected.
+  const bad = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+    policy: policy('active', { worker: [DEVIN], critic: [NEON], arbiter: [dsArbiter] }),
+    base: { worker: DEVIN, critic: NEON, arbiter: dsArbiter } });
+  assert.equal(bad.outcome, 'rejected');
+  assert.equal(bad.reason, 'route_base_acceptance_incompatible');
+});
+
+test('Neon без reasoningLevel в allowlist тоже требует Sol — Devin/Neon/DeepSeek не выходит (#1263 r5)', () => {
+  // Критик google-семейства БЕЗ reasoningLevel: isNeonReview его не видит,
+  // но runner позже наследует 'medium' из профиля и acceptHeld отклонит
+  // триаду. Селектор считает Neon-shaped ЛЮБОЙ google-семейный критик.
+  const neonNoLevel = { provider: 'google', model: 'gemini-4-neon' };
+  const agyNeon = { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' };
+  const dsArbiter = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const solCritic = { provider: 'pi', model: 'openai/gpt-6.2-sol' };
+  for (const critic of [neonNoLevel, agyNeon]) {
+    const lines = [
+      ...journal(DEVIN, 6),
+      ...Array.from({ length: 6 }, () => JSON.stringify({
+        kind: 'attempt_summary', schema: 1,
+        models: { worker: DEVIN, critic, arbiter: dsArbiter },
+        labels: { size: 'S', domain: 'backend' },
+        rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+        phases_ms: { total: 60000 }, outcome: 'done', open: false })),
+    ];
+    const scorecard = aggregateScorecard(lines, { seed: [] });
+    const res = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+      policy: policy('active', { worker: [DEVIN], critic: [critic, solCritic],
+        arbiter: [dsArbiter] }),
+      base: { worker: DEVIN, critic: solCritic, arbiter: dsArbiter } });
+    assert.equal(res.outcome, 'fallback', `${critic.provider}: ${res.reason}`);
+    assert.match(res.reason, /^route_active_rejected:/);
+    assert.notDeepEqual(res.selected,
+      { worker: DEVIN, critic, arbiter: dsArbiter });
+
+    // Несовместимая база — явный rejected, без reasoningLevel тоже.
+    const bad = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+      policy: policy('active', { worker: [DEVIN], critic: [critic],
+        arbiter: [dsArbiter] }),
+      base: { worker: DEVIN, critic, arbiter: dsArbiter } });
+    assert.equal(bad.outcome, 'rejected');
+    assert.equal(bad.reason, 'route_base_acceptance_incompatible');
   }
 });

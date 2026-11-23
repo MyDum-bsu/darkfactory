@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { parseArgs, promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import { acceptHeld } from './acceptance.mjs';
 import { reserveWorktree, saveState } from './slot.mjs';
 import { advanceWithProjection } from './controller.mjs';
@@ -12,7 +13,8 @@ import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
-import { isolatedArbiterRunner, isolatedPiReviewRunner } from './review-runner.mjs';
+import { isolatedArbiterRunner, isolatedPiReviewRunner,
+  l2CriticSpec, runnerReviewSpec } from './review-runner.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter } from './review-policy.mjs';
 import { MAX_QUESTION_TTL_MS, readSignedAnswer, signedAnswerVerifier } from './question-gate.mjs';
@@ -22,8 +24,17 @@ import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.
 import { DEFAULT_INTERVAL_MS, RotatingJournal, runDaemon, TERMINAL_PHASES } from './daemon.mjs';
 import { localReleasePort } from './local-release.mjs';
 import { ReleaseDenied } from './release-contract.mjs';
-import { arbiterIntakePrompt, workerIntakePrompt } from './intake-prompt.mjs';
-import { createTelemetryRecorder, threadUsage } from './telemetry.mjs';
+import { arbiterIntakePrompt, decisionsPromptBlock, projectMemoryPromptBlock,
+  workerIntakePrompt } from './intake-prompt.mjs';
+import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
+  resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
+import { createProjectMemoryWriter, DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS,
+  extractPostReviewMemoryUpdates, memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir,
+  resolveProjectMemory, writeTrustedReviewReceipt } from './project-memory.mjs';
+import { createTelemetryRecorder, readTelemetryLines, threadUsage } from './telemetry.mjs';
+import { aggregateScorecard } from './model-scorecard.mjs';
+import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
+  loadLessons, validateDistilledLessons } from './rework-distiller.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -31,7 +42,18 @@ const inside = (root, p) => {
   const rel = relative(root, p);
   return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
-const approved = new Map([['acp-devin', 'swe-2-high'], ['acp-zcode-start', 'builtin:zai-start-plan\\GLM-5.3-Flash']]);
+// Routing Policy v2: зависимость от acp-zcode-start снята. Допущены
+// acp-devin/swe-2-high и acp-antigravity-acp/gemini-4-neon; харнесс pi —
+// только с моделями opencode-go/deepseek-* (см. opencodeGoPolicyViolation).
+const approved = [
+  { provider: 'acp-devin', model: 'swe-2-high' },
+  { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' },
+];
+const isApprovedWorker = bb =>
+  approved.some(e => e.provider === bb?.provider && e.model === bb?.model) ||
+  (bb?.provider === 'pi' && typeof bb.model === 'string' &&
+    /^opencode-go\//i.test(bb.model) &&
+    workerSelector.workerFamily(bb) === 'deepseek');
 
 async function operatorReviewSetup(policy) {
   const critic = policy.profiles?.[policy.route.checkProfile]?.review;
@@ -87,6 +109,77 @@ async function releaseSetup(policy, { tree, inbox, root }) {
     url: config.url, worktree: tree, artifact: config.artifact, smokePrefix: config.smokePrefix });
 }
 
+const ACCEPTED_MEMORY_OUTCOMES = new Set(['done', 'accepted', 'verified']);
+
+// Доверенный пост-шаг записи в Project Memory после подтверждённого REVIEW_OK:
+// при rework/hold/отсутствии REVIEW_OK квитанция не выписывается и память не
+// обновляется. При успехе выписывает HMAC-подписанную квитанцию в
+// trustedReceiptDir и вызывает закреплённый writer.recordUpdate(...).
+export async function recordPostReviewMemory({
+  writer,
+  trustedReceiptDir,
+  hmacKey,
+  projectId,
+  worktree,
+  result,
+  outcome,
+  reviewReceipt,
+  attempt,
+  submission,
+  worker,
+  reviewer,
+  updates,
+}) {
+  if (!writer) return { recorded: false, reason: 'writer_not_configured' };
+  const res = result ?? outcome;
+  const finalStatus = res?.outcome ?? res?.status;
+  const receipt = reviewReceipt ?? res?.review;
+  if (!ACCEPTED_MEMORY_OUTCOMES.has(finalStatus) || receipt?.verdict !== 'REVIEW_OK') {
+    return { recorded: false, reason: 'not_review_ok' };
+  }
+  const verifiedSha = submission?.candidate_sha ?? res?.sha ?? receipt?.sha;
+  if (typeof verifiedSha !== 'string' || !/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(verifiedSha)) {
+    return { recorded: false, reason: 'invalid_sha' };
+  }
+  if (receipt?.sha !== undefined && receipt.sha !== verifiedSha) {
+    return { recorded: false, reason: 'sha_mismatch' };
+  }
+  const resolvedUpdates = Array.isArray(updates) && updates.length > 0
+    ? updates
+    : extractPostReviewMemoryUpdates({ result: res, attempt, reviewReceipt: receipt, verifiedSha });
+  if (!Array.isArray(resolvedUpdates) || resolvedUpdates.length === 0) {
+    return { recorded: false, reason: 'no_updates' };
+  }
+  const receiptPath = join(
+    trustedReceiptDir,
+    `review-${attempt.task_id}-${attempt.attempt_id}-${verifiedSha.slice(0, 12)}.receipt.json`,
+  );
+  try {
+    await writeTrustedReviewReceipt({
+      receiptPath,
+      trustedReceiptDir,
+      hmacKey,
+      worktree,
+      receipt: {
+        role: 'controller',
+        verdict: 'REVIEW_OK',
+        sha: verifiedSha,
+        worker,
+        reviewer,
+        sourceCard: String(attempt.task_id),
+      },
+    });
+    const saved = await writer.recordUpdate({ projectId, receiptPath, updates: resolvedUpdates });
+    return { recorded: true, receiptPath, result: saved };
+  } catch (error) {
+    return {
+      recorded: false,
+      reason: 'post_review_memory_write_failed',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 async function execute() {
   const { values } = parseArgs({ options: { execute: { type: 'boolean' }, policy: { type: 'string' },
     state: { type: 'string' }, 'recheck-rejected-handoff': { type: 'boolean' },
@@ -99,8 +192,9 @@ async function execute() {
   const activation = boardActivation(p, {
     allowLive: values['allow-live-pilot'], pilotChannel: process.env.DF_PILOT_CHANNEL,
   });
-  if (!p.bb || !approved.has(p.bb.provider) || approved.get(p.bb.provider) !== p.bb.model ||
-      (p.bb.provider === 'acp-zcode-start' && p.bb.effort !== 'max') || !/^proj_[a-z0-9]+$/.test(p.bb.project ?? '')) {
+  const opencodeViolation = workerSelector.opencodeGoPolicyViolation(p.bb);
+  if (opencodeViolation) throw new Error(opencodeViolation);
+  if (!p.bb || !isApprovedWorker(p.bb) || !/^proj_[a-z0-9]+$/.test(p.bb.project ?? '')) {
     throw new Error('Implementation preset is not approved');
   }
   // Режим прав исполнителя: 'full' нужен живому воркеру для локальных
@@ -148,10 +242,7 @@ async function execute() {
     models: { worker: { provider: p.bb.provider, model: p.bb.model },
       critic: reviewSetup.critic, arbiter: reviewSetup.arbiter } });
   let telemetry = newTelemetry();
-  // Фактический источник токенов критика: поток agy (neon) или pi-транскрипт.
-  const criticSource = reviewSetup.neon ? 'agy_stream' : 'pi_stream';
-  const route = { ...p.route, policyDigest: pinned.digest,
-    zcodeQuota: p.zcodeQuota ?? p.bb?.zcodeQuota };
+  const route = { ...p.route, policyDigest: pinned.digest };
   // Queue-driven маршрут без route.taskId: карточку берёт board.claimReady по
   // allowlist оператора (owner + маршрутная метка + дополнительно требуемые метки).
   if (route.taskId === undefined) {
@@ -171,6 +262,56 @@ async function execute() {
   const { board } = loadSdk();
   const ownerAnswers = await ownerAnswerSource(p.questionGate, p.owner, tree, inbox);
   const releasePort = await releaseSetup(p, { tree, inbox, root });
+  // Owner Decision Ledger (Board #1261): путь приходит только из
+  // policy.decisionLedger или DF_DECISION_LEDGER_PATH. Активный срез и запись
+  // ответов проходят через resolveActiveDecisions/recordDecision с fail-closed
+  // границей — журнал не может жить внутри рабочего дерева воркера.
+  const ledgerCfg = ledgerPolicyConfig(p.decisionLedger);
+  const ledgerPath = resolveLedgerPath({ policy: p.decisionLedger });
+  if (ledgerCfg.scope !== undefined && !/^(global|project:[a-z0-9_-]{1,64})$/.test(ledgerCfg.scope)) {
+    throw new Error('decision_ledger_policy_invalid');
+  }
+  const decisionScope = ledgerCfg.scope ?? `project:${p.bb.project}`;
+  const currentDecisions = async () => ledgerPath === null ? null : resolveActiveDecisions({
+    ledgerPath, projectId: p.bb.project, worktree: tree,
+    maxChars: ledgerCfg.maxChars ?? DEFAULT_MAX_CHARS });
+  // Единый snapshot на попытку (task_id:epoch): воркер, критик и арбитр одного
+  // кандидата проверяют идентичный закреплённый срез/digest, а не журнал,
+  // перечитанный в разные моменты.
+  const pinnedDecisions = pinDecisions(currentDecisions, { persistDir: root });
+  // Project Memory (Board #1265): компактная память проекта в операторском
+  // каталоге вне worktree. Воркер, критик и арбитр читают строго read-only
+  // закреплённый срез; запись в память из контекста воркера запрещена.
+  const memoryCfg = memoryPolicyConfig(p.projectMemory);
+  const memoryStoreDir = resolveMemoryStoreDir({ policy: p.projectMemory });
+  const currentProjectMemory = async () => memoryStoreDir === null ? null : resolveProjectMemory({
+    storeDir: memoryStoreDir, projectId: p.bb.project, worktree: tree,
+    maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS });
+  // Всегда создаём/читаем pin в root (даже при выключенной памяти: enabled:false),
+  // чтобы смена DF_PROJECT_MEMORY_DIR при рестарте не подменила срез той же попытки.
+  const pinnedProjectMemory = pinProjectMemory(currentProjectMemory,
+    { persistDir: root, projectId: p.bb.project });
+  const activeProjectMemory = async key => {
+    const slice = await pinnedProjectMemory(key);
+    return slice && slice.enabled !== false ? slice : undefined;
+  };
+  const projectMemoryWriter = memoryStoreDir !== null &&
+      (memoryCfg.trustedReceiptDir !== undefined || memoryCfg.hmacKey !== undefined)
+    ? createProjectMemoryWriter({
+        storeDir: memoryStoreDir,
+        trustedReceiptDir: memoryCfg.trustedReceiptDir,
+        hmacKey: memoryCfg.hmacKey,
+        worktree: tree,
+        maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS,
+        ...(memoryCfg.maxEntriesPerSection !== undefined
+          ? { maxEntriesPerSection: memoryCfg.maxEntriesPerSection } : {}),
+      })
+    : undefined;
+  const decisionLedger = ledgerPath !== null && ledgerCfg.recordAnswers === true
+    ? ({ answer, question }) => recordDecision({ ledgerPath, scope: decisionScope, rule: answer,
+        sourceCard: question.task_id, recordedBy: ledgerCfg.recordedBy ?? 'question-resume',
+        worktree: tree })
+    : undefined;
   const assertOpen = activation && (async () => { await assertPinned(); await switchOpen(); });
   const port = nativeBoardPort(board(), { channel: p.channel, isolatedQuestionOwner: Boolean(ownerAnswers),
     pilot: activation && { scope: activation.scope, assertOpen } });
@@ -178,6 +319,52 @@ async function execute() {
   // и сырых логов; не влезает в лимит 1000 — квитанция уходит без неё.
   const completeCard = port.complete.bind(port);
   port.complete = (taskId, epoch, evidence) => completeCard(taskId, epoch, telemetry.embed(evidence));
+  // VS-4.2 Self-Learning Review Loop (#1263): уроки REWORK живут в
+  // приватном каталоге состояния, вне дерева воркера. При инъекции
+  // хранилище проходит повторный fail-closed гейт — ослабляющий урок
+  // в промпт не попадает никогда.
+  const lessonsPath = join(root, 'lessons.jsonl');
+  const currentLessons = async () => {
+    // Границы хранилища: файл в приватном root, не симлинк, вне worktree.
+    const existing = await loadLessons(lessonsPath, { allowedDir: root, outside: [tree] });
+    if (!existing.length) return [];
+    const { accepted } = validateDistilledLessons(existing);
+    return accepted;
+  };
+  // Скоркард для динамического роутинга: журнал телеметрии того же root.
+  // Любая деградация — null → resolveTriad откатывается к дефолтной триаде.
+  const currentScorecard = async () => {
+    try {
+      const lines = await readTelemetryLines(join(root, 'telemetry.jsonl'));
+      return aggregateScorecard(lines);
+    } catch {
+      return null;
+    }
+  };
+  // Дистилляция после закрытия карточки с >=2 раундами REWORK. Fail-open:
+    // урок не может сломать приёмку — ошибка только журналируется.
+  const distillClosedAttempt = async () => {
+    try {
+      const record = await state.load();
+      const rounds = Array.isArray(record?.roundsHistory) ? record.roundsHistory : [];
+      if (rounds.length < DEFAULT_MIN_REWORK_ROUNDS) return;
+      const candidates = distillReworkLessons(rounds,
+        { cardId: String(record.taskId ?? route.taskId ?? 'unknown') });
+      if (!candidates.length) return;
+      const existing = await loadLessons(lessonsPath, { allowedDir: root, outside: [tree] });
+      const { accepted, pending, rejected } = validateDistilledLessons(candidates, { existing });
+      if (accepted.length) {
+        await appendLessons(lessonsPath, accepted,
+          { existing, allowedDir: root, outside: [tree] });
+      }
+      if (pending.length || rejected.length) {
+        console.log(JSON.stringify({ kind: 'lessons_gate',
+          pending: pending.map(lesson => lesson.id), rejected }));
+      }
+    } catch (error) {
+      console.error(`rework-distiller: ${String(error?.message ?? error).split('\n')[0]}`);
+    }
+  };
   const record = join(root, 'attempt.json');
   const git = async (...args) =>
     (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
@@ -203,12 +390,8 @@ async function execute() {
   const bb = {
     // Доступность исполнителя и квоты — отдельно от spawn; фактический запуск
     // и конверт проверяются независимо (спека §4, §5).
-    async probeAvailability(worker) {
-      return {
-        status: 'available',
-        activeBackgroundAgentCount: 0,
-        zcodeQuota: worker?.provider === 'acp-zcode-start' ? route.zcodeQuota : undefined,
-      };
+    async probeAvailability() {
+      return { status: 'available', activeBackgroundAgentCount: 0 };
     },
     // Доказательство чистоты worktree до любого перехода на резерв: ноль
     // фоновых агентов + clean и HEAD на base_sha попытки.
@@ -229,8 +412,12 @@ async function execute() {
       const initial = join(root, `worker-${attempt.attempt_id}-${randomUUID()}.md`);
       const handoff = { task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
         worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' };
+      const lessonRules = await currentLessons().catch(() => []);
       const prompt = workerIntakePrompt({ brief: pinned.inputs.get(brief).toString('utf8'), tree,
-        handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers) });
+        handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers),
+        decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined,
+        projectMemory: await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`),
+        lessons: lessonRules.length ? lessonRules : undefined });
       await writeFile(initial, prompt, { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
         '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
@@ -245,7 +432,7 @@ async function execute() {
         const { stdout } = await telemetry.phase('spawn', () => exec('bb', argv, { timeout: 60_000 }),
           { subject: attempt, worker: execSpec });
         const spawned = JSON.parse(stdout);
-        telemetry.workerResume({ subject: attempt, worker: execSpec });
+        telemetry.workerResume({ subject: { ...attempt, bb_thread_id: spawned.id }, worker: execSpec });
         return { threadId: spawned.id };
       } catch (error) {
         let diagnostic;
@@ -347,6 +534,7 @@ async function execute() {
     return { turnSeq: terminal.seq, completed: thread.status === 'idle' && terminal.data?.status === 'completed' };
   }
   const submissions = { async read(attempt, after) {
+    telemetry.observe(attempt);
     const observed = await observedTurn(attempt.bb_thread_id, after);
     if (!observed) return;
     const { turnSeq, completed } = observed;
@@ -384,13 +572,38 @@ async function execute() {
       return await stableCheckpoint(threadId, question.checkpoint.turn_seq) === question.checkpoint.sha;
     },
   };
-  const reviewRunner = reviewSetup.neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner;
   const verify = async (attempt, submission) => {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
     const beforeEffect = activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
-    const review = reviewRunner({ journal: root, prompt: reviewText, beforeEffect });
+    const decisionSlice = await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`);
+    const memorySlice = await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`);
+    const criticPrompt = [reviewText, decisionSlice && decisionsPromptBlock(decisionSlice),
+      memorySlice && projectMemoryPromptBlock(memorySlice)].filter(Boolean).join('\n\n');
+    // Фактический критик L2 и арбитр — закреплённая триада попытки
+    // (#1263), иначе проверенный дефолт. Спек нормализуется к провайдеру,
+    // реально исполняемому L2-раннером ('pi/openai/…' → 'openai',
+    // 'acp-antigravity-acp' → 'google'): без egress-адресов раннер
+    // не запускается вообще. Раннер следует за типом критика.
+    // reasoningLevel наследуется в l2CriticSpec ДО выбора раннера: критик
+    // google-семейства без него получает наследство из профиля (или
+    // 'medium') — иначе Neon ушёл бы в Pi-раннер, а acceptHeld отклонил бы
+    // квитанцию review_isolation_missing (#1263 r6).
+    const attemptCritic = l2CriticSpec(attempt.triad?.critic ?? reviewSetup.critic,
+      { defaultReasoningLevel: profile.review?.reasoningLevel });
+    const attemptArbiter = runnerReviewSpec(attempt.triad?.arbiter ?? reviewSetup.arbiter);
+    // Закреплённый, но неисполняемый провайдер — fail-closed, а не тихая
+    // подмена дефолтом: такой пин не доходит до контейнера.
+    if (attemptCritic === null) throw new Error('route_critic_not_runnable');
+    if (attemptArbiter === null) throw new Error('route_arbiter_not_runnable');
+    const neon = isNeonReview(attemptCritic);
+    // В телеметрию пишется закреплённый спек (worker-форма 'pi/opencode-go/…'),
+    // как в allowlist, — canonical modelKey сопоставляет обе формы.
+    telemetry.recordModel('critic', attempt.triad?.critic ?? reviewSetup.critic);
+    telemetry.recordModel('arbiter', attempt.triad?.arbiter ?? reviewSetup.arbiter);
+    const review = (neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner)(
+      { journal: root, prompt: criticPrompt, beforeEffect });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
     // сверяется с доверенным значением, а не сам с собой.
@@ -399,7 +612,8 @@ async function execute() {
       profiles: { [attempt.check_profile]: { ...profile, visual: profile.visual,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
-      arbiter: reviewSetup.arbiter, review: { ...profile.review, requireAttestation: true } } } };
+      arbiter: attemptArbiter,
+      review: { ...profile.review, ...attemptCritic, requireAttestation: true } } } };
     let lost = false;
     let renewal = Promise.resolve();
     const timer = setInterval(() => {
@@ -410,6 +624,7 @@ async function execute() {
       // VS-3: фазы приёмки (L1 local, tamper, L3 visual, L2 critic) замеряются
       // вокруг портов; usage критика — из квитанции ревью, иначе null.
       telemetry.roundStart();
+      let lastReviewReceipt = null;
       const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', worktreeInspector(policy)),
         local: telemetry.port('l1_local', offlineProfileRunner(root, { beforeEffect })),
@@ -423,11 +638,35 @@ async function execute() {
           await assertPinned();
           await beforeEffect?.();
           const receipt = await telemetry.phase('l2_critic', () => review(handoff, trusted));
-          telemetry.recordUsage('critic', receipt?.usage, criticSource);
+          lastReviewReceipt = receipt ?? null;
+          telemetry.recordUsage('critic', receipt?.usage, neon ? 'agy_stream' : 'pi_stream');
           return receipt;
         },
       } });
       telemetry.recordRound({ outcome: result.outcome, reason: result.reason, sha: submission.candidate_sha });
+      // Запись памяти идёт уже после приёмки/закрытия карточки: отказ записи
+      // памяти никогда не должен ронять verify() и переводить попытку в uncertain.
+      try {
+        const memResult = await recordPostReviewMemory({
+          writer: projectMemoryWriter,
+          trustedReceiptDir: memoryCfg.trustedReceiptDir,
+          hmacKey: memoryCfg.hmacKey,
+          projectId: p.bb.project,
+          worktree: tree,
+          result,
+          reviewReceipt: lastReviewReceipt,
+          attempt,
+          submission,
+          worker: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
+          reviewer: attemptCritic,
+          updates: result.memoryUpdates ?? lastReviewReceipt?.memoryUpdates,
+        });
+        if (memResult.reason === 'post_review_memory_write_failed') {
+          console.error(`project-memory post-review write failed: ${memResult.error}`);
+        }
+      } catch (error) {
+        console.error(`project-memory post-review write failed: ${error?.message ?? String(error)}`);
+      }
       return result;
     } finally {
       clearInterval(timer);
@@ -445,7 +684,9 @@ async function execute() {
     const beforeEffect = activation && (() => port.guardTask(req.task_id, req.epoch));
     await beforeEffect?.();
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
-      prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '') });
+      prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
+        await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined,
+        await activeProjectMemory(`${req.task_id}:${req.attempt_id}:${req.epoch}`)) });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
     telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
     telemetry.recordArbitration();
@@ -457,7 +698,26 @@ async function execute() {
   const tick = guardedEffect(assertOpen, advanceWithProjection);
   const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
     release: releasePort, recheckRejectedHandoff: recheck,
-    workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter, arbitrate } });
+    workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter,
+      arbitrate,
+      // VS-4.2 (#1263): триада резолвится один раз — при запуске попытки —
+      // контроллером через pinTriad и закрепляется в записи (spawn, L2,
+      // арбитраж, seal идут на одной тройке; скоркард не перечитывается на
+      // каждом тике). Любая деградация — проверенный откат resolveTriad.
+      pinTriad: async () => {
+        const routed = workerSelector.resolveTriad({
+          policy: p,
+          scorecard: await currentScorecard(),
+          base: { worker: workerSelector.PRIMARY_WORKER,
+            critic: reviewSetup.critic, arbiter: reviewSetup.arbiter },
+          log: note => console.log(JSON.stringify(note)),
+        });
+        if (routed.outcome === 'rejected') return { outcome: 'rejected', reason: routed.reason };
+        return { plan: routed.plan,
+          critic: routed.selected.critic ?? reviewSetup.critic,
+          arbiter: routed.selected.arbiter ?? reviewSetup.arbiter };
+      } },
+    decisionLedger });
   const observeTick = result => {
     recheck = false;
     lastResult = result;
@@ -501,6 +761,8 @@ async function execute() {
             return 'stop';
           }
           if (result.phase === 'done' || result.phase === 'hold') {
+            // Дистилляция уроков ревью до сброса записи попытки (#1263).
+            await distillClosedAttempt();
             // Иначе сводка следующей карточки унаследует счётчики предыдущей.
             await finishTelemetry();
             await state.save(null);
@@ -529,12 +791,18 @@ async function execute() {
     }
     throw new Error('Pilot wait elapsed; current attempt is preserved');
   } finally {
-    try { await finishTelemetry(); }
+    try {
+      // Закрытая карточка с историей REWORK — источник уроков (#1263).
+      if (['done', 'hold'].includes(lastResult?.phase)) await distillClosedAttempt();
+      await finishTelemetry();
+    }
     finally { await release(); }
   }
 }
 
-try { await execute(); } catch (error) {
-  console.error(`isolated-pilot: ${error.message.split('\n')[0]}`);
-  process.exitCode = 1;
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  try { await execute(); } catch (error) {
+    console.error(`isolated-pilot: ${error.message.split('\n')[0]}`);
+    process.exitCode = 1;
+  }
 }

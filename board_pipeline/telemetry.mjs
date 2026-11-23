@@ -66,6 +66,55 @@ export function sumUsages(raws) {
   return totals;
 }
 
+// Стоимость в USD: принимаются только конечные неотрицательные числа;
+// отсутствие данных от провайдера — строго null, никогда не выдуманный 0.
+export function normalizeCost(raw) {
+  if (typeof raw === 'number') return token(raw);
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const direct = pick(raw, ['cost_usd', 'costUsd', 'total_cost_usd', 'totalCostUsd', 'cost']);
+  if (direct !== null) return direct;
+  if (raw.usage !== null && typeof raw.usage === 'object' && !Array.isArray(raw.usage)) {
+    return pick(raw.usage, ['cost_usd', 'costUsd', 'total_cost_usd', 'totalCostUsd', 'cost']);
+  }
+  return null;
+}
+
+// Суммирование стоимости: null остаётся null, пока не появится хотя бы одно число.
+export function sumCosts(values) {
+  if (!Array.isArray(values)) return null;
+  let total = null;
+  for (const raw of values) {
+    const cost = normalizeCost(raw);
+    if (cost === null) continue;
+    total = (total ?? 0) + cost;
+  }
+  return total;
+}
+
+// Медиана конечных числовых значений; пустой набор — null.
+export function computeMedian(values) {
+  if (!Array.isArray(values)) return null;
+  const sorted = values.filter(v => typeof v === 'number' && Number.isFinite(v)).sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Разбор JSONL-строк журнала телеметрии с подсчётом битых строк.
+export function parseTelemetryLines(lines) {
+  const entries = [];
+  let corrupt = 0;
+  if (!Array.isArray(lines)) return { entries, corrupt };
+  for (const line of lines) {
+    if (typeof line !== 'string' || !line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { corrupt += 1; continue; }
+    if (entry?.kind !== 'attempt_summary' || entry?.schema !== TELEMETRY_SCHEMA) continue;
+    entries.push(entry);
+  }
+  return { entries, corrupt };
+}
+
 // usage из снимков bb/pi: защита от неизвестных форм — ищем usage в известных
 // местах снимка потока/треда; нет — провайдер не отдал, остаётся null.
 export function threadUsage(snapshot) {
@@ -128,7 +177,7 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
   const rounds = { total: 0, rework: 0, pass: 0, arbitration: 0, open: 0 };
   const gateCounts = new Map();
   const tokens = { worker: null, critic: null, arbiter: null };
-  const identity = { task_id: null, attempt_id: null, epoch: null };
+  const identity = { task_id: null, attempt_id: null, epoch: null, bb_thread_id: null };
   const roleModels = { worker: null, critic: null, arbiter: null };
 
   // Модели из доверенной политики: фактические переопределяются при spawn.
@@ -156,6 +205,10 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
     if (typeof subject.task_id === 'string' && subject.task_id) identity.task_id = subject.task_id;
     if (typeof subject.attempt_id === 'string' && subject.attempt_id) identity.attempt_id = subject.attempt_id;
     if (Number.isSafeInteger(subject.epoch)) identity.epoch = subject.epoch;
+    const threadId = subject.bb_thread_id ?? subject.thread_id;
+    if (typeof threadId === 'string' && threadId) identity.bb_thread_id = threadId;
+    // На восстановленной попытке окна spawn нет; источник модели — WAL, не дефолт политики.
+    model('worker', subject.executor);
   };
   const model = (role, spec) => {
     if (!ROLES.includes(role) || spec === null || typeof spec !== 'object' ||
@@ -178,6 +231,10 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
 
   return {
     observe(subject) { guarded(() => observe(subject), 'observe'); },
+
+    // Фактическая модель роли (динамический роутинг #1263): pinned триада
+    // может отличаться от заявленной в политике — журнал пишет факт.
+    recordModel(role, spec) { guarded(() => model(role, spec), 'record_model'); },
 
     // Длительность шага эффектов: длительность фиксируется и при отказе,
     // сама ошибка шага проходит без изменений (fail-open). Окно работы
@@ -295,6 +352,7 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
           task_id: identity.task_id,
           attempt_id: identity.attempt_id,
           epoch: identity.epoch,
+          ...(identity.bb_thread_id !== null ? { bb_thread_id: identity.bb_thread_id } : {}),
           phases_ms: phasesMs,
           rounds: { ...rounds,
             ...(gateCounts.size ? { gates: Object.fromEntries([...gateCounts.entries()].sort()) } : {}) },

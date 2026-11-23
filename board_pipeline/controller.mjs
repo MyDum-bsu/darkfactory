@@ -65,7 +65,12 @@ function attemptOf(record, route) {
   const attempt = { task_id: record.taskId ?? route.taskId, attempt_id: record.attemptId, epoch: record.epoch,
     bb_thread_id: record.threadId, worktree: route.worktree, base_sha: route.base,
     check_profile: route.checkProfile, finish: route.finish };
-  if (record.executor !== undefined) attempt.executor = record.executor;
+  // Фактический исполнитель — executor; при восстановлении после lost spawn
+  // известна только закреплённая первичная модель триады.
+  attempt.executor = record.executor ?? record.triad?.worker;
+  // Закреплённая триада попытки (Board #1263): spawn, L2-критик, арбитраж
+  // и seal работают на одной тройке на всех тиках и после рестарта.
+  if (record.triad !== undefined) attempt.triad = record.triad;
   if (record.contract) {
     attempt.repo_id = record.contract.repo_id;
     attempt.spec_digest = record.contract.spec_digest;
@@ -81,7 +86,7 @@ function attemptOf(record, route) {
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
 export async function advance({ route, state, board, bb, submissions, verify, authorize,
-  recheckRejectedHandoff, workerSelector, mutants, questionGate, release }) {
+  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const hazards = mutants ?? {};
@@ -188,12 +193,15 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     return uncertain(`interrupted_${record.phase}`);
   };
 
-  // Единый фактический критик/арбитр для триады: настроенный селектор важнее
-  // маршрутного; расхождение route.critic с фактическим — отказ до claim.
+  // Единый фактический критик/арбитр для триады: закреплённая триада
+  // попытки важнее всего (одна тройка для spawn/L2/арбитража/seal и
+  // после рестарта), затем настроенный селектор и маршрут; расхождение
+  // route.critic с фактическим — отказ до claim.
+  const pinnedTriad = record?.triad;
   const selCritic = workerSelector
-    ? (workerSelector.critic ?? route.critic ?? workerSelector.DEFAULT_CRITIC) : undefined;
+    ? (pinnedTriad?.critic ?? workerSelector.critic ?? route.critic ?? workerSelector.DEFAULT_CRITIC) : undefined;
   const selArbiter = workerSelector
-    ? (workerSelector.arbiter ?? route.arbiter ?? workerSelector.DEFAULT_ARBITER) : undefined;
+    ? (pinnedTriad?.arbiter ?? workerSelector.arbiter ?? route.arbiter ?? workerSelector.DEFAULT_ARBITER) : undefined;
   const criticMismatch = Boolean(workerSelector && route.critic && workerSelector.critic &&
     (route.critic.provider !== workerSelector.critic.provider ||
      route.critic.model !== workerSelector.critic.model ||
@@ -205,17 +213,16 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     record.reason === 'invalid_or_stale_submission' && !record.turnSeq && record.seenShas.length === 0;
   if (recheckRejectedHandoff && !recheck) return { phase: 'hold', reason: 'no_rejected_handoff_to_recheck' };
   if (!record) {
-    // Кросс-семейственная триада отвергает маршрут до claim — для ВСЕХ
-    // кандидатов цепочки: нарушивший независимость резерв блокирует маршрут.
+    // Кросс-семейственная триада отвергает маршрут до claim, если её нарушает
+    // первичный исполнитель; резерв-нарушитель пропускается попыткой.
     if (workerSelector) {
       if (criticMismatch) {
         await save({ binding, phase: 'hold', reason: 'review_profile_mismatch', seenShas: [] });
         return visible();
       }
       try {
-        for (const candidate of workerSelector.selectWorker({ route, zcodeQuota: route.zcodeQuota })) {
-          workerSelector.assertTriadIndependent({ executor: candidate, critic: selCritic, arbiter: selArbiter });
-        }
+        const [primary] = workerSelector.selectWorker({ route });
+        workerSelector.assertTriadIndependent({ executor: primary, critic: selCritic, arbiter: selArbiter });
       } catch (e) {
         await save({ binding, phase: 'hold',
           reason: `route_triad_violation:${e.reason ?? e.message}`, seenShas: [] });
@@ -264,14 +271,47 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       let launched;
       let workerTrail = null;
       if (workerSelector) {
+        // Board #1263: триада резолвится ОДИН раз на попытку (pinTriad —
+        // динамический routeTriad либо проверенный откат) и закрепляется в
+        // записи: те же worker/critic/arbiter обслуживают spawn, L2,
+        // арбитраж и seal на всех тиках и после рестарта. Деградация пина —
+        // дефолтная триада, не повторное сканирование скоркарда.
+        let pinned = null;
+        if (typeof workerSelector.pinTriad === 'function') {
+          try {
+            pinned = await workerSelector.pinTriad({ route, attempt: attemptOf(record, route) });
+          } catch {
+            // Исключение пина — fail-closed: дефолтный воркер не запускается
+            // на недоказанной триаде (ревью #1263 r2).
+            await save({ phase: 'hold', reason: 'route_pin_failed' });
+            return visible();
+          }
+        }
+        if (pinned?.outcome === 'rejected') {
+          await save({ phase: 'hold', reason: pinned.reason ?? 'route_rejected' });
+          return visible();
+        }
+        const attemptCritic = pinned?.critic ?? selCritic;
+        const attemptArbiter = pinned?.arbiter ?? selArbiter;
+        const attemptPlan = Array.isArray(pinned?.plan) && pinned.plan.length
+          ? pinned.plan : workerSelector.selectWorker({ route });
+        // Триада закрепляется в записи ДО внешнего spawn: при потерянном
+        // ответе reconcileSpawn восстанавливает попытку уже с триадой —
+        // worker пишется по факту после выбора исполнителя.
+        await save({ triad: { worker: attemptPlan[0], critic: attemptCritic, arbiter: attemptArbiter } });
         // Приоритет acp-devin/swe-2-high; резерв только при подтверждённом
         // отказе, неизвестный исход — карантин без второго писателя.
         const selection = await workerSelector.attemptSpawnWithFallback({
           route, attempt: attemptOf(record, route),
-          zcodeQuota: route.zcodeQuota,
-          critic: selCritic,
-          arbiter: selArbiter,
+          critic: attemptCritic,
+          arbiter: attemptArbiter,
+          plan: attemptPlan,
           probe: typeof bb.probeAvailability === 'function' ? w => bb.probeAvailability(w) : undefined,
+          // Перед КАЖДЫМ spawn (включая резерв) запись несёт фактического
+          // кандидата: worker триады и executor — это запускаемый, иначе
+          // reconcileSpawn восстановил бы первичного из плана.
+          onBeforeSpawn: worker => save({ executor: worker,
+            triad: { worker, critic: attemptCritic, arbiter: attemptArbiter } }),
           spawn: envelope => bb.spawn(envelope),
           inspectWorktree: typeof bb.inspectWorktree === 'function'
             ? att => bb.inspectWorktree(att) : undefined,
@@ -289,7 +329,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         }
         launched = { threadId: selection.threadId };
         workerTrail = { executor: selection.worker, fallbackReason: selection.fallbackReason ?? null,
-          attemptedWorkers: selection.attemptedWorkers };
+          attemptedWorkers: selection.attemptedWorkers,
+          // Закреплённая триада: worker уточняется по факту (резерв мог
+          // подменить первичного), критик и арбитр — из пина выше.
+          triad: { worker: selection.worker, critic: attemptCritic, arbiter: attemptArbiter } };
       } else {
         launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
       }
@@ -312,7 +355,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         attempt: attemptOf(record, route), feedbackId, sha: question.checkpoint.sha,
         question, contract: record.contract, reason: 'owner_answer_confirmed',
         evidence: { questionId: question.question_id, ownerAnswer: answer },
-      }), reconcileFeedback: reconcileInFlight });
+      }), reconcileFeedback: reconcileInFlight, decisionLedger });
   }
   if (release && RELEASE_PHASES.has(record.phase)) {
     if (!questionGate) throw new ReleaseDenied('release_approval_unavailable');
