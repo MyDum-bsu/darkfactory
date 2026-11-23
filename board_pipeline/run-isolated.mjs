@@ -14,8 +14,8 @@ import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
 import { assertRetrySubjectUnchanged, isolatedArbiterRunner, isolatedPiReviewRunner,
-  l2CriticSpec, l2LaunchBoundary, l2ReviewRetryGuard, l2ReviewWithTransientRetry,
-  runnerReviewSpec } from './review-runner.mjs';
+  l2CriticRunners, l2CriticSpec, l2FreshLeaseCheck, l2LaunchBoundary,
+  l2ReviewRetryGuard, l2ReviewWithTransientRetry, runnerReviewSpec } from './review-runner.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { isNeonReview } from './review-policy.mjs';
 import { operatorReviewSetup } from './review-setup.mjs';
@@ -630,35 +630,29 @@ async function execute() {
     // Граница-перепроверка вооружается только самим повтором: первый вызов
     // читателя идёт прежним путём, без дополнительного Board/git трафика.
     // Продукционный порядок — в l2LaunchBoundary: дешёвый daemon-стоп-файл
-    // читается последним, после всех асинхронных проверок.
+    // читается последним, после всех асинхронных проверок. Доказательство
+    // lease — свежий нативный verifyHeld с точной эпохой на самой границе
+    // второго запуска; кэш renewal-флага здесь не доказательство.
     const launchBoundary = l2LaunchBoundary({ retryGuard,
       verifySubject: () => assertRetrySubjectUnchanged(launchBinding),
       assertOpen, assertPinned, daemonOpen,
-      checkLease: async () => {
-        await renewal;
-        if (lost) throw new Error('Lease lost');
-      } });
-    let retryBoundary = false;
+      checkLease: l2FreshLeaseCheck({ port, taskId: attempt.task_id,
+        epoch: attempt.epoch }) });
     // В телеметрию пишется закреплённый спек (worker-форма 'pi/opencode-go/…'),
     // как в allowlist, — canonical modelKey сопоставляет обе формы.
     telemetry.recordModel('critic', attempt.triad?.critic ?? reviewSetup.critic);
     telemetry.recordModel('arbiter', attempt.triad?.arbiter ?? reviewSetup.arbiter);
-    const review = (neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner)(
-      { journal: root, prompt: criticPrompt,
-        // Пре-эффект читателя включает daemon kill-switch и доказательство
-        // живого lease (флаг renewal-цикла): второй вызов после повторных
-        // гейтов тоже обязан упереться в действующий стоп и не запускаться
-        // на потерянном удержании карточки.
-        beforeEffect: async () => {
-          await beforeEffect?.();
-          await daemonOpen?.();
-          await renewal;
-          if (lost) throw new Error('Lease lost');
-          // Граница запуска ТОЛЬКО для повтора: свежее доказательство
-          // lease/допуска/контракта/пинов, чистый закреплённый checkout и
-          // финальный стоп-файл — в продукционном l2LaunchBoundary.
-          if (retryBoundary && launchBinding) await launchBoundary();
-        } });
+    const { review, retry: retryReview } = l2CriticRunners({
+      makeRunner: neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner,
+      options: { journal: root, prompt: criticPrompt },
+      // Первый читатель — прежний пре-эффект, как до DF-OPS-1.
+      beforeEffect,
+      // Пре-эффект второго читателя — вся граница запуска: свежее
+      // доказательство lease/допуска/контракта/пинов, чистый закреплённый
+      // checkout и финальный стоп-файл — в продукционном l2LaunchBoundary.
+      retryBeforeEffect: async () => {
+        if (launchBinding) await launchBoundary();
+      } });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
     // сверяется с доверенным значением, а не сам с собой.
@@ -716,8 +710,8 @@ async function execute() {
           // субъект заново непосредственно перед docker run каждого вызова.
           launchBinding = { ...handoff, worktree: tree, branch: profile.branch };
           const receipt = await telemetry.phase('l2_critic', () => l2ReviewWithTransientRetry({
-            review, binding: handoff, profile: trusted,
-            beforeRetry: async () => { await retryGuard(); retryBoundary = true; },
+            review, retry: retryReview, binding: handoff, profile: trusted,
+            beforeRetry: retryGuard,
             verifySubject: b => assertRetrySubjectUnchanged({ ...b, worktree: tree,
               branch: profile.branch }),
             log: note => console.log(JSON.stringify(note)),

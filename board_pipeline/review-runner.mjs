@@ -43,8 +43,7 @@ const TRUNCATED_TRANSCRIPT = new Set([
 // отказ или mismatch. Возвращает причину отказа либо null.
 function transcriptDisqualifying(ndjson, critic) {
   const tools = new Set();
-  let settledOk = false;
-  let lastAssistant = null;
+  let finishedResponse = false;
   const noteTools = (list) => {
     if (Array.isArray(list)) {
       for (const t of list) tools.add(typeof t === 'string' ? t : t?.name);
@@ -71,13 +70,9 @@ function transcriptDisqualifying(ndjson, critic) {
         (event?.type === 'auto_retry_end' && event.success === false)) {
       return 'review_runner_reported_error';
     }
-    if (event?.type === 'agent_settled' && event.aborted === false) {
-      settledOk = true;
-    }
     if (event?.type !== 'message_end') continue;
     const message = event.message ?? event.data?.message;
     if (message?.role !== 'assistant') continue;
-    lastAssistant = message;
     // Отказ провайдера может быть записан в самом assistant-сообщении
     // (stopReason 'error' / errorMessage) без верхнеуровневого error-события —
     // зафиксированный отказ — hold, не transient.
@@ -113,19 +108,22 @@ function transcriptDisqualifying(ndjson, critic) {
         return 'review_verdict_emitted';
       }
     }
+    // Штатно закрывшийся assistant-ответ (stop/completed) — завершённый
+    // исход хода: даже без agent_settled и с недоказуемым вердиктом
+    // (например, битый {verdict: ...}) это hold, а не обрыв потока.
+    if (message.stopReason === 'stop' &&
+        (message.rawStopReason === undefined ||
+          message.rawStopReason === 'completed')) {
+      finishedResponse = true;
+    }
   }
   for (const tool of tools) {
     if (!READ_ONLY_TOOLS.includes(tool)) return `review_forbidden_tool:${tool}`;
   }
-  // Завершённый ответ без вердикта — невалидный исход, а не обрыв:
-  // settlement пришёл, ход закрылся штатно, но текст пуст/без вердикта —
-  // hold, повтор не должен заменять завершённый невалидный ответ.
-  if (settledOk && lastAssistant !== null &&
-      lastAssistant.stopReason === 'stop' &&
-      (lastAssistant.rawStopReason === undefined ||
-        lastAssistant.rawStopReason === 'completed')) {
-    return 'review_verdict_missing';
-  }
+  // Завершённый ответ без доказуемого вердикта — невалидный исход, а не
+  // обрыв: пропажа settlement/недоказуемое намерение не открывает повтор —
+  // второй вызов не должен заменять завершённый ответ читателя.
+  if (finishedResponse) return 'review_verdict_missing';
   return null;
 }
 
@@ -754,6 +752,28 @@ export function l2LaunchBoundary({ retryGuard, verifySubject, assertOpen,
   };
 }
 
+// Пара read-only читателей L2 одного закреплённого критика: первый запуск
+// идёт прежним beforeEffect — тем же хуком, что до DF-OPS-1, без новых
+// daemon-чтений, ожидания renewal и повторных гейтов в пре-эффекте. Второй
+// экземпляр того же раннера и pinned-модели получает retry-only хук
+// границы запуска — retry-проверки существуют только у него.
+export function l2CriticRunners({ makeRunner, options, beforeEffect, retryBeforeEffect }) {
+  return {
+    review: makeRunner({ ...options, beforeEffect }),
+    retry: makeRunner({ ...options, beforeEffect: retryBeforeEffect }),
+  };
+}
+
+// Доказательство lease на границе запуска — только свежий нативный
+// verifyHeld с точной эпохой: кэшированный флаг renewal-цикла и await
+// pending-промиса не доказывают текущее удержание карточки.
+export function l2FreshLeaseCheck({ port, taskId, epoch }) {
+  return async () => {
+    const live = await port.verifyHeld(taskId, epoch);
+    if (live?.epoch !== epoch) throw new Error('Lease lost');
+  };
+}
+
 // Один повторный вызов L2-критика внутри review-порта — только по
 // ReviewRunnerTimeout, без сна и скрытых циклов. Повтор идёт с теми же
 // binding/profile: тот же критик, модель/effort и subject_digest
@@ -761,8 +781,8 @@ export function l2LaunchBoundary({ retryGuard, verifySubject, assertOpen,
 // гейты (lease/epoch, допуск карточки, kill-switch, закреплённые входы);
 // любой неуспех гейта отменяет повтор, ошибка уходит в обычный hold.
 // Второй сбой пробрасывается наружу без третьей попытки.
-export async function l2ReviewWithTransientRetry({ review, binding, profile, beforeRetry,
-  verifySubject = assertRetrySubjectUnchanged, log }) {
+export async function l2ReviewWithTransientRetry({ review, retry = review, binding, profile,
+  beforeRetry, verifySubject = assertRetrySubjectUnchanged, log }) {
   try {
     return await review(binding, profile);
   } catch (error) {
@@ -778,7 +798,9 @@ export async function l2ReviewWithTransientRetry({ review, binding, profile, bef
     await verifySubject(binding);
     log?.({ kind: 'l2_review_retry', task: binding?.task_id ?? null,
       sha: binding?.candidate_sha ?? null, reason: error.reason });
-    return await review(binding, profile);
+    // Второй вызов может идти отдельным экземпляром того же раннера с
+    // retry-only пре-эффектом — первый запуск retry-гейтов не несёт.
+    return await retry(binding, profile);
   }
 }
 
