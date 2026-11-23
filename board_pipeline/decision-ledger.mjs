@@ -254,16 +254,27 @@ const isSlice = s => s !== null && typeof s === 'object' && !Array.isArray(s) &&
 
 const sliceDigest = items => createHash('sha256').update(canonicalJson(items)).digest('hex');
 
-// Персистированный pin должен нести items, из которых digest пересчитывается
-// при чтении, а text/ids/truncated/total обязаны быть согласованы с ними —
-// подмена любого поля без пересчёта не проходит.
-const isPin = s => isSlice(s) && Array.isArray(s.items) &&
+// pin_sha256 покрывает все поля pin-файла — подмена total/truncated/digest/
+// text/items не проходит сверку при чтении.
+const pinIntegrity = s => createHash('sha256').update(canonicalJson(
+  { digest: s.digest, ids: s.ids, items: s.items, truncated: s.truncated,
+    total: s.total })).digest('hex');
+
+// Срез, пригодный к публикации: items согласованы с digest/text/ids/truncated/
+// total — pin-файл всегда самопроверяем.
+const isSliceContent = s => isSlice(s) && Array.isArray(s.items) &&
   s.items.length === s.ids.length &&
+  s.total >= s.ids.length &&
   s.items.every((item, i) => item !== null && typeof item === 'object' &&
     item.id === s.ids[i] && typeof item.scope === 'string' && typeof item.rule === 'string') &&
   s.text === s.items.map(item => `- [${item.scope}] ${item.rule} (${item.id})`).join('\n') &&
   s.truncated === (s.total > s.ids.length) &&
   sliceDigest(s.items) === s.digest;
+
+// Персистированный pin: валидное содержимое плюс pin_sha256, покрывающий все
+// поля — подмена любого поля без пересчёта не проходит.
+const isPin = s => isSliceContent(s) &&
+  DIGEST.test(s.pin_sha256 ?? '') && pinIntegrity(s) === s.pin_sha256;
 
 // Закрепление активного среза за попыткой: воркер, критик и арбитр одного
 // кандидата видят один и тот же snapshot/digest, а не независимо перечитанный
@@ -280,7 +291,8 @@ export function pinDecisions(resolve_, { persistDir } = {}) {
     try { saved = JSON.parse(await readFile(file, 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
     if (!isPin(saved)) throw new Error('decision_ledger_pin_invalid');
-    return saved;
+    const { text, digest, ids, truncated, total, items } = saved;
+    return { text, digest, ids, truncated, total, items };
   };
   return key => {
     let pin = pins.get(key);
@@ -293,12 +305,12 @@ export function pinDecisions(resolve_, { persistDir } = {}) {
         }
         const slice = (await resolve_()) ?? null;
         if (file !== null && slice !== null) {
-          if (!isPin(slice)) throw new Error('decision_ledger_slice_invalid');
+          if (!isSliceContent(slice)) throw new Error('decision_ledger_slice_invalid');
           // Атомарная публикация: полные байты во временном файле, link() делает
           // появление pinPath мгновенным и failsafe-EEXIST — канон чужого pin.
           const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
           try {
-            await writeFile(tmp, JSON.stringify(slice), { mode: 0o600 });
+            await writeFile(tmp, JSON.stringify({ ...slice, pin_sha256: pinIntegrity(slice) }), { mode: 0o600 });
             try {
               await link(tmp, file);
             } catch (error) {

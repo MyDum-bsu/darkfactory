@@ -366,14 +366,23 @@ test('pinned snapshot persists across process restart for the same epoch', async
     const y = sliceFor([{ id: 'y', scope: 'global', rule: 'r2' }]);
     const third = pinDecisions(async () => y, { persistDir: dir });
     assert.deepEqual((await third('7:2')).ids, ['y']);
-    // Подмена содержимого без пересчёта digest — fail-closed.
+    // Подмена любого поля без пересчёта pin_sha256 — fail-closed; для каждой
+    // подмены — свежий pinDecisions, чтобы гарантированно читать файл с диска.
     const name = `decisions-${createHash('sha256').update('7:1').digest('hex').slice(0, 32)}.json`;
-    await writeFile(join(dir, name), JSON.stringify({ ...slice, text: 'forged' }));
-    const fourth = pinDecisions(async () => slice, { persistDir: dir });
-    await assert.rejects(() => fourth('7:1'), /decision_ledger_pin_invalid/);
-    // Подмена самого digest под чужие items — тоже fail-closed.
-    await writeFile(join(dir, name), JSON.stringify({ ...slice, digest: 'f'.repeat(64) }));
-    await assert.rejects(() => fourth('7:1'), /decision_ledger_pin_invalid/);
+    const file = join(dir, name);
+    const saved = JSON.parse(await readFile(file, 'utf8'));
+    for (const tampered of [
+      { ...saved, text: 'forged' },
+      { ...saved, digest: 'f'.repeat(64) },
+      { ...saved, total: 0 },
+      { ...saved, truncated: true },
+      { ...saved, ids: [] },
+      { ...saved, pin_sha256: 'f'.repeat(64) },
+    ]) {
+      await writeFile(file, JSON.stringify(tampered));
+      const fresh = pinDecisions(async () => slice, { persistDir: dir });
+      await assert.rejects(() => fresh('7:1'), /decision_ledger_pin_invalid/);
+    }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
