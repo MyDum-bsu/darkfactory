@@ -14,7 +14,7 @@ import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
 import { isolatedArbiterRunner, isolatedPiReviewRunner,
-  l2CriticSpec, runnerReviewSpec } from './review-runner.mjs';
+  l2CriticSpec, l2ReviewWithTransientRetry, runnerReviewSpec } from './review-runner.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter } from './review-policy.mjs';
 import { MAX_QUESTION_TTL_MS, readSignedAnswer, signedAnswerVerifier } from './question-gate.mjs';
@@ -671,7 +671,21 @@ async function execute() {
               journal: root, readArtifact, assertCurrent: beforeEffect, inspect, readState: state.load }));
             await beforeEffect();
           }
-          const receipt = await telemetry.phase('l2_critic', () => review(handoff, trusted));
+          // Один повтор того же критика/субъекта только по доказанному
+          // таймауту раннера (exit 143 / host timeout). Перед повтором —
+          // текущий lease/epoch, допуск карточки и kill-switch,
+          // закреплённые входы оператора и неизменный чистый worktree на
+          // candidate_sha; неуспех гейта или второй сбой — обычный hold.
+          const receipt = await telemetry.phase('l2_critic', () => l2ReviewWithTransientRetry({
+            review, binding: handoff, profile: trusted,
+            beforeRetry: async () => {
+              await renewal;
+              if (lost) throw new Error('Lease lost');
+              await assertPinned();
+              await beforeEffect?.();
+            },
+            log: note => console.log(JSON.stringify(note)),
+          }));
           lastReviewReceipt = receipt ?? null;
           telemetry.recordUsage('critic', receipt?.usage, neon ? 'agy_stream' : 'pi_stream');
           return receipt;

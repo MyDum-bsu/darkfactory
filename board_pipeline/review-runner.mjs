@@ -50,6 +50,18 @@ export class ReviewDenied extends Error {
   }
 }
 
+// Доказанный transient-сбой read-only раннера L2: хостовый таймаут exec или
+// подтверждённый SIGTERM контейнера (код 143). Единственный класс ошибок, по
+// которому контроллер делает один повтор того же закреплённого критика и
+// субъекта. Отказ, битый вердикт, mismatch модели и обычный REWORK сюда не
+// попадают — это не ReviewRunnerTimeout и повтора не даёт.
+export class ReviewRunnerTimeout extends ReviewDenied {
+  constructor(reason, options) {
+    super(reason, options);
+    this.transient = true;
+  }
+}
+
 // Строгая таблица разрешённых идентификаторов: provider и model должны быть
 // известны и принадлежать одному семейству. Никакого поиска по подстроке.
 const PROVIDER_FAMILY = new Map([
@@ -496,6 +508,7 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   let code = 0;
   let stdout = '';
   let stderr = '';
+  let timedOut = false;
   await beforeEffect?.();
   try {
     const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
@@ -503,6 +516,10 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
     stderr = run.stderr;
   } catch (error) {
     code = typeof error.code === 'number' ? error.code : null;
+    // Доказательство хостового таймаута: execFile добил дочерний процесс по
+    // истечении timeout (killed + SIGTERM). Нечисловой код без этого
+    // признака — обычный сбой exec (spawn/ENOENT), не доказанный таймаут.
+    timedOut = error.killed === true && error.signal === 'SIGTERM';
     stdout = error.stdout ?? '';
     stderr = error.stderr ?? '';
   } finally {
@@ -514,7 +531,57 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
       }
     }
   }
-  return { code, stdout, stderr };
+  return { code, stdout, stderr, timedOut };
+}
+
+// Классификация ненулевого выхода read-only раннера: только числовой код 143
+// (SIGTERM процесса контейнера) или доказанный хостовый таймаут exec дают
+// transient ReviewRunnerTimeout. Произвольный null, строка «143» в stderr,
+// SIGKILL (137), отказ запуска и прочие коды — обычный ReviewDenied.
+export function reviewRunnerExitFailure(run) {
+  const reason = `review_runner_exit:${run?.code ?? 'timeout'}`;
+  if (run?.code === 143 || run?.timedOut === true) {
+    return new ReviewRunnerTimeout(reason);
+  }
+  return new ReviewDenied(reason);
+}
+
+// Перед единственным повтором L2: тот же чистый зачисленный worktree на том же
+// candidate_sha, с тем же base-предком. Смена HEAD, грязное дерево или
+// невозможность проверить — отказ, повторного вызова нет.
+async function assertRetrySubjectUnchanged(binding) {
+  if (!isAbsolute(binding?.worktree ?? '') || !SHA.test(binding?.candidate_sha ?? '')) {
+    throw new ReviewDenied('review_retry_subject_unverified');
+  }
+  const head = await git(binding.worktree, 'rev-parse', 'HEAD');
+  const status = await git(binding.worktree, 'status', '--porcelain=v1', '--untracked-files=all');
+  if (head !== binding.candidate_sha || status !== '') {
+    throw new ReviewDenied('review_retry_subject_changed');
+  }
+  if (SHA.test(binding.base_sha ?? '')) {
+    await git(binding.worktree, 'merge-base', '--is-ancestor',
+      binding.base_sha, binding.candidate_sha);
+  }
+}
+
+// Один повторный вызов L2-критика внутри review-порта — только по
+// ReviewRunnerTimeout, без сна и скрытых циклов. Повтор идёт с теми же
+// binding/profile: тот же критик, модель/effort и subject_digest
+// гарантированы идентичностью аргументов. beforeRetry — контроллерские
+// гейты (lease/epoch, допуск карточки, kill-switch, закреплённые входы);
+// любой неуспех гейта отменяет повтор, ошибка уходит в обычный hold.
+// Второй сбой пробрасывается наружу без третьей попытки.
+export async function l2ReviewWithTransientRetry({ review, binding, profile, beforeRetry, log }) {
+  try {
+    return await review(binding, profile);
+  } catch (error) {
+    if (!(error instanceof ReviewRunnerTimeout)) throw error;
+    await beforeRetry?.();
+    await assertRetrySubjectUnchanged(binding);
+    log?.({ kind: 'l2_review_retry', task: binding?.task_id ?? null,
+      sha: binding?.candidate_sha ?? null, reason: error.reason });
+    return await review(binding, profile);
+  }
 }
 
 function runModelInReadOnlySandbox({ allow, argv, env = {}, mounts = [], ...options }) {
@@ -678,7 +745,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           await writeFile(join(journal, `${name}.stderr`),
             String(run.stderr || run.stdout || ''), { flag: 'wx', mode: 0o600 });
         } catch { /* журнал недоступен — не маскируем исходную ошибку */ }
-        throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
+        throw reviewRunnerExitFailure(run);
       }
 
       // Приватный сырой транскрипт: контроллер владеет каталогом журнала.
