@@ -5,7 +5,7 @@
 // закреплённый срез; запись разрешена только через доверенный пост-шаг с
 // подтверждённым REVIEW_OK + verified_sha + независимой парой семейств.
 
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { lstatSync } from 'node:fs';
 import { link, lstat, mkdir, open, readFile, readlink, realpath, rename, rm,
   unlink, writeFile } from 'node:fs/promises';
@@ -33,8 +33,6 @@ export const TRUSTED_WRITE_ROLES = Object.freeze([
 export const DEFAULT_MAX_CHARS = 4000;
 export const DEFAULT_MAX_ENTRIES_PER_SECTION = 25;
 
-const TRUSTED_RECEIPT_CAP = Symbol('darkfactory.project-memory.trusted-receipt');
-const TRUSTED_RECEIPTS = new WeakSet();
 const MAX_RECEIPT_BYTES = 256 * 1024;
 
 const SECTION_SET = new Set(PROJECT_MEMORY_SECTIONS);
@@ -369,11 +367,20 @@ function toCanonicalFamilySpec(spec) {
 }
 
 export function reviewReceiptDigest(receipt) {
-  const { receipt_sha256, ...body } = receipt;
+  const { receipt_sha256, receipt_hmac_sha256, ...body } = receipt;
   return createHash('sha256').update(canonicalJson(body)).digest('hex');
 }
 
-function validateReceiptFields(raw, { requireDigest = false } = {}) {
+export function reviewReceiptHmac(receipt, hmacKey) {
+  if ((typeof hmacKey !== 'string' || hmacKey.length === 0) &&
+      (!Buffer.isBuffer(hmacKey) || hmacKey.length === 0)) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  const { receipt_hmac_sha256, ...body } = receipt;
+  return createHmac('sha256', hmacKey).update(canonicalJson(body)).digest('hex');
+}
+
+function validateReceiptFields(raw, { requireDigest = false, hmacKey } = {}) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('project_memory_untrusted_write');
   }
@@ -408,6 +415,17 @@ function validateReceiptFields(raw, { requireDigest = false } = {}) {
       throw new Error('project_memory_untrusted_write');
     }
   }
+  if (hmacKey !== undefined) {
+    if (typeof raw.receipt_hmac_sha256 !== 'string' || !DIGEST.test(raw.receipt_hmac_sha256)) {
+      throw new Error('project_memory_untrusted_write');
+    }
+    const expected = reviewReceiptHmac(raw, hmacKey);
+    const actualBuf = Buffer.from(raw.receipt_hmac_sha256, 'hex');
+    const expectedBuf = Buffer.from(expected, 'hex');
+    if (actualBuf.length !== expectedBuf.length || !timingSafeEqual(actualBuf, expectedBuf)) {
+      throw new Error('project_memory_untrusted_write');
+    }
+  }
   return {
     role,
     verifiedSha: raw.sha,
@@ -417,86 +435,100 @@ function validateReceiptFields(raw, { requireDigest = false } = {}) {
   };
 }
 
-// Выдача runtime capability-токена доверенной квитанции ревью:
-// обычный JSON-объект не может попасть в приватный WeakSet TRUSTED_RECEIPTS.
-export function createTrustedReviewReceipt({
-  role,
-  verdict,
-  sha,
-  worker,
-  reviewer,
-  sourceCard,
-  source_card,
-}) {
-  const card = sourceCard ?? source_card;
-  const body = {
-    schema: REVIEW_RECEIPT_SCHEMA,
-    role: typeof role === 'string' ? role.trim().toLowerCase() : role,
-    verdict,
-    sha,
-    worker,
-    reviewer,
-    source_card: card !== undefined ? String(card) : undefined,
-  };
-  validateReceiptFields(body, { requireDigest: false });
-  const receipt = Object.freeze({
-    ...body,
-    receipt_sha256: reviewReceiptDigest(body),
-    [TRUSTED_RECEIPT_CAP]: true,
-  });
-  TRUSTED_RECEIPTS.add(receipt);
-  return receipt;
+async function assertTrustedReceiptDir(trustedReceiptDir, worktree) {
+  if (typeof trustedReceiptDir !== 'string' || !isAbsolute(trustedReceiptDir)) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  let dirStat;
+  try {
+    dirStat = lstatSync(trustedReceiptDir);
+  } catch {
+    throw new Error('project_memory_untrusted_write');
+  }
+  if (dirStat.isSymbolicLink()) {
+    throw new Error('project_memory_symlink_disallowed');
+  }
+  if (!dirStat.isDirectory()) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  return assertStoreOutside(trustedReceiptDir, worktree);
 }
 
-export async function writeTrustedReviewReceipt({ receiptPath, receipt, worktree }) {
+export async function writeTrustedReviewReceipt({
+  receiptPath,
+  trustedReceiptDir,
+  receipt,
+  hmacKey,
+  worktree,
+}) {
   if (typeof receiptPath !== 'string' || !isAbsolute(receiptPath)) {
     throw new Error('project_memory_path_relative');
   }
-  if (!TRUSTED_RECEIPTS.has(receipt) || receipt[TRUSTED_RECEIPT_CAP] !== true) {
-    throw new Error('project_memory_untrusted_write');
+  const trustedDir = await assertTrustedReceiptDir(trustedReceiptDir, worktree);
+  const body = {
+    schema: REVIEW_RECEIPT_SCHEMA,
+    role: typeof receipt?.role === 'string' ? receipt.role.trim().toLowerCase() : receipt?.role,
+    verdict: receipt?.verdict,
+    sha: receipt?.sha,
+    worker: receipt?.worker,
+    reviewer: receipt?.reviewer,
+    source_card: (receipt?.sourceCard ?? receipt?.source_card) !== undefined
+      ? String(receipt.sourceCard ?? receipt.source_card) : undefined,
+  };
+  validateReceiptFields(body, { requireDigest: false });
+  const signed = { ...body, receipt_sha256: reviewReceiptDigest(body) };
+  if (hmacKey !== undefined) {
+    signed.receipt_hmac_sha256 = reviewReceiptHmac(signed, hmacKey);
   }
-  const dir = await assertStoreOutside(dirname(receiptPath), worktree);
-  const expectedFile = join(dir, basename(receiptPath));
   try {
-    const st = lstatSync(expectedFile);
+    const st = lstatSync(receiptPath);
     if (st.isSymbolicLink()) throw new Error('project_memory_symlink_disallowed');
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  const resolved = await resolveLoose(expectedFile);
-  if (resolved !== expectedFile) throw new Error('project_memory_symlink_disallowed');
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const tmp = `${expectedFile}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  const resolved = await resolveLoose(receiptPath);
+  if (!inside(trustedDir, resolved) || resolved === trustedDir) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  await mkdir(dirname(resolved), { recursive: true, mode: 0o700 });
+  const tmp = `${resolved}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   try {
-    await writeFile(tmp, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
-    await rename(tmp, expectedFile);
-    return expectedFile;
+    await writeFile(tmp, `${JSON.stringify(signed, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, resolved);
+    return resolved;
   } finally {
     await unlink(tmp).catch(() => {});
   }
 }
 
-async function readTrustedReceiptFile(receiptPath, worktree) {
+async function readTrustedReceiptFile(receiptPath, trustedReceiptDir, worktree, hmacKey) {
+  const trustedDir = await assertTrustedReceiptDir(trustedReceiptDir, worktree);
   if (typeof receiptPath !== 'string' || !isAbsolute(receiptPath)) {
-    throw new Error('project_memory_path_relative');
+    throw new Error('project_memory_untrusted_write');
   }
-  const dir = await assertStoreOutside(dirname(receiptPath), worktree);
-  const expectedFile = join(dir, basename(receiptPath));
   let st;
   try {
-    st = lstatSync(expectedFile);
+    st = lstatSync(receiptPath);
   } catch {
     throw new Error('project_memory_untrusted_write');
   }
-  if (st.isSymbolicLink() || !st.isFile()) {
+  if (st.isSymbolicLink()) {
     throw new Error('project_memory_symlink_disallowed');
   }
-  const resolved = await resolveLoose(expectedFile);
-  if (resolved !== expectedFile) {
+  if (!st.isFile()) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  const resolved = await resolveLoose(receiptPath);
+  // Квитанция обязана лежать строго внутри trustedReceiptDir (не просто «вне worktree»)
+  // и не иметь подменённых симлинком промежуточных сегментов.
+  if (!inside(trustedDir, resolved) || resolved === trustedDir) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  if (relative(resolve(trustedReceiptDir), resolve(receiptPath)) !== relative(trustedDir, resolved)) {
     throw new Error('project_memory_symlink_disallowed');
   }
   let raw;
-  try { raw = await readFile(expectedFile, 'utf8'); } catch {
+  try { raw = await readFile(resolved, 'utf8'); } catch {
     throw new Error('project_memory_untrusted_write');
   }
   if (Buffer.byteLength(raw) > MAX_RECEIPT_BYTES) {
@@ -506,25 +538,25 @@ async function readTrustedReceiptFile(receiptPath, worktree) {
   try { parsed = JSON.parse(raw); } catch {
     throw new Error('project_memory_untrusted_write');
   }
-  return validateReceiptFields(parsed, { requireDigest: true });
+  return validateReceiptFields(parsed, { requireDigest: true, hmacKey });
 }
 
 // Жёсткая граница доверия на запись:
-// простой неподписанный JSON-объект без доверенного файла квитанции вне worktree
-// (receiptPath) или runtime capability-токена createTrustedReviewReceipt()
-// немедленно отклоняется fail-closed (project_memory_untrusted_write).
-async function verifyTrustedWrite({ attestation, receiptPath, receipt, sourceCard, worktree }) {
-  let verified;
-  if (receiptPath !== undefined) {
-    verified = await readTrustedReceiptFile(receiptPath, worktree);
-  } else {
-    const cap = receipt ?? attestation?.receipt;
-    if (cap === null || typeof cap !== 'object' ||
-        !TRUSTED_RECEIPTS.has(cap) || cap[TRUSTED_RECEIPT_CAP] !== true) {
-      throw new Error('project_memory_untrusted_write');
-    }
-    verified = validateReceiptFields(cap, { requireDigest: true });
+// единственный допустимый путь — квитанция ревью на диске строго внутри
+// доверенного операторского каталога trustedReceiptDir (не symlink, вне worktree),
+// с проверкой receipt_sha256, REVIEW_OK, assertCrossFamily и опционального HMAC-SHA256.
+async function verifyTrustedWrite({
+  attestation,
+  receiptPath,
+  trustedReceiptDir,
+  hmacKey,
+  sourceCard,
+  worktree,
+}) {
+  if (receiptPath === undefined || trustedReceiptDir === undefined) {
+    throw new Error('project_memory_untrusted_write');
   }
+  const verified = await readTrustedReceiptFile(receiptPath, trustedReceiptDir, worktree, hmacKey);
 
   if (sourceCard !== undefined && String(sourceCard) !== verified.sourceCard) {
     throw new Error('project_memory_untrusted_write');
@@ -616,14 +648,22 @@ export async function recordProjectMemoryUpdate({
   updates,
   attestation,
   receiptPath,
-  receipt,
+  trustedReceiptDir,
+  hmacKey,
   sourceCard,
   worktree,
   maxChars = DEFAULT_MAX_CHARS,
   maxEntriesPerSection = DEFAULT_MAX_ENTRIES_PER_SECTION,
   now = new Date(),
 }) {
-  const verified = await verifyTrustedWrite({ attestation, receiptPath, receipt, sourceCard, worktree });
+  const verified = await verifyTrustedWrite({
+    attestation,
+    receiptPath,
+    trustedReceiptDir,
+    hmacKey,
+    sourceCard,
+    worktree,
+  });
   if (!Array.isArray(updates) || updates.length === 0) {
     throw new Error('project_memory_updates_invalid');
   }
