@@ -611,15 +611,24 @@ async function execute() {
     if (attemptCritic === null) throw new Error('route_critic_not_runnable');
     if (attemptArbiter === null) throw new Error('route_arbiter_not_runnable');
     const neon = isNeonReview(attemptCritic);
+    let lost = false;
+    let renewal = Promise.resolve();
     // В телеметрию пишется закреплённый спек (worker-форма 'pi/opencode-go/…'),
     // как в allowlist, — canonical modelKey сопоставляет обе формы.
     telemetry.recordModel('critic', attempt.triad?.critic ?? reviewSetup.critic);
     telemetry.recordModel('arbiter', attempt.triad?.arbiter ?? reviewSetup.arbiter);
     const review = (neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner)(
       { journal: root, prompt: criticPrompt,
-        // Пре-эффект читателя включает daemon kill-switch: второй вызов
-        // после повторных гейтов тоже обязан упереться в действующий стоп.
-        beforeEffect: async () => { await beforeEffect?.(); await daemonOpen?.(); } });
+        // Пре-эффект читателя включает daemon kill-switch и доказательство
+        // живого lease (флаг renewal-цикла): второй вызов после повторных
+        // гейтов тоже обязан упереться в действующий стоп и не запускаться
+        // на потерянном удержании карточки.
+        beforeEffect: async () => {
+          await beforeEffect?.();
+          await daemonOpen?.();
+          await renewal;
+          if (lost) throw new Error('Lease lost');
+        } });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
     // сверяется с доверенным значением, а не сам с собой.
@@ -630,8 +639,6 @@ async function execute() {
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
       arbiter: attemptArbiter,
       review: { ...profile.review, ...attemptCritic, requireAttestation: true } } } };
-    let lost = false;
-    let renewal = Promise.resolve();
     const timer = setInterval(() => {
       renewal = renewal.then(() => { if (!lost) return port.verifyHeld(attempt.task_id, attempt.epoch); })
         .catch(() => { lost = true; });
@@ -684,6 +691,7 @@ async function execute() {
                     policy_digest: attempt.policy_digest, profile_id: attempt.check_profile,
                     fixtures_digest: attempt.fixtures_digest ?? null,
                     has_ui: attempt.has_ui, finish: route.finish },
+              required: route.allowlist?.required,
               assertPinned, beforeEffect, assertOpen, daemonOpen }),
             verifySubject: b => assertRetrySubjectUnchanged({ ...b, worktree: tree,
               branch: profile.branch }),

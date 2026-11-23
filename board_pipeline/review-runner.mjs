@@ -630,24 +630,32 @@ export async function assertRetrySubjectUnchanged(binding) {
 // pilot kill-switch, закреплённые входы оператора, передэффектные гейты.
 // Ничего не берётся из кэшированного флага — каждая проверка живая.
 export function l2ReviewRetryGuard({ port, taskId, epoch, owner, label, contract,
-  assertPinned, beforeEffect, assertOpen, daemonOpen }) {
+  required, assertPinned, beforeEffect, assertOpen, daemonOpen }) {
   return async () => {
     const live = await port.verifyHeld(taskId, epoch);
     if (live?.epoch !== epoch) throw new Error('Lease lost');
     if (owner && label && await port.matches?.(taskId, { owner, label, state: 'claimed' }) === false) {
       throw new Error('Task no longer authorized');
     }
-    if (contract) {
+    if (contract || required?.length) {
       const live = await port.labels?.(taskId);
       if (!live) throw new Error('contract_labels_unavailable');
-      for (const key of ['repo_id', 'spec_digest', 'policy_digest',
-          'profile_id', 'finish', 'fixtures_digest']) {
-        if ((live[key] ?? null) !== (contract[key] ?? null)) {
-          throw new Error(`contract_drift:${key}`);
+      if (contract) {
+        for (const key of ['repo_id', 'spec_digest', 'policy_digest',
+            'profile_id', 'finish', 'fixtures_digest']) {
+          if ((live[key] ?? null) !== (contract[key] ?? null)) {
+            throw new Error(`contract_drift:${key}`);
+          }
+        }
+        if ((live.has_ui === 'true') !== (contract.has_ui === true)) {
+          throw new Error('contract_drift:has_ui');
         }
       }
-      if ((live.has_ui === 'true') !== (contract.has_ui === true)) {
-        throw new Error('contract_drift:has_ui');
+      // Дополнительные required-метки маршрута — тот же допуск, что у
+      // claimReady на первичном захвате: метка, снятая во время первой
+      // попытки, делает карточку непригодной для повтора.
+      for (const key of required ?? []) {
+        if (live[key] === undefined) throw new Error(`required_label_missing:${key}`);
       }
     }
     await port.guardTask?.(taskId, epoch);
@@ -856,9 +864,11 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           if (error instanceof ReviewDenied && !TRUNCATED_TRANSCRIPT.has(error.reason)) {
             throw error;
           }
-          const disqualified = error instanceof ReviewDenied &&
-            error.reason === 'review_incomplete_turn' &&
-            transcriptDisqualifying(run.stdout, critic);
+          // Скан дисквалификации идёт по сырому потоку при ЛЮБОЙ усечённой
+          // причине: поток из одного error-события парсится как empty,
+          // битая строка — как corrupt; оба случая могут уже содержать
+          // зафиксированный отказ или чужую закреплённую модель.
+          const disqualified = transcriptDisqualifying(run.stdout, critic);
           if (disqualified) throw new ReviewDenied(disqualified);
           throw reviewRunnerExitFailure(run);
         }
@@ -885,12 +895,11 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         throw new ReviewDenied('review_verdict_subject_mismatch');
       }
 
-      // Ненулевой выход с завершённым потоком не даёт квитанции приёмки и
-      // не повторяется. Только по доказанному transient-выходу (143 или
-      // host-timeout) содержательный REWORK/ESCALATE сохраняет свой исход;
-      // PASS по грязному выходу и любой нетранзиентный код — обычный hold.
-      const transientExit = run.code === 143 || run.timedOut === true;
-      if (dirtyExit && !(transientExit && verdict.status !== 'PASS')) {
+      // Ненулевой выход не даёт квитанции вообще: завершённый поток прошёл
+      // обычную валидацию выше (mismatch-модели — уже hold со своей причиной),
+      // но любой вердикт по грязному выходу, включая REWORK/ESCALATE при
+      // transient-коде, — обычный hold, как до добавления повтора.
+      if (dirtyExit) {
         throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
       }
 

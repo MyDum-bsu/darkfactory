@@ -54,6 +54,11 @@ const canExecStub = await (async () => {
 })();
 const shTest = canExecStub ? test
   : (name, fn) => test(name, { skip: 'no executable stub env' }, fn);
+// Сквозные docker-stub сценарии требуют и git (fixture-репо), и исполняемый
+// стаб — обе проверки доступности обязаны учитываться, иначе в среде с
+// noexec-tmp тест упадёт по ограничению фикстуры, а не по сути.
+const dockerTest = hasGit && canExecStub ? test
+  : (name, fn) => test(name, { skip: 'needs git + executable stub' }, fn);
 
 // Счётчик вызовов review без git и без контейнера: сценарий ошибок/квитанций
 // подаётся последовательно, повтор идёт тем же вызовом с теми же аргументами.
@@ -245,6 +250,35 @@ test('guard: дрейф контрактных меток до повтора �
       verifySubject: async () => {} }),
     (e) => e.message === 'contract_labels_unavailable');
   assert.equal(calls(), 1);
+});
+
+test('guard: снятие required-метки маршрута до повтора — ноль доп. вызовов', async () => {
+  // Тот же допуск, что claimReady на первичном захвате: метка из
+  // route.required, снятая во время первой попытки, запрещает повтор.
+  const live = { ...CONTRACT }; // ui_e2e снята
+  const { review, calls } = scriptedReview([
+    timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
+  const { guard } = guardFixture({ required: ['ui_e2e'],
+    port: {
+      verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true,
+      labels: async () => live, guardTask: async () => {} } });
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review, binding: BINDING,
+      profile: { review: CRITIC }, beforeRetry: guard,
+      verifySubject: async () => {} }),
+    (e) => e.message === 'required_label_missing:ui_e2e');
+  assert.equal(calls(), 1);
+  // Метка на месте — повтор допускается.
+  const { review: review2, calls: calls2 } = scriptedReview([
+    timeout('review_runner_exit:143'), { verdict: 'REVIEW_OK' }]);
+  const { guard: guard2 } = guardFixture({ required: ['ui_e2e'],
+    port: {
+      verifyHeld: async (t, e) => ({ epoch: e }), matches: async () => true,
+      labels: async () => ({ ...CONTRACT, ui_e2e: '1' }), guardTask: async () => {} } });
+  const receipt = await l2ReviewWithTransientRetry({ review: review2, binding: BINDING,
+    profile: { review: CRITIC }, beforeRetry: guard2, verifySubject: async () => {} });
+  assert.equal(calls2(), 2);
+  assert.equal(receipt.verdict, 'REVIEW_OK');
 });
 
 test('guard: daemon kill-switch закрыт до повтора — ноль доп. вызовов', async () => {
@@ -492,7 +526,7 @@ shTest('adapter: сбой cleanup — ReviewDenied, не transient', async (t) =
       e.reason === 'sandbox_cleanup_failed');
 });
 
-gitTest('runner: host-timeout через адаптер → повтор только после cleanup', async (t) => {
+dockerTest('runner: host-timeout через адаптер → повтор только после cleanup', async (t) => {
   const { calls } = await dockerStub(t);
   const { binding, profile, journal, piRoot } = await fixture(t, []);
   const runner = isolatedPiReviewRunner({ journal, piRoot,
@@ -505,7 +539,7 @@ gitTest('runner: host-timeout через адаптер → повтор тол�
   assert.deepEqual(await calls(), ['info', 'run', 'rm', 'info', 'run', 'rm']);
 });
 
-gitTest('runner: сбой cleanup первого читателя — повтора нет', async (t) => {
+dockerTest('runner: сбой cleanup первого читателя — повтора нет', async (t) => {
   const { calls } = await dockerStub(t, { rmExit: 1 });
   const { binding, profile, journal, piRoot } = await fixture(t, []);
   const runner = isolatedPiReviewRunner({ journal, piRoot,
@@ -517,17 +551,52 @@ gitTest('runner: сбой cleanup первого читателя — повто
   assert.deepEqual(await calls(), ['info', 'run', 'rm']);
 });
 
-gitTest('runner: завершённый REWORK при коде 143 — один вызов, вердикт сохранён', async (t) => {
+dockerTest('runner: lease потерян в окне запуска — второго reader нет', async (t) => {
+  // Между успешным beforeRetry и docker run второго читателя renewal-цикл
+  // потерял lease: beforeEffect раннера обязан взорваться на границе эффекта,
+  // и контейнер не стартует (второго `run` в журнале нет).
+  const { calls } = await dockerStub(t);
+  const { binding, profile, journal, piRoot } = await fixture(t, []);
+  let lost = false;
+  const runner = isolatedPiReviewRunner({ journal, piRoot,
+    sandbox: runInReadOnlySandbox, timeoutMs: 300,
+    beforeEffect: async () => { if (lost) throw new Error('Lease lost'); } });
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review: runner, binding, profile,
+      beforeRetry: async () => { lost = true; } }),
+    (e) => e.message === 'Lease lost');
+  // Второй docker info — host-side preflight перед beforeEffect; `run` нет.
+  assert.deepEqual(await calls(), ['info', 'run', 'rm', 'info']);
+});
+
+gitTest('runner: завершённый REWORK при коде 143 — hold, как и любой грязный выход', async (t) => {
+  // Ненулевой выход не даёт квитанции вообще: завершённый поток проходит
+  // обычную валидацию, но вердикт по грязному выходу уходит в hold —
+  // иначе failed execution мог бы подать обычный rework/escalate.
   const rework = stream(JSON.stringify({ verdict: 'REWORK', summary: 'bad',
     subject_digest: DIGEST,
     findings: [{ file: 'b.txt', line: 1, expected: 'x', actual: 'y' }] }));
+  for (const code of [1, 137, 143]) {
+    const { review, binding, profile, calls } = await fixture(t, [
+      { code, stdout: rework, stderr: '' },
+      { code: 0, stdout: PASS, stderr: '' }]);
+    await assert.rejects(
+      l2ReviewWithTransientRetry({ review, binding, profile,
+        beforeRetry: async () => { throw new Error('no retry expected'); } }),
+      (e) => e instanceof ReviewDenied && !(e instanceof ReviewRunnerTimeout) &&
+        e.reason === `review_runner_exit:${code}`);
+    assert.equal(calls(), 1, `exit ${code}`);
+  }
+  // Host-timeout с завершённым REWORK — тот же hold, повторный вызов не
+  // «сохраняет» вердикт failed execution.
   const { review, binding, profile, calls } = await fixture(t, [
-    { code: 143, stdout: rework, stderr: '' },
+    { code: null, timedOut: true, stdout: rework, stderr: '' },
     { code: 0, stdout: PASS, stderr: '' }]);
-  const receipt = await l2ReviewWithTransientRetry({ review, binding, profile,
-    beforeRetry: async () => { throw new Error('no retry expected'); } });
+  await assert.rejects(
+    l2ReviewWithTransientRetry({ review, binding, profile,
+      beforeRetry: async () => { throw new Error('no retry expected'); } }),
+    (e) => e.reason === 'review_runner_exit:timeout');
   assert.equal(calls(), 1);
-  assert.equal(receipt.status, 'REWORK');
 });
 
 gitTest('runner: завершённый, но misattested ответ при 143 — отказ без повтора', async (t) => {
@@ -552,6 +621,13 @@ gitTest('runner: незавершённый, но дисквалифицирую
   for (const { stdout, reason } of [
     // Явный error-event провайдера: отказ зафиксирован, не обрыв.
     { stdout: [JSON.stringify({ type: 'error', message: 'refused' }), msg()].join('\n'),
+      reason: 'review_runner_reported_error' },
+    // Только error-event без assistant-хода: парсер отвечает empty, но
+    // скан по сырому потоку всё равно обязан увидеть зафиксированный отказ.
+    { stdout: JSON.stringify({ type: 'error', message: 'refused' }),
+      reason: 'review_runner_reported_error' },
+    // Битая NDJSON-строка не должна скрывать error-event в остальных строках.
+    { stdout: ['{"type":"error"', JSON.stringify({ type: 'error', message: 'refused' })].join('\n'),
       reason: 'review_runner_reported_error' },
     // Assistant-сообщение чужой модели без settled: mismatch, не transient.
     { stdout: msg({ model: 'gpt-6.2-astra' }), reason: 'review_model_mismatch' }]) {
