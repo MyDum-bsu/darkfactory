@@ -34,7 +34,19 @@ async function durableIntent(dir, key, text) {
   return path;
 }
 
-export function verifyBbStageTurn({ snapshot, events, threadId, parentThread, project, workspace, provider, model, reasoning, challenge }) {
+export function pilotWriterWorkspaceReady(snapshot, { threadId, parentThread, project, workspace }) {
+  const { thread, environment } = snapshot ?? {};
+  if (thread?.id !== threadId || thread.parentThreadId !== parentThread || thread.projectId !== project) {
+    throw new Error('ab_pilot_writer_identity_drift');
+  }
+  if (environment?.path === workspace) return true;
+  // No handoff, verify or side effects while BB is still allocating the env.
+  if (thread.status === 'starting' && (environment?.path == null)) return false;
+  throw new Error('BB workspace changed');
+}
+
+export function verifyBbStageTurn({ snapshot, events, threadId, parentThread, project, workspace, provider,
+  model, reasoning, challenge, promptText }) {
   const { thread, environment } = snapshot ?? {};
   if (thread?.id !== threadId || thread.parentThreadId !== parentThread || thread.projectId !== project ||
       thread.providerId !== provider || thread.status !== 'idle' || thread.activeBackgroundAgentCount !== 0 ||
@@ -51,8 +63,9 @@ export function verifyBbStageTurn({ snapshot, events, threadId, parentThread, pr
   if (requested.length !== 1 || finished.length !== 1 || end.seq <= request.seq || end.data?.status !== 'completed' ||
       typeof end.scope?.turnId !== 'string' || !end.scope.turnId || request.data?.execution?.model !== model ||
       (reasoning !== null && request.data.execution.reasoningLevel !== reasoning) ||
-      !request.data.input?.some(item => item?.type === 'text' && typeof item.text === 'string' &&
-        item.text.includes(`Challenge: ${challenge}`))) throw new Error('stage_turn_unconfirmed');
+      typeof promptText !== 'string' || !Array.isArray(request.data.input) || request.data.input.length !== 1 ||
+      request.data.input[0]?.type !== 'text' || typeof request.data.input[0].text !== 'string' ||
+      request.data.input[0].text.trim() !== promptText.trim()) throw new Error('stage_turn_unconfirmed');
   const items = events.filter(e => e.seq > request.seq && e.seq < end.seq && ['item/started', 'item/completed'].includes(e.type));
   if (items.some(e => e.scope?.turnId !== end.scope.turnId || !['agentMessage', 'reasoning'].includes(e.data?.item?.type))) {
     throw new Error('stage_unexpected_tool_use');
@@ -120,7 +133,7 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     const snapshot = await run(['thread', 'show', spawned.id, '--json']);
     const events = await run(['thread', 'log', spawned.id, '--all', '--json']);
     const { verdict } = verifyBbStageTurn({ snapshot, events, threadId: spawned.id, parentThread,
-      project, workspace, provider, model, reasoning: request.model.reasoning, challenge });
+      project, workspace, provider, model, reasoning: request.model.reasoning, challenge, promptText: text });
     await assertCurrent(request.binding);
     if (verdict !== 'BLOCKED' && verdict !== expectedVerdict) throw new Error('stage_artifact_disputed');
     return { binding: request.binding, registryDigest: request.registryDigest, playbook: request.playbook,

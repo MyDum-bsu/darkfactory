@@ -59,13 +59,17 @@ export async function enrollAbPilot(config, { policy, tree, root, inbox, daemon,
 }
 
 export async function inspectPilotDiff(ab, { git, base, candidate }) {
-  const files = (await git('diff', '--name-only', '-z', base, candidate)).split('\0').filter(Boolean).sort();
+  const changes = (await git('diff', '--no-renames', '--name-status', '-z', base, candidate)).split('\0');
+  if (changes.pop() !== '' || changes.length % 2 || changes.some((value, i) => i % 2 === 0 && value !== 'A')) {
+    throw new Error('ab_pilot_diff_out_of_scope');
+  }
+  const files = changes.filter((_, i) => i % 2 === 1).sort();
   if (JSON.stringify(files) !== JSON.stringify([...CASES[ab.case].files].sort())) throw new Error('ab_pilot_diff_out_of_scope');
   const diff = await git('diff', '--no-ext-diff', '--no-textconv', base, candidate, '--', ...files);
   return { files, diffDigest: sha(diff) };
 }
 
-export async function pilotArtifacts(ab, { git, candidate, diff, localEvidence, brief, review }) {
+export function pilotArtifacts({ candidate, diff, localEvidence, brief, review }) {
   if (!diff || localEvidence?.ok !== true || localEvidence.sha !== candidate ||
       !Array.isArray(localEvidence.evidence) || !localEvidence.evidence.length ||
       localEvidence.evidence.some(item => item?.exit !== 0 || !isId(hex, item.sha256))) {
@@ -76,14 +80,6 @@ export async function pilotArtifacts(ab, { git, candidate, diff, localEvidence, 
     ['change-set', { diff: diff.diffDigest, changed: diff.files.length, failedChecks: 0 }],
     ['rubric-review', { rubric: sha(review), criteria: localEvidence.evidence.length, blockers: 0 }],
   ]);
-  if (ab.case === 'docs') {
-    const document = await git('show', `${candidate}:docs/typed-handoff-quickstart.md`);
-    const headings = document.split('\n').filter(line => line.startsWith('## ')).map(line => line.slice(3));
-    const missing = ['Поля', 'Отказ', 'Проверка'].filter(section => !headings.includes(section)).length;
-    const digest = sha(document);
-    digests.set('course-outline', { outline: digest, lessons: headings.length, uncoveredGoals: missing });
-    digests.set('technical-copy', { document: digest, sections: headings.length, unsupportedClaims: missing });
-  }
   return request => {
     const facts = digests.get(request.verifier);
     if (!facts) throw new Error('ab_pilot_artifact_not_available');

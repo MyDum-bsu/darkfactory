@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createBbStageObserver, verifyBbStageTurn } from './bb-stage-adapter.mjs';
-import { enrollAbPilot, inspectPilotDiff, CASES } from './ab-pilot.mjs';
+import { createBbStageObserver, pilotWriterWorkspaceReady, verifyBbStageTurn } from './bb-stage-adapter.mjs';
+import { enrollAbPilot, inspectPilotDiff, pilotArtifacts, CASES } from './ab-pilot.mjs';
 
 const parentThread = 'thr_parent';
 const threadId = 'thr_fixture';
@@ -19,7 +19,8 @@ function trace(workspace, nonce = challenge) {
   const events = [event(1, 'client/turn/requested', { execution: { model }, input: [{ type: 'text', text: `Challenge: ${nonce}` }] }),
     event(2, 'item/completed', { item: { type: 'agentMessage', text: `${nonce} PASS` } }),
     event(3, 'turn/completed', { status: 'completed' })];
-  return { snapshot, events, threadId, workspace, parentThread, project, provider, model, reasoning: null, challenge: nonce };
+  return { snapshot, events, threadId, workspace, parentThread, project, provider, model, reasoning: null, challenge: nonce,
+    promptText: `Challenge: ${nonce}` };
 }
 
 test('native stage proof binds only the single requested turn and rejects foreign/model/tool evidence', () => {
@@ -27,6 +28,7 @@ test('native stage proof binds only the single requested turn and rejects foreig
   assert.deepEqual(verifyBbStageTurn(valid), { verdict: 'PASS', eventSeq: 3 });
   assert.throws(() => verifyBbStageTurn({ ...valid, parentThread: 'thr_other' }), /stage_bb_unconfirmed/);
   assert.throws(() => verifyBbStageTurn({ ...valid, model: 'another-model' }), /stage_turn_unconfirmed/);
+  assert.throws(() => verifyBbStageTurn({ ...valid, promptText: `Changed artifact. Challenge: ${challenge}` }), /stage_turn_unconfirmed/);
   assert.throws(() => verifyBbStageTurn({ ...valid, events: valid.events.slice(0, 2) }), /stage_turn_unconfirmed/);
   const tool = structuredClone(valid);
   tool.events[1].data.item.type = 'commandExecution';
@@ -34,6 +36,16 @@ test('native stage proof binds only the single requested turn and rejects foreig
   const badNonce = structuredClone(valid);
   badNonce.events[1].data.item.text = 'b'.repeat(64) + ' PASS';
   assert.throws(() => verifyBbStageTurn(badNonce), /stage_verdict_unconfirmed/);
+});
+
+test('writer provision is wait-only; wrong ready environment or parent stays denied', () => {
+  const desired = trace('/isolated');
+  const starting = { thread: { ...desired.snapshot.thread, status: 'starting' }, environment: null };
+  assert.equal(pilotWriterWorkspaceReady(starting, desired), false);
+  assert.equal(pilotWriterWorkspaceReady(desired.snapshot, desired), true);
+  assert.throws(() => pilotWriterWorkspaceReady({ ...starting, environment: { path: '/other' } }, desired), /workspace changed/);
+  assert.throws(() => pilotWriterWorkspaceReady({ ...starting, thread: { ...starting.thread, parentThreadId: 'thr_other' } }, desired),
+    /ab_pilot_writer_identity_drift/);
 });
 
 test('observer binds embedded skill and host artifact to one operator-parented spawn, no repeat', async t => {
@@ -55,6 +67,7 @@ test('observer binds embedded skill and host artifact to one operator-parented s
       assert.match(prompt, /Embedded fixture skill/);
       assert.ok(prompt.includes(artifact.toString()));
       current = trace(workspace, /Challenge: ([a-f0-9]{64})/.exec(prompt)[1]);
+      current.events[0].data.input[0].text = prompt;
       result = { id: threadId };
     } else if (argv[1] === 'show') result = current.snapshot;
     else if (argv[1] === 'log') result = current.events;
@@ -76,6 +89,20 @@ test('observer binds embedded skill and host artifact to one operator-parented s
   assert.equal(spawnCalls, 1);
 });
 
+test('role artifacts require verified L1 evidence on the same Git candidate', () => {
+  const candidate = 'a'.repeat(40);
+  const args = { candidate, diff: { diffDigest: 'e'.repeat(64), files: CASES.policy.files },
+    brief: 'Frozen task', review: 'Frozen independent check',
+    localEvidence: { ok: true, sha: candidate, evidence: [{ exit: 0, sha256: 'f'.repeat(64) }] } };
+  assert.throws(() => pilotArtifacts({ ...args, localEvidence: null }), /ab_pilot_l1_unconfirmed/);
+  assert.throws(() => pilotArtifacts({ ...args, localEvidence: { ...args.localEvidence, sha: 'b'.repeat(40) } }), /ab_pilot_l1_unconfirmed/);
+  const read = pilotArtifacts(args);
+  assert.deepEqual(JSON.parse(read({ verifier: 'change-set' })), {
+    type: 'change-set', diff: 'e'.repeat(64), changed: 2, failedChecks: 0,
+  });
+  assert.throws(() => read({ verifier: 'visual-report' }), /ab_pilot_artifact_not_available/);
+});
+
 test('retired or non-DeepSeek model cannot launch and out-of-scope pilot cannot opt in', async t => {
   const root = await mkdtemp(join(tmpdir(), 'df-ab-deny-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -91,8 +118,10 @@ test('retired or non-DeepSeek model cannot launch and out-of-scope pilot cannot 
     parent: parentThread, policy: { scope: 'pilot', channel: 'pilot' },
   }), /ab_pilot_scope_denied/);
   assert.equal(await enrollAbPilot(undefined, {}), null);
-  const git = (...args) => args.includes('--name-only') ? CASES.policy.files.join('\0') + '\0' : 'diff';
+  const git = (...args) => args.includes('--name-status') ? CASES.policy.files.map(name => `A\0${name}\0`).join('') : 'diff';
   assert.equal((await inspectPilotDiff({ case: 'policy' }, { git, base: 'x', candidate: 'y' })).files.length, 2);
-  await assert.rejects(inspectPilotDiff({ case: 'policy' }, { git: () => 'outside.mjs\0', base: 'x', candidate: 'y' }),
+  await assert.rejects(inspectPilotDiff({ case: 'policy' }, { git: () => 'A\0outside.mjs\0', base: 'x', candidate: 'y' }),
     /ab_pilot_diff_out_of_scope/);
+  await assert.rejects(inspectPilotDiff({ case: 'policy' }, { git: () => `M\0${CASES.policy.files[0]}\0A\0${CASES.policy.files[1]}\0`,
+    base: 'x', candidate: 'y' }), /ab_pilot_diff_out_of_scope/);
 });

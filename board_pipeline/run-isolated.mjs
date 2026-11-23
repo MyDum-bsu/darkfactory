@@ -37,6 +37,7 @@ import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
   loadLessons, validateDistilledLessons } from './rework-distiller.mjs';
 import * as workerSelector from './worker-selector.mjs';
 import { enrollAbPilot, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
+import { pilotWriterWorkspaceReady } from './bb-stage-adapter.mjs';
 
 const exec = promisify(execFile);
 const inside = (root, p) => {
@@ -373,8 +374,8 @@ async function execute() {
     }
   };
   const record = join(root, 'attempt.json');
-  const git = async (...args) =>
-    (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout.trim();
+  const rawGit = async (...args) => (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout;
+  const git = async (...args) => (await rawGit(...args)).trim();
   const authorize = async (state, taskId) => {
     await assertPinned();
     // В queue-режиме на фазе 'ready' карточки ещё нет — allowlist-допуск делает claimReady
@@ -535,7 +536,9 @@ async function execute() {
     const { stdout } = await exec('bb', ['thread', 'show', threadId, '--json'], { timeout: 9000 });
     const snapshot = JSON.parse(stdout);
     const thread = snapshot.thread;
-    if (snapshot.environment?.path !== tree || thread?.id !== threadId) throw new Error('BB workspace changed');
+    if (ab) {
+      if (!pilotWriterWorkspaceReady(snapshot, { threadId, parentThread: ab.parent, project: p.bb.project, workspace: tree })) return;
+    } else if (snapshot.environment?.path !== tree || thread?.id !== threadId) throw new Error('BB workspace changed');
     if (!['idle', 'failed', 'interrupted'].includes(thread.status) || thread.activeBackgroundAgentCount !== 0 ||
         thread.queuedMessageCount !== 0) return;
     const log = await exec('bb', ['thread', 'log', thread.id, '--after-seq', String(after), '--all', '--json'],
@@ -649,7 +652,7 @@ async function execute() {
       const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', inspect),
         local: telemetry.port('l1_local', ab ? async (binding, trusted) => {
-          diff = await inspectPilotDiff(ab, { git, base: route.base, candidate: binding.candidate_sha });
+          diff = await inspectPilotDiff(ab, { git: rawGit, base: route.base, candidate: binding.candidate_sha });
           localEvidence = await runLocal(binding, trusted);
           return localEvidence;
         } : runLocal),
@@ -663,7 +666,7 @@ async function execute() {
           await assertPinned();
           await beforeEffect?.();
           if (ab?.arm === 'foreman') {
-            const readArtifact = await pilotArtifacts(ab, { git, candidate: handoff.candidate_sha, diff, localEvidence,
+            const readArtifact = pilotArtifacts({ candidate: handoff.candidate_sha, diff, localEvidence,
               brief: pinned.inputs.get(brief), review: reviewSpec });
             await telemetry.phase('ab_foreman', () => runPilotForeman(ab, { attempt, handoff, project: p.bb.project,
               journal: root, readArtifact, assertCurrent: beforeEffect, inspect, readState: state.load }));

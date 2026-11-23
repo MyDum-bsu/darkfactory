@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { cp, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { promisify, parseArgs } from 'node:util';
 import { homedir } from 'node:os';
@@ -43,12 +43,11 @@ async function writeCatalog(catalog, name) {
     reasoning: kind === 'verifier' ? 'medium' : 'inherit', tools: kind === 'writer' ? ['snapshot-read', 'worktree-edit'] : ['snapshot-read'] });
   const roles = {
     intake: role('analyst', 'executor', 'inventory', ['materials-intake']),
-    implementation: name === 'policy'
-      ? role('writer', 'executor', 'change-set', ['feature-blueprint', 'property-testing'])
-      : role('writer', 'executor', 'technical-copy', ['writer-course', 'session-handoff']),
+    implementation: role('writer', 'executor', 'change-set', name === 'policy'
+      ? ['feature-blueprint', 'property-testing'] : ['writer-course', 'session-handoff']),
     verification: role('verifier', 'critic', 'rubric-review', ['sparring', 'issue-register']),
   };
-  if (name === 'docs') roles.outline = role('analyst', 'executor', 'course-outline', ['feature-blueprint', 'writer-course']);
+  if (name === 'docs') roles.outline = role('analyst', 'executor', 'inventory', ['feature-blueprint', 'writer-course']);
   const steps = Object.keys(roles).filter(key => key !== 'outline');
   if (name === 'docs') steps.splice(1, 0, 'outline');
   const stages = steps.map((id, i) => ({ id, role: id, next: { pass: steps[i + 1] ?? 'ready', rework: 'hold' } }));
@@ -113,6 +112,31 @@ async function writeSealedCase({ run, name, arm, project, parent, owner, url, tr
   return { policyFile, label, specDigest: hashes[2], policyDigest: sha(JSON.stringify(hashes)) };
 }
 
+async function stopKnownChildren(run, parent, project) {
+  const readOptional = async path => {
+    try { return await readFile(path, 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return ''; throw error; }
+  };
+  const raw = await readOptional(join(run, 'state/attempt.json'));
+  const attempt = raw ? JSON.parse(raw) : null;
+  const stageLog = await readOptional(join(run, 'state/ab-stage-threads.jsonl'));
+  const known = stageLog.split('\n').filter(Boolean)
+    .map(line => [JSON.parse(line).threadId, join(run, 'observer')]);
+  if (attempt?.threadId) known.push([attempt.threadId, join(run, 'worktree')]);
+  for (const [id, workspace] of known) {
+    if (!/^thr_[a-z0-9]+$/.test(id ?? '')) throw new Error('pilot_cleanup_unbound');
+    const snapshot = JSON.parse(await trim('bb', ['thread', 'show', id, '--json'], { timeout: 8000 }));
+    const thread = snapshot.thread;
+    if (thread?.id !== id || thread.parentThreadId !== parent || thread.projectId !== project ||
+        (snapshot.environment?.path !== workspace && !(thread.status === 'starting' && snapshot.environment?.path == null))) {
+      throw new Error('pilot_cleanup_unbound');
+    }
+    if (!['idle', 'failed', 'interrupted'].includes(thread.status) || thread.activeBackgroundAgentCount > 0) {
+      await exec('bb', ['thread', 'stop', id], { timeout: 15000 });
+    }
+  }
+}
+
 async function runCell(name, arm, root, parent, project) {
   const run = join(root, `${name}-${arm}`);
   await mkdir(run, { mode: 0o700 }); // a second launch of the same cell must fail
@@ -163,7 +187,10 @@ async function runCell(name, arm, root, parent, project) {
     await writeFile(join(run, 'board-receipt.json'), JSON.stringify(snapshot.message), { mode: 0o600 });
     console.log(JSON.stringify(outcome));
   } finally {
-    if (board.child.exitCode === null) { const stopped = once(board.child, 'exit'); board.child.kill('SIGTERM'); await stopped; }
+    try { await stopKnownChildren(run, parent, project); }
+    finally {
+      if (board.child.exitCode === null) { const stopped = once(board.child, 'exit'); board.child.kill('SIGTERM'); await stopped; }
+    }
   }
 }
 
@@ -177,6 +204,10 @@ try {
     throw new Error('Use --execute --case policy|docs --arm linear|foreman --root ABS_DIR from the approved parent thread');
   }
   const root = await realpath(values.root);
+  const info = await lstat(root);
+  if (root !== values.root || !info.isDirectory() || info.uid !== process.getuid() || info.mode & 0o077) {
+    throw new Error('Pilot evidence root must be canonical, private and owned by the operator');
+  }
   await requireWorkspaceSpace(root, 'worktree');
   await runCell(values.case, values.arm, root, parent, project);
 } catch (error) {
