@@ -74,13 +74,16 @@ export async function advanceQuestion({ record, save, visible, board, gate, feed
       if (!await authorized('blocked')) return uncertain('question_resume_checkpoint_drift');
       if (gate.now() >= question.expires_at) return visible();
       // Опциональная запись подтверждённого ответа владельца в Decision Ledger
-      // (Board #1261): только при явно переданном порту; повторный прогон той же
-      // фазы идемпотентен за счёт дедупликации в recordDecision. Отказ записи —
-      // uncertain, незаписанный ответ не считается запомненным.
+      // (Board #1261): только при явно переданном порту и непустом текстовом
+      // ответе — чистый approve без правила в журнал не пишется. Повторный
+      // прогон фазы идемпотентен за счёт дедупликации в recordDecision. Отказ
+      // записи или конверт без id — uncertain, блокировка не снимается.
       let decisionId;
-      if (decisionLedger) {
+      if (decisionLedger && typeof ownerAnswer.answer === 'string' && ownerAnswer.answer.trim() !== '') {
         const entry = await decisionLedger({ answer: ownerAnswer.answer, question }).catch(() => null);
-        if (entry === null) return uncertain('decision_ledger_unconfirmed');
+        if (typeof entry?.id !== 'string' || entry.id === '') {
+          return uncertain('decision_ledger_unconfirmed');
+        }
         decisionId = entry.id;
       }
       await save({ phase: 'unblocking', ownerAnswer,

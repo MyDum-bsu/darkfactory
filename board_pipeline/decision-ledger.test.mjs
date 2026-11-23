@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { recordDecision, recordDigest, resolveActiveDecisions, resolveLedgerPath,
-  LEDGER_PATH_ENV } from './decision-ledger.mjs';
+import { pinDecisions, recordDecision, recordDigest, resolveActiveDecisions,
+  resolveLedgerPath, LEDGER_PATH_ENV, LEDGER_SCHEMA } from './decision-ledger.mjs';
 
 const exec = promisify(execFile);
 const cli = fileURLToPath(new URL('./decision-ledger.mjs', import.meta.url));
@@ -65,11 +65,12 @@ test('supersedes marks the old decision via append-only tombstone', async () => 
     const next = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'new rule',
       supersedes: old.id, ...base('lead') });
     const lines = (await readFile(ledger, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
-    assert.equal(lines.length, 3);
-    assert.equal(lines[0].status, 'active'); // прошлая строка не перезаписана
-    assert.equal(lines[1].id, old.id);
-    assert.equal(lines[1].status, 'superseded');
-    assert.equal(lines[2].supersedes, old.id);
+    // Одна атомарная строка: supersedes живёт в новой записи, прошлая строка не
+    // перезаписана и промежуточного «погашено без нового» не существует.
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0].status, 'active');
+    assert.equal(lines[1].id, next.id);
+    assert.equal(lines[1].supersedes, old.id);
     const slice = await resolveActiveDecisions({ ledgerPath: ledger, worktree: tree });
     assert.deepEqual(slice.ids, [next.id]);
     assert.doesNotMatch(slice.text, /old rule/);
@@ -170,4 +171,111 @@ test('CLI record/resolve roundtrip honours --worktree guard', async () => {
       '--scope', 'global', '--rule', 'x', '--source-card', '1', '--recorded-by', 'lead',
       '--worktree', tree]), /decision_ledger_inside_worker_paths/);
   } finally { await cleanup(); }
+});
+
+test('fail-closed on symlink escape into the worktree, dangling or not', async () => {
+  const { tree, dir, cleanup } = await sandbox();
+  try {
+    // Существующий файл внутри worktree через symlink в операторском каталоге.
+    await writeFile(join(tree, 'inside.jsonl'), '');
+    await symlink(join(tree, 'inside.jsonl'), join(dir, 'ops', 'link.jsonl'));
+    await assert.rejects(() => recordDecision({ ledgerPath: join(dir, 'ops', 'link.jsonl'),
+      scope: 'global', rule: 'x', worktree: tree, sourceCard: '1', recordedBy: 'lead' }),
+      /decision_ledger_inside_worker_paths/);
+    // Dangling symlink на ещё не созданный файл внутри worktree.
+    await symlink(join(tree, 'future.jsonl'), join(dir, 'ops', 'dangling.jsonl'));
+    await assert.rejects(() => recordDecision({ ledgerPath: join(dir, 'ops', 'dangling.jsonl'),
+      scope: 'global', rule: 'x', worktree: tree, sourceCard: '1', recordedBy: 'lead' }),
+      /decision_ledger_inside_worker_paths/);
+    // Симлинк-родитель, указывающий внутрь worktree.
+    await symlink(tree, join(dir, 'ops', 'treedir'));
+    await assert.rejects(() => recordDecision({ ledgerPath: join(dir, 'ops', 'treedir', 'd.jsonl'),
+      scope: 'global', rule: 'x', worktree: tree, sourceCard: '1', recordedBy: 'lead' }),
+      /decision_ledger_inside_worker_paths/);
+  } finally { await cleanup(); }
+});
+
+function forged(overrides) {
+  const rec = { schema: LEDGER_SCHEMA, id: 'forge-1', scope: 'project:proj_bbb',
+    status: 'active', rule: 'hostile', source_card: '1', timestamp: new Date().toISOString(),
+    recorded_by: 'lead', ...overrides };
+  rec.sha256 = recordDigest(rec);
+  return rec;
+}
+
+test('read is fail-closed on cross-scope and dangling supersedes in the journal', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const g = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'g', ...base('lead') });
+    // Валидный по sha256 журнал, нарушающий инвариант scope: project:b гасит global.
+    await appendFile(ledger, `${JSON.stringify(forged({ supersedes: g.id }))}\n`);
+    await assert.rejects(() => resolveActiveDecisions({ ledgerPath: ledger, worktree: tree }),
+      /decision_ledger_scope_violation/);
+    await writeFile(ledger, `${JSON.stringify(forged({ id: 'forge-2', supersedes: 'ghost' }))}\n`);
+    await assert.rejects(() => resolveActiveDecisions({ ledgerPath: ledger, worktree: tree }),
+      /decision_ledger_scope_violation/);
+  } finally { await cleanup(); }
+});
+
+test('concurrent supersedes of one target serialize under the lock', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const a = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'a', ...base('lead') });
+    const results = await Promise.allSettled([
+      recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'r1', supersedes: a.id, ...base('lead') }),
+      recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'r2', supersedes: a.id, ...base('lead') }),
+    ]);
+    const ok = results.filter(r => r.status === 'fulfilled');
+    const failed = results.filter(r => r.status === 'rejected');
+    assert.equal(ok.length, 1);
+    assert.match(String(failed[0].reason), /decision_ledger_supersedes_invalid/);
+    const lines = (await readFile(ledger, 'utf8')).trim().split('\n');
+    assert.equal(lines.length, 2);
+    const slice = await resolveActiveDecisions({ ledgerPath: ledger, worktree: tree });
+    assert.equal(slice.ids.length, 1);
+  } finally { await cleanup(); }
+});
+
+test('idempotent retry must match supersedes; a different target is a conflict', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const a = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'a', ...base('lead') });
+    const c = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'c', ...base('lead') });
+    const b = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'b',
+      supersedes: a.id, ...base('lead') });
+    const again = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'b',
+      supersedes: a.id, ...base('lead') });
+    assert.equal(again.id, b.id);
+    await assert.rejects(() => recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'b',
+      supersedes: c.id, ...base('lead') }), /decision_ledger_rule_conflict/);
+    await assert.rejects(() => recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'b',
+      ...base('lead') }), /decision_ledger_rule_conflict/);
+  } finally { await cleanup(); }
+});
+
+test('a journal not ending in newline fails closed and stays untouched', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const rec = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'ok', ...base('lead') });
+    const partial = JSON.stringify(forged({ id: 'part-1', scope: 'global' }));
+    await appendFile(ledger, partial); // без '\n' — оборванная частичная запись
+    await assert.rejects(() => resolveActiveDecisions({ ledgerPath: ledger, worktree: tree }),
+      /decision_ledger_corrupt/);
+    await assert.rejects(() => recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'more',
+      worktree: tree, ...base('lead') }), /decision_ledger_corrupt/);
+    const lines = (await readFile(ledger, 'utf8')).split('\n').filter(Boolean);
+    assert.equal(lines.length, 2); // append поверх обрыва не состоялся
+    assert.equal(JSON.parse(lines[0]).id, rec.id);
+  } finally { await cleanup(); }
+});
+
+test('pinDecisions resolves once per attempt key and reuses the snapshot', async () => {
+  let calls = 0;
+  const pinned = pinDecisions(async () => ({ text: `t${++calls}`, digest: 'd'.repeat(64), ids: [] }));
+  const a1 = await pinned('1:1');
+  const a2 = await pinned('1:1');
+  const b = await pinned('1:2');
+  assert.equal(a1, a2);
+  assert.notEqual(a1, b);
+  assert.equal(calls, 2);
 });

@@ -69,3 +69,15 @@ test('decisionsPromptBlock is fail-closed on an unpinned slice', () => {
   const empty = decisionsPromptBlock({ ...slice, text: '', ids: [] });
   assert.match(empty, /нет активных решений/);
 });
+
+test('a truncated slice with zero shown decisions fails closed, never reads as empty', () => {
+  assert.throws(() => decisionsPromptBlock({ ...slice, text: '', ids: [], truncated: true, total: 3 }),
+    /decision_ledger_slice_truncated/);
+});
+
+test('a partially truncated slice keeps its entries and flags the cut', () => {
+  const block = decisionsPromptBlock({ ...slice, truncated: true, total: 5 });
+  assert.match(block, /- \[global\] CSV для выгрузки \(dec-1\)/);
+  assert.match(block, /срез усечён: показано 1 из 5/);
+  assert.doesNotMatch(block, /нет активных решений/);
+});

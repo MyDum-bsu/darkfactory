@@ -69,3 +69,33 @@ test('past awaiting_answer the ledger is not rewritten on rerun', async () => {
   assert.equal(result.phase, 'resume_pending');
   assert.equal(h.calls.ledger, 0);
 });
+
+test('a clean approve with empty answer skips the ledger without blocking', async () => {
+  const h = harness({ ledger: async () => ({ id: 'dec-x' }) });
+  h.record.question = { ...question, kind: 'release',
+    checkpoint: { ...question.checkpoint, subject_digest: 'b'.repeat(64) } };
+  const calls = { ledger: 0 };
+  const decisionLedger = async () => { calls.ledger += 1; return { id: 'dec-x' }; };
+  const record = h.record;
+  const save = async patch => { Object.assign(record, patch); return record; };
+  const states = ['blocked', 'ready'];
+  let i = 0;
+  const result = await advanceQuestion({ record, save, visible: async () => record,
+    board: { questionState: async () => states[Math.min(i++, 1)], unblockQuestion: async () => {} },
+    gate: { now: () => 1_000, read: async () => ({ decision: 'approve', answer: '', signature: 's' }),
+      verify: () => ({ decision: 'approve', answer: '', signature: 's', verified_at: 1_000 }),
+      canResume: async () => true },
+    feedback: async () => ({ confirmed: true }), reconcileFeedback: async () => record,
+    decisionLedger });
+  assert.equal(result.phase, 'resume_pending');
+  assert.equal(calls.ledger, 0);
+  assert.equal(record.decisionId, undefined);
+});
+
+test('a port returning an entry without id is fail-closed uncertain', async () => {
+  const h = harness({ ledger: async () => ({}) });
+  const result = await h.run();
+  assert.equal(result.phase, 'uncertain');
+  assert.equal(result.reason, 'decision_ledger_unconfirmed');
+  assert.equal(h.calls.unblock, 0);
+});

@@ -23,8 +23,8 @@ import { DEFAULT_INTERVAL_MS, RotatingJournal, runDaemon, TERMINAL_PHASES } from
 import { localReleasePort } from './local-release.mjs';
 import { ReleaseDenied } from './release-contract.mjs';
 import { arbiterIntakePrompt, decisionsPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
-import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, recordDecision, resolveActiveDecisions,
-  resolveLedgerPath } from './decision-ledger.mjs';
+import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
+  resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
 import { createTelemetryRecorder, threadUsage } from './telemetry.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
@@ -197,6 +197,10 @@ async function execute() {
   const currentDecisions = async () => ledgerPath === null ? null : resolveActiveDecisions({
     ledgerPath, projectId: p.bb.project, worktree: tree,
     maxChars: ledgerCfg.maxChars ?? DEFAULT_MAX_CHARS });
+  // Единый snapshot на попытку (task_id:epoch): воркер, критик и арбитр одного
+  // кандидата проверяют идентичный закреплённый срез/digest, а не журнал,
+  // перечитанный в разные моменты.
+  const pinnedDecisions = pinDecisions(currentDecisions);
   const decisionLedger = ledgerPath !== null && ledgerCfg.recordAnswers === true
     ? ({ answer, question }) => recordDecision({ ledgerPath, scope: decisionScope, rule: answer,
         sourceCard: question.task_id, recordedBy: ledgerCfg.recordedBy ?? 'question-resume',
@@ -258,7 +262,7 @@ async function execute() {
         worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' };
       const prompt = workerIntakePrompt({ brief: pinned.inputs.get(brief).toString('utf8'), tree,
         handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers),
-        decisions: await currentDecisions() ?? undefined });
+        decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined });
       await writeFile(initial, prompt, { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
         '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
@@ -418,7 +422,7 @@ async function execute() {
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
     const beforeEffect = activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
-    const decisionSlice = await currentDecisions();
+    const decisionSlice = await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`);
     const criticPrompt = decisionSlice ? [reviewText, decisionsPromptBlock(decisionSlice)].join('\n\n')
       : reviewText;
     const review = reviewRunner({ journal: root, prompt: criticPrompt, beforeEffect });
@@ -477,7 +481,7 @@ async function execute() {
     await beforeEffect?.();
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
       prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
-        await currentDecisions() ?? undefined) });
+        await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined) });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
     telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
     telemetry.recordArbitration();

@@ -5,8 +5,9 @@
 // контентного sha256 или ledger внутри worktree — ошибка, а не пустой срез.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, mkdir, readFile, realpath } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { appendFile, lstat, mkdir, open, readFile, readlink, realpath, rm } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { canonicalJson } from './subject.mjs';
@@ -55,21 +56,42 @@ async function resolveExisting(path) {
   }
 }
 
+// Полный резолв цели пути с обходом ещё не существующего хвоста: поднимаемся к
+// ближайшему существующему узлу (realpath ловит symlink-предков), а dangling
+// symlink в самом пути дочитываем через readlink — ссылка на несуществующий
+// файл внутри worktree не должна давать записи туда.
+async function resolveLoose(path) {
+  let probe = path;
+  const tail = [];
+  for (;;) {
+    const real = await resolveExisting(probe);
+    if (real !== null) return tail.length ? join(real, ...tail.reverse()) : real;
+    const st = await lstat(probe).catch(() => null);
+    if (st?.isSymbolicLink()) {
+      probe = resolve(dirname(probe), await readlink(probe));
+      continue;
+    }
+    tail.push(basename(probe));
+    const parent = dirname(probe);
+    if (parent === probe) return join(probe, ...tail.reverse());
+    probe = parent;
+  }
+}
+
 // Fail-closed граница доверия: ledger и его каталог не могут находиться внутри
 // рабочего дерева воркера (воркер мог бы подменить/записать файл), а worktree —
 // внутри каталога ledger. Передаётся реальный worktree оператора, не
-// контролируемый воркером текст.
+// контролируемый воркером текст. Сверяется и лексический путь, и полностью
+// разрешённая через symlink цель (включая ещё не созданный файл).
 async function assertLedgerOutside(ledgerPath, worktree) {
   if (!isAbsolute(ledgerPath)) throw new Error('decision_ledger_path_relative');
   if (worktree === undefined) return;
   const tree = await resolveExisting(worktree);
   if (tree === null) throw new Error('decision_ledger_worktree_missing');
   const norm = resolve(ledgerPath);
-  if (inside(tree, norm) || inside(norm, tree)) throw new Error('decision_ledger_inside_worker_paths');
-  // Существующий файл или ближайший существующий предок — realpath-сверка
-  // против symlink-уклона внутрь worktree.
-  const probe = (await resolveExisting(ledgerPath)) ?? (await resolveExisting(dirname(ledgerPath)));
-  if (probe !== null && (inside(tree, probe) || inside(probe, tree))) {
+  const target = await resolveLoose(ledgerPath);
+  if (inside(tree, norm) || inside(norm, tree) ||
+      inside(tree, target) || inside(target, tree)) {
     throw new Error('decision_ledger_inside_worker_paths');
   }
 }
@@ -81,6 +103,9 @@ async function readEntries(ledgerPath) {
     throw error;
   }
   if (Buffer.byteLength(text) > MAX_LEDGER_BYTES) throw new Error('decision_ledger_oversized');
+  // Непустой файл обязан заканчиваться '\n': оборванная последняя строка —
+  // признак частичной записи; fail-closed, а не молчаливый append поверх неё.
+  if (text !== '' && !text.endsWith('\n')) throw new Error('decision_ledger_corrupt');
   const entries = [];
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
@@ -93,14 +118,20 @@ async function readEntries(ledgerPath) {
 }
 
 // Сводит append-only лог к эффективному состоянию: последняя строка с тем же id
-// (tombstone) определяет статус; любая запись с supersedes гасит цель.
+// определяет статус; любая запись с supersedes гасит цель. Инвариант scope
+// проверяется и при чтении: запись project:b не может гасить global или
+// project:a — подменённый журнал даёт ошибку, а не тихую изоляцию нарушителя.
 function foldEntries(entries) {
   const byId = new Map();
   for (const rec of entries) byId.set(rec.id, rec);
   const dead = new Set();
   for (const rec of entries) {
     if (rec.status === 'superseded') dead.add(rec.id);
-    if (rec.supersedes !== undefined) dead.add(rec.supersedes);
+    if (rec.supersedes !== undefined) {
+      const target = byId.get(rec.supersedes);
+      if (!target || target.scope !== rec.scope) throw new Error('decision_ledger_scope_violation');
+      dead.add(rec.supersedes);
+    }
   }
   return { byId, dead };
 }
@@ -131,10 +162,36 @@ export async function resolveActiveDecisions({ ledgerPath, projectId, maxChars =
   return { text: lines.join('\n'), digest, ids, truncated, total: active.length };
 }
 
-// Append-only запись решения. supersedes гасит прежнее решение tombstone-строкой
-// (прошлые строки не перезаписываются). Проверки противоречий: дубликат активного
-// rule в том же scope от другой карточки, supersede отсутствующего/погашенного/
-// чужого scope — ошибка. Повтор той же записи (scope+rule+source_card) идемпотентен.
+// Lockfile рядом с журналом: конкурентные recordDecision (в первую очередь
+// два supersedes одной цели) сериализуются, а не проходят оба по stale-снимку.
+async function withLedgerLock(ledgerPath, fn) {
+  const lock = `${ledgerPath}.lock`;
+  let fd;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      fd = await open(lock, 'wx');
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      await delay(50);
+    }
+  }
+  if (fd === undefined) throw new Error('decision_ledger_locked');
+  try {
+    return await fn();
+  } finally {
+    await fd.close().catch(() => {});
+    await rm(lock, { force: true }).catch(() => {});
+  }
+}
+
+// Append-only запись решения: одна атомарная строка. supersedes живёт в самой
+// новой записи и гасит цель при свёртке — промежуточного состояния «старое
+// погашено, нового нет» не существует по построению. Проверки противоречий:
+// дубликат активного rule в том же scope от другой карточки, повтор с другой
+// целью supersedes, supersede отсутствующего/погашенного/чужого scope — ошибка.
+// Идемпотентный повтор (scope+rule+source_card+supersedes) возвращает прошлую
+// запись без новой строки.
 export async function recordDecision({ ledgerPath, scope, rule, sourceCard, recordedBy,
   supersedes, worktree, now = new Date(), id = randomUUID() }) {
   if (!SCOPE.test(scope ?? '')) throw new Error('decision_ledger_scope_invalid');
@@ -146,32 +203,41 @@ export async function recordDecision({ ledgerPath, scope, rule, sourceCard, reco
   if (!RECORDED_BY.test(recordedBy ?? '')) throw new Error('decision_ledger_recorded_by_invalid');
   await assertLedgerOutside(ledgerPath, worktree);
   await mkdir(dirname(ledgerPath), { recursive: true, mode: 0o700 });
-  const entries = await readEntries(ledgerPath);
-  const { byId, dead } = foldEntries(entries);
-  const duplicate = entries.find(rec => rec.scope === scope && !dead.has(rec.id) &&
-    byId.get(rec.id) === rec && rec.rule.trim() === rule.trim());
-  if (duplicate) {
-    if (String(duplicate.source_card) === card) return duplicate;
-    throw new Error('decision_ledger_rule_conflict');
-  }
-  const timestamp = now.toISOString();
-  const base = { schema: LEDGER_SCHEMA, scope, source_card: card, recorded_by: recordedBy };
-  let appended = '';
-  if (supersedes !== undefined) {
-    const target = byId.get(supersedes);
-    if (!target || dead.has(supersedes) || target.scope !== scope) {
-      throw new Error('decision_ledger_supersedes_invalid');
+  return withLedgerLock(ledgerPath, async () => {
+    const entries = await readEntries(ledgerPath);
+    const { byId, dead } = foldEntries(entries);
+    const duplicate = entries.find(rec => rec.scope === scope && !dead.has(rec.id) &&
+      byId.get(rec.id) === rec && rec.rule.trim() === rule.trim());
+    if (duplicate) {
+      if (String(duplicate.source_card) === card && (duplicate.supersedes ?? null) === (supersedes ?? null)) {
+        return duplicate;
+      }
+      throw new Error('decision_ledger_rule_conflict');
     }
-    const tombstone = { ...target, status: 'superseded', timestamp, recorded_by: recordedBy };
-    tombstone.sha256 = recordDigest(tombstone);
-    appended += `${JSON.stringify(tombstone)}\n`;
-  }
-  const record = { ...base, id, status: 'active', rule: rule.trim(), timestamp,
-    ...(supersedes !== undefined ? { supersedes } : {}) };
-  record.sha256 = recordDigest(record);
-  appended += `${JSON.stringify(record)}\n`;
-  await appendFile(ledgerPath, appended, { mode: 0o600 });
-  return record;
+    if (supersedes !== undefined) {
+      const target = byId.get(supersedes);
+      if (!target || dead.has(supersedes) || target.scope !== scope) {
+        throw new Error('decision_ledger_supersedes_invalid');
+      }
+    }
+    const record = { schema: LEDGER_SCHEMA, id, scope, status: 'active', rule: rule.trim(),
+      source_card: card, timestamp: now.toISOString(), recorded_by: recordedBy,
+      ...(supersedes !== undefined ? { supersedes } : {}) };
+    record.sha256 = recordDigest(record);
+    await appendFile(ledgerPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    return record;
+  });
+}
+
+// Закрепление активного среза за попыткой: воркер, критик и арбитр одного
+// кандидата видят один и тот же snapshot/digest, а не независимо перечитанный
+// журнал. Ключ — task_id:epoch попытки.
+export function pinDecisions(resolve_) {
+  const pins = new Map();
+  return async key => {
+    if (!pins.has(key)) pins.set(key, await resolve_());
+    return pins.get(key);
+  };
 }
 
 // Разрешение пути из конфигурации/env: явный аргумент > policy.decisionLedger

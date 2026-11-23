@@ -8,12 +8,19 @@ const OWNER_PRECHECK = [
 // владельца с digest-пиннингом. Воркер получает выписку, но не может менять
 // ledger — сам журнал живёт вне его рабочего дерева.
 export function decisionsPromptBlock(slice) {
-  if (!slice || typeof slice.digest !== 'string' || !/^[a-f0-9]{64}$/.test(slice.digest)) {
+  if (!slice || typeof slice.digest !== 'string' || !/^[a-f0-9]{64}$/.test(slice.digest) ||
+      !Array.isArray(slice.ids)) {
     throw new Error('decision_ledger_slice_invalid');
   }
+  // Усечённый срез, из которого не влезла ни одна запись, нельзя маскировать под
+  // «нет активных решений» — fail-closed, оператор поднимает maxChars.
+  if (slice.truncated === true && slice.ids.length === 0 && slice.total > 0) {
+    throw new Error('decision_ledger_slice_truncated');
+  }
   const header = `Принятые решения владельца (read-only, срез digest ${slice.digest}):`;
-  if (slice.text) return `${header}\n${slice.text}`;
-  return `${header}\n(нет активных решений)`;
+  const body = slice.text || '(нет активных решений)';
+  const note = slice.truncated ? `\n(срез усечён: показано ${slice.ids.length} из ${slice.total})` : '';
+  return `${header}\n${body}${note}`;
 }
 
 export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions }) {
