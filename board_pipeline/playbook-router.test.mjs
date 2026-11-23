@@ -109,6 +109,10 @@ test('mismatched pins, scope, model or switch prevent progression', async () => 
       const artifact = Buffer.from(receipt.artifact.toString().replace('"unresolved":0', '"unresolved":1,"unresolved":0'));
       return { ...receipt, artifact, artifactDigest: createHash('sha256').update(artifact).digest('hex') };
     }, 'stage_artifact_invalid'],
+    ...['1e-400', '0.000000000000000000001', '9007199254740993', '-0'].map(number => [receipt => {
+      const artifact = Buffer.from(receipt.artifact.toString().replace('"unresolved":0', `"unresolved":${number}`));
+      return { ...receipt, artifact, artifactDigest: createHash('sha256').update(artifact).digest('hex') };
+    }, 'stage_artifact_invalid']),
   ]) {
     observed = 0;
     await assert.rejects(runPlaybook(bound, {

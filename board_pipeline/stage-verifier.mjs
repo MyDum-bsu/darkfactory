@@ -1,6 +1,8 @@
-import { parseDocument } from 'yaml';
+import { parseDocument, visit } from 'yaml';
 
 const HEX = /^[a-f0-9]{64}$/;
+const COUNT_LITERAL = /^(?:0|[1-9][0-9]{0,15})$/;
+const MAX_COUNT = BigInt(Number.MAX_SAFE_INTEGER);
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const positive = value => count(value) && value > 0;
 const digest = value => typeof value === 'string' && HEX.test(value);
@@ -34,11 +36,17 @@ export function artifactVerdict(verifier, bytes) {
   let artifact;
   try {
     const json = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    artifact = JSON.parse(json);
-    // JSON.parse checks syntax but discards duplicate keys. The JSON-schema
-    // document parser detects them before schema and verdict checks.
+    // Validate duplicate keys and original numeric lexemes before consuming
+    // the JSON values: IEEE-754 would round a tiny nonzero counter to zero.
     const doc = parseDocument(json, { schema: 'json', uniqueKeys: true, merge: false });
     if (doc.errors.length || doc.warnings.length) throw new Error('ambiguous JSON');
+    visit(doc, { Scalar(_key, node) {
+      if (typeof node.value === 'number' &&
+          (!COUNT_LITERAL.test(node.source ?? '') || BigInt(node.source) > MAX_COUNT)) {
+        throw new Error('noncanonical counter');
+      }
+    } });
+    artifact = JSON.parse(json);
   } catch (cause) { throw new Error('stage_artifact_invalid', { cause }); }
   const [fields, passes] = CHECKS[verifier];
   if (!artifact || artifact.type !== verifier || Object.keys(artifact).length !== Object.keys(fields).length + 1 ||
