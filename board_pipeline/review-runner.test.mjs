@@ -1046,3 +1046,61 @@ test('runner: ошибка host OAuth refresh отклоняет ревью до
     await rm(piRoot, { recursive: true, force: true });
   }
 });
+
+test('runner: routed-критик с egress исполняется, acp-devin — отказ до sandbox (#1263 r3)', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'runner-repo-'));
+  const journal = await mkdtemp(join(tmpdir(), 'runner-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'runner-pi-'));
+  try {
+    const git = async (...args) =>
+      (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
+    await git('init', '-q', '-b', 'pilot');
+    await git('config', 'user.email', 't@l');
+    await git('config', 'user.name', 't');
+    await writeFile(join(repo, 'a.txt'), 'x\n');
+    await git('add', 'a.txt');
+    await git('commit', '-qm', 'cand');
+    const sha = await git('rev-parse', 'HEAD');
+    const digest = 'f'.repeat(64);
+    // Закреплённый критик в worker-форме pi-харнесса — нормализуется к
+    // 'deepseek' (есть в PROVIDER_EGRESS) и доходит до контейнера.
+    await writeFile(join(piRoot, 'auth.json'), '{"deepseek":{"k":"v"}}');
+    const routed = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash',
+      reasoningLevel: 'medium' };
+    const stream = [
+      msg({ provider: 'deepseek', model: 'deepseek-v4.1-flash',
+        content: [{ type: 'text',
+          text: `{"verdict":"PASS","subject_digest":"${digest}"}` }] }), settled,
+    ].join('\n');
+    let allow = null;
+    const runner = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async (opts) => {
+        allow = opts.allow;
+        return { code: 0, stdout: stream, stderr: '' };
+      } });
+    const receipt = await runner(
+      { task_id: '1', candidate_sha: sha, worktree: repo,
+        executor: 'acp-devin/swe-2-high', subject_digest: digest },
+      { review: routed });
+    assert.equal(receipt.actual.provider, 'deepseek');
+    assert.equal(receipt.actual.model, 'deepseek-v4.1-flash');
+    assert.ok(allow.length > 0, 'egress allowlist заполнен — нет model_proxy_allowlist_invalid');
+
+    // 'acp-devin' как критик — у раннера адресов нет: отказ ДО sandbox,
+    // не model_proxy_allowlist_invalid внутри контейнера.
+    let calls = 0;
+    const unrunnable = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async () => { calls++; return { code: 0, stdout: '', stderr: '' }; } });
+    await assert.rejects(
+      () => unrunnable({ task_id: '1', candidate_sha: sha, worktree: repo,
+        executor: 'acp-devin/swe-2-high' },
+        { review: { provider: 'acp-devin', model: 'swe-2-high',
+          reasoningLevel: 'medium' } }),
+      (e) => e instanceof ReviewDenied && e.reason === 'review_profile_not_approved');
+    assert.equal(calls, 0);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+  }
+});

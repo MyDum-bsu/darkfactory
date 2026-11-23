@@ -12,7 +12,8 @@ import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
-import { isolatedArbiterRunner, isolatedPiReviewRunner } from './review-runner.mjs';
+import { isolatedArbiterRunner, isolatedPiReviewRunner,
+  runnerReviewSpec } from './review-runner.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter } from './review-policy.mjs';
 import { MAX_QUESTION_TTL_MS, readSignedAnswer, signedAnswerVerifier } from './question-gate.mjs';
@@ -474,10 +475,16 @@ async function execute() {
     const criticPrompt = decisionSlice ? [reviewText, decisionsPromptBlock(decisionSlice)].join('\n\n')
       : reviewText;
     // Фактический критик L2 и арбитр — закреплённая триада попытки
-    // (#1263), иначе проверенный дефолт. Раннер следует за типом критика:
-    // routed pi-критик не может уйти в neon-транспорт и наоборот.
-    const attemptCritic = attempt.triad?.critic ?? reviewSetup.critic;
-    const attemptArbiter = attempt.triad?.arbiter ?? reviewSetup.arbiter;
+    // (#1263), иначе проверенный дефолт. Спек нормализуется к провайдеру,
+    // реально исполняемому L2-раннером ('pi/openai/…' → 'openai',
+    // 'acp-antigravity-acp' → 'google'): без egress-адресов раннер
+    // не запускается вообще. Раннер следует за типом критика.
+    const attemptCritic = runnerReviewSpec(attempt.triad?.critic ?? reviewSetup.critic);
+    const attemptArbiter = runnerReviewSpec(attempt.triad?.arbiter ?? reviewSetup.arbiter);
+    // Закреплённый, но неисполняемый провайдер — fail-closed, а не тихая
+    // подмена дефолтом: такой пин не доходит до контейнера.
+    if (attemptCritic === null) throw new Error('route_critic_not_runnable');
+    if (attemptArbiter === null) throw new Error('route_arbiter_not_runnable');
     const neon = isNeonReview(attemptCritic);
     telemetry.recordModel('critic', attemptCritic);
     telemetry.recordModel('arbiter', attemptArbiter);

@@ -249,7 +249,7 @@ test('триада для base: невалидный по семействам b
 test('routeTriad: worker-шаг видит переданные base.critic/base.arbiter', () => {
   // Кастомный base.critic — deepseek-семейство: кандидат-executor DS легален
   // против дефолтного NEON (google), но ломает триаду против этого base.
-  const dsCritic = { provider: 'opencode-go', model: 'deepseek-reasoner' };
+  const dsCritic = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
   const scorecard = aggregateScorecard(journal(DS, 6), { seed: [] });
   const res = routeTriad({
     size: 'S', domain: 'backend',
@@ -502,4 +502,39 @@ test('resolveTriad shadow: рекомендация считается, назн
   assert.equal(res.outcome, 'shadow');
   assert.equal(res.selected.worker, DEVIN); // назначение не изменилось
   assert.equal(modelKey(res.recommended), modelKey(DS)); // рекомендация видна
+});
+
+test('критик L2 только на провайдерах с реальным egress (#1263 r3)', () => {
+  // 'acp-devin' у L2-раннера адресов нет — его нельзя выбрать критиком,
+  // иначе реальный раннер упадёт model_proxy_allowlist_invalid.
+  for (const role of ['critic', 'arbiter']) {
+    assert.throws(() => normalizeRoutingPolicy(policy('active', {
+      worker: [DEVIN], critic: role === 'critic' ? [DEVIN] : [NEON],
+      arbiter: role === 'arbiter' ? [DEVIN] : [SOL] })),
+      e => e instanceof ReviewDenied && e.reason === `route_${role}_not_runnable`);
+  }
+  // Исполняемые формы: прямой pi-провайдер, pi-харнесс с вложением,
+  // acp-antigravity-acp (Neon-транспорт).
+  const ok = normalizeRoutingPolicy(policy('active', {
+    worker: [DEVIN],
+    critic: [NEON, { provider: 'pi', model: 'openai/gpt-6.2-sol' },
+      { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' }],
+    arbiter: [SOL, { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' }] }));
+  assert.equal(ok.allowlist.critic.length, 3);
+  // Активный выбор критика: routed pi-критик исполняем раннером —
+  // 'pi/opencode-go/deepseek-…' нормализуется к 'deepseek' с egress.
+  const critic = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const lines = Array.from({ length: 6 }, () => JSON.stringify({
+    kind: 'attempt_summary', schema: 1,
+    models: { worker: DEVIN, critic, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+    phases_ms: { total: 60000 }, outcome: 'done', open: false }));
+  const scorecard = aggregateScorecard(lines, { seed: [] });
+  const res = resolveTriad({ size: 'S', domain: 'backend', scorecard,
+    policy: policy('active', { worker: [DEVIN], critic: [NEON, critic],
+      arbiter: [SOL] }),
+    base: { worker: DEVIN, critic: NEON, arbiter: SOL } });
+  assert.equal(res.outcome, 'routed');
+  assert.deepEqual(res.selected.critic, critic);
 });

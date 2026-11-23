@@ -8,7 +8,7 @@
 // чистый worktree и HEAD === base_sha. Неизвестный исход — uncertain без
 // второго писателя.
 
-import { executorFamily, ReviewDenied } from './review-runner.mjs';
+import { executorFamily, l2RunnableSpec, ReviewDenied } from './review-runner.mjs';
 import { NEON_CRITIC, SOL_ARBITER } from './review-policy.mjs';
 import {
   DEFAULT_MIN_OBSERVATIONS,
@@ -169,7 +169,7 @@ async function cleanAfterRefusal(source, attempt, inspectWorktree) {
 // activeBackgroundAgentCount: 0 }. inspectWorktree(attempt) →
 // { clean, head } — обязателен для любого перехода на резерв.
 export async function attemptSpawnWithFallback({
-  route, attempt, probe, spawn, plan, inspectWorktree,
+  route, attempt, probe, spawn, plan, inspectWorktree, onBeforeSpawn,
   critic = DEFAULT_CRITIC, arbiter = DEFAULT_ARBITER,
 }) {
   const order = plan ?? selectWorker({ route });
@@ -237,6 +237,10 @@ export async function attemptSpawnWithFallback({
     }
     let launched;
     try {
+      // Кандидат фиксируется в состоянии попытки ДО внешнего spawn: при
+      // потерянном ответе reconcileSpawn восстанавливает фактически
+      // запущенного исполнителя, а не первичного из плана (#1263 r3).
+      await onBeforeSpawn?.(worker);
       launched = await spawn({ ...attempt, executor: worker });
     } catch {
       return {
@@ -604,6 +608,13 @@ export function normalizeRoutingPolicy(policy) {
       const violation = retiredProviderViolation(spec) ?? opencodeGoPolicyViolation(spec);
       if (violation) throw new ReviewDenied(violation);
       if (workerFamily(spec) === null) throw new ReviewDenied('route_allowlist_unknown_family');
+      // Роли критика и арбитра исполняются L2-раннером: допускаются только
+      // провайдеры с реальным egress (pi-харнесс с доказанным pi-провайдером,
+      // acp-antigravity-acp, прямые pi-провайдеры) — 'acp-devin' и прочие без
+      // адресов в политику не попадают.
+      if ((role === 'critic' || role === 'arbiter') && !l2RunnableSpec(spec)) {
+        throw new ReviewDenied(`route_${role}_not_runnable`);
+      }
       return spec;
     });
   }
@@ -806,6 +817,10 @@ export function resolveTriad({ size, domain, policy, scorecard,
       const v = retiredProviderViolation(spec) ?? opencodeGoPolicyViolation(spec);
       if (v) return `route_base_invalid:${v}`;
     }
+    // Критик и арбитр базы исполняются L2-раннером — без egress-адресов
+    // база не доказана (та же политика допуска, что и у allowlist).
+    if (!l2RunnableSpec(base.critic)) return 'route_base_critic_not_runnable';
+    if (!l2RunnableSpec(base.arbiter)) return 'route_base_arbiter_not_runnable';
     try {
       assertTriadIndependent({ executor: base.worker, critic: base.critic, arbiter: base.arbiter });
     } catch (e) {
@@ -877,6 +892,12 @@ export function resolveTriad({ size, domain, policy, scorecard,
       critic: routed.selected.critic, arbiter: routed.selected.arbiter });
   } catch (e) {
     return fallback(`route_triad_violation:${e?.reason ?? e?.message ?? 'failed'}`);
+  }
+  // Исполняемость критика и арбитра L2-раннером — финальная проверка:
+  // недоказанный провайдер не выходит даже при согласованных семействах.
+  if (!l2RunnableSpec(routed.selected.critic) ||
+      !l2RunnableSpec(routed.selected.arbiter)) {
+    return fallback('route_role_not_runnable');
   }
   return { outcome: 'routed', mode: 'active', selected: routed.selected,
     plan: safePlan(routed.selected.worker, routed.selected.critic, routed.selected.arbiter),

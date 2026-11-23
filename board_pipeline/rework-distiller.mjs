@@ -9,7 +9,8 @@
 // requires_owner_approval и НЕ попадают в чек-лист автоматически.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open, realpath, rename, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 
 export const LESSONS_SCHEMA = 1;
@@ -349,7 +350,22 @@ export async function loadLessons(path, { allowedDir = null, outside = [] } = {}
     return [];
   }
   await assertLessonsPathAllowed(path, { allowedDir, outside });
-  const text = await readFile(path, 'utf8');
+  // Чтение строго по дескриптору, открытому с O_NOFOLLOW: подмена файла
+  // симлинком между проверкой пути и чтением (TOCTOU) невозможна —
+  // open на симлинке падает ELOOP ещё до fstat.
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    .catch(error => {
+      if (error.code === 'ELOOP') throw new Error('lessons_store_not_a_file');
+      throw error;
+    });
+  let text;
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error('lessons_store_not_a_file');
+    text = await handle.readFile('utf8');
+  } finally {
+    await handle.close();
+  }
   const lines = text.split('\n');
   // Хвост без завершающего перевода строки — неполная запись, не урок.
   if (!text.endsWith('\n')) lines.pop();

@@ -307,6 +307,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           arbiter: attemptArbiter,
           plan: attemptPlan,
           probe: typeof bb.probeAvailability === 'function' ? w => bb.probeAvailability(w) : undefined,
+          // Перед КАЖДЫМ spawn (включая резерв) запись несёт фактического
+          // кандидата: worker триады и executor — это запускаемый, иначе
+          // reconcileSpawn восстановил бы первичного из плана.
+          onBeforeSpawn: worker => save({ executor: worker,
+            triad: { worker, critic: attemptCritic, arbiter: attemptArbiter } }),
           spawn: envelope => bb.spawn(envelope),
           inspectWorktree: typeof bb.inspectWorktree === 'function'
             ? att => bb.inspectWorktree(att) : undefined,

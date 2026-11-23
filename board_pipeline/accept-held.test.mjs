@@ -1963,13 +1963,17 @@ test('shadow: закреплённая триада Devin/Neon/Sol — acceptHel
   assert.equal(denied.reason, 'invalid_triad');
 });
 
-test('active: routed DeepSeek/Devin/Neon — закреплённый routed-критик проходит политику', async t => {
+test('active: routed Devin/DeepSeek/Neon — закреплённый routed-критик проходит политику', async t => {
   const { handle, ported } = await isolated(t);
   const id = await contractTask(handle);
   const { epoch, port: boardPort } = await held(ported, id);
   const journal = await tmpJournal();
-  const DS = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
-  const DEVIN = { provider: 'acp-devin', model: 'swe-2-high', reasoningLevel: 'medium' };
+  const DEVIN = { provider: 'acp-devin', model: 'swe-2-high' };
+  // Закреплённый критик — worker-формат pi-харнесса; ревью-профиль несёт
+  // runner-форму {provider:'deepseek'}, как в verify run-isolated.
+  const DS_CRITIC = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const RUNNER_CRITIC = { provider: 'deepseek', model: 'deepseek-v4.1-flash',
+    reasoningLevel: 'medium' };
   const NEON = { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' };
   const transcript = 'private provider transcript';
   await writeFile(path.join(journal, 'critic.json'), transcript, { mode: 0o600 });
@@ -1977,17 +1981,61 @@ test('active: routed DeepSeek/Devin/Neon — закреплённый routed-к�
   ports.review = async binding => {
     calls.review++;
     assert.equal(binding.subject_digest, expectedDigest());
-    return { task: id, sha: CAND, actual: DEVIN, verdict: 'REVIEW_OK', checkpoint: 'feed80ab',
-      isolation: 'docker-ro-v1', subject_digest: binding.subject_digest,
-      transcript_file: 'critic.json',
+    return { task: id, sha: CAND, actual: RUNNER_CRITIC, verdict: 'REVIEW_OK',
+      checkpoint: 'feed80ab', isolation: 'docker-ro-v1',
+      subject_digest: binding.subject_digest, transcript_file: 'critic.json',
       transcript_sha256: createHash('sha256').update(transcript).digest('hex') };
   };
   const res = await acceptHeld({
-    attempt: contractAttempt(id, epoch, { executor: DS,
-      triad: { worker: DS, critic: DEVIN, arbiter: NEON } }),
+    attempt: contractAttempt(id, epoch, { executor: DEVIN,
+      triad: { worker: DEVIN, critic: DS_CRITIC, arbiter: NEON } }),
     submission: submission(id, epoch),
-    policy: policy(id, { review: { ...DEVIN, requireAttestation: true }, arbiter: NEON }),
+    policy: policy(id, { review: { ...RUNNER_CRITIC, requireAttestation: true },
+      arbiter: NEON }),
     journal, ports: { ...ports, board: boardPort } });
   assert.equal(res.outcome, 'verified', res.reason);
   assert.deepEqual(calls, { inspect: 2, local: 1, review: 1 });
+
+  // Триада из трёх Neon — отказ до порта Board.
+  const idB = await contractTask(handle);
+  const { epoch: eB, port: pB } = await held(ported, idB);
+  const same = await acceptHeld({
+    attempt: contractAttempt(idB, eB, { executor: NEON,
+      triad: { worker: NEON, critic: NEON, arbiter: NEON } }),
+    submission: submission(idB, eB),
+    policy: policy(idB, { review: { ...NEON, skills: ['logika'] }, arbiter: NEON }),
+    journal: await tmpJournal(), ports: { ...stubs().ports, board: pB } });
+  assert.equal(same.outcome, 'denied');
+  assert.match(same.reason, /^invalid_triad/);
+
+  // Триада, не совпадающая с критиком профиля — triad_mismatch.
+  const idC = await contractTask(handle);
+  const { epoch: eC, port: pC } = await held(ported, idC);
+  const mismatch = await acceptHeld({
+    attempt: contractAttempt(idC, eC, { executor: DEVIN,
+      triad: { worker: DEVIN, critic: NEON, arbiter: SOL_ARBITER } }),
+    submission: submission(idC, eC),
+    policy: policy(idC, { review: { ...RUNNER_CRITIC, requireAttestation: true },
+      arbiter: NEON }),
+    journal: await tmpJournal(), ports: { ...stubs().ports, board: pC } });
+  assert.equal(mismatch.outcome, 'denied');
+  assert.equal(mismatch.reason, 'triad_mismatch');
+});
+
+test('Neon с нестандартным reasoningLevel не обходит skills-гейт routed-веткой', async t => {
+  const { handle, ported } = await isolated(t);
+  const id = await contractTask(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const { ports } = stubs();
+  // google-модель с другим reasoningLevel и без skills — ни neon-ветка,
+  // ни routed-допуск её не пускают.
+  const res = await acceptHeld({
+    attempt: contractAttempt(id, epoch,
+      { executor: { provider: 'acp-devin', model: 'swe-2-high' } }),
+    submission: submission(id, epoch),
+    policy: policy(id, { review: { provider: 'google', model: 'gemini-4-neon',
+      reasoningLevel: 'high' }, arbiter: SOL_ARBITER }),
+    journal: await tmpJournal(), ports: { ...ports, board: boardPort } });
+  assert.equal(res.outcome, 'denied');
+  assert.equal(res.reason, 'review_profile_not_approved');
 });

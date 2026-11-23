@@ -7,6 +7,7 @@ import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
 import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter, NEON_ISOLATION } from './review-policy.mjs';
+import { l2RunnableSpec, runnerReviewSpec } from './review-runner.mjs';
 import { assertTriadIndependent, opencodeGoPolicyViolation,
   retiredProviderViolation, workerFamily } from './worker-selector.mjs';
 
@@ -129,13 +130,16 @@ function validatePolicy(policy, checkProfile, { allowNeon = false } = {}) {
 // DeepSeek-only в opencode-go и аттестованное семейство. Независимость
 // триады проверяется ниже отдельно, как для первичного, так и routed.
 function isRoutedReview(review) {
-  // Neon-критик обслуживается строго только neon-веткой со skills-гейтом —
-  // routed-допуск не должен обходить её.
-  if (isNeonReview(review)) return false;
+  // Google-семейство (любой Neon и acp-antigravity-acp, независимо от
+  // reasoningLevel) обслуживается строго neon-веткой со skills-гейтом —
+  // routed-допуск не должен обходить isReviewSkillList.
+  if (workerFamily(review) === 'google') return false;
   if (!validWorkerSpec(review) || typeof review.model !== 'string' ||
       review.model.length === 0) return false;
   if (retiredProviderViolation(review) ?? opencodeGoPolicyViolation(review)) return false;
-  return workerFamily(review) !== null;
+  // Routed-критик обязан быть исполняем реальным L2-раннером: провайдер
+  // с egress-allowlist, иначе срыв model_proxy_allowlist_invalid позже.
+  return l2RunnableSpec(review);
 }
 
 function strictKeys(record, allowed, optional = []) {
@@ -900,6 +904,27 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     // переключения на резерв.
     const executor = attempt.executor ?? profile.executor;
     const arbiter = attempt.arbiter ?? profile.arbiter;
+    // Закреплённая триада попытки (#1263): сама обязана доказать три
+    // независимых семейства и совпасть с исполнителем/критиком профиля/
+    // арбитром — несогласованная или однофамильная триада отклоняется
+    // до любого порта Board.
+    if (attempt.triad !== undefined) {
+      try {
+        assertTriadIndependent({ executor: attempt.triad.worker,
+          critic: attempt.triad.critic, arbiter: attempt.triad.arbiter });
+      } catch (e) {
+        throw new Denied(e instanceof ReviewDenied ? `invalid_triad:${e.reason}` : 'invalid_triad');
+      }
+      const sameSpec = (a, b) =>
+        a?.provider === b?.provider && a?.model === b?.model;
+      const sameRunner = (a, b) =>
+        sameSpec(runnerReviewSpec(a) ?? a, runnerReviewSpec(b) ?? b);
+      if ((executor !== undefined && !sameSpec(executor, attempt.triad.worker)) ||
+          !sameRunner(profile.review, attempt.triad.critic) ||
+          (arbiter !== undefined && !sameRunner(arbiter, attempt.triad.arbiter))) {
+        throw new Denied('triad_mismatch');
+      }
+    }
     if (isNeonReview(profile.review)) {
       if (!isSolArbiter(arbiter) || executor === undefined) throw new Denied('vs2_review_triad_not_approved');
       if (attempt.policy_digest === undefined) throw new Denied('subject_contract_incomplete');

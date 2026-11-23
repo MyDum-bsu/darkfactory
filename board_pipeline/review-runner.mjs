@@ -60,6 +60,11 @@ const PROVIDER_FAMILY = new Map([
   ['google', 'google'],
   ['acp-antigravity-acp', 'google'],
   ['agy', 'anthropic'],
+  // pi-провайдеры из runner-формы спеков (PROVIDER_EGRESS) — семейство
+  // совпадает с именем провайдера, аттестуются напрямую.
+  ['deepseek', 'deepseek'],
+  ['glm', 'glm'],
+  ['cognition', 'cognition'],
 ]);
 // Провайдеры-харнессы: сами семейства не несут, семейство берётся из модели.
 const HARNESS_PROVIDERS = new Set(['pi']);
@@ -555,9 +560,11 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
     throw new ReviewDenied('review_runner_misconfigured');
   }
   return async (binding, profile) => {
-    const critic = profile?.review;
-    if (critic === null || typeof critic !== 'object' ||
-        !nonEmpty(critic.provider) || !nonEmpty(critic.model) || !nonEmpty(critic.reasoningLevel)) {
+    // Спек критика нормализуется к провайдеру, реально исполняемому этим
+    // раннером ('pi/openai/…' → 'openai' и т.д.); без egress — отказ до
+    // контейнера, а не model_proxy_allowlist_invalid внутри песочницы.
+    const critic = runnerReviewSpec(profile?.review);
+    if (critic === null || !nonEmpty(critic.model) || !nonEmpty(critic.reasoningLevel)) {
       throw new ReviewDenied('review_profile_not_approved');
     }
     // Кросс-семейственный инвариант до запуска контейнера и модели.
@@ -745,6 +752,36 @@ const PROVIDER_EGRESS = new Map([
   ['cognition', ['api.cognition.ai:443']],
 ]);
 
+// Спек критика/арбитра в форме, реально исполняемой L2-раннером, либо
+// null, когда у раннера нет для него разрешённых адресов:
+// — харнесс 'pi' берёт pi-провайдера вложения 'pi/inner/model'; у вложения
+//   без собственного egress берётся его семейство
+//   ('pi/opencode-go/deepseek-…' → 'deepseek', 'pi/openai/…' → 'openai');
+// — 'acp-antigravity-acp' → 'google' (Neon/agy-транспорт);
+// — прямые pi-провайдеры из PROVIDER_EGRESS — как есть.
+// 'acp-devin' и прочие → null: адреса для них не выдумываются.
+export function runnerReviewSpec(spec) {
+  if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) return null;
+  let { provider, model } = spec;
+  if (provider === 'acp-antigravity-acp') {
+    provider = 'google';
+  } else if (provider === 'pi' && typeof model === 'string' && model.includes('/')) {
+    const i = model.indexOf('/');
+    const inner = model.slice(0, i).toLowerCase();
+    provider = PROVIDER_EGRESS.has(inner)
+      ? inner : (PROVIDER_FAMILY.get(inner) ?? inner);
+    model = model.slice(i + 1);
+  }
+  if (typeof provider !== 'string' || !PROVIDER_EGRESS.has(provider)) return null;
+  return { ...spec, provider, model };
+}
+
+// Провайдер исполняем L2-раннером (критик L2 или pi-арбитр) тогда и только
+// тогда, когда спек нормализуется к провайдеру с egress-allowlist.
+export function l2RunnableSpec(spec) {
+  return runnerReviewSpec(spec) !== null;
+}
+
 function parseArbiterDecision(text) {
   const body = String(text ?? '').trim();
   const json = /^```(?:json)?\s+([\s\S]*?)```$/i.exec(body)?.[1] ?? body;
@@ -767,10 +804,11 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
     throw new ReviewDenied('arbiter_runner_misconfigured');
   }
   return async (req) => {
-    const arbiter = req?.arbiter;
+    // Та же нормализация, что и у критика: pi-арбитр исполняется только
+    // на провайдере с egress-allowlist.
+    const arbiter = runnerReviewSpec(req?.arbiter);
     const effort = arbiter?.reasoningLevel ?? 'high';
-    if (arbiter === null || typeof arbiter !== 'object' || Array.isArray(arbiter) ||
-        !nonEmpty(arbiter.provider) || !nonEmpty(arbiter.model)) {
+    if (arbiter === null || !nonEmpty(arbiter.model)) {
       throw new ReviewDenied('arbiter_profile_not_approved');
     }
     const scratch = await mkdtemp(join(tmpdir(), 'board-arbiter-'));

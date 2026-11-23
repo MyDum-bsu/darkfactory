@@ -1060,3 +1060,50 @@ test('reconcileSpawn после lost spawn восстанавливает зак
   assert.deepEqual(x.effects.attempts[0].triad, record.triad);
   assert.deepEqual(x.effects.attempts[0].executor, ws.PRIMARY_WORKER);
 });
+
+test('reconcileSpawn после потери ответа резервного кандидата восстанавливает его, а не первичного', async t => {
+  const x = await lab(t);
+  const PINNED_CRITIC = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const PINNED_ARBITER = { provider: 'openai', model: 'gpt-5.6-sol' };
+  // Резерв — третье независимое семейство (критик deepseek, арбитр openai).
+  const RESERVE = { provider: 'agy', model: 'claude-opus-5.5' };
+  let seenAtReconcile = null;
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () =>
+      ({ plan: [ws.PRIMARY_WORKER, RESERVE], critic: PINNED_CRITIC, arbiter: PINNED_ARBITER }),
+  });
+  // Первичный — подтверждённый отказ; у резервного ответ spawn теряется.
+  x.cfg.bb.probeAvailability = async w => w.provider === 'acp-devin'
+    ? { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 }
+    : { status: 'available', activeBackgroundAgentCount: 0 };
+  x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
+  x.cfg.bb.spawn = async env => {
+    x.effects.spawn++;
+    assert.equal(env.executor.provider, 'agy');
+    throw new Error('lost transport response');
+  };
+  assert.equal((await x.tick()).phase, 'uncertain');
+  assert.equal(x.effects.spawn, 1);
+  const inflight = await x.cfg.state.load();
+  // До внешнего spawn запись уже несёт РЕЗЕРВНОГО кандидата как
+  // worker триады и executor — reconcile не «откатит» её к первичному.
+  assert.deepEqual(inflight.triad,
+    { worker: RESERVE, critic: PINNED_CRITIC, arbiter: PINNED_ARBITER });
+  assert.deepEqual(inflight.executor, RESERVE);
+  await x.cfg.state.save({ ...inflight, phase: 'launching', reason: undefined, receipt: undefined });
+  x.cfg.bb.reconcileSpawn = async attempt => {
+    seenAtReconcile = structuredClone(attempt);
+    return { status: 'matched', threadId: 'thr_reserve' };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.equal(record.threadId, 'thr_reserve');
+  assert.deepEqual(record.triad.worker, RESERVE);
+  assert.deepEqual(record.executor, RESERVE);
+  assert.deepEqual(seenAtReconcile.triad, record.triad);
+  assert.deepEqual(seenAtReconcile.executor, RESERVE);
+  x.submit('b'.repeat(40));
+  await x.tick();
+  assert.deepEqual(x.effects.attempts[0].executor, RESERVE);
+  assert.deepEqual(x.effects.attempts[0].triad, record.triad);
+});
