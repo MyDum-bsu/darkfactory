@@ -34,6 +34,7 @@ export const DEFAULT_MAX_CHARS = 4000;
 export const DEFAULT_MAX_ENTRIES_PER_SECTION = 25;
 
 const MAX_RECEIPT_BYTES = 256 * 1024;
+const MIN_HMAC_KEY_BYTES = 16;
 
 const SECTION_SET = new Set(PROJECT_MEMORY_SECTIONS);
 const TRUSTED_ROLE_SET = new Set(TRUSTED_WRITE_ROLES);
@@ -371,11 +372,17 @@ export function reviewReceiptDigest(receipt) {
   return createHash('sha256').update(canonicalJson(body)).digest('hex');
 }
 
-export function reviewReceiptHmac(receipt, hmacKey) {
-  if ((typeof hmacKey !== 'string' || hmacKey.length === 0) &&
-      (!Buffer.isBuffer(hmacKey) || hmacKey.length === 0)) {
-    throw new Error('project_memory_untrusted_write');
+function assertValidHmacKey(hmacKey) {
+  if (typeof hmacKey === 'string') {
+    if (Buffer.byteLength(hmacKey, 'utf8') >= MIN_HMAC_KEY_BYTES) return;
+  } else if (Buffer.isBuffer(hmacKey)) {
+    if (hmacKey.length >= MIN_HMAC_KEY_BYTES) return;
   }
+  throw new Error('project_memory_untrusted_write');
+}
+
+export function reviewReceiptHmac(receipt, hmacKey) {
+  assertValidHmacKey(hmacKey);
   const { receipt_hmac_sha256, ...body } = receipt;
   return createHmac('sha256', hmacKey).update(canonicalJson(body)).digest('hex');
 }
@@ -410,12 +417,11 @@ function validateReceiptFields(raw, { requireDigest = false, hmacKey } = {}) {
     throw new Error('project_memory_source_card_invalid');
   }
   if (requireDigest) {
+    assertValidHmacKey(hmacKey);
     if (typeof raw.receipt_sha256 !== 'string' || !DIGEST.test(raw.receipt_sha256) ||
         reviewReceiptDigest(raw) !== raw.receipt_sha256) {
       throw new Error('project_memory_untrusted_write');
     }
-  }
-  if (hmacKey !== undefined) {
     if (typeof raw.receipt_hmac_sha256 !== 'string' || !DIGEST.test(raw.receipt_hmac_sha256)) {
       throw new Error('project_memory_untrusted_write');
     }
@@ -476,10 +482,9 @@ export async function writeTrustedReviewReceipt({
       ? String(receipt.sourceCard ?? receipt.source_card) : undefined,
   };
   validateReceiptFields(body, { requireDigest: false });
+  assertValidHmacKey(hmacKey);
   const signed = { ...body, receipt_sha256: reviewReceiptDigest(body) };
-  if (hmacKey !== undefined) {
-    signed.receipt_hmac_sha256 = reviewReceiptHmac(signed, hmacKey);
-  }
+  signed.receipt_hmac_sha256 = reviewReceiptHmac(signed, hmacKey);
   try {
     const st = lstatSync(receiptPath);
     if (st.isSymbolicLink()) throw new Error('project_memory_symlink_disallowed');
@@ -553,9 +558,10 @@ async function verifyTrustedWrite({
   sourceCard,
   worktree,
 }) {
-  if (receiptPath === undefined || trustedReceiptDir === undefined) {
+  if (receiptPath === undefined || trustedReceiptDir === undefined || hmacKey === undefined) {
     throw new Error('project_memory_untrusted_write');
   }
+  assertValidHmacKey(hmacKey);
   const verified = await readTrustedReceiptFile(receiptPath, trustedReceiptDir, worktree, hmacKey);
 
   if (sourceCard !== undefined && String(sourceCard) !== verified.sourceCard) {
@@ -726,6 +732,58 @@ export async function recordProjectMemoryUpdate({
       digest: sliceDigest(projectId, items),
       pin_sha256: saved.pin_sha256,
     };
+  });
+}
+
+// Доверенная фабрика записи: однократно закрепляет storeDir, trustedReceiptDir,
+// hmacKey и worktree в замыкании из операторской конфигурации; вызывающий
+// writer.recordUpdate(...) не может переопределить доверенный каталог или ключ.
+export function createProjectMemoryWriter({
+  storeDir,
+  trustedReceiptDir,
+  hmacKey,
+  worktree,
+  maxChars = DEFAULT_MAX_CHARS,
+  maxEntriesPerSection = DEFAULT_MAX_ENTRIES_PER_SECTION,
+}) {
+  if (typeof storeDir !== 'string' || !isAbsolute(storeDir)) {
+    throw new Error('project_memory_path_relative');
+  }
+  if (typeof trustedReceiptDir !== 'string' || !isAbsolute(trustedReceiptDir)) {
+    throw new Error('project_memory_untrusted_write');
+  }
+  assertValidHmacKey(hmacKey);
+  const pinnedStoreDir = storeDir;
+  const pinnedReceiptDir = trustedReceiptDir;
+  const pinnedHmacKey = Buffer.isBuffer(hmacKey) ? Buffer.from(hmacKey) : hmacKey;
+  const pinnedWorktree = worktree;
+  const defaultMaxChars = maxChars;
+  const defaultMaxEntries = maxEntriesPerSection;
+
+  return Object.freeze({
+    async recordUpdate(params) {
+      if (params === null || typeof params !== 'object' || Array.isArray(params)) {
+        throw new Error('project_memory_untrusted_write');
+      }
+      if ('trustedReceiptDir' in params || 'hmacKey' in params ||
+          'storeDir' in params || 'worktree' in params) {
+        throw new Error('project_memory_untrusted_write');
+      }
+      return recordProjectMemoryUpdate({
+        storeDir: pinnedStoreDir,
+        trustedReceiptDir: pinnedReceiptDir,
+        hmacKey: pinnedHmacKey,
+        worktree: pinnedWorktree,
+        projectId: params.projectId,
+        receiptPath: params.receiptPath,
+        updates: params.updates,
+        attestation: params.attestation,
+        sourceCard: params.sourceCard,
+        maxChars: params.maxChars ?? defaultMaxChars,
+        maxEntriesPerSection: params.maxEntriesPerSection ?? defaultMaxEntries,
+        now: params.now,
+      });
+    },
   });
 }
 

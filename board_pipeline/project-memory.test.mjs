@@ -11,6 +11,7 @@ import * as projectMemoryModule from './project-memory.mjs';
 import {
   clearProjectMemory,
   compactProjectMemory,
+  createProjectMemoryWriter,
   entryDigest,
   memoryPolicyConfig,
   pinProjectMemory,
@@ -647,21 +648,21 @@ test('regression R3: no public capability minting; receipt must live in trustedR
       /project_memory_untrusted_write/,
     );
 
-    // Missing HMAC when hmacKey is enabled -> project_memory_untrusted_write
+    // Missing HMAC when hmacKey is required -> project_memory_untrusted_write
     const unsignedReceiptPath = join(receiptDir, 'unsigned.receipt.json');
-    await writeTrustedReviewReceipt({
-      receiptPath: unsignedReceiptPath,
-      trustedReceiptDir: receiptDir,
-      worktree: tree,
-      receipt: {
-        role: 'controller',
-        verdict: 'REVIEW_OK',
-        sha: sha64,
-        worker: 'acp-devin/swe-2-high',
-        reviewer: 'acp-antigravity-acp/gemini-4-neon',
-        sourceCard: '1265',
-      },
-    });
+    const unsignedBody = {
+      schema: REVIEW_RECEIPT_SCHEMA,
+      role: 'controller',
+      verdict: 'REVIEW_OK',
+      sha: sha64,
+      worker: 'acp-devin/swe-2-high',
+      reviewer: 'acp-antigravity-acp/gemini-4-neon',
+      source_card: '1265',
+    };
+    await writeFile(unsignedReceiptPath, JSON.stringify({
+      ...unsignedBody,
+      receipt_sha256: reviewReceiptDigest(unsignedBody),
+    }));
     await assert.rejects(
       () => recordProjectMemoryUpdate({
         storeDir, projectId: 'proj_r3', worktree: tree, updates,
@@ -678,6 +679,110 @@ test('regression R3: no public capability minting; receipt must live in trustedR
       receiptPath: goodReceiptPath,
       trustedReceiptDir: receiptDir,
       hmacKey: TEST_HMAC_KEY,
+    });
+    assert.equal(ok.total, 1);
+  } finally { await cleanup(); }
+});
+
+test('regression R4: hmacKey (>=16 bytes) is mandatory and createProjectMemoryWriter pins operator config', async () => {
+  const { dir, tree, storeDir, receiptDir, cleanup } = await sandbox();
+  const rogueDir = join(dir, 'ops', 'rogue-r4');
+  await mkdir(rogueDir, { recursive: true });
+  const updates = [{ section: 'conventions', text: 'HMAC-pinned writer convention' }];
+  try {
+    const goodReceiptPath = join(receiptDir, 'r4-good.receipt.json');
+    await writeTrustedReviewReceipt({
+      receiptPath: goodReceiptPath,
+      trustedReceiptDir: receiptDir,
+      worktree: tree,
+      hmacKey: TEST_HMAC_KEY,
+      receipt: {
+        role: 'operator',
+        verdict: 'REVIEW_OK',
+        sha: SHA_A,
+        worker: 'openai/gpt-6.2-sol',
+        reviewer: 'google/gemini-4-neon',
+        sourceCard: '1265',
+      },
+    });
+
+    // Missing or too-short (<16 bytes) hmacKey fails closed (no bare-SHA256 fallback)
+    for (const badKey of [undefined, '', 'short-key-15byt', Buffer.alloc(15, 1)]) {
+      await assert.rejects(
+        () => recordProjectMemoryUpdate({
+          storeDir, projectId: 'proj_r4', worktree: tree, updates,
+          receiptPath: goodReceiptPath,
+          trustedReceiptDir: receiptDir,
+          hmacKey: badKey,
+        }),
+        /project_memory_untrusted_write/,
+      );
+      assert.throws(
+        () => createProjectMemoryWriter({
+          storeDir, trustedReceiptDir: receiptDir, hmacKey: badKey, worktree: tree,
+        }),
+        /project_memory_untrusted_write/,
+      );
+    }
+
+    // Writer pins storeDir, trustedReceiptDir, hmacKey, worktree in closure
+    const writer = createProjectMemoryWriter({
+      storeDir,
+      trustedReceiptDir: receiptDir,
+      hmacKey: TEST_HMAC_KEY,
+      worktree: tree,
+    });
+
+    // Attempting to override trustedReceiptDir / hmacKey / storeDir / worktree is rejected
+    const rogueKey = 'rogue-attacker-hmac-key-12345678';
+    const rogueReceiptPath = join(rogueDir, 'rogue.receipt.json');
+    await writeTrustedReviewReceipt({
+      receiptPath: rogueReceiptPath,
+      trustedReceiptDir: rogueDir,
+      worktree: tree,
+      hmacKey: rogueKey,
+      receipt: {
+        role: 'operator',
+        verdict: 'REVIEW_OK',
+        sha: SHA_A,
+        worker: 'openai/gpt-6.2-sol',
+        reviewer: 'google/gemini-4-neon',
+        sourceCard: '1265',
+      },
+    });
+    for (const override of [
+      { trustedReceiptDir: rogueDir },
+      { hmacKey: rogueKey },
+      { trustedReceiptDir: rogueDir, hmacKey: rogueKey },
+      { storeDir: rogueDir },
+      { worktree: undefined },
+    ]) {
+      await assert.rejects(
+        () => writer.recordUpdate({
+          projectId: 'proj_r4',
+          receiptPath: goodReceiptPath,
+          updates,
+          ...override,
+        }),
+        /project_memory_untrusted_write/,
+      );
+    }
+
+    // Passing a rogue receipt outside pinned trustedReceiptDir fails closed
+    await assert.rejects(
+      () => writer.recordUpdate({
+        projectId: 'proj_r4',
+        receiptPath: rogueReceiptPath,
+        updates,
+      }),
+      /project_memory_untrusted_write/,
+    );
+
+    // Valid call without overriding pinned operator config succeeds
+    const ok = await writer.recordUpdate({
+      projectId: 'proj_r4',
+      receiptPath: goodReceiptPath,
+      updates,
     });
     assert.equal(ok.total, 1);
   } finally { await cleanup(); }
