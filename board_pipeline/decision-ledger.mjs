@@ -4,9 +4,9 @@
 // в модуле нет зашитых путей. Чтение fail-closed: битая строка, подмена
 // контентного sha256 или ledger внутри worktree — ошибка, а не пустой срез.
 
-import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, lstat, mkdir, open, readFile, readlink, realpath, rm,
-  writeFile } from 'node:fs/promises';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { appendFile, link, lstat, mkdir, open, readFile, readlink, realpath, rm,
+  unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
@@ -95,12 +95,14 @@ async function assertLedgerOutside(ledgerPath, worktree) {
   if (tree === null) throw new Error('decision_ledger_worktree_missing');
   const norm = resolve(ledgerPath);
   const dirTarget = await resolveLoose(dirname(ledgerPath));
-  // Проверяются и сам журнал, и разрешённый родитель: lockfile создаётся рядом
-  // с канонической целью, но каталог по симлинку тоже не может указывать внутрь
-  // worktree.
+  const targetDir = dirname(target);
+  // Проверяются журнал, родитель исходного пути и родитель канонической цели:
+  // lockfile создаётся рядом с канонической целью, а симлинк не может вывести
+  // запись или лок внутрь worktree.
   if (inside(tree, norm) || inside(norm, tree) ||
       inside(tree, target) || inside(target, tree) ||
-      inside(tree, dirTarget) || inside(dirTarget, tree)) {
+      inside(tree, dirTarget) || inside(dirTarget, tree) ||
+      inside(tree, targetDir) || inside(targetDir, tree)) {
     throw new Error('decision_ledger_inside_worker_paths');
   }
   return target;
@@ -171,9 +173,9 @@ export async function resolveActiveDecisions({ ledgerPath, projectId, maxChars =
     lines.push(line);
     ids.push(rec.id);
   }
-  const digest = createHash('sha256').update(canonicalJson(
-    ids.map((id, i) => ({ id, scope: active[i].scope, rule: active[i].rule.trim() })))).digest('hex');
-  return { text: lines.join('\n'), digest, ids, truncated, total: active.length };
+  const items = ids.map((id, i) => ({ id, scope: active[i].scope, rule: active[i].rule.trim() }));
+  const digest = createHash('sha256').update(canonicalJson(items)).digest('hex');
+  return { text: lines.join('\n'), digest, ids, truncated, total: active.length, items };
 }
 
 // Lockfile рядом с журналом: конкурентные recordDecision (в первую очередь
@@ -234,6 +236,9 @@ export async function recordDecision({ ledgerPath, scope, rule, sourceCard, reco
         throw new Error('decision_ledger_supersedes_invalid');
       }
     }
+    // Повторный id в журнале недопустим (см. foldEntries): не доводить до
+    // append, который необратимо испортил бы лог.
+    if (byId.has(id)) throw new Error('decision_ledger_duplicate_id');
     const record = { schema: LEDGER_SCHEMA, id, scope, status: 'active', rule: rule.trim(),
       source_card: card, timestamp: now.toISOString(), recorded_by: recordedBy,
       ...(supersedes !== undefined ? { supersedes } : {}) };
@@ -246,6 +251,19 @@ export async function recordDecision({ ledgerPath, scope, rule, sourceCard, reco
 const isSlice = s => s !== null && typeof s === 'object' && !Array.isArray(s) &&
   DIGEST.test(s.digest) && Array.isArray(s.ids) && s.ids.every(id => typeof id === 'string') &&
   typeof s.text === 'string' && typeof s.truncated === 'boolean' && Number.isSafeInteger(s.total);
+
+const sliceDigest = items => createHash('sha256').update(canonicalJson(items)).digest('hex');
+
+// Персистированный pin должен нести items, из которых digest пересчитывается
+// при чтении, а text/ids/truncated/total обязаны быть согласованы с ними —
+// подмена любого поля без пересчёта не проходит.
+const isPin = s => isSlice(s) && Array.isArray(s.items) &&
+  s.items.length === s.ids.length &&
+  s.items.every((item, i) => item !== null && typeof item === 'object' &&
+    item.id === s.ids[i] && typeof item.scope === 'string' && typeof item.rule === 'string') &&
+  s.text === s.items.map(item => `- [${item.scope}] ${item.rule} (${item.id})`).join('\n') &&
+  s.truncated === (s.total > s.ids.length) &&
+  sliceDigest(s.items) === s.digest;
 
 // Закрепление активного среза за попыткой: воркер, критик и арбитр одного
 // кандидата видят один и тот же snapshot/digest, а не независимо перечитанный
@@ -261,7 +279,7 @@ export function pinDecisions(resolve_, { persistDir } = {}) {
     let saved;
     try { saved = JSON.parse(await readFile(file, 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
-    if (!isSlice(saved)) throw new Error('decision_ledger_pin_invalid');
+    if (!isPin(saved)) throw new Error('decision_ledger_pin_invalid');
     return saved;
   };
   return key => {
@@ -275,15 +293,22 @@ export function pinDecisions(resolve_, { persistDir } = {}) {
         }
         const slice = (await resolve_()) ?? null;
         if (file !== null && slice !== null) {
-          if (!isSlice(slice)) throw new Error('decision_ledger_slice_invalid');
+          if (!isPin(slice)) throw new Error('decision_ledger_slice_invalid');
+          // Атомарная публикация: полные байты во временном файле, link() делает
+          // появление pinPath мгновенным и failsafe-EEXIST — канон чужого pin.
+          const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
           try {
-            await writeFile(file, JSON.stringify(slice), { mode: 0o600, flag: 'wx' });
-          } catch (error) {
-            if (error.code !== 'EEXIST') throw error;
-            // Параллельный процесс закрепил первым — его snapshot и есть канон.
-            const saved = await readPinned(file);
-            if (saved === undefined) throw new Error('decision_ledger_pin_invalid');
-            return saved;
+            await writeFile(tmp, JSON.stringify(slice), { mode: 0o600 });
+            try {
+              await link(tmp, file);
+            } catch (error) {
+              if (error.code !== 'EEXIST') throw error;
+              const saved = await readPinned(file);
+              if (saved === undefined) throw new Error('decision_ledger_pin_invalid');
+              return saved;
+            }
+          } finally {
+            await unlink(tmp).catch(() => {});
           }
         }
         return slice;

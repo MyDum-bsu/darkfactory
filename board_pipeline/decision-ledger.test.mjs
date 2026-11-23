@@ -1,13 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, symlink,
+  writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { pinDecisions, recordDecision, recordDigest, resolveActiveDecisions,
   resolveLedgerPath, LEDGER_PATH_ENV, LEDGER_SCHEMA } from './decision-ledger.mjs';
+import { canonicalJson } from './subject.mjs';
 
 const exec = promisify(execFile);
 const cli = fileURLToPath(new URL('./decision-ledger.mjs', import.meta.url));
@@ -340,10 +343,17 @@ test('pinDecisions caches the in-flight promise: one resolve under a race', asyn
   assert.equal(b, c);
 });
 
+// Срез с настоящим пересчитываемым digest — как у resolveActiveDecisions.
+const sliceFor = items => {
+  const digest = createHash('sha256').update(canonicalJson(items)).digest('hex');
+  return { text: items.map(i => `- [${i.scope}] ${i.rule} (${i.id})`).join('\n'),
+    digest, ids: items.map(i => i.id), truncated: false, total: items.length, items };
+};
+
 test('pinned snapshot persists across process restart for the same epoch', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'decision-pin-'));
   try {
-    const slice = { text: '- [global] r', digest: 'e'.repeat(64), ids: ['x'], truncated: false, total: 1 };
+    const slice = sliceFor([{ id: 'x', scope: 'global', rule: 'r' }]);
     let calls = 0;
     const first = pinDecisions(async () => { calls += 1; return slice; }, { persistDir: dir });
     assert.deepEqual(await first('7:1'), slice);
@@ -353,13 +363,59 @@ test('pinned snapshot persists across process restart for the same epoch', async
     assert.deepEqual(await second('7:1'), slice);
     assert.equal(calls, 1);
     // Другой epoch — свой snapshot, не наследует чужой.
-    const third = pinDecisions(async () => ({ ...slice, ids: ['y'] }), { persistDir: dir });
+    const y = sliceFor([{ id: 'y', scope: 'global', rule: 'r2' }]);
+    const third = pinDecisions(async () => y, { persistDir: dir });
     assert.deepEqual((await third('7:2')).ids, ['y']);
-    // Подменённый pin-файл именно для '7:1' — fail-closed.
-    const { createHash } = await import('node:crypto');
+    // Подмена содержимого без пересчёта digest — fail-closed.
     const name = `decisions-${createHash('sha256').update('7:1').digest('hex').slice(0, 32)}.json`;
-    await writeFile(join(dir, name), JSON.stringify({ digest: 'bad' }));
+    await writeFile(join(dir, name), JSON.stringify({ ...slice, text: 'forged' }));
     const fourth = pinDecisions(async () => slice, { persistDir: dir });
     await assert.rejects(() => fourth('7:1'), /decision_ledger_pin_invalid/);
+    // Подмена самого digest под чужие items — тоже fail-closed.
+    await writeFile(join(dir, name), JSON.stringify({ ...slice, digest: 'f'.repeat(64) }));
+    await assert.rejects(() => fourth('7:1'), /decision_ledger_pin_invalid/);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('pin publish is atomic: tmp+link, no partial file, winner pin is canonical', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'decision-pin-'));
+  try {
+    const a = sliceFor([{ id: 'a', scope: 'global', rule: 'ra' }]);
+    const b = sliceFor([{ id: 'b', scope: 'global', rule: 'rb' }]);
+    // Два «процесса» (два экземпляра) публикуют одновременно — выигрывает один,
+    // оба вызова получают один и тот же канонический срез.
+    const pinA = pinDecisions(async () => a, { persistDir: dir });
+    const pinB = pinDecisions(async () => b, { persistDir: dir });
+    const [ra, rb] = await Promise.all([pinA('8:1'), pinB('8:1')]);
+    assert.deepEqual(ra, rb);
+    assert.ok(ra.ids[0] === 'a' || ra.ids[0] === 'b');
+    const files = await readdir(dir);
+    assert.equal(files.filter(f => f.endsWith('.tmp')).length, 0);
+    const saved = JSON.parse(await readFile(join(dir, files[0]), 'utf8'));
+    assert.equal(saved.digest, ra.digest);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('canonical target parent inside/containing the worktree is rejected', async () => {
+  const { tree, dir, cleanup } = await sandbox();
+  try {
+    // Симлинк в операторском каталоге на файл в каталоге, СОДЕРЖАЩЕМ worktree:
+    // сам target вне tree, но его канонический родитель — нет.
+    const alias = join(dir, 'ops', 'linked.jsonl');
+    await symlink(join(dir, 'real.jsonl'), alias);
+    await assert.rejects(() => recordDecision({ ledgerPath: alias, scope: 'global', rule: 'x',
+      worktree: tree, sourceCard: '1', recordedBy: 'lead' }),
+      /decision_ledger_inside_worker_paths/);
+  } finally { await cleanup(); }
+});
+
+test('recordDecision refuses a duplicated id before appending', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const a = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'a', ...base('lead') });
+    await assert.rejects(() => recordDecision({ ledgerPath: ledger, scope: 'project:proj_bbb',
+      rule: 'hostile', id: a.id, ...base('lead') }), /decision_ledger_duplicate_id/);
+    const lines = (await readFile(ledger, 'utf8')).trim().split('\n');
+    assert.equal(lines.length, 1); // журнал не испорчен
+  } finally { await cleanup(); }
 });
