@@ -1,0 +1,17 @@
+# Шаблон systemd user-таймера для фабричного сторожа (раз в 10 минут).
+# УСТАНОВКА В ЖИВУЮ СИСТЕМУ — ТОЛЬКО ВЛАДЕЛЬЦЕМ И ВРУЧНУЮ (см. RESOURCE-STEWARD.md).
+
+[Unit]
+Description=Run darkfactory resource steward every 10 minutes
+
+[Timer]
+# Карточка VS-3: раз в 5–10 минут. 10 минут — дефолт; для 5 замени на *:0/5.
+OnCalendar=*:0/10
+AccuracySec=1min
+RandomizedDelaySec=45
+# Догонять пропущенные тики после сна/выключения машины.
+Persistent=true
+Unit=resource-steward.service
+
+[Install]
+WantedBy=timers.target
