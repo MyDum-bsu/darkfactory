@@ -279,3 +279,87 @@ test('pinDecisions resolves once per attempt key and reuses the snapshot', async
   assert.notEqual(a1, b);
   assert.equal(calls, 2);
 });
+
+test('ledger parent directory containing or inside the worktree is rejected', async () => {
+  const { tree, dir, cleanup } = await sandbox();
+  try {
+    // Журнал в каталоге, который содержит worktree: lockfile/запись небезопасны.
+    await assert.rejects(() => recordDecision({ ledgerPath: join(dir, 'top.jsonl'),
+      scope: 'global', rule: 'x', worktree: tree, sourceCard: '1', recordedBy: 'lead' }),
+      /decision_ledger_inside_worker_paths/);
+    // А журнал в изолированном операторском каталоге по-прежнему работает.
+    const rec = await recordDecision({ ledgerPath: join(dir, 'ops', 'ok.jsonl'),
+      scope: 'global', rule: 'x', worktree: tree, sourceCard: '1', recordedBy: 'lead' });
+    assert.equal(rec.status, 'active');
+  } finally { await cleanup(); }
+});
+
+test('a symlink to the same ledger shares the canonical lockfile', async () => {
+  const { tree, dir, ledger, cleanup } = await sandbox();
+  try {
+    const a = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'a', ...base('lead') });
+    const alias = join(dir, 'ops', 'alias.jsonl');
+    await symlink(ledger, alias);
+    const results = await Promise.allSettled([
+      recordDecision({ ledgerPath: alias, scope: 'global', rule: 'r1', supersedes: a.id, ...base('lead') }),
+      recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'r2', supersedes: a.id, ...base('lead') }),
+    ]);
+    assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+    const lines = (await readFile(ledger, 'utf8')).trim().split('\n');
+    assert.equal(lines.length, 2);
+    const slice = await resolveActiveDecisions({ ledgerPath: alias, worktree: tree });
+    assert.equal(slice.ids.length, 1);
+    // Lockfile после завершения убран; ни один не остался рядом с симлинком.
+    assert.rejects(() => readFile(`${ledger}.lock`), /ENOENT/);
+  } finally { await cleanup(); }
+});
+
+test('a duplicated id in the journal fails closed instead of masking scope', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const g = await recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'g', ...base('lead') });
+    // Валидная по sha256 запись project:b с тем же id — не должна перекрывать global.
+    await appendFile(ledger, `${JSON.stringify(forged({ id: g.id }))}\n`);
+    await assert.rejects(() => resolveActiveDecisions({ ledgerPath: ledger, worktree: tree }),
+      /decision_ledger_duplicate_id/);
+    await assert.rejects(() => recordDecision({ ledgerPath: ledger, scope: 'global', rule: 'x',
+      worktree: tree, ...base('lead') }), /decision_ledger_duplicate_id/);
+  } finally { await cleanup(); }
+});
+
+test('pinDecisions caches the in-flight promise: one resolve under a race', async () => {
+  let calls = 0;
+  const pinned = pinDecisions(async () => {
+    calls += 1;
+    await new Promise(r => setTimeout(r, 20));
+    return { text: 't', digest: 'd'.repeat(64), ids: [], truncated: false, total: 0 };
+  });
+  const [a, b, c] = await Promise.all([pinned('1:1'), pinned('1:1'), pinned('1:1')]);
+  assert.equal(calls, 1);
+  assert.equal(a, b);
+  assert.equal(b, c);
+});
+
+test('pinned snapshot persists across process restart for the same epoch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'decision-pin-'));
+  try {
+    const slice = { text: '- [global] r', digest: 'e'.repeat(64), ids: ['x'], truncated: false, total: 1 };
+    let calls = 0;
+    const first = pinDecisions(async () => { calls += 1; return slice; }, { persistDir: dir });
+    assert.deepEqual(await first('7:1'), slice);
+    // «Рестарт»: новый экземпляр, resolver упал бы — но вызова нет, срез из state.
+    const second = pinDecisions(async () => { throw new Error('must not resolve'); },
+      { persistDir: dir });
+    assert.deepEqual(await second('7:1'), slice);
+    assert.equal(calls, 1);
+    // Другой epoch — свой snapshot, не наследует чужой.
+    const third = pinDecisions(async () => ({ ...slice, ids: ['y'] }), { persistDir: dir });
+    assert.deepEqual((await third('7:2')).ids, ['y']);
+    // Подменённый pin-файл именно для '7:1' — fail-closed.
+    const { createHash } = await import('node:crypto');
+    const name = `decisions-${createHash('sha256').update('7:1').digest('hex').slice(0, 32)}.json`;
+    await writeFile(join(dir, name), JSON.stringify({ digest: 'bad' }));
+    const fourth = pinDecisions(async () => slice, { persistDir: dir });
+    await assert.rejects(() => fourth('7:1'), /decision_ledger_pin_invalid/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

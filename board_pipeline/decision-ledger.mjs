@@ -5,7 +5,8 @@
 // контентного sha256 или ledger внутри worktree — ошибка, а не пустой срез.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, lstat, mkdir, open, readFile, readlink, realpath, rm } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, open, readFile, readlink, realpath, rm,
+  writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
@@ -83,17 +84,26 @@ async function resolveLoose(path) {
 // внутри каталога ledger. Передаётся реальный worktree оператора, не
 // контролируемый воркером текст. Сверяется и лексический путь, и полностью
 // разрешённая через symlink цель (включая ещё не созданный файл).
+// Возвращает канонически разрешённую цель ledgerPath — вся последующая работа
+// (lockfile, read, append) идёт по ней, так что прямой путь и симлинк на тот же
+// журнал делят один lockfile и не обходят блокировку.
 async function assertLedgerOutside(ledgerPath, worktree) {
   if (!isAbsolute(ledgerPath)) throw new Error('decision_ledger_path_relative');
-  if (worktree === undefined) return;
+  const target = await resolveLoose(ledgerPath);
+  if (worktree === undefined) return target;
   const tree = await resolveExisting(worktree);
   if (tree === null) throw new Error('decision_ledger_worktree_missing');
   const norm = resolve(ledgerPath);
-  const target = await resolveLoose(ledgerPath);
+  const dirTarget = await resolveLoose(dirname(ledgerPath));
+  // Проверяются и сам журнал, и разрешённый родитель: lockfile создаётся рядом
+  // с канонической целью, но каталог по симлинку тоже не может указывать внутрь
+  // worktree.
   if (inside(tree, norm) || inside(norm, tree) ||
-      inside(tree, target) || inside(target, tree)) {
+      inside(tree, target) || inside(target, tree) ||
+      inside(tree, dirTarget) || inside(dirTarget, tree)) {
     throw new Error('decision_ledger_inside_worker_paths');
   }
+  return target;
 }
 
 async function readEntries(ledgerPath) {
@@ -123,7 +133,11 @@ async function readEntries(ledgerPath) {
 // project:a — подменённый журнал даёт ошибку, а не тихую изоляцию нарушителя.
 function foldEntries(entries) {
   const byId = new Map();
-  for (const rec of entries) byId.set(rec.id, rec);
+  for (const rec of entries) {
+    // Повторный id в журнале — подмена (project:b перекрывает global): fail-closed.
+    if (byId.has(rec.id)) throw new Error('decision_ledger_duplicate_id');
+    byId.set(rec.id, rec);
+  }
   const dead = new Set();
   for (const rec of entries) {
     if (rec.status === 'superseded') dead.add(rec.id);
@@ -142,8 +156,8 @@ function foldEntries(entries) {
 export async function resolveActiveDecisions({ ledgerPath, projectId, maxChars = DEFAULT_MAX_CHARS, worktree }) {
   if (projectId !== undefined && !PROJECT.test(projectId)) throw new Error('decision_ledger_project_invalid');
   if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error('decision_ledger_maxchars_invalid');
-  await assertLedgerOutside(ledgerPath, worktree);
-  const entries = await readEntries(ledgerPath);
+  const target = await assertLedgerOutside(ledgerPath, worktree);
+  const entries = await readEntries(target);
   const { byId, dead } = foldEntries(entries);
   const wanted = new Set(projectId === undefined ? ['global'] : ['global', `project:${projectId}`]);
   const active = entries.filter(rec => wanted.has(rec.scope) && !dead.has(rec.id) &&
@@ -201,10 +215,10 @@ export async function recordDecision({ ledgerPath, scope, rule, sourceCard, reco
   const card = String(sourceCard ?? '');
   if (!CARD.test(card)) throw new Error('decision_ledger_source_card_invalid');
   if (!RECORDED_BY.test(recordedBy ?? '')) throw new Error('decision_ledger_recorded_by_invalid');
-  await assertLedgerOutside(ledgerPath, worktree);
-  await mkdir(dirname(ledgerPath), { recursive: true, mode: 0o700 });
-  return withLedgerLock(ledgerPath, async () => {
-    const entries = await readEntries(ledgerPath);
+  const target = await assertLedgerOutside(ledgerPath, worktree);
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  return withLedgerLock(target, async () => {
+    const entries = await readEntries(target);
     const { byId, dead } = foldEntries(entries);
     const duplicate = entries.find(rec => rec.scope === scope && !dead.has(rec.id) &&
       byId.get(rec.id) === rec && rec.rule.trim() === rule.trim());
@@ -224,19 +238,59 @@ export async function recordDecision({ ledgerPath, scope, rule, sourceCard, reco
       source_card: card, timestamp: now.toISOString(), recorded_by: recordedBy,
       ...(supersedes !== undefined ? { supersedes } : {}) };
     record.sha256 = recordDigest(record);
-    await appendFile(ledgerPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    await appendFile(target, `${JSON.stringify(record)}\n`, { mode: 0o600 });
     return record;
   });
 }
 
+const isSlice = s => s !== null && typeof s === 'object' && !Array.isArray(s) &&
+  DIGEST.test(s.digest) && Array.isArray(s.ids) && s.ids.every(id => typeof id === 'string') &&
+  typeof s.text === 'string' && typeof s.truncated === 'boolean' && Number.isSafeInteger(s.total);
+
 // Закрепление активного среза за попыткой: воркер, критик и арбитр одного
 // кандидата видят один и тот же snapshot/digest, а не независимо перечитанный
-// журнал. Ключ — task_id:epoch попытки.
-export function pinDecisions(resolve_) {
+// журнал. Ключ — task_id:epoch попытки. In-flight Promise кладётся в кэш
+// синхронно (параллельные первые вызовы делят один срез); при persistDir
+// snapshot пишется атомарно (wx) в доверенный state-каталог — после рестарта
+// процесса тот же epoch получает строго тот же срез, который видел воркер.
+export function pinDecisions(resolve_, { persistDir } = {}) {
   const pins = new Map();
-  return async key => {
-    if (!pins.has(key)) pins.set(key, await resolve_());
-    return pins.get(key);
+  const fileFor = key => join(persistDir,
+    `decisions-${createHash('sha256').update(key).digest('hex').slice(0, 32)}.json`);
+  const readPinned = async file => {
+    let saved;
+    try { saved = JSON.parse(await readFile(file, 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+    if (!isSlice(saved)) throw new Error('decision_ledger_pin_invalid');
+    return saved;
+  };
+  return key => {
+    let pin = pins.get(key);
+    if (pin === undefined) {
+      pin = (async () => {
+        const file = persistDir === undefined ? null : fileFor(key);
+        if (file !== null) {
+          const saved = await readPinned(file);
+          if (saved !== undefined) return saved;
+        }
+        const slice = (await resolve_()) ?? null;
+        if (file !== null && slice !== null) {
+          if (!isSlice(slice)) throw new Error('decision_ledger_slice_invalid');
+          try {
+            await writeFile(file, JSON.stringify(slice), { mode: 0o600, flag: 'wx' });
+          } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+            // Параллельный процесс закрепил первым — его snapshot и есть канон.
+            const saved = await readPinned(file);
+            if (saved === undefined) throw new Error('decision_ledger_pin_invalid');
+            return saved;
+          }
+        }
+        return slice;
+      })();
+      pins.set(key, pin);
+    }
+    return pin;
   };
 }
 

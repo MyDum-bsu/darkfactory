@@ -200,7 +200,7 @@ async function execute() {
   // Единый snapshot на попытку (task_id:epoch): воркер, критик и арбитр одного
   // кандидата проверяют идентичный закреплённый срез/digest, а не журнал,
   // перечитанный в разные моменты.
-  const pinnedDecisions = pinDecisions(currentDecisions);
+  const pinnedDecisions = pinDecisions(currentDecisions, { persistDir: root });
   const decisionLedger = ledgerPath !== null && ledgerCfg.recordAnswers === true
     ? ({ answer, question }) => recordDecision({ ledgerPath, scope: decisionScope, rule: answer,
         sourceCard: question.task_id, recordedBy: ledgerCfg.recordedBy ?? 'question-resume',
