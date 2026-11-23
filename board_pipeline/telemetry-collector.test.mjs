@@ -757,6 +757,24 @@ test('ревью r2 #1: spawn + workerResume с bb_thread_id (как в run-isol
   assert.equal(snapshot.models[0].tokens.input, 100);
 });
 
+test('resumed pinned executor owns usage when the collector deduplicates its BB thread', async () => {
+  const executor = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const rec = createTelemetryRecorder({ models: { worker: { provider: 'acp-devin', model: 'swe-2-high' } } });
+  rec.observe({ task_id: '302', attempt_id: 'att-302', epoch: 1, bb_thread_id: 'thr_resume', executor });
+  rec.recordUsage('worker', { input_tokens: 123 }, 'bb_thread');
+  rec.roundStart();
+  rec.recordRound({ outcome: 'verified' });
+  const { record } = await rec.finish({ outcome: 'done' });
+  assert.deepEqual(record.models.worker, executor);
+  const snapshot = await collectTelemetry({
+    telemetryRuns: [{ kind: 'attempt_summary', schema: TELEMETRY_SCHEMA, ...record }],
+    bbThreads: [{ id: 'thr_resume', task_id: '302', ...executor, status: 'completed', usage: { input_tokens: 123 } }],
+  });
+  assert.equal(snapshot.models.length, 1);
+  assert.match(snapshot.models[0].model, /deepseek-v4\.1-flash/);
+  assert.equal(snapshot.models[0].tokens.input, 123);
+});
+
 test('ревью r2 #2: порядок попыток по времени [done@11:00, hold@09:00] выбирает done@11:00 и закрывает задачу', async () => {
   const snapshot = await collectTelemetry({
     telemetryRuns: [

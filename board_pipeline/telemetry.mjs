@@ -207,6 +207,8 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
     if (Number.isSafeInteger(subject.epoch)) identity.epoch = subject.epoch;
     const threadId = subject.bb_thread_id ?? subject.thread_id;
     if (typeof threadId === 'string' && threadId) identity.bb_thread_id = threadId;
+    // На восстановленной попытке окна spawn нет; источник модели — WAL, не дефолт политики.
+    model('worker', subject.executor);
   };
   const model = (role, spec) => {
     if (!ROLES.includes(role) || spec === null || typeof spec !== 'object' ||
