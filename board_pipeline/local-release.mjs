@@ -1,55 +1,19 @@
 import { execFile } from 'node:child_process';
-import { request } from 'node:http';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { canonicalDigest } from './subject.mjs';
-import { isVersion, promoteKey, ReleaseDenied, sameVersion } from './release-contract.mjs';
-import { ARTIFACT_LIMIT, digestBytes, makeReleaseRecord, openLocalTarget,
+import { promoteKey, ReleaseDenied, sameVersion } from './release-contract.mjs';
+import { ARTIFACT_LIMIT, makeReleaseRecord, openLocalTarget,
   readTargetRecord, writeExclusiveTargetRecord } from './release-target.mjs';
+import { releaseReader } from './release-readback.mjs';
 import { kernelLock, syncDir } from './slot.mjs';
 
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
-const HEX = /^[a-f0-9]{64}$/;
 const SAFE_PATH = /^[A-Za-z0-9][A-Za-z0-9_.-]*(\/[A-Za-z0-9][A-Za-z0-9_.-]*)*$/;
 
 export const promotingOperation = plan => canonicalDigest(plan);
 export const rollbackOperation = plan => canonicalDigest({ action: 'rollback', promotion: promotingOperation(plan) });
-
-function endpoint(url) {
-  if (typeof url !== 'string' || !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(url)) {
-    throw new ReleaseDenied('release_endpoint_invalid');
-  }
-  const port = Number(url.split(':').at(-1));
-  if (port === 44100 || port > 65535) throw new ReleaseDenied('release_endpoint_invalid');
-  return port;
-}
-
-async function get(port, path, limit) {
-  try {
-    const response = await new Promise((resolve, reject) => {
-      const req = request({ hostname: '127.0.0.1', port, path, method: 'GET', agent: false,
-        signal: AbortSignal.timeout(5000) }, resolve);
-      req.once('error', reject);
-      req.end();
-    });
-    if (response.statusCode !== 200) {
-      response.destroy();
-      throw new ReleaseDenied('release_target_readback_failed');
-    }
-    const chunks = [];
-    let bytes = 0;
-    for await (const chunk of response) {
-      bytes += chunk.length;
-      if (bytes > limit) throw new ReleaseDenied('release_target_reply_too_large');
-      chunks.push(chunk);
-    }
-    return { bytes: Buffer.concat(chunks), headers: response.headers };
-  } catch (cause) {
-    if (cause instanceof ReleaseDenied) throw cause;
-    throw new ReleaseDenied('release_target_unreachable', { cause });
-  }
-}
 
 async function trackedArtifact(worktree, sha, path, target) {
   if (typeof sha !== 'string' || !SHA.test(sha) || typeof path !== 'string' || !SAFE_PATH.test(path)) {
@@ -70,7 +34,7 @@ async function trackedArtifact(worktree, sha, path, target) {
 }
 
 export async function localReleasePort({ root, target, repo, url, worktree, artifact, smokePrefix }) {
-  const port = endpoint(url);
+  const reader = releaseReader(url);
   if (typeof artifact !== 'string' || !SAFE_PATH.test(artifact) || typeof smokePrefix !== 'string' ||
       !smokePrefix.trim() || smokePrefix.length > 128) throw new ReleaseDenied('release_policy_invalid');
   const site = await openLocalTarget(root, { target, repo });
@@ -79,15 +43,7 @@ export async function localReleasePort({ root, target, repo, url, worktree, arti
 
   async function readBack() {
     await site.assertTarget();
-    const reply = await get(port, '/version', 2048);
-    let live;
-    try { live = JSON.parse(reply.bytes.toString('utf8')); }
-    catch (cause) { throw new ReleaseDenied('release_readback_invalid', { cause }); }
-    if (!isVersion(live) || live.target !== target || live.instance !== site.instance ||
-        (live.operation !== null && (typeof live.operation !== 'string' || !HEX.test(live.operation)))) {
-      throw new ReleaseDenied('release_readback_invalid');
-    }
-    return { sha: live.sha, digest: live.digest, operation: live.operation };
+    return reader.readBack(site);
   }
 
   function checkPlan(plan) {
@@ -104,10 +60,7 @@ export async function localReleasePort({ root, target, repo, url, worktree, arti
   }
 
   async function smoke(expected) {
-    const { bytes, headers } = await get(port, '/artifact', ARTIFACT_LIMIT);
-    if (headers['x-release-instance'] !== site.instance || headers['x-release-sha'] !== expected.sha ||
-        headers['x-release-digest'] !== expected.digest || headers['x-release-operation'] !== (expected.operation ?? '') ||
-        digestBytes(bytes) !== expected.digest) throw new ReleaseDenied('release_smoke_version_changed');
+    const { bytes } = await reader.readArtifact(expected, site.instance);
     return { ok: bytes.toString('utf8').startsWith(smokePrefix), sha: expected.sha, digest: expected.digest };
   }
 
