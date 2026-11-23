@@ -18,17 +18,19 @@ import {
   rankCandidates,
 } from './model-scorecard.mjs';
 
-// Согласованная политика исполнителей: первичный, согласованный резерв и
-// узкий резерв (только при явном allowNarrowReserve в маршруте).
+// Согласованная политика исполнителей (Routing Policy v2): первичный и два
+// согласованных резерва независимых семейств. Резерв, нарушающий
+// кросс-семейственную триаду конкретного маршрута, пропускается — маршрут
+// продолжается по следующему кандидату.
 export const PRIMARY_WORKER = Object.freeze({ provider: 'acp-devin', model: 'swe-2-high' });
-export const FALLBACK_ZCODE = Object.freeze({
-  provider: 'acp-zcode-start',
-  model: 'builtin:zai-start-plan\\GLM-5.3-Flash',
-  effort: 'max',
-});
 export const NARROW_RESERVE_PI = Object.freeze({
   provider: 'pi',
   model: 'opencode-go/deepseek-v4.1-flash',
+});
+export const FALLBACK_ANTIGRAVITY_NEON = Object.freeze({
+  provider: 'acp-antigravity-acp',
+  model: 'gemini-4-neon',
+  reasoningLevel: 'high',
 });
 
 // Дефолтный критик и арбитр третьего независимого семейства.
@@ -50,14 +52,31 @@ export function workerFamily(worker) {
   return executorFamily(worker);
 }
 
-// Упорядоченный план исполнителей маршрута. Резерв ZCode входит в план
-// ТОЛЬКО при явном opts.zcodeQuota === 'available'; узкий резерв — только
-// при явном допуске в маршруте, не как общий автозаменитель.
-export function selectWorker({ route, zcodeQuota } = {}) {
-  const plan = [PRIMARY_WORKER];
-  if (zcodeQuota === 'available') plan.push(FALLBACK_ZCODE);
-  if (route?.allowNarrowReserve === true) plan.push(NARROW_RESERVE_PI);
-  return plan;
+// Политика opencode-go: допускаются строго модели DeepSeek
+// ('opencode-go/deepseek-*'). Любая другая модель opencode-go — явный отказ
+// 'opencode_go_non_deepseek_disallowed'. Для харнесса 'pi' правило
+// применяется к вложенной модели вида 'provider/model'.
+export function opencodeGoPolicyViolation(spec) {
+  if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) return null;
+  const check = model =>
+    /^deepseek-/i.test(model ?? '') ? null : 'opencode_go_non_deepseek_disallowed';
+  if (typeof spec.provider === 'string' && spec.provider.toLowerCase() === 'opencode-go') {
+    return check(spec.model);
+  }
+  if (typeof spec.provider === 'string' && spec.provider.toLowerCase() === 'pi' &&
+      typeof spec.model === 'string' && spec.model.includes('/')) {
+    const i = spec.model.indexOf('/');
+    if (spec.model.slice(0, i).toLowerCase() === 'opencode-go') return check(spec.model.slice(i + 1));
+  }
+  return null;
+}
+
+// Упорядоченный план исполнителей маршрута: первичный acp-devin/swe-2-high,
+// затем согласованные резервы независимых семейств. Фактическая пригодность
+// резерва решается попыткой: нарушитель триады пропускается, подтверждённый
+// отказ допускает переход только при доказанной чистоте worktree.
+export function selectWorker() {
+  return [PRIMARY_WORKER, NARROW_RESERVE_PI, FALLBACK_ANTIGRAVITY_NEON];
 }
 
 // Триада: family(critic) !== family(executor) и арбитр из третьего
@@ -109,32 +128,45 @@ async function cleanAfterRefusal(source, attempt, inspectWorktree) {
 }
 
 // Последовательный запуск по плану с честным различением исходов.
-// probe(worker) → 'available' | 'confirmed_refusal' | { status, zcodeQuota,
+// probe(worker) → 'available' | 'confirmed_refusal' | { status,
 // activeBackgroundAgentCount }; spawn(attempt) → { threadId } либо конверт
 // подтверждённого отказа { status: 'confirmed_refusal',
 // activeBackgroundAgentCount: 0 }. inspectWorktree(attempt) →
 // { clean, head } — обязателен для любого перехода на резерв.
 export async function attemptSpawnWithFallback({
-  route, attempt, probe, spawn, plan, zcodeQuota, inspectWorktree,
+  route, attempt, probe, spawn, plan, inspectWorktree,
   critic = DEFAULT_CRITIC, arbiter = DEFAULT_ARBITER,
 }) {
-  const order = plan ?? selectWorker({ route, zcodeQuota });
-  // Кросс-семейственная триада проверяется для ВСЕХ кандидатов цепочки:
-  // нарушивший независимость резерв отклоняет маршрут, а не пропускается тихо.
-  for (const worker of order) {
+  const order = plan ?? selectWorker({ route });
+  // Кросс-семейственная триада проверяется для каждого кандидата до запуска:
+  // первичный, нарушивший независимость, отклоняет маршрут; резерв с
+  // нарушением или запрещённой моделью пропускается с явным вердиктом —
+  // инвариант трёх семейств сохраняется без остановки маршрута.
+  const attemptedWorkers = [];
+  const order2 = [];
+  for (const [index, worker] of order.entries()) {
+    const violation = opencodeGoPolicyViolation(worker);
     try {
+      if (violation) throw new ReviewDenied(violation);
       assertTriadIndependent({ executor: worker, critic, arbiter });
+      order2.push(worker);
     } catch (e) {
-      return {
-        outcome: 'rejected',
-        reason: `route_triad_violation:${e.reason ?? e.message}`,
-        attemptedWorkers: [],
-      };
+      if (index === 0) {
+        return {
+          outcome: 'rejected',
+          reason: e.reason === violation
+            ? violation
+            : `route_triad_violation:${e.reason ?? e.message}`,
+          attemptedWorkers: [],
+        };
+      }
+      attemptedWorkers.push({ ...worker, family: workerFamily(worker),
+        verdict: 'skipped',
+        reason: e.reason === violation ? violation : `triad_violation:${e.reason ?? e.message}` });
     }
   }
-  const attemptedWorkers = [];
   let lastRefusal = null;
-  for (const worker of order) {
+  for (const worker of order2) {
     let probed = { status: 'available', activeBackgroundAgentCount: 0 };
     if (typeof probe === 'function') {
       try {
@@ -163,21 +195,6 @@ export async function attemptSpawnWithFallback({
         };
       }
       const reason = `confirmed_refusal:${worker.provider}`;
-      attemptedWorkers.push({ ...worker, family: workerFamily(worker), verdict: 'confirmed_refusal', reason });
-      lastRefusal = reason;
-      continue;
-    }
-    // Согласованный резерв ZCode — только при подтверждённой доступности/квоте.
-    if (worker === FALLBACK_ZCODE && probed?.zcodeQuota !== 'available') {
-      if (!await cleanAfterRefusal(probed, attempt, inspectWorktree)) {
-        return {
-          outcome: 'uncertain',
-          reason: 'worker_launch_outcome_unknown',
-          attemptedWorkers: [...attemptedWorkers,
-            { ...worker, family: workerFamily(worker), verdict: 'unknown_outcome' }],
-        };
-      }
-      const reason = 'zcode_quota_unavailable';
       attemptedWorkers.push({ ...worker, family: workerFamily(worker), verdict: 'confirmed_refusal', reason });
       lastRefusal = reason;
       continue;
@@ -548,6 +565,8 @@ export function normalizeRoutingPolicy(policy) {
       const spec = { provider: entry?.provider, model: entry?.model,
         ...(entry?.effort !== undefined ? { effort: entry.effort } : {}),
         ...(entry?.reasoningLevel !== undefined ? { reasoningLevel: entry.reasoningLevel } : {}) };
+      const violation = opencodeGoPolicyViolation(spec);
+      if (violation) throw new ReviewDenied(violation);
       if (workerFamily(spec) === null) throw new ReviewDenied('route_allowlist_unknown_family');
       return spec;
     });
@@ -694,4 +713,82 @@ export function routeTriad({ size, domain, policy, scorecard,
   }
   return { outcome: steps.worker.mode === 'active' ? 'routed' : 'shadow',
     mode: steps.worker.mode, selected, steps };
+}
+
+// ── Точечный escalation-слот Opus 5.5 (Routing Policy v2) ─────────────────
+// «Хирургический» сторонний ревьюер для high-stakes ситуаций: активируется
+// ТОЛЬКО при одновременном выполнении (а) явного high-stakes триггера,
+// (б) подтверждённой квоты с жёстким cap и (в) инварианта трёх независимых
+// семейств (anthropic ≠ worker ≠ primary critic). Иначе — детерминированный
+// graceful fallback на Pi/Sol или Gemini 4 Neon high с явной причиной.
+
+export const ESCALATION_REVIEWER_OPUS = Object.freeze({
+  provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'high',
+});
+export const ESCALATION_FALLBACK_PI_SOL = Object.freeze({
+  provider: 'pi', model: 'openai/gpt-6.2-sol', reasoningLevel: 'high',
+});
+export const ESCALATION_FALLBACK_NEON_HIGH = Object.freeze({
+  provider: 'acp-antigravity-acp', model: 'gemini-4-neon', reasoningLevel: 'high',
+});
+const ESCALATION_FALLBACKS = Object.freeze([
+  ESCALATION_FALLBACK_PI_SOL, ESCALATION_FALLBACK_NEON_HIGH,
+]);
+
+const HIGH_STAKES_TRIGGERS = new Set(['security_gate', 'release_gate', 'critical_math_or_arch']);
+
+// Явный high-stakes триггер: строка-код, либо объект с полем kind/name/
+// trigger из фиксированного списка, либо dispute_rounds >= 2.
+function escalationTriggerActive(trigger) {
+  if (typeof trigger === 'string') return HIGH_STAKES_TRIGGERS.has(trigger);
+  if (trigger === null || typeof trigger !== 'object' || Array.isArray(trigger)) return false;
+  if (Number.isSafeInteger(trigger.dispute_rounds) && trigger.dispute_rounds >= 2) return true;
+  return HIGH_STAKES_TRIGGERS.has(trigger.kind ?? trigger.name ?? trigger.trigger);
+}
+
+// Доступная квота Opus: status 'available', remaining >= 1 и — при заданном
+// жёстком cap — used строго меньше cap. Что-либо недоказано — недоступно.
+function opusQuotaAvailable(quota) {
+  if (quota === null || typeof quota !== 'object' || Array.isArray(quota)) return false;
+  if (quota.status !== 'available') return false;
+  if (!Number.isSafeInteger(quota.remaining) || quota.remaining < 1) return false;
+  if (quota.cap !== undefined) {
+    if (!Number.isSafeInteger(quota.cap) || !Number.isSafeInteger(quota.used) ||
+        quota.used >= quota.cap) return false;
+  }
+  return true;
+}
+
+// Детерминированный выбор escalation-ревьюера.
+// trigger — high-stakes триггер; quota — { status, remaining, used, cap };
+// triad — { worker, critic } действующей пары (семейства обязаны быть
+// аттестованы: неизвестное семейство не доказывает независимость).
+// Возврат: { outcome: 'selected', reviewer, family } — слот Opus 5.5;
+// { outcome: 'fallback', reason, reviewer, family } — Pi/Sol либо
+// Gemini 4 Neon high с причиной ('no_escalation_trigger',
+// 'opus_quota_exhausted', 'opus_triad_violation'); { outcome: 'rejected',
+// reason: 'escalation_reviewer_unavailable' } — ни один вариант не
+// сохраняет инвариант.
+export function selectEscalationReviewer({ trigger, quota, triad } = {}) {
+  const workerFam = workerFamily(triad?.worker ?? triad?.executor);
+  const criticFam = workerFamily(triad?.critic);
+  const independent = spec => {
+    if (workerFam === null || criticFam === null) return false;
+    const family = workerFamily(spec);
+    return family !== null && family !== workerFam && family !== criticFam;
+  };
+  const fallback = reason => {
+    for (const spec of ESCALATION_FALLBACKS) {
+      if (independent(spec)) {
+        return { outcome: 'fallback', reason, reviewer: spec, family: workerFamily(spec) };
+      }
+    }
+    return { outcome: 'rejected', reason: 'escalation_reviewer_unavailable',
+      fallbackReason: reason, reviewer: null };
+  };
+  if (!escalationTriggerActive(trigger)) return fallback('no_escalation_trigger');
+  if (!opusQuotaAvailable(quota)) return fallback('opus_quota_exhausted');
+  if (!independent(ESCALATION_REVIEWER_OPUS)) return fallback('opus_triad_violation');
+  return { outcome: 'selected', reviewer: ESCALATION_REVIEWER_OPUS,
+    family: workerFamily(ESCALATION_REVIEWER_OPUS) };
 }

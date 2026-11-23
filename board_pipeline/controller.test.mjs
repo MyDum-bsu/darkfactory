@@ -382,27 +382,29 @@ test('queue mode does not admit a card whose profile_id differs from the route p
 test('worker selector spawns the agreed fallback only on a confirmed refusal and records the trail', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector();
-  x.cfg.route.zcodeQuota = 'available';
   x.cfg.bb.probeAvailability = async w => w.provider === 'acp-devin'
     ? { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 }
-    : { status: 'available', activeBackgroundAgentCount: 0, zcodeQuota: 'available' };
+    : { status: 'available', activeBackgroundAgentCount: 0 };
   x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
   x.cfg.bb.spawn = async env => {
     x.effects.spawn++;
-    assert.equal(env.executor.provider, 'acp-zcode-start');
-    assert.equal(env.executor.model, 'builtin:zai-start-plan\\GLM-5.3-Flash');
-    return { threadId: 'thr_glm1' };
+    assert.equal(env.executor.provider, 'pi');
+    assert.equal(env.executor.model, 'opencode-go/deepseek-v4.1-flash');
+    return { threadId: 'thr_ds1' };
   };
   assert.equal((await x.tick()).phase, 'working');
   const record = await x.cfg.state.load();
-  assert.equal(record.executor.provider, 'acp-zcode-start');
+  assert.equal(record.executor.provider, 'pi');
   assert.equal(record.fallbackReason, 'confirmed_refusal:acp-devin');
-  assert.equal(record.attemptedWorkers.length, 2);
+  // google-критик по умолчанию исключает antigravity/gemini — он записан
+  // пропущенным до подтверждённого отказа первичного и spawn резерва.
+  assert.equal(record.attemptedWorkers.length, 3);
+  assert.equal(record.attemptedWorkers[0].verdict, 'skipped');
   assert.equal(x.effects.spawn, 1, 'первичный не спаунился после probe confirmed_refusal');
   x.submit('c');
   assert.equal((await x.tick()).phase, 'done');
   const attempt = x.effects.attempts.at(-1);
-  assert.equal(attempt.executor.provider, 'acp-zcode-start',
+  assert.equal(attempt.executor.provider, 'pi',
     'доверенная попытка несёт фактического исполнителя');
 });
 
@@ -415,14 +417,13 @@ test('worker selector quarantines an unknown launch outcome without a second wri
   assert.equal((await x.tick()).reason, 'worker_launch_outcome_unknown');
   assert.equal(x.effects.spawn, 0);
   const record = await x.cfg.state.load();
-  assert.equal(record.attemptedWorkers[0].verdict, 'unknown_outcome');
+  assert.equal(record.attemptedWorkers.find(w => w.provider === 'acp-devin').verdict, 'unknown_outcome');
 });
 
 // Пункт 3: отказ первичного при грязном worktree — карантин без второго писателя.
 test('worker selector quarantines a confirmed refusal on a dirty worktree', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector();
-  x.cfg.route.zcodeQuota = 'available';
   x.cfg.bb.probeAvailability = async () =>
     ({ status: 'confirmed_refusal', activeBackgroundAgentCount: 0 });
   x.cfg.bb.inspectWorktree = async () => ({ clean: false, head: 'a'.repeat(40) });
@@ -441,17 +442,30 @@ test('a triad violation rejects the route before any claim or spawn', async t =>
   assert.equal(x.effects.spawn, 0);
 });
 
-// Пункт 4: триада проверяется для ВСЕХ кандидатов — резерв ZCode семейства glm
-// конфликтует с критиком glm, маршрут отклоняется до claim.
-test('a fallback violating the triad rejects the route before claim', async t => {
+// Пункт 4: нарушение триады первичным отклоняет маршрут до claim; нарушение
+// резервом — пропуск резерва, маршрут продолжается со следующим кандидатом.
+test('a fallback violating the triad is skipped, the route continues', async t => {
   const x = await lab(t);
   x.cfg.workerSelector = workerSelector();
-  x.cfg.route.zcodeQuota = 'available';
-  x.cfg.route.critic = { provider: 'acp-zcode-start',
-    model: 'builtin:zai-start-plan\\GLM-5.3-Flash' };
-  assert.equal((await x.tick()).reason, 'route_triad_violation:review_same_family');
-  assert.equal((await x.inspect()).state, 'ready');
-  assert.equal(x.effects.spawn, 0);
+  // Критик deepseek: резерв pi/deepseek ломает триаду и пропускается,
+  // antigravity/gemini остаётся допустимым резервом.
+  x.cfg.route.critic = { provider: 'opencode-go', model: 'deepseek-v4' };
+  x.cfg.bb.probeAvailability = async w => w.provider === 'acp-devin'
+    ? { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 }
+    : { status: 'available', activeBackgroundAgentCount: 0 };
+  x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
+  x.cfg.bb.spawn = async env => {
+    x.effects.spawn++;
+    assert.equal(env.executor.provider, 'acp-antigravity-acp');
+    return { threadId: 'thr_neon1' };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.equal(record.executor.provider, 'acp-antigravity-acp');
+  const skipped = record.attemptedWorkers.find(w => w.provider === 'pi');
+  assert.equal(skipped.verdict, 'skipped');
+  assert.match(skipped.reason, /^triad_violation:/);
+  assert.equal(x.effects.spawn, 1);
 });
 
 test('three converging rework rounds complete without a round cap', async t => {

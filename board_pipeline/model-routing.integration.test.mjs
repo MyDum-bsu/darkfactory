@@ -10,9 +10,11 @@ import {
   DEFAULT_ARBITER,
   DEFAULT_CRITIC,
   normalizeRoutingPolicy,
+  opencodeGoPolicyViolation,
   PRIMARY_WORKER,
   routeRole,
   routeTriad,
+  selectEscalationReviewer,
   workerFamily,
 } from './worker-selector.mjs';
 import { ReviewDenied } from './review-runner.mjs';
@@ -298,4 +300,47 @@ test('end-to-end: реальный журнал на диске → отчёт �
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+// ── Routing Policy v2 интеграция: opencode-go и Opus 5.5 escalation ────────
+test('opencode-go: не-DeepSeek модель в allowlist — явный отказ политики', () => {
+  // DeepSeek допускается и маршрутизируется.
+  const ok = normalizeRoutingPolicy(policy('active', {
+    worker: [DEVIN, DEEPSEEK], critic: [NEON], arbiter: [SOL] }));
+  assert.equal(ok.allowlist.worker.length, 2);
+  // Не-DeepSeek opencode-go — отказ с причиной политики, в т.ч. через pi-харнесс.
+  for (const spec of [{ provider: 'opencode-go', model: 'deepseek-v4' },
+      { provider: 'pi', model: 'opencode-go/kimi-k2' }]) {
+    const violation = opencodeGoPolicyViolation(spec);
+    const expected = spec.model.endsWith('kimi-k2')
+      ? 'opencode_go_non_deepseek_disallowed' : null;
+    assert.equal(violation, expected, JSON.stringify(spec));
+  }
+  assert.throws(() => normalizeRoutingPolicy(policy('active', {
+    worker: [DEVIN, { provider: 'pi', model: 'opencode-go/qwen3-coder' }],
+    critic: [NEON], arbiter: [SOL] })),
+    e => e instanceof ReviewDenied && e.reason === 'opencode_go_non_deepseek_disallowed');
+});
+
+test('Opus 5.5 escalation: все три условия → anthropic; иначе graceful fallback', () => {
+  const triad = { worker: DEVIN, critic: NEON };
+  const quota = { status: 'available', remaining: 1, used: 0, cap: 3 };
+  // High-stakes триггер + квота + инвариант → слот Opus 5.5.
+  const opus = selectEscalationReviewer({ trigger: 'release_gate', quota, triad });
+  assert.equal(opus.outcome, 'selected');
+  assert.equal(opus.reviewer.provider, 'agy');
+  assert.equal(opus.family, 'anthropic');
+  // Семейство ревьюера независимо от воркера и критика триады.
+  const fams = new Set([opus.family, workerFamily(DEVIN), workerFamily(NEON)]);
+  assert.equal(fams.size, 3);
+  // Исчерпанная квота → детерминированный fallback Pi/Sol с явной причиной.
+  const fb = selectEscalationReviewer({
+    trigger: { dispute_rounds: 3 }, quota: { status: 'available', remaining: 0 }, triad });
+  assert.equal(fb.outcome, 'fallback');
+  assert.equal(fb.reason, 'opus_quota_exhausted');
+  assert.equal(fb.reviewer.provider, 'pi');
+  // Без триггера — тот же детерминированный fallback, другая причина.
+  const noTrig = selectEscalationReviewer({ trigger: 'local_checks_failed', quota, triad });
+  assert.equal(noTrig.outcome, 'fallback');
+  assert.equal(noTrig.reason, 'no_escalation_trigger');
 });

@@ -59,6 +59,7 @@ const PROVIDER_FAMILY = new Map([
   ['openai', 'openai'],
   ['google', 'google'],
   ['acp-antigravity-acp', 'google'],
+  ['agy', 'anthropic'],
 ]);
 // Провайдеры-харнессы: сами семейства не несут, семейство берётся из модели.
 const HARNESS_PROVIDERS = new Set(['pi']);
@@ -78,6 +79,7 @@ const MODEL_FAMILY = new Map([
   ['gpt-5.6-sol', 'openai'],
   ['codex', 'openai'],
   ['gemini-4-neon', 'google'],
+  ['claude-opus-5.5', 'anthropic'],
 ]);
 
 // Семейство по идентификатору исполнителя/критика. Строка вида 'acp-devin'

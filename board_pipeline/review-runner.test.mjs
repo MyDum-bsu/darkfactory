@@ -31,6 +31,8 @@ test('family: строгая таблица provider/model без подстро
   assert.equal(executorFamily('openai/gpt-6.2-sol'), 'openai');
   assert.equal(executorFamily({ provider: 'openai', model: 'gpt-6.2-astra' }), 'openai');
   assert.equal(executorFamily({ provider: 'acp-antigravity-acp', model: 'gemini-4-neon' }), 'google');
+  // Routing Policy v2: escalation-слот Opus 5.5 — семейство anthropic.
+  assert.equal(executorFamily({ provider: 'agy', model: 'claude-opus-5.5' }), 'anthropic');
   // Провайдер без модели и модель без провайдера — отказ.
   assert.equal(executorFamily({ provider: 'openai' }), null);
   assert.equal(executorFamily({ model: 'gpt-6.2-sol' }), null);

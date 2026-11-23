@@ -31,7 +31,16 @@ const inside = (root, p) => {
   const rel = relative(root, p);
   return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
-const approved = new Map([['acp-devin', 'swe-2-high'], ['acp-zcode-start', 'builtin:zai-start-plan\\GLM-5.3-Flash']]);
+// Routing Policy v2: зависимость от acp-zcode-start снята. Допущены
+// acp-devin/swe-2-high и acp-antigravity-acp/gemini-4-neon; харнесс pi —
+// только с моделями opencode-go/deepseek-* (см. opencodeGoPolicyViolation).
+const approved = [
+  { provider: 'acp-devin', model: 'swe-2-high' },
+  { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' },
+];
+const isApprovedWorker = bb =>
+  approved.some(e => e.provider === bb?.provider && e.model === bb?.model) ||
+  (bb?.provider === 'pi' && /^opencode-go\/deepseek-/i.test(bb?.model ?? ''));
 
 async function operatorReviewSetup(policy) {
   const critic = policy.profiles?.[policy.route.checkProfile]?.review;
@@ -99,8 +108,9 @@ async function execute() {
   const activation = boardActivation(p, {
     allowLive: values['allow-live-pilot'], pilotChannel: process.env.DF_PILOT_CHANNEL,
   });
-  if (!p.bb || !approved.has(p.bb.provider) || approved.get(p.bb.provider) !== p.bb.model ||
-      (p.bb.provider === 'acp-zcode-start' && p.bb.effort !== 'max') || !/^proj_[a-z0-9]+$/.test(p.bb.project ?? '')) {
+  const opencodeViolation = workerSelector.opencodeGoPolicyViolation(p.bb);
+  if (opencodeViolation) throw new Error(opencodeViolation);
+  if (!p.bb || !isApprovedWorker(p.bb) || !/^proj_[a-z0-9]+$/.test(p.bb.project ?? '')) {
     throw new Error('Implementation preset is not approved');
   }
   // Режим прав исполнителя: 'full' нужен живому воркеру для локальных
@@ -150,8 +160,7 @@ async function execute() {
   let telemetry = newTelemetry();
   // Фактический источник токенов критика: поток agy (neon) или pi-транскрипт.
   const criticSource = reviewSetup.neon ? 'agy_stream' : 'pi_stream';
-  const route = { ...p.route, policyDigest: pinned.digest,
-    zcodeQuota: p.zcodeQuota ?? p.bb?.zcodeQuota };
+  const route = { ...p.route, policyDigest: pinned.digest };
   // Queue-driven маршрут без route.taskId: карточку берёт board.claimReady по
   // allowlist оператора (owner + маршрутная метка + дополнительно требуемые метки).
   if (route.taskId === undefined) {
@@ -203,12 +212,8 @@ async function execute() {
   const bb = {
     // Доступность исполнителя и квоты — отдельно от spawn; фактический запуск
     // и конверт проверяются независимо (спека §4, §5).
-    async probeAvailability(worker) {
-      return {
-        status: 'available',
-        activeBackgroundAgentCount: 0,
-        zcodeQuota: worker?.provider === 'acp-zcode-start' ? route.zcodeQuota : undefined,
-      };
+    async probeAvailability() {
+      return { status: 'available', activeBackgroundAgentCount: 0 };
     },
     // Доказательство чистоты worktree до любого перехода на резерв: ноль
     // фоновых агентов + clean и HEAD на base_sha попытки.

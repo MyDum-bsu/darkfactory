@@ -205,17 +205,16 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     record.reason === 'invalid_or_stale_submission' && !record.turnSeq && record.seenShas.length === 0;
   if (recheckRejectedHandoff && !recheck) return { phase: 'hold', reason: 'no_rejected_handoff_to_recheck' };
   if (!record) {
-    // Кросс-семейственная триада отвергает маршрут до claim — для ВСЕХ
-    // кандидатов цепочки: нарушивший независимость резерв блокирует маршрут.
+    // Кросс-семейственная триада отвергает маршрут до claim, если её нарушает
+    // первичный исполнитель; резерв-нарушитель пропускается попыткой.
     if (workerSelector) {
       if (criticMismatch) {
         await save({ binding, phase: 'hold', reason: 'review_profile_mismatch', seenShas: [] });
         return visible();
       }
       try {
-        for (const candidate of workerSelector.selectWorker({ route, zcodeQuota: route.zcodeQuota })) {
-          workerSelector.assertTriadIndependent({ executor: candidate, critic: selCritic, arbiter: selArbiter });
-        }
+        const [primary] = workerSelector.selectWorker({ route });
+        workerSelector.assertTriadIndependent({ executor: primary, critic: selCritic, arbiter: selArbiter });
       } catch (e) {
         await save({ binding, phase: 'hold',
           reason: `route_triad_violation:${e.reason ?? e.message}`, seenShas: [] });
@@ -268,7 +267,6 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         // отказе, неизвестный исход — карантин без второго писателя.
         const selection = await workerSelector.attemptSpawnWithFallback({
           route, attempt: attemptOf(record, route),
-          zcodeQuota: route.zcodeQuota,
           critic: selCritic,
           arbiter: selArbiter,
           probe: typeof bb.probeAvailability === 'function' ? w => bb.probeAvailability(w) : undefined,
