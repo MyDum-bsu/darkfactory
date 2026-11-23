@@ -28,6 +28,7 @@ import {
   writeTrustedReviewReceipt,
 } from './project-memory.mjs';
 import { arbiterIntakePrompt, projectMemoryPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
+import { recordPostReviewMemory } from './run-isolated.mjs';
 
 const exec = promisify(execFile);
 const cli = fileURLToPath(new URL('./project-memory.mjs', import.meta.url));
@@ -674,5 +675,62 @@ test('regression R3/R4/R5: no raw write or capability export; only pinned create
     // Valid receipt inside pinned trustedReceiptDir with valid HMAC -> succeeds
     const ok = await writer.recordUpdate({ projectId: 'proj_r5', receiptPath: goodReceiptPath, updates });
     assert.equal(ok.total, 1);
+  } finally { await cleanup(); }
+});
+
+test('regression R6: run-isolated recordPostReviewMemory writes memory after REVIEW_OK and skips on REWORK/hold', async () => {
+  const { tree, storeDir, receiptDir, writer, cleanup } = await sandbox();
+  const attempt = { task_id: '1265', attempt_id: 'att-r6', epoch: 1 };
+  const submission = { candidate_sha: SHA_A };
+  const worker = { provider: 'openai', model: 'gpt-6.2-sol' };
+  const reviewer = { provider: 'google', model: 'gemini-4-neon' };
+  const updates = [{ id: 'r6-inv', section: 'invariants', text: 'Post-review steward persists verified memory' }];
+  try {
+    // On REWORK or hold (or non-REVIEW_OK verdict), nothing is written to receipts or memory
+    for (const bad of [
+      { result: { outcome: 'rework' }, reviewReceipt: { verdict: 'REVIEW_REWORK', sha: SHA_A } },
+      { result: { outcome: 'hold' }, reviewReceipt: { verdict: 'REVIEW_BLOCKED', sha: SHA_A } },
+      { result: { outcome: 'done' }, reviewReceipt: { verdict: 'REVIEW_REWORK', sha: SHA_A } },
+    ]) {
+      const skipped = await recordPostReviewMemory({
+        writer,
+        trustedReceiptDir: receiptDir,
+        hmacKey: TEST_HMAC_KEY,
+        projectId: 'proj_r6',
+        worktree: tree,
+        attempt,
+        submission,
+        worker,
+        reviewer,
+        updates,
+        ...bad,
+      });
+      assert.equal(skipped.recorded, false);
+      assert.equal(skipped.reason, 'not_review_ok');
+    }
+    assert.equal((await resolveProjectMemory({ storeDir, projectId: 'proj_r6', worktree: tree })).total, 0);
+    assert.equal((await readdir(receiptDir)).length, 0);
+
+    // On confirmed REVIEW_OK + done outcome, writes HMAC-signed receipt and calls writer.recordUpdate
+    const written = await recordPostReviewMemory({
+      writer,
+      trustedReceiptDir: receiptDir,
+      hmacKey: TEST_HMAC_KEY,
+      projectId: 'proj_r6',
+      worktree: tree,
+      result: { outcome: 'done' },
+      reviewReceipt: { verdict: 'REVIEW_OK', sha: SHA_A },
+      attempt,
+      submission,
+      worker,
+      reviewer,
+      updates,
+    });
+    assert.equal(written.recorded, true);
+    assert.equal(written.result.total, 1);
+
+    const slice = await resolveProjectMemory({ storeDir, projectId: 'proj_r6', worktree: tree });
+    assert.deepEqual(slice.ids, ['r6-inv']);
+    assert.match(slice.text, /Post-review steward persists verified memory/);
   } finally { await cleanup(); }
 });

@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { parseArgs, promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import { acceptHeld } from './acceptance.mjs';
 import { reserveWorktree, saveState } from './slot.mjs';
 import { advanceWithProjection } from './controller.mjs';
@@ -27,7 +28,8 @@ import { arbiterIntakePrompt, decisionsPromptBlock, projectMemoryPromptBlock,
 import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
   resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
 import { createProjectMemoryWriter, DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS,
-  memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir, resolveProjectMemory } from './project-memory.mjs';
+  memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir, resolveProjectMemory,
+  writeTrustedReviewReceipt } from './project-memory.mjs';
 import { createTelemetryRecorder, threadUsage } from './telemetry.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
@@ -101,6 +103,62 @@ async function releaseSetup(policy, { tree, inbox, root }) {
   }
   return localReleasePort({ root: target, target: config.target, repo: policy.route.repoId,
     url: config.url, worktree: tree, artifact: config.artifact, smokePrefix: config.smokePrefix });
+}
+
+const ACCEPTED_MEMORY_OUTCOMES = new Set(['done', 'accepted', 'verified']);
+
+// Доверенный пост-шаг записи в Project Memory после подтверждённого REVIEW_OK:
+// при rework/hold/отсутствии REVIEW_OK квитанция не выписывается и память не
+// обновляется. При успехе выписывает HMAC-подписанную квитанцию в
+// trustedReceiptDir и вызывает закреплённый writer.recordUpdate(...).
+export async function recordPostReviewMemory({
+  writer,
+  trustedReceiptDir,
+  hmacKey,
+  projectId,
+  worktree,
+  result,
+  reviewReceipt,
+  attempt,
+  submission,
+  worker,
+  reviewer,
+  updates,
+}) {
+  if (!writer) return { recorded: false, reason: 'writer_not_configured' };
+  if (!ACCEPTED_MEMORY_OUTCOMES.has(result?.outcome) || reviewReceipt?.verdict !== 'REVIEW_OK') {
+    return { recorded: false, reason: 'not_review_ok' };
+  }
+  const verifiedSha = submission?.candidate_sha;
+  if (typeof verifiedSha !== 'string' || !/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(verifiedSha)) {
+    return { recorded: false, reason: 'invalid_sha' };
+  }
+  if (reviewReceipt?.sha !== undefined && reviewReceipt.sha !== verifiedSha) {
+    return { recorded: false, reason: 'sha_mismatch' };
+  }
+  if (!Array.isArray(updates) || updates.length === 0) {
+    return { recorded: false, reason: 'no_updates' };
+  }
+  const receiptPath = join(
+    trustedReceiptDir,
+    `review-${attempt.task_id}-${attempt.attempt_id}-${verifiedSha.slice(0, 12)}.receipt.json`,
+  );
+  await writeTrustedReviewReceipt({
+    receiptPath,
+    trustedReceiptDir,
+    hmacKey,
+    worktree,
+    receipt: {
+      role: 'controller',
+      verdict: 'REVIEW_OK',
+      sha: verifiedSha,
+      worker,
+      reviewer,
+      sourceCard: String(attempt.task_id),
+    },
+  });
+  const saved = await writer.recordUpdate({ projectId, receiptPath, updates });
+  return { recorded: true, receiptPath, result: saved };
 }
 
 async function execute() {
@@ -478,6 +536,7 @@ async function execute() {
       // VS-3: фазы приёмки (L1 local, tamper, L3 visual, L2 critic) замеряются
       // вокруг портов; usage критика — из квитанции ревью, иначе null.
       telemetry.roundStart();
+      let lastReviewReceipt = null;
       const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', worktreeInspector(policy)),
         local: telemetry.port('l1_local', offlineProfileRunner(root, { beforeEffect })),
@@ -491,11 +550,26 @@ async function execute() {
           await assertPinned();
           await beforeEffect?.();
           const receipt = await telemetry.phase('l2_critic', () => review(handoff, trusted));
+          lastReviewReceipt = receipt ?? null;
           telemetry.recordUsage('critic', receipt?.usage, criticSource);
           return receipt;
         },
       } });
       telemetry.recordRound({ outcome: result.outcome, reason: result.reason, sha: submission.candidate_sha });
+      await recordPostReviewMemory({
+        writer: projectMemoryWriter,
+        trustedReceiptDir: memoryCfg.trustedReceiptDir,
+        hmacKey: memoryCfg.hmacKey,
+        projectId: p.bb.project,
+        worktree: tree,
+        result,
+        reviewReceipt: lastReviewReceipt,
+        attempt,
+        submission,
+        worker: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
+        reviewer: reviewSetup.critic,
+        updates: result.memoryUpdates ?? lastReviewReceipt?.memoryUpdates,
+      });
       return result;
     } finally {
       clearInterval(timer);
@@ -528,7 +602,7 @@ async function execute() {
   const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
     release: releasePort, recheckRejectedHandoff: recheck,
     workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter, arbitrate },
-    decisionLedger, projectMemoryWriter });
+    decisionLedger });
   const observeTick = result => {
     recheck = false;
     lastResult = result;
@@ -605,7 +679,9 @@ async function execute() {
   }
 }
 
-try { await execute(); } catch (error) {
-  console.error(`isolated-pilot: ${error.message.split('\n')[0]}`);
-  process.exitCode = 1;
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  try { await execute(); } catch (error) {
+    console.error(`isolated-pilot: ${error.message.split('\n')[0]}`);
+    process.exitCode = 1;
+  }
 }
