@@ -21,6 +21,7 @@ import { reconcileFeedbackFromBb, reconcileSpawnFromBb } from './bb-reconcile.mj
 import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.mjs';
 import { localReleasePort } from './local-release.mjs';
 import { ReleaseDenied } from './release-contract.mjs';
+import { arbiterIntakePrompt, workerIntakePrompt } from './intake-prompt.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -205,13 +206,11 @@ async function execute() {
       // Уникальное имя промпта на каждый запуск: повторный вход spawn для
       // резервного провайдера не падает с EEXIST.
       const initial = join(root, `worker-${attempt.attempt_id}-${randomUUID()}.md`);
-      const text = await readFile(brief, 'utf8');
-      const example = JSON.stringify({ task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
-        worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' });
-      const handoff = `Запиши JSON атомарно в ${handoffPath(attempt)} и заверши ход. Сохрани типы полей: ${example}`;
-      const productQuestion = ownerAnswers ? '\nЕсли выбор владельца действительно необходим, вместо candidate_sha передай question: {"prompt":"один конкретный вопрос","evidence":"короткое обоснование"}. Не вставляй секреты или сырой лог.' : '';
-      await writeFile(initial, `${text}\n\nРабочий путь: ${tree}. ${handoff}${productQuestion}\nДругие треды и доски не трогай.\n`,
-        { mode: 0o600, flag: 'wx' });
+      const handoff = { task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+        worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' };
+      const prompt = workerIntakePrompt({ brief: pinned.inputs.get(brief).toString('utf8'), tree,
+        handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers) });
+      await writeFile(initial, prompt, { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
         '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
         '--prompt-file', initial,
@@ -408,8 +407,7 @@ async function execute() {
     const beforeEffect = activation && (() => port.guardTask(req.task_id, req.epoch));
     await beforeEffect?.();
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
-      prompt: ['Use the following specification; output only an arbitration decision, not a critic verdict.',
-        reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : ''].join('\n\n') });
+      prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '') });
     return arbiterRunner(req);
   };
   try {
