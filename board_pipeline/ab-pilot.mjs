@@ -64,6 +64,20 @@ export async function enrollAbPilot(config, { policy, tree, root, inbox, daemon,
     } };
 }
 
+export function guardAbBoard(ab, board) {
+  if (!ab) return board;
+  const writes = ['verifyHeld', 'claim', 'claimReady', 'complete', 'block', 'unblockQuestion', 'claimForQuestion'];
+  const guarded = { ...board };
+  for (const name of writes) {
+    if (typeof board[name] !== 'function') continue;
+    guarded[name] = async (...args) => {
+      await ab.assertOpen();
+      return board[name](...args);
+    };
+  }
+  return guarded;
+}
+
 export function abEffectGuard(ab, { verifyHeld, assertPinned }, taskId, epoch) {
   return async () => {
     await ab.assertOpen();

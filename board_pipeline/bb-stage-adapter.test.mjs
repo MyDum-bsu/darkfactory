@@ -4,7 +4,8 @@ import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createBbStageObserver, matchesNativeStageWitness, pilotWriterWorkspaceReady, verifyBbStageTurn } from './bb-stage-adapter.mjs';
-import { abEffectGuard, enrollAbPilot, inspectPilotDiff, pilotArtifacts, CASES } from './ab-pilot.mjs';
+import { abEffectGuard, enrollAbPilot, guardAbBoard, inspectPilotDiff, pilotArtifacts, CASES } from './ab-pilot.mjs';
+import { resolveArbitration } from './worker-selector.mjs';
 
 const parentThread = 'thr_parent';
 const threadId = 'thr_fixture';
@@ -66,6 +67,22 @@ test('the same attempt effect guard rejects arbitration after the cutoff', async
   await assert.rejects(arbitrate(), /ab_pilot_dispatch_deadline/);
   assert.equal(renews, 0);
   assert.equal(effects, 0);
+});
+
+test('native arbitration resolver cannot renew or invoke the reviewer after pilot cutoff', async () => {
+  let renews = 0, reviews = 0, blocks = 0;
+  const board = guardAbBoard({ assertOpen() { throw new Error('ab_pilot_dispatch_deadline'); } }, {
+    verifyHeld() { renews++; return { epoch: 1 }; },
+    block() { blocks++; },
+  });
+  const result = await resolveArbitration({
+    attempt: { task_id: '1', epoch: 1, attempt_id: 'attempt-1' },
+    trigger: { trigger: 'no_progress' }, subjectDigest: 'a'.repeat(64),
+    verifyHeld: board.verifyHeld, arbitrate: () => { reviews++; },
+  });
+  assert.equal(result.reason, 'lease_lost_before_arbitration');
+  await assert.rejects(board.block('1', 1, 'red'), /ab_pilot_dispatch_deadline/);
+  assert.deepEqual([renews, reviews, blocks], [0, 0, 0]);
 });
 
 test('writer provision is wait-only; wrong ready environment or parent stays denied', () => {

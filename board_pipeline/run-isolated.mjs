@@ -36,7 +36,7 @@ import { aggregateScorecard } from './model-scorecard.mjs';
 import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
   loadLessons, validateDistilledLessons } from './rework-distiller.mjs';
 import * as workerSelector from './worker-selector.mjs';
-import { abEffectGuard, enrollAbPilot, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
+import { abEffectGuard, enrollAbPilot, guardAbBoard, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
 import { pilotWriterWorkspaceReady } from './bb-stage-adapter.mjs';
 
 const exec = promisify(execFile);
@@ -318,8 +318,8 @@ async function execute() {
         worktree: tree })
     : undefined;
   const assertOpen = activation && (async () => { await assertPinned(); await switchOpen(); });
-  const port = nativeBoardPort(board(), { channel: p.channel, isolatedQuestionOwner: Boolean(ownerAnswers),
-    pilot: activation && { scope: activation.scope, assertOpen } });
+  const port = guardAbBoard(ab, nativeBoardPort(board(), { channel: p.channel, isolatedQuestionOwner: Boolean(ownerAnswers),
+    pilot: activation && { scope: activation.scope, assertOpen } }));
   // Компактная строка телеметрии в квитанции закрытия карточки: без секретов
   // и сырых логов; не влезает в лимит 1000 — квитанция уходит без неё.
   const completeCard = port.complete.bind(port);
