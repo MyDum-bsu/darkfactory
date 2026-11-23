@@ -4,11 +4,24 @@ const OWNER_PRECHECK = [
   'Используй только выписку по задаче: не ищи приватную базу. Выписка не даёт допуска к расходам, доступу, необратимым действиям или выпуску.',
 ].join('\n');
 
-export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions }) {
+// Read-only блок активного среза Owner Decision Ledger (Board #1261): решения
+// владельца с digest-пиннингом. Воркер получает выписку, но не может менять
+// ledger — сам журнал живёт вне его рабочего дерева.
+export function decisionsPromptBlock(slice) {
+  if (!slice || typeof slice.digest !== 'string' || !/^[a-f0-9]{64}$/.test(slice.digest)) {
+    throw new Error('decision_ledger_slice_invalid');
+  }
+  const header = `Принятые решения владельца (read-only, срез digest ${slice.digest}):`;
+  if (slice.text) return `${header}\n${slice.text}`;
+  return `${header}\n(нет активных решений)`;
+}
+
+export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions }) {
   const instructions = [
     brief,
     `\nРабочий путь: ${tree}. Запиши JSON атомарно в ${handoffPath} и заверши ход. Сохрани типы полей: ${JSON.stringify(handoff)}`,
   ];
+  if (decisions) instructions.push(decisionsPromptBlock(decisions));
   if (productQuestions) {
     instructions.push(OWNER_PRECHECK,
       'Только для одной оставшейся продуктовой развилки вместо candidate_sha передай question: {"prompt":"один конкретный вопрос","evidence":"короткое обоснование"}. Не вставляй секреты или сырой лог.');
@@ -16,8 +29,8 @@ export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQ
   return [...instructions, 'Другие треды и доски не трогай.', ''].join('\n');
 }
 
-export function arbiterIntakePrompt(spec, extra) {
+export function arbiterIntakePrompt(spec, extra, decisions) {
   return ['Use the following specification; output only an arbitration decision, not a critic verdict.',
-    spec, extra, OWNER_PRECHECK,
+    spec, extra, decisions && decisionsPromptBlock(decisions), OWNER_PRECHECK,
     'Выбирай escalate_owner только для оставшейся продуктовой развилки.'].filter(Boolean).join('\n\n');
 }

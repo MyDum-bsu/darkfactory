@@ -22,7 +22,9 @@ import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.
 import { DEFAULT_INTERVAL_MS, RotatingJournal, runDaemon, TERMINAL_PHASES } from './daemon.mjs';
 import { localReleasePort } from './local-release.mjs';
 import { ReleaseDenied } from './release-contract.mjs';
-import { arbiterIntakePrompt, workerIntakePrompt } from './intake-prompt.mjs';
+import { arbiterIntakePrompt, decisionsPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
+import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, recordDecision, resolveActiveDecisions,
+  resolveLedgerPath } from './decision-ledger.mjs';
 import { createTelemetryRecorder, threadUsage } from './telemetry.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
@@ -182,6 +184,24 @@ async function execute() {
   const { board } = loadSdk();
   const ownerAnswers = await ownerAnswerSource(p.questionGate, p.owner, tree, inbox);
   const releasePort = await releaseSetup(p, { tree, inbox, root });
+  // Owner Decision Ledger (Board #1261): путь приходит только из
+  // policy.decisionLedger или DF_DECISION_LEDGER_PATH. Активный срез и запись
+  // ответов проходят через resolveActiveDecisions/recordDecision с fail-closed
+  // границей — журнал не может жить внутри рабочего дерева воркера.
+  const ledgerCfg = ledgerPolicyConfig(p.decisionLedger);
+  const ledgerPath = resolveLedgerPath({ policy: p.decisionLedger });
+  if (ledgerCfg.scope !== undefined && !/^(global|project:[a-z0-9_-]{1,64})$/.test(ledgerCfg.scope)) {
+    throw new Error('decision_ledger_policy_invalid');
+  }
+  const decisionScope = ledgerCfg.scope ?? `project:${p.bb.project}`;
+  const currentDecisions = async () => ledgerPath === null ? null : resolveActiveDecisions({
+    ledgerPath, projectId: p.bb.project, worktree: tree,
+    maxChars: ledgerCfg.maxChars ?? DEFAULT_MAX_CHARS });
+  const decisionLedger = ledgerPath !== null && ledgerCfg.recordAnswers === true
+    ? ({ answer, question }) => recordDecision({ ledgerPath, scope: decisionScope, rule: answer,
+        sourceCard: question.task_id, recordedBy: ledgerCfg.recordedBy ?? 'question-resume',
+        worktree: tree })
+    : undefined;
   const assertOpen = activation && (async () => { await assertPinned(); await switchOpen(); });
   const port = nativeBoardPort(board(), { channel: p.channel, isolatedQuestionOwner: Boolean(ownerAnswers),
     pilot: activation && { scope: activation.scope, assertOpen } });
@@ -237,7 +257,8 @@ async function execute() {
       const handoff = { task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
         worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' };
       const prompt = workerIntakePrompt({ brief: pinned.inputs.get(brief).toString('utf8'), tree,
-        handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers) });
+        handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers),
+        decisions: await currentDecisions() ?? undefined });
       await writeFile(initial, prompt, { mode: 0o600, flag: 'wx' });
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
         '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
@@ -397,7 +418,10 @@ async function execute() {
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
     const beforeEffect = activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
-    const review = reviewRunner({ journal: root, prompt: reviewText, beforeEffect });
+    const decisionSlice = await currentDecisions();
+    const criticPrompt = decisionSlice ? [reviewText, decisionsPromptBlock(decisionSlice)].join('\n\n')
+      : reviewText;
+    const review = reviewRunner({ journal: root, prompt: criticPrompt, beforeEffect });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
     // сверяется с доверенным значением, а не сам с собой.
@@ -452,7 +476,8 @@ async function execute() {
     const beforeEffect = activation && (() => port.guardTask(req.task_id, req.epoch));
     await beforeEffect?.();
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
-      prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '') });
+      prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
+        await currentDecisions() ?? undefined) });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
     telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
     telemetry.recordArbitration();
@@ -464,7 +489,8 @@ async function execute() {
   const tick = guardedEffect(assertOpen, advanceWithProjection);
   const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
     release: releasePort, recheckRejectedHandoff: recheck,
-    workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter, arbitrate } });
+    workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter, arbitrate },
+    decisionLedger });
   const observeTick = result => {
     recheck = false;
     lastResult = result;

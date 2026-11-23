@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { arbiterIntakePrompt, workerIntakePrompt } from './intake-prompt.mjs';
+import { arbiterIntakePrompt, decisionsPromptBlock, workerIntakePrompt } from './intake-prompt.mjs';
 
 const spec = 'Принятые решения: CSV для ручной выгрузки, потому что оператор сверяет таблицу (D-01).';
 const handoff = { task_id: '492', epoch: 1, attempt_id: 'attempt', worker_thread_id: '<BB_THREAD_ID>',
@@ -36,4 +36,36 @@ test('arbitration reads the approved spec before escalating only an unresolved f
   assert.match(prompt, /Operator rules\./);
   assert.match(prompt, /не ищи приватную базу/);
   assert.match(prompt, /не даёт допуска.*выпуску/);
+});
+
+const slice = { text: '- [global] CSV для выгрузки (dec-1)',
+  digest: 'a'.repeat(64), ids: ['dec-1'], truncated: false, total: 1 };
+
+test('P1.1 worker gets the pinned read-only ledger slice before the question rules', () => {
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice });
+  const block = prompt.indexOf('Принятые решения владельца (read-only');
+  const check = prompt.indexOf('Перед продуктовым вопросом');
+  assert.ok(block > 0 && check > block);
+  assert.match(prompt, /digest a{64}/);
+  assert.match(prompt, /- \[global\] CSV для выгрузки \(dec-1\)/);
+});
+
+test('worker without a configured ledger gets no decisions block', () => {
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: false });
+  assert.doesNotMatch(prompt, /read-only, срез digest/);
+});
+
+test('arbiter receives the same pinned slice alongside manual extra rules', () => {
+  const prompt = arbiterIntakePrompt(spec, 'Operator rules.', slice);
+  assert.match(prompt, /Принятые решения владельца \(read-only, срез digest a{64}\)/);
+  assert.match(prompt, /Operator rules\./);
+  // Старый ручной owner-decisions текст в extra сохраняется без изменений.
+  assert.ok(prompt.indexOf('Operator rules.') < prompt.indexOf('Принятые решения владельца'));
+});
+
+test('decisionsPromptBlock is fail-closed on an unpinned slice', () => {
+  assert.throws(() => decisionsPromptBlock({ text: 'x', digest: 'short' }), /decision_ledger_slice_invalid/);
+  assert.throws(() => decisionsPromptBlock(null), /decision_ledger_slice_invalid/);
+  const empty = decisionsPromptBlock({ ...slice, text: '', ids: [] });
+  assert.match(empty, /нет активных решений/);
 });

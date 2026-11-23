@@ -81,7 +81,7 @@ function attemptOf(record, route) {
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
 export async function advance({ route, state, board, bb, submissions, verify, authorize,
-  recheckRejectedHandoff, workerSelector, mutants, questionGate, release }) {
+  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const hazards = mutants ?? {};
@@ -310,7 +310,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         attempt: attemptOf(record, route), feedbackId, sha: question.checkpoint.sha,
         question, contract: record.contract, reason: 'owner_answer_confirmed',
         evidence: { questionId: question.question_id, ownerAnswer: answer },
-      }), reconcileFeedback: reconcileInFlight });
+      }), reconcileFeedback: reconcileInFlight, decisionLedger });
   }
   if (release && RELEASE_PHASES.has(record.phase)) {
     if (!questionGate) throw new ReleaseDenied('release_approval_unavailable');

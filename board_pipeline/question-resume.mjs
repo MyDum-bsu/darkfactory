@@ -3,7 +3,8 @@ import { questionBlockText } from './question-gate.mjs';
 
 export const QUESTION_PHASES = new Set(['awaiting_answer', 'unblocking', 'resume_pending', 'resume_claiming']);
 
-export async function advanceQuestion({ record, save, visible, board, gate, feedback, reconcileFeedback }) {
+export async function advanceQuestion({ record, save, visible, board, gate, feedback, reconcileFeedback,
+  decisionLedger }) {
   const { question } = record;
   const stateOf = () => board.questionState(question, questionBlockText(question));
   const uncertain = async reason => {
@@ -72,7 +73,18 @@ export async function advanceQuestion({ record, save, visible, board, gate, feed
       }
       if (!await authorized('blocked')) return uncertain('question_resume_checkpoint_drift');
       if (gate.now() >= question.expires_at) return visible();
+      // Опциональная запись подтверждённого ответа владельца в Decision Ledger
+      // (Board #1261): только при явно переданном порту; повторный прогон той же
+      // фазы идемпотентен за счёт дедупликации в recordDecision. Отказ записи —
+      // uncertain, незаписанный ответ не считается запомненным.
+      let decisionId;
+      if (decisionLedger) {
+        const entry = await decisionLedger({ answer: ownerAnswer.answer, question }).catch(() => null);
+        if (entry === null) return uncertain('decision_ledger_unconfirmed');
+        decisionId = entry.id;
+      }
       await save({ phase: 'unblocking', ownerAnswer,
+        ...(decisionId !== undefined ? { decisionId } : {}),
         intent: { kind: 'unblock', questionId: question.question_id, epoch: question.epoch } });
       try { await board.unblockQuestion(question, questionBlockText(question)); }
       catch { return reconcileUnblock(); }
