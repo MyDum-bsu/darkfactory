@@ -717,8 +717,12 @@ gitTest('runner: незавершённый, но дисквалифицирую
       reason: 'review_verdict_missing' },
     // Битый НЕквотированный {verdict: ...} в завершённом assistant-ответе
     // без settled: намерение недоказуемо — консервативный hold, пропажа
-    // settlement не превращает закрытый ответ в обрыв.
+    // settlement не превращает закрытый ответ в обрыв. Оба нормальных
+    // rawStopReason OpenAI-совместимого адаптера ('completed' и 'stop').
     { stdout: msg({ stopReason: 'stop', rawStopReason: 'completed',
+        content: [{ type: 'text', text: '{verdict: REWORK, findings: []}' }] }),
+      reason: 'review_verdict_missing' },
+    { stdout: msg({ stopReason: 'stop', rawStopReason: 'stop',
         content: [{ type: 'text', text: '{verdict: REWORK, findings: []}' }] }),
       reason: 'review_verdict_missing' }]) {
     const { review, binding, profile, calls } = await fixture(t, [

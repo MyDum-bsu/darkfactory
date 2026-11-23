@@ -108,12 +108,14 @@ function transcriptDisqualifying(ndjson, critic) {
         return 'review_verdict_emitted';
       }
     }
-    // Штатно закрывшийся assistant-ответ (stop/completed) — завершённый
-    // исход хода: даже без agent_settled и с недоказуемым вердиктом
-    // (например, битый {verdict: ...}) это hold, а не обрыв потока.
+    // Штатно закрывшийся assistant-ответ — завершённый исход хода: даже
+    // без agent_settled и с недоказуемым вердиктом (например, битый
+    // {verdict: ...}) это hold, а не обрыв потока. rawStopReason
+    // 'completed' и 'stop' — нормальные завершения OpenAI-совместимого
+    // адаптера; отсутствие поля — тоже закрытый ответ.
     if (message.stopReason === 'stop' &&
         (message.rawStopReason === undefined ||
-          message.rawStopReason === 'completed')) {
+          ['completed', 'stop'].includes(message.rawStopReason))) {
       finishedResponse = true;
     }
   }
