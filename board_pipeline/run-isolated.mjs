@@ -36,6 +36,7 @@ import { aggregateScorecard } from './model-scorecard.mjs';
 import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
   loadLessons, validateDistilledLessons } from './rework-distiller.mjs';
 import * as workerSelector from './worker-selector.mjs';
+import { enrollAbPilot, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
 
 const exec = promisify(execFile);
 const inside = (root, p) => {
@@ -211,6 +212,8 @@ async function execute() {
   if (inside(root, inbox) || inside(inbox, root) || inside(tree, inbox)) throw new Error('Handoff inbox must be separate');
   const st = await lstat(root);
   if (!st.isDirectory() || st.uid !== process.getuid() || st.mode & 0o077) throw new Error('State must be private');
+  const ab = await enrollAbPilot(p.abPilot, { policy: p, tree, root, inbox, daemon: values.daemon,
+    allowLive: values['allow-live-pilot'], parent: process.env.BB_THREAD_ID });
   const switchOpen = activation && await createPilotSwitch(activation.killSwitch, {
     permitDirectory: dir => [tree, inbox, root].every(path => !inside(path, dir) && !inside(dir, path)),
   });
@@ -251,6 +254,7 @@ async function execute() {
   }
   const assertPinned = async () => {
     if ((await readOperatorInputs(files)).digest !== route.policyDigest) throw new Error('Operator inputs changed');
+    await ab?.assertOpen();
   };
   if (p.version !== route.policyVersion || !p.owner || !p.label?.key || !p.label?.value ||
       !p.profiles?.[route.checkProfile]?.branch) throw new Error('Incomplete enrolled policy');
@@ -267,7 +271,7 @@ async function execute() {
   // ответов проходят через resolveActiveDecisions/recordDecision с fail-closed
   // границей — журнал не может жить внутри рабочего дерева воркера.
   const ledgerCfg = ledgerPolicyConfig(p.decisionLedger);
-  const ledgerPath = resolveLedgerPath({ policy: p.decisionLedger });
+  const ledgerPath = ab ? null : resolveLedgerPath({ policy: p.decisionLedger });
   if (ledgerCfg.scope !== undefined && !/^(global|project:[a-z0-9_-]{1,64})$/.test(ledgerCfg.scope)) {
     throw new Error('decision_ledger_policy_invalid');
   }
@@ -283,7 +287,7 @@ async function execute() {
   // каталоге вне worktree. Воркер, критик и арбитр читают строго read-only
   // закреплённый срез; запись в память из контекста воркера запрещена.
   const memoryCfg = memoryPolicyConfig(p.projectMemory);
-  const memoryStoreDir = resolveMemoryStoreDir({ policy: p.projectMemory });
+  const memoryStoreDir = ab ? null : resolveMemoryStoreDir({ policy: p.projectMemory });
   const currentProjectMemory = async () => memoryStoreDir === null ? null : resolveProjectMemory({
     storeDir: memoryStoreDir, projectId: p.bb.project, worktree: tree,
     maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS });
@@ -325,6 +329,7 @@ async function execute() {
   // в промпт не попадает никогда.
   const lessonsPath = join(root, 'lessons.jsonl');
   const currentLessons = async () => {
+    if (ab) return [];
     // Границы хранилища: файл в приватном root, не симлинк, вне worktree.
     const existing = await loadLessons(lessonsPath, { allowedDir: root, outside: [tree] });
     if (!existing.length) return [];
@@ -334,6 +339,7 @@ async function execute() {
   // Скоркард для динамического роутинга: журнал телеметрии того же root.
   // Любая деградация — null → resolveTriad откатывается к дефолтной триаде.
   const currentScorecard = async () => {
+    if (ab) return null;
     try {
       const lines = await readTelemetryLines(join(root, 'telemetry.jsonl'));
       return aggregateScorecard(lines);
@@ -344,6 +350,7 @@ async function execute() {
   // Дистилляция после закрытия карточки с >=2 раундами REWORK. Fail-open:
     // урок не может сломать приёмку — ошибка только журналируется.
   const distillClosedAttempt = async () => {
+    if (ab) return;
     try {
       const record = await state.load();
       const rounds = Array.isArray(record?.roundsHistory) ? record.roundsHistory : [];
@@ -413,7 +420,11 @@ async function execute() {
       const handoff = { task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
         worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' };
       const lessonRules = await currentLessons().catch(() => []);
-      const prompt = workerIntakePrompt({ brief: pinned.inputs.get(brief).toString('utf8'), tree,
+      const operatorBrief = pinned.inputs.get(brief).toString('utf8');
+      const writer = ab?.writer;
+      const roleBrief = writer ? [operatorBrief, 'Навыки роли реализации (read-only):',
+        ...writer.skills.map(skill => skill.text)].join('\n\n') : operatorBrief;
+      const prompt = workerIntakePrompt({ brief: roleBrief, tree,
         handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers),
         decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined,
         projectMemory: await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`),
@@ -423,11 +434,13 @@ async function execute() {
         '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
         '--prompt-file', initial,
         '--parent-notifications', 'off', '--permission-mode', permissionMode, '--json'];
+      if (ab) argv.push('--parent-thread', ab.parent);
       const effort = execSpec.effort ?? execSpec.reasoningLevel;
       if (effort) argv.push('--reasoning-level', effort);
       const live = await port.verifyHeld(attempt.task_id, attempt.epoch);
       if (live.epoch !== attempt.epoch) throw new Error('lease_lost_before_bb_call');
       await port.guardTask?.(attempt.task_id, attempt.epoch);
+      await ab?.assertOpen();
       try {
         const { stdout } = await telemetry.phase('spawn', () => exec('bb', argv, { timeout: 60_000 }),
           { subject: attempt, worker: execSpec });
@@ -509,6 +522,7 @@ async function execute() {
       const live = await port.verifyHeld(packet.attempt.task_id, packet.attempt.epoch);
       if (live.epoch !== packet.attempt.epoch) throw new Error('lease_lost_before_bb_feedback');
       await port.guardTask?.(packet.attempt.task_id, packet.attempt.epoch);
+      await ab?.assertOpen();
       const { stdout } = await telemetry.phase('worker_feedback', () => exec('bb',
         ['thread', 'tell', packet.attempt.bb_thread_id, '--mode', 'queue',
         '--permission-mode', permissionMode, '--message-file', message, '--json'], { timeout: 50_000 }));
@@ -576,7 +590,11 @@ async function execute() {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
-    const beforeEffect = activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
+    const beforeEffect = ab ? async () => {
+      const live = await port.verifyHeld(attempt.task_id, attempt.epoch);
+      if (live.epoch !== attempt.epoch) throw new Error('ab_pilot_lease_lost');
+      await assertPinned();
+    } : activation && (() => port.guardTask(attempt.task_id, attempt.epoch));
     const decisionSlice = await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`);
     const memorySlice = await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`);
     const criticPrompt = [reviewText, decisionSlice && decisionsPromptBlock(decisionSlice),
@@ -625,9 +643,16 @@ async function execute() {
       // вокруг портов; usage критика — из квитанции ревью, иначе null.
       telemetry.roundStart();
       let lastReviewReceipt = null;
+      const inspect = worktreeInspector(policy);
+      const runLocal = offlineProfileRunner(root, { beforeEffect });
+      let diff, localEvidence;
       const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
-        board: port, inspect: telemetry.port('inspect', worktreeInspector(policy)),
-        local: telemetry.port('l1_local', offlineProfileRunner(root, { beforeEffect })),
+        board: port, inspect: telemetry.port('inspect', inspect),
+        local: telemetry.port('l1_local', ab ? async (binding, trusted) => {
+          diff = await inspectPilotDiff(ab, { git, base: route.base, candidate: binding.candidate_sha });
+          localEvidence = await runLocal(binding, trusted);
+          return localEvidence;
+        } : runLocal),
         tamper: telemetry.port('tamper', tamperGate),
         visual: telemetry.port('l3_visual', offlineVisualRunner(root, { beforeEffect })),
         // Смена брифа/файлов политики во время проверок останавливает кандидата до complete.
@@ -637,6 +662,13 @@ async function execute() {
           if (lost) throw new Error('Lease lost');
           await assertPinned();
           await beforeEffect?.();
+          if (ab?.arm === 'foreman') {
+            const readArtifact = await pilotArtifacts(ab, { git, candidate: handoff.candidate_sha, diff, localEvidence,
+              brief: pinned.inputs.get(brief), review: reviewSpec });
+            await telemetry.phase('ab_foreman', () => runPilotForeman(ab, { attempt, handoff, project: p.bb.project,
+              journal: root, readArtifact, assertCurrent: beforeEffect, inspect, readState: state.load }));
+            await beforeEffect();
+          }
           const receipt = await telemetry.phase('l2_critic', () => review(handoff, trusted));
           lastReviewReceipt = receipt ?? null;
           telemetry.recordUsage('critic', receipt?.usage, neon ? 'agy_stream' : 'pi_stream');
@@ -699,7 +731,7 @@ async function execute() {
   const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
     release: releasePort, recheckRejectedHandoff: recheck,
     workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter,
-      arbitrate,
+      ...(ab ? { selectWorker: () => [{ provider: p.bb.provider, model: p.bb.model }] } : {}), arbitrate,
       // VS-4.2 (#1263): триада резолвится один раз — при запуске попытки —
       // контроллером через pinTriad и закрепляется в записи (spawn, L2,
       // арбитраж, seal идут на одной тройке; скоркард не перечитывается на
@@ -708,7 +740,7 @@ async function execute() {
         const routed = workerSelector.resolveTriad({
           policy: p,
           scorecard: await currentScorecard(),
-          base: { worker: workerSelector.PRIMARY_WORKER,
+          base: { worker: ab ? { provider: p.bb.provider, model: p.bb.model } : workerSelector.PRIMARY_WORKER,
             critic: reviewSetup.critic, arbiter: reviewSetup.arbiter },
           log: note => console.log(JSON.stringify(note)),
         });

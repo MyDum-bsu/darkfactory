@@ -1,0 +1,98 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createBbStageObserver, verifyBbStageTurn } from './bb-stage-adapter.mjs';
+import { enrollAbPilot, inspectPilotDiff, CASES } from './ab-pilot.mjs';
+
+const parentThread = 'thr_parent';
+const threadId = 'thr_fixture';
+const project = 'proj_fixture';
+const provider = 'pi';
+const model = 'opencode-go/deepseek-v4.1-flash';
+const challenge = 'a'.repeat(64);
+function trace(workspace, nonce = challenge) {
+  const snapshot = { thread: { id: threadId, parentThreadId: parentThread, projectId: project, providerId: provider,
+    status: 'idle', activeBackgroundAgentCount: 0, queuedMessageCount: 0 }, environment: { path: workspace } };
+  const event = (seq, type, data) => ({ threadId, seq, type, data, scope: { turnId: 't1' } });
+  const events = [event(1, 'client/turn/requested', { execution: { model }, input: [{ type: 'text', text: `Challenge: ${nonce}` }] }),
+    event(2, 'item/completed', { item: { type: 'agentMessage', text: `${nonce} PASS` } }),
+    event(3, 'turn/completed', { status: 'completed' })];
+  return { snapshot, events, threadId, workspace, parentThread, project, provider, model, reasoning: null, challenge: nonce };
+}
+
+test('native stage proof binds only the single requested turn and rejects foreign/model/tool evidence', () => {
+  const valid = trace('/isolated');
+  assert.deepEqual(verifyBbStageTurn(valid), { verdict: 'PASS', eventSeq: 3 });
+  assert.throws(() => verifyBbStageTurn({ ...valid, parentThread: 'thr_other' }), /stage_bb_unconfirmed/);
+  assert.throws(() => verifyBbStageTurn({ ...valid, model: 'another-model' }), /stage_turn_unconfirmed/);
+  assert.throws(() => verifyBbStageTurn({ ...valid, events: valid.events.slice(0, 2) }), /stage_turn_unconfirmed/);
+  const tool = structuredClone(valid);
+  tool.events[1].data.item.type = 'commandExecution';
+  assert.throws(() => verifyBbStageTurn(tool), /stage_unexpected_tool_use/);
+  const badNonce = structuredClone(valid);
+  badNonce.events[1].data.item.text = 'b'.repeat(64) + ' PASS';
+  assert.throws(() => verifyBbStageTurn(badNonce), /stage_verdict_unconfirmed/);
+});
+
+test('observer binds embedded skill and host artifact to one operator-parented spawn, no repeat', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'df-ab-stage-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'observer'), journal = join(root, 'journal');
+  await mkdir(workspace, { mode: 0o700 });
+  await mkdir(journal, { mode: 0o700 });
+  let current, spawnCalls = 0;
+  const tracked = [];
+  const artifact = Buffer.from(JSON.stringify({ type: 'inventory', inventory: 'a'.repeat(64), items: 1, unresolved: 0 }));
+  const execBb = async argv => {
+    let result = {};
+    if (argv[1] === 'spawn') {
+      spawnCalls++;
+      assert.equal(argv[argv.indexOf('--parent-thread') + 1], parentThread);
+      assert.equal(argv[argv.indexOf('--environment') + 1], workspace);
+      const prompt = await readFile(argv[argv.indexOf('--prompt-file') + 1], 'utf8');
+      assert.match(prompt, /Embedded fixture skill/);
+      assert.ok(prompt.includes(artifact.toString()));
+      current = trace(workspace, /Challenge: ([a-f0-9]{64})/.exec(prompt)[1]);
+      result = { id: threadId };
+    } else if (argv[1] === 'show') result = current.snapshot;
+    else if (argv[1] === 'log') result = current.events;
+    return { stdout: JSON.stringify(result) };
+  };
+  const observe = await createBbStageObserver({ workspace, project, journal, parentThread }, {
+    assertCurrent() {}, readArtifact: () => artifact, record: row => tracked.push(row), execBb,
+  });
+  const req = { stage: 'intake', role: 'materials-reader', verifier: 'inventory', playbook: 'policy',
+    registryDigest: 'a'.repeat(64), inputArtifactDigest: null,
+    model: { provider, model, reasoning: null },
+    binding: { task_id: '1', candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) },
+    skills: [{ text: 'Embedded fixture skill' }] };
+  const got = await observe(req);
+  assert.equal(got.verdict, 'PASS');
+  assert.ok(got.artifact.equals(artifact));
+  assert.equal(tracked[0].threadId, threadId);
+  await assert.rejects(observe(req), /stage_intent_already_exists/);
+  assert.equal(spawnCalls, 1);
+});
+
+test('retired or non-DeepSeek model cannot launch and out-of-scope pilot cannot opt in', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'df-ab-deny-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'observer'), journal = join(root, 'journal');
+  await mkdir(workspace, { mode: 0o700 });
+  await mkdir(journal, { mode: 0o700 });
+  const unexpected = () => assert.fail('unexpected effect');
+  const observe = await createBbStageObserver({ workspace, project, journal, parentThread }, {
+    assertCurrent() {}, readArtifact: unexpected, record: unexpected, execBb: unexpected,
+  });
+  await assert.rejects(observe({ model: { provider: 'pi', model: 'opencode-go/other' } }), /stage_model_denied/);
+  await assert.rejects(enrollAbPilot({ arm: 'linear', case: 'policy', parent: parentThread }, {
+    parent: parentThread, policy: { scope: 'pilot', channel: 'pilot' },
+  }), /ab_pilot_scope_denied/);
+  assert.equal(await enrollAbPilot(undefined, {}), null);
+  const git = (...args) => args.includes('--name-only') ? CASES.policy.files.join('\0') + '\0' : 'diff';
+  assert.equal((await inspectPilotDiff({ case: 'policy' }, { git, base: 'x', candidate: 'y' })).files.length, 2);
+  await assert.rejects(inspectPilotDiff({ case: 'policy' }, { git: () => 'outside.mjs\0', base: 'x', candidate: 'y' }),
+    /ab_pilot_diff_out_of_scope/);
+});
