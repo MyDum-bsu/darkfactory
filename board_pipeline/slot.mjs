@@ -17,7 +17,7 @@ export async function saveState(path, value) {
   await syncDir(dirname(path));
 }
 
-async function kernelLock(path) {
+export async function kernelLock(path) {
   // The helper owns flock while this process holds its stdin open. SIGKILL closes the pipe too.
   const child = spawn('flock', ['--no-fork', '--nonblock', path, process.execPath, '-e',
     'process.stdout.write("held\\n");process.stdin.resume()'], { stdio: ['pipe', 'pipe', 'ignore'] });

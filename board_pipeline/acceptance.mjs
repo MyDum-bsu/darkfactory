@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
+import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter, NEON_ISOLATION } from './review-policy.mjs';
 import { assertTriadIndependent } from './worker-selector.mjs';
 
 const HANDOFF_KEYS = [
@@ -59,7 +60,6 @@ const REVIEW_OK = 'REVIEW_OK';
 const REVIEW_BLOCKED = 'REVIEW_BLOCKED';
 const REVIEW_ESCALATE = 'REVIEW_ESCALATE';
 const FINISH = new Set(['verified', 'deployed']);
-const REVIEW_MODELS = new Set(['gpt-6.2-sol', 'gpt-6.2-astra']);
 
 class Denied extends Error {
   constructor(reason) {
@@ -102,7 +102,7 @@ function validateHandoff(handoff) {
   if (!SHA_RE.test(handoff.base_sha)) throw new Denied('base_sha_not_full');
 }
 
-function validatePolicy(policy, checkProfile) {
+function validatePolicy(policy, checkProfile, { allowNeon = false } = {}) {
   if (policy === null || typeof policy !== 'object') throw new Denied('policy_not_object');
   if (typeof policy.version !== 'string' && typeof policy.version !== 'number') {
     throw new Denied('policy_version_missing');
@@ -114,8 +114,9 @@ function validatePolicy(policy, checkProfile) {
   if (profile === null || typeof profile !== 'object') {
     throw new Denied(`unknown_profile:${checkProfile}`);
   }
-  if (profile.review?.provider !== 'openai' || profile.review.reasoningLevel !== 'medium' ||
-      !REVIEW_MODELS.has(profile.review.model)) {
+  const legacy = isLegacyPiReview(profile.review);
+  const neon = allowNeon && isNeonReview(profile.review) && isReviewSkillList(profile.review.skills);
+  if (!legacy && !neon) {
     throw new Denied('review_profile_not_approved');
   }
   return profile;
@@ -627,9 +628,10 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   // Полный набор обязателен при любом из признаков аттестации ИЛИ когда
   // профиль требует аттестацию — независимо от наличия манифеста.
   const attestationRequired = hasAttestationFields ||
-    profile.review?.requireAttestation === true;
+    profile.review?.requireAttestation === true || isNeonReview(profile.review);
   if (attestationRequired) {
-    if (rev.isolation !== 'docker-ro-v1') {
+    const isolation = isNeonReview(profile.review) ? NEON_ISOLATION : 'docker-ro-v1';
+    if (rev.isolation !== isolation) {
       return { status: 'hold', reason: 'review_isolation_missing' };
     }
     if (!SHA256_RE.test(rev.transcript_sha256 ?? '')) {
@@ -864,7 +866,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   try {
     validateAttempt(attempt);
     validateSubmission(submission, attempt);
-    profile = validatePolicy(policy, attempt.check_profile);
+    profile = validatePolicy(policy, attempt.check_profile, { allowNeon: true });
     validateEnrolled(attempt, profile);
     // Исполнитель из доверенной попытки (или профиля) и критик — разные семейства.
     // При настроенном арбитре проверяется вся триада: арбитр обязан быть из
@@ -872,6 +874,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     // переключения на резерв.
     const executor = attempt.executor ?? profile.executor;
     const arbiter = attempt.arbiter ?? profile.arbiter;
+    if (isNeonReview(profile.review)) {
+      if (!isSolArbiter(arbiter) || executor === undefined) throw new Denied('vs2_review_triad_not_approved');
+      if (attempt.policy_digest === undefined) throw new Denied('subject_contract_incomplete');
+    }
     try {
       if (arbiter !== undefined) {
         assertTriadIndependent({ executor, critic: profile.review, arbiter });
@@ -1005,7 +1011,12 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     } } : {}),
   });
 
-  const intent = async (phase) => append({ kind: 'intent', phase });
+  const phases = new Map([['local', 'L1'], ['visual', 'L3'], ['review', 'L2']]);
+  const project = phase => ports.board.project?.(attempt.task_id, attempt.epoch, phase, binding.candidate_sha);
+  const intent = async phase => {
+    await append({ kind: 'intent', phase });
+    if (phases.has(phase)) await project(phases.get(phase));
+  };
   const step = async (phase, ok, detail) => append({ kind: 'result', phase, ok, detail });
 
   // tree_sha из реальной инспекции снимка (не из слов воркера и не только из
@@ -1195,6 +1206,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     subjectDigest: () => digest,
     journal });
   if (verdict.status === 'lost') return settle('denied', { reason: verdict.reason });
+  if (verdict.status === 'verified') await project('L2_PASS');
+  if (verdict.status === 'rework' && verdict.review?.verdict === REVIEW_BLOCKED) await project('L2_REWORK');
 
   // GUARD:NoBlindRoundClose — возврат на доработку никогда не превращается в
   // complete без свежего verified-вердикта на тот же кандидат.

@@ -14,6 +14,7 @@ const SHA = /^[0-9a-f]{40}$/;
 
 // Файл считается тестовым по типичным каталогам и суффиксам JS/TS/Python.
 const TEST_FILE = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[a-z]+$|(^|\/)test_[^/]*\.py$|_test\.py$/;
+const isTest = name => typeof name === 'string' && TEST_FILE.test(name);
 // Удалённое определение тестового кейса: JS/TS test(, it(, describe( и Python def test_.
 // Граница слева не допускает '.': вызов RegExp.test() не является тест-кейсом.
 const TEST_DEF = /(?:^|[^\w$.])(?:it|test|describe)\s*\(|(?:^|[^\w$])def\s+test_/;
@@ -89,7 +90,6 @@ function parseDiffTree(raw) {
 export function analyzeDiffTree(raw, { allowTestDeletion = false } = {}) {
   const violations = [];
   for (const { oldMode, newMode, status, oldPath, path } of parseDiffTree(raw)) {
-    const isTest = (name) => typeof name === 'string' && TEST_FILE.test(name);
     if (!allowTestDeletion) {
       if (status === 'D' && isTest(path)) {
         violations.push({ kind: 'test_file_deleted', file: path, line: 0,
@@ -119,6 +119,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
   let oldName = null;
   let file = null;
   let inHunk = false;
+  let testHunk = false;
   let oldLine = 0;
   let newLine = 0;
 
@@ -161,6 +162,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
     const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
     if (hunk && file !== null) {
       inHunk = true;
+      testHunk = isTest(file) || isTest(oldName?.replace(/^a\//, ''));
       oldLine = Number(hunk[1]);
       newLine = Number(hunk[2]);
       continue;
@@ -173,7 +175,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       if (!allowTestDeletion && TEST_DEF.test(text)) {
         push('test_deleted', oldLine, 'removed test case');
       }
-      if (isAssert(text)) {
+      if (testHunk && isAssert(text)) {
         const tally = tallyFor(asserts, file);
         tally.removed.push(oldLine);
         if (STRONG_ASSERT.test(text)) tally.strongRemoved++;
@@ -189,7 +191,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       if (SKIP_MARK.test(text)) {
         push('test_skipped', newLine, 'added test skip/only marker');
       }
-      if (TRIVIAL_ASSERT.test(text)) {
+      if (testHunk && TRIVIAL_ASSERT.test(text)) {
         push('assertion_weakened', newLine, 'trivial assertion added');
       }
       for (const [rule, label] of SECRET_RULES) {
@@ -198,7 +200,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       if (RUNNER_FILE.test(file) && EXIT_OK.test(text)) {
         push('gate_bypass', newLine, 'added forced success in check runner');
       }
-      if (isAssert(text)) {
+      if (testHunk && isAssert(text)) {
         const tally = tallyFor(asserts, file);
         tally.added.push(newLine);
         if (STRONG_ASSERT.test(text)) tally.strongAdded++;

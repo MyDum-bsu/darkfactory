@@ -57,8 +57,8 @@ test('workerFamily различает cognition, glm, deepseek, openai, google',
   assert.equal(workerFamily(PRIMARY_WORKER), 'cognition');
   assert.equal(workerFamily(FALLBACK_ZCODE), 'glm');
   assert.equal(workerFamily(NARROW_RESERVE_PI), 'deepseek');
-  assert.equal(workerFamily(DEFAULT_CRITIC), 'openai');
-  assert.equal(workerFamily(DEFAULT_ARBITER), 'google');
+  assert.equal(workerFamily(DEFAULT_CRITIC), 'google');
+  assert.equal(workerFamily(DEFAULT_ARBITER), 'openai');
   assert.equal(workerFamily({ provider: 'unknown', model: 'unknown' }), null);
 });
 
@@ -231,11 +231,15 @@ test('резерв нарушающий триаду отклоняет весь
 
 test('assertTriadIndependent требует три разных семейства', () => {
   assert.deepEqual(assertTriadIndependent({ executor: PRIMARY_WORKER }),
-    { executor: 'cognition', critic: 'openai', arbiter: 'google' });
+    { executor: 'cognition', critic: 'google', arbiter: 'openai' });
   assert.deepEqual(assertTriadIndependent({ executor: FALLBACK_ZCODE }),
-    { executor: 'glm', critic: 'openai', arbiter: 'google' });
+    { executor: 'glm', critic: 'google', arbiter: 'openai' });
   assert.deepEqual(assertTriadIndependent({ executor: NARROW_RESERVE_PI }),
-    { executor: 'deepseek', critic: 'openai', arbiter: 'google' });
+    { executor: 'deepseek', critic: 'google', arbiter: 'openai' });
+  assert.throws(() => assertTriadIndependent({ executor: 'pi/openai/gpt-6.2-sol' }),
+    e => e.reason === 'arbiter_family_not_independent');
+  assert.throws(() => assertTriadIndependent({ executor: 'google/gemini-4-neon' }),
+    e => e.reason === 'review_same_family');
   assert.throws(() => assertTriadIndependent({
     executor: PRIMARY_WORKER,
     critic: { provider: 'acp-devin', model: 'swe-2-medium' },

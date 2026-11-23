@@ -12,6 +12,8 @@ import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { unpackExact } from './runtime.mjs';
+import { withModelProxy } from './model-proxy.mjs';
+import { sumUsages } from './telemetry.mjs';
 
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
@@ -24,28 +26,14 @@ export const REVIEW_IMAGE =
 
 // В контейнер критика монтируются только каталоги кода ~/.pi/agent:
 // sessions/, subagents/ и auth.json исключены — секрет едет копией в tmpfs.
-const PROXY_ENV = ['HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy'];
-
-// Дублирует правила pi-guard.cjs на стороне хоста: приватный прокси
-// не должен даже попадать в окружение контейнера.
-function privateProxyHost(hostname) {
-  const h = String(hostname ?? '').toLowerCase().replace(/^\[|\]$/g, '');
-  if (h === 'localhost' || h.endsWith('.localhost') || h === '::1' || h === '::' ||
-      h.startsWith('fe80') || h.startsWith('fc') || h.startsWith('fd')) return true;
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-  if (!m) return false;
-  const [a, b] = m.slice(1).map(Number);
-  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
-}
+const PROXY_BOOTSTRAP = new URL('./model-proxy-client.cjs', import.meta.url).pathname;
 
 const READ_ONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
 
 // Монтируются только каталоги кода; конфиги идут через /pi-cfg копией в tmpfs.
 const PI_MOUNT_DIRS = ['bin', 'install', 'npm'];
 const PI_CONFIG_FILES = ['settings.json', 'models.json', 'models-store.json'];
-// Хостовый httpProxy (обычно loopback-relay) в изолированном песочнике
-// недостижим и не нужен: egress уже ограничен PI_ALLOW_CONNECT и pi-guard.
+// Host proxy URLs (including any credentials) stay in the host broker.
 async function sandboxedPiConfig(file, src) {
   const body = await readFile(src);
   if (file !== 'settings.json') return body;
@@ -56,8 +44,8 @@ async function sandboxedPiConfig(file, src) {
 const GUARD_FILE = new URL('./pi-guard.cjs', import.meta.url).pathname;
 
 export class ReviewDenied extends Error {
-  constructor(reason) {
-    super(reason);
+  constructor(reason, options) {
+    super(reason, options);
     this.reason = reason;
   }
 }
@@ -154,7 +142,8 @@ export function hasValidFinding(findings) {
 // Возвращает actual { provider, model, reasoningLevel } ассистентских
 // message_end (все обязаны совпадать, включая responseModel/actualModel и
 // providerThinkingLevel/reasoningEffort, когда те присутствуют), объединение
-// ВСЕХ toolsAdded по потоку и текст строго последнего хода.
+// ВСЕХ toolsAdded по потоку, суммарный usage ассистентских message_end
+// (null, если провайдер токены не отдал) и текст строго последнего хода.
 export function parseReviewTranscript(ndjson) {
   const events = [];
   for (const line of String(ndjson).split('\n')) {
@@ -172,6 +161,7 @@ export function parseReviewTranscript(ndjson) {
     }
   };
   const seen = [];
+  const usages = [];
   let hasError = false;
   let seenSettled = false;
   let aborted = null;
@@ -193,6 +183,12 @@ export function parseReviewTranscript(ndjson) {
     if (event?.type !== 'message_end') continue;
     const message = event.message ?? event.data?.message;
     if (message?.role !== 'assistant') continue;
+    // VS-3: usage хода — числовые поля суммируются позже (sumUsages);
+    // отсутствующий/нечисловой usage хода не ломает разбор.
+    if (message.usage !== null && typeof message.usage === 'object' &&
+        !Array.isArray(message.usage)) {
+      usages.push(message.usage);
+    }
     const parts = Array.isArray(message.content) ? message.content : [];
     const text = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
     seen.push({
@@ -236,6 +232,7 @@ export function parseReviewTranscript(ndjson) {
     actual: { provider: actual.provider, model: actual.model,
       reasoningLevel: actual.reasoningLevel },
     seen, toolsAdded, finalText: last.text, responseId: last.responseId, events,
+    usage: sumUsages(usages),
   };
 }
 
@@ -459,12 +456,9 @@ export function assertToolsAllowed(toolsAdded) {
   }
 }
 
-// Внутренний вызов команды внутри rootless Docker read-only контура.
-// Публичный раннер всегда работает с --network=none; сеть для модельного
-// вызова включает только piSandbox (дополнительно режется pi-guard.cjs).
-async function sandboxExec({ snapshot, argv, image = REVIEW_IMAGE,
-  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate',
-  modelNetwork = false }) {
+// Both snapshot tools and model clients have an isolated network namespace.
+export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAGE,
+  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate', beforeEffect }) {
   if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length) {
     throw new ReviewDenied('sandbox_request_invalid');
   }
@@ -475,13 +469,8 @@ async function sandboxExec({ snapshot, argv, image = REVIEW_IMAGE,
     throw new ReviewDenied('sandbox_requires_rootless_docker');
   }
   const name = `board-review-${randomUUID()}`;
-  const args = ['run', '--rm', '--name', name, '--pull=never', '--read-only',
+  const args = ['run', '--rm', '--name', name, '--pull=never', '--read-only', '--network=none',
     '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0'];
-  if (modelNetwork) {
-    args.push('--add-host', 'localhost:127.0.0.254');
-  } else {
-    args.push('--network=none');
-  }
   args.push('--tmpfs=/tmp:rw,nosuid,nodev,size=64m', '-e', 'HOME=/tmp',
     '--mount', `type=bind,src=${snapshot},dst=/candidate,readonly`);
   for (const { src, dst } of mounts) {
@@ -500,6 +489,7 @@ async function sandboxExec({ snapshot, argv, image = REVIEW_IMAGE,
   let code = 0;
   let stdout = '';
   let stderr = '';
+  await beforeEffect?.();
   try {
     const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
     stdout = run.stdout;
@@ -511,25 +501,54 @@ async function sandboxExec({ snapshot, argv, image = REVIEW_IMAGE,
   } finally {
     try {
       await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
-    } catch { /* контейнер уже удалён --rm или не стартовал */ }
+    } catch (failure) {
+      if (!String(failure.stderr).includes('No such container')) {
+        throw new ReviewDenied('sandbox_cleanup_failed', { cause: failure });
+      }
+    }
   }
   return { code, stdout, stderr };
 }
 
-// Публичный sandbox-раннер: сеть физически отключена всегда.
-export function runInReadOnlySandbox(opts) {
-  return sandboxExec({ ...opts, modelNetwork: false });
+function runModelInReadOnlySandbox({ allow, argv, env = {}, mounts = [], ...options }) {
+  const { NODE_OPTIONS, ...bootEnv } = env;
+  if (NODE_OPTIONS) bootEnv.DF_CHILD_NODE_OPTIONS = NODE_OPTIONS;
+  return withModelProxy({ allow, beforeConnect: options.beforeEffect }, socket => runInReadOnlySandbox({ ...options,
+    argv: ['node', '/model-proxy/client.cjs', ...argv], env: bootEnv,
+    mounts: [...mounts, { src: PROXY_BOOTSTRAP, dst: '/model-proxy/client.cjs' },
+      { src: socket, dst: '/model-proxy/upstream.sock' }] }));
 }
 
-// Внутренний раннер ревьюера: единственный, кому нужен egress модели.
 function piSandbox(opts) {
-  return sandboxExec({ ...opts, modelNetwork: true });
+  return runModelInReadOnlySandbox(opts);
 }
 
-// Адаптер ReviewPort: реальный Pi/Sol в read-only rootless Docker на снимке
-// unpackExact(candidate_sha). Возвращает аттестованный ReviewReceipt.
+async function sandboxPiCredential(piRoot, provider, kind, beforeEffect) {
+  const load = async () => JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'))?.[provider];
+  let auth = await load();
+  if (auth == null) throw new ReviewDenied(`${kind}_auth_missing`);
+  if (auth.type !== 'oauth') return auth;
+  // Refresh is a host-side operation: a rotated refresh token must survive
+  // the sandbox, and the long-lived credential must never be copied into it.
+  if (typeof auth.expires === 'number' && auth.expires <= Date.now() + 10 * 60 * 1000) {
+    await beforeEffect?.();
+    try {
+      await exec(join(piRoot, 'bin', 'pi'), ['auth', 'print-bearer-token', '--provider', provider,
+        '--min-expiry', '10m'], { timeout: 60_000, maxBuffer: 1024 * 1024 });
+    } catch {
+      // A child-process error can include the bearer in stdout; don't forward it.
+      throw new ReviewDenied(`${kind}_auth_refresh_failed`);
+    }
+    auth = await load();
+  }
+  if (auth?.type !== 'oauth' || !nonEmpty(auth.access)) throw new ReviewDenied(`${kind}_auth_missing`);
+  return { type: 'oauth', access: auth.access, expires: auth.expires, refresh: 'sandbox-redacted',
+    ...(nonEmpty(auth.accountId) ? { accountId: auth.accountId } : {}) };
+}
+
+// Legacy Pi/Sol ReviewPort on the hardened snapshot; VS-2 uses the Neon adapter.
 export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
-  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox }) {
+  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect }) {
   if (!isAbsolute(journal ?? '') || !isAbsolute(piRoot ?? '')) {
     throw new ReviewDenied('review_runner_misconfigured');
   }
@@ -577,36 +596,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // одного провайдера критика и уничтожается pi-guard после первого чтения.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
-      let fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
-      let credential = fullAuth?.[critic.provider];
-      if (credential === undefined || credential === null) {
-        throw new ReviewDenied('review_auth_missing');
-      }
-      // OAuth refresh-токен одноразовый: если контейнер рефрешит его, новая
-      // пара гибнет в tmpfs, а на хосте остаётся погашенный токен. Поэтому
-      // рефреш — только на хосте, до запуска контейнера. pi сам атомарно
-      // перезаписывает auth.json; stdout (bearer) не логируем.
-      if (credential?.type === 'oauth' && typeof credential.expires === 'number' &&
-          credential.expires <= Date.now() + 10 * 60 * 1000) {
-        try {
-          await exec(join(piRoot, 'bin', 'pi'),
-            ['auth', 'print-bearer-token', '--provider', critic.provider,
-             '--min-expiry', '10m'],
-            { timeout: 60_000, maxBuffer: 1024 * 1024 });
-        } catch {
-          throw new ReviewDenied('review_auth_refresh_failed');
-        }
-        fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
-        credential = fullAuth?.[critic.provider];
-      }
-      // В контейнер refresh-токен не передаётся вообще: внутри sandbox нет
-      // долгоживущего секрета и pi никогда не пытается OAuth-refresh.
-      const sandboxCredential = credential?.type === 'oauth'
-        ? { ...credential, refresh: 'sandbox-redacted',
-            expires: Math.max(Number(credential.expires) || 0, Date.now() + 3600_000) }
-        : credential;
+      const credential = await sandboxPiCredential(piRoot, critic.provider, 'review', beforeEffect);
       await writeFile(join(cfgDir, 'auth.json'),
-        JSON.stringify({ [critic.provider]: sandboxCredential }));
+        JSON.stringify({ [critic.provider]: credential }), { mode: 0o600 });
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
@@ -625,31 +617,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         const info = await lstat(src).catch(() => null);
         if (info) mounts.push({ src, dst: `/pi-ro/${component}` });
       }
-      // Egress-allowlist для pi-guard: только адрес прокси и публичные
-      // endpoint'ы модели. Прокси на :44100 запрещён до запуска; NO_PROXY
-      // в контейнер не передаётся.
-      const allow = ['api.openai.com:443', 'chatgpt.com:443'];
-      // PI_OFFLINE: pi не скачивает внешние инструменты (fd/rg с github.com)
-      // — иначе egress-allowlist роняет процесс на старте.
-      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1' };
-      for (const key of PROXY_ENV) {
-        const value = process.env[key];
-        if (typeof value !== 'string' || !value) continue;
-        let u;
-        try {
-          u = new URL(value);
-        } catch {
-          throw new ReviewDenied('review_proxy_invalid');
-        }
-        // Прокси на приватном/loopback адресе или порту Board запрещён до
-        // запуска: такой endpoint дал бы контейнеру выход к локальным службам.
-        if (u.port === '44100' || privateProxyHost(u.hostname)) {
-          throw new ReviewDenied('review_proxy_blocked');
-        }
-        env[key] = value;
-        allow.push(`${u.hostname.toLowerCase()}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`);
-      }
-      env.PI_ALLOW_CONNECT = [...new Set(allow)].join(',');
+      const allow = PROVIDER_EGRESS.get(critic.provider) ?? [];
+      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1',
+        PI_ALLOW_CONNECT: allow.join(',') };
 
       const hasDiff = mounts.some((m) => m.dst === '/review/diff.patch');
       const diffLine = hasDiff
@@ -692,8 +662,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         '--no-approve', '--tools', READ_ONLY_TOOLS.join(','),
         '--session-dir', '/tmp/session', instruction];
 
-      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts,
-        timeoutMs });
+      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs, beforeEffect });
       if (run.code !== 0) {
         // Сырой вывод — только в приватный журнал (0600), не в причину Board.
         try {
@@ -755,6 +724,8 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           model: parsed.actual.model,
           reasoningLevel: parsed.actual.reasoningLevel,
         },
+        // VS-3: суммарный usage ходов pi; провайдер не отдал — явный null.
+        usage: parsed.usage ?? null,
         isolation: 'docker-ro-v1',
       };
     } finally {
@@ -772,26 +743,16 @@ const PROVIDER_EGRESS = new Map([
   ['cognition', ['api.cognition.ai:443']],
 ]);
 
-// Решение арбитра — ровно один JSON-объект в конце выдачи: код-блок ```json
-// или последний сбалансированный {...}. Нечитаемый ответ — null.
 function parseArbiterDecision(text) {
-  const body = String(text ?? '');
-  const fences = [...body.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
-  for (const m of fences.reverse()) {
-    try {
-      const v = JSON.parse(m[1]);
-      if (v !== null && typeof v === 'object' && !Array.isArray(v)) return v;
-    } catch { /* следующий блок */ }
+  const body = String(text ?? '').trim();
+  const json = /^```(?:json)?\s+([\s\S]*?)```$/i.exec(body)?.[1] ?? body;
+  try {
+    const decision = JSON.parse(json);
+    if (decision !== null && typeof decision === 'object' && !Array.isArray(decision)) return decision;
+  } catch (cause) {
+    throw new ReviewDenied('arbiter_response_invalid', { cause });
   }
-  const tail = body.lastIndexOf('{');
-  while (tail >= 0) {
-    try {
-      const v = JSON.parse(body.slice(tail));
-      if (v !== null && typeof v === 'object' && !Array.isArray(v)) return v;
-    } catch { /* хвост не JSON */ }
-    break;
-  }
-  return null;
+  throw new ReviewDenied('arbiter_response_invalid');
 }
 
 // Изолированный раннер арбитра третьего независимого семейства. Тот же
@@ -799,12 +760,13 @@ function parseArbiterDecision(text) {
 // арбитр судит по сериализованному спору (trigger + evidence + спека), а не
 // по дереву — дерево и worktree в контейнер не монтируются вообще.
 export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
-  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox }) {
+  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect }) {
   if (!isAbsolute(piRoot ?? '')) {
     throw new ReviewDenied('arbiter_runner_misconfigured');
   }
   return async (req) => {
     const arbiter = req?.arbiter;
+    const effort = arbiter?.reasoningLevel ?? 'high';
     if (arbiter === null || typeof arbiter !== 'object' || Array.isArray(arbiter) ||
         !nonEmpty(arbiter.provider) || !nonEmpty(arbiter.model)) {
       throw new ReviewDenied('arbiter_profile_not_approved');
@@ -814,13 +776,9 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
       // auth только одного провайдера арбитра — как у критика, копией в tmpfs.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
-      const fullAuth = JSON.parse(await readFile(join(piRoot, 'auth.json'), 'utf8'));
-      const credential = fullAuth?.[arbiter.provider];
-      if (credential === undefined || credential === null) {
-        throw new ReviewDenied('arbiter_auth_missing');
-      }
+      const credential = await sandboxPiCredential(piRoot, arbiter.provider, 'arbiter', beforeEffect);
       await writeFile(join(cfgDir, 'auth.json'),
-        JSON.stringify({ [arbiter.provider]: credential }));
+        JSON.stringify({ [arbiter.provider]: credential }), { mode: 0o600 });
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
@@ -837,24 +795,9 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
           mounts.push({ src, dst: `/pi-ro/${component}` });
         }
       }
-      const allow = [...(PROVIDER_EGRESS.get(arbiter.provider) ?? [])];
-      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs' };
-      for (const key of PROXY_ENV) {
-        const value = process.env[key];
-        if (typeof value !== 'string' || !value) continue;
-        let u;
-        try {
-          u = new URL(value);
-        } catch {
-          throw new ReviewDenied('arbiter_proxy_invalid');
-        }
-        if (u.port === '44100' || privateProxyHost(u.hostname)) {
-          throw new ReviewDenied('arbiter_proxy_blocked');
-        }
-        env[key] = value;
-        allow.push(`${u.hostname.toLowerCase()}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`);
-      }
-      env.PI_ALLOW_CONNECT = [...new Set(allow)].join(',');
+      const allow = PROVIDER_EGRESS.get(arbiter.provider) ?? [];
+      const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1',
+        PI_ALLOW_CONNECT: allow.join(',') };
 
       const instruction = [
         `Independent arbitration for Board #${req.task_id} attempt ${req.attempt_id}.`,
@@ -886,14 +829,14 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
         'exec /pi-ro/bin/pi "$@"', 'pi',
         '--print', '--mode', 'json',
         '--provider', arbiter.provider, '--model', arbiter.model,
-        '--thinking', arbiter.reasoningLevel ?? 'high',
+        '--thinking', effort,
         '--no-mcp', '--no-extensions', '--no-skills', '--no-context-files',
         '--no-approve', '--tools', READ_ONLY_TOOLS.join(','),
         '--session-dir', '/tmp/session', instruction];
 
       const snapshot = join(scratch, 'empty');
       await mkdir(snapshot);
-      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, timeoutMs });
+      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, allow, timeoutMs, beforeEffect });
       if (run.code !== 0) {
         throw new ReviewDenied(`arbiter_runner_exit:${run.code ?? 'timeout'}`);
       }
@@ -908,12 +851,14 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
           throw new ReviewDenied(`arbiter_${key}_mismatch`);
         }
       }
+      if (parsed.actual.reasoningLevel !== effort) throw new ReviewDenied('arbiter_effort_mismatch');
       assertToolsAllowed(parsed.toolsAdded);
       const decision = parseArbiterDecision(parsed.finalText);
-      if (decision === null) {
-        throw new ReviewDenied('arbiter_response_invalid');
+      if (!SHA256.test(req.subject_digest ?? '') || decision.subject_digest !== req.subject_digest) {
+        throw new ReviewDenied('arbiter_subject_mismatch');
       }
-      return decision;
+      // VS-3: решение арбитра с суммарным usage его ходов (null при отсутствии).
+      return { ...decision, usage: parsed.usage ?? null };
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }

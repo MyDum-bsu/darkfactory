@@ -2,14 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 import {
   executorFamily, assertCrossFamily, parseReviewTranscript, parseReviewVerdict,
-  hasValidFinding, isolatedPiReviewRunner, runInReadOnlySandbox, snapshotDigest,
+  hasValidFinding, isolatedArbiterRunner, isolatedPiReviewRunner, runInReadOnlySandbox, snapshotDigest,
   worktreeFingerprint, assertToolsAllowed, ReviewDenied, REVIEW_IMAGE,
 } from './review-runner.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
@@ -975,6 +975,31 @@ console.log('acc-refreshed');
     await rm(repo, { recursive: true, force: true });
     await rm(journal, { recursive: true, force: true });
     await rm(piRoot, { recursive: true, force: true });
+  }
+});
+
+test('Sol arbiter authenticates model effort and subject without mounting the OAuth refresh token', async t => {
+  const piRoot = await mkdtemp(join(tmpdir(), 'arbiter-pi-'));
+  t.after(() => rm(piRoot, { recursive: true, force: true }));
+  await writeFile(join(piRoot, 'auth.json'), JSON.stringify({ openai: { type: 'oauth', access: 'short-lived',
+    refresh: 'host-only-refresh', expires: Date.now() + 3_600_000 } }));
+  const subject_digest = 'a'.repeat(64);
+  const decision = { subject_digest, decision: 'directed_rework', directive: 'Correct sum.' };
+  const req = { task_id: '9', epoch: 1, attempt_id: 'abc', subject_digest, arbiter: CRITIC };
+  for (const [body, effort, reason] of [[decision, 'medium'], [decision, 'high', 'arbiter_effort_mismatch'],
+      [{ ...decision, subject_digest: 'b'.repeat(64) }, 'medium', 'arbiter_subject_mismatch']]) {
+    const runner = isolatedArbiterRunner({ piRoot, sandbox: async opts => {
+      const source = opts.mounts.find(m => m.dst === '/pi-cfg').src;
+      const auth = await readFile(join(source, 'auth.json'), 'utf8');
+      assert.doesNotMatch(auth, /host-only-refresh/);
+      assert.equal(opts.argv[opts.argv.indexOf('--thinking') + 1], 'medium');
+      assert.ok(opts.argv.includes('--no-mcp'));
+      const reply = msg({ thinkingLevel: effort, content: [{ type: 'text', text: JSON.stringify(body) }] });
+      return { code: 0, stdout: `${reply}\n${settled}` };
+    } });
+    if (reason) await assert.rejects(runner(req), { reason });
+    // Решение арбитра несёт usage ходов pi (здесь транскрипт без usage — null).
+    else assert.deepEqual(await runner(req), { ...decision, usage: null });
   }
 });
 
