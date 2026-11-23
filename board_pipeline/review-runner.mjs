@@ -89,18 +89,9 @@ function transcriptDisqualifying(ndjson, critic) {
     // {"verdict":42}), и маркер legacy-вердикта в тексте хода.
     const parts = Array.isArray(message.content) ? message.content : [];
     const text = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
-    for (const chunk of extractJsonObjects(text)) {
-      let parsed;
-      try {
-        parsed = JSON.parse(chunk);
-      } catch {
-        continue;
-      }
-      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) &&
-          'verdict' in parsed) {
-        return 'review_verdict_emitted';
-      }
-    }
+    // Вердиктоподобный фрагмент обязателен даже когда сам JSON битый:
+    // {"verdict":"REWORK",} не парсится, но исход уже издан — hold.
+    if (/"verdict"\s*:/.test(text)) return 'review_verdict_emitted';
     try {
       parseReviewVerdict(text);
       return 'review_verdict_emitted';
@@ -642,7 +633,10 @@ export function classifySandboxExit(error) {
 // SIGKILL (137), отказ запуска и прочие коды — обычный ReviewDenied.
 export function reviewRunnerExitFailure(run) {
   const reason = `review_runner_exit:${run?.code ?? 'timeout'}`;
-  if (run?.code === 143 || run?.timedOut === true) {
+  // Код 137 — SIGKILL и нетранзиентен даже при timedOut-флаге: дочерний
+  // процесс вышел 137-м, обработав deadline-сигнал, — числовой выход
+  // доминирует над host-доказательством.
+  if (run?.code === 143 || (run?.timedOut === true && run?.code !== 137)) {
     return new ReviewRunnerTimeout(reason);
   }
   return new ReviewDenied(reason);

@@ -87,6 +87,9 @@ test('classification: только 143 и host-timeout — typed transient', () 
   }
   // SIGKILL, отказ запуска, произвольный null и «143» внутри stderr — не transient.
   for (const run of [{ code: 137 }, { code: 1 }, { code: 126 }, { code: 255 },
+      // 137 остаётся SIGKILL-нетранзиентом даже при timedOut-флаге:
+      // числовой выход доминирует над host-доказательством.
+      { code: 137, timedOut: true },
       { code: null }, { code: null, stderr: 'killed 143' },
       { code: null, timedOut: false }, { code: '143' }]) {
     const e = reviewRunnerExitFailure(run);
@@ -561,23 +564,31 @@ dockerTest('runner: сбой cleanup первого читателя — пов�
 
 dockerTest('runner: живые гейты на границе запуска — второго reader нет', async (t) => {
   // Между успешным beforeRetry и docker run второго читателя меняется ЖИВОЕ
-  // состояние (lease отпущен / renewal-флаг): beforeEffect раннера обязан
-  // заново доказать гейт на границе эффекта, и контейнер не стартует.
-  for (const mode of ['flag', 'live']) {
+  // состояние (lease отпущен / renewal-флаг / switch закрыт В ОКНЕ сверки
+  // субъекта): beforeEffect раннера обязан заново доказать гейт на границе
+  // эффекта, а дешёвый switch/lost — последним, после асинхронной проверки.
+  for (const mode of ['flag', 'live', 'closing']) {
     const { calls } = await dockerStub(t);
     const { binding, profile, journal, piRoot } = await fixture(t, []);
     let held = true;
+    let second = false;
     const runner = isolatedPiReviewRunner({ journal, piRoot,
       sandbox: runInReadOnlySandbox, timeoutMs: 300,
-      // 'flag' — кэш lost-флага renewal-цикла; 'live' — свежая проверка
-      // удержания на самой границе запуска (тот же retry-guard).
-      beforeEffect: mode === 'flag'
-        ? async () => { if (!held) throw new Error('Lease lost'); }
-        : async () => { if (!(await Promise.resolve(held))) throw new Error('claim_lost'); } });
+      beforeEffect: mode === 'closing' ? async () => {
+        // Продукционный порядок: живой гейт → асинхронная сверка субъекта,
+        // в её окне switch закрывается → финальная дешёвая проверка ловит.
+        if (!second) return;
+        await Promise.resolve();         // живой гейт проходит
+        held = false;                    // switch/lease закрываются в окне
+        await Promise.resolve();         // окно async subject-check
+        if (!held) throw new Error('kill_switch');
+      } : async () => {
+        if (second && !held) throw new Error(mode === 'flag' ? 'Lease lost' : 'claim_lost');
+      } });
     await assert.rejects(
       l2ReviewWithTransientRetry({ review: runner, binding, profile,
-        beforeRetry: async () => { held = false; } }),
-      (e) => /Lease lost|claim_lost/.test(e.message), mode);
+        beforeRetry: async () => { second = true; if (mode !== 'closing') held = false; } }),
+      (e) => /Lease lost|claim_lost|kill_switch/.test(e.message), mode);
     // Второй docker info — host-side preflight перед beforeEffect; `run` нет.
     assert.deepEqual(await calls(), ['info', 'run', 'rm', 'info'], mode);
   }
@@ -657,6 +668,10 @@ gitTest('runner: незавершённый, но дисквалифицирую
     // Malformed-вердикт {"verdict":42} в целом assistant-сообщении без
     // settled: вердиктоподобный объект уже издан — hold, не повтор.
     { stdout: msg({ content: [{ type: 'text', text: '{"verdict":42}' }] }),
+      reason: 'review_verdict_emitted' },
+    // Синтаксически битый вердикт-объект (JSON.parse не проходит) — исход
+    // уже издан, hold; review_verdict_missing здесь недопустим как transient.
+    { stdout: msg({ content: [{ type: 'text', text: '{"verdict":"REWORK",}' }] }),
       reason: 'review_verdict_emitted' },
     // session_info с запрещённым tool без assistant-хода: нарушение политики
     // инструментов зафиксировано потоком — потеря settlement его не стирает.
