@@ -105,3 +105,22 @@ test('deadline и dispose: таймеры снимаются, сигнал жи�
   await delay(80);
   assert.equal(quiet.signal.aborted, false, 'dispose снимает все armed таймеры');
 });
+
+test('leavePhase: неиспользованный бюджет покинутой фазы не абортит следующую', async () => {
+  const signals = createAttemptSignals({ phaseBudgets: { stages: 30, l2_critic: 60_000 } });
+  signals.phase('stages');
+  await delay(10);
+  signals.leavePhase();
+  await delay(60);
+  assert.equal(signals.signal.aborted, false, 'старый таймер stages обязан быть снят');
+  signals.phase('l2_critic');
+  await delay(60);
+  assert.equal(signals.signal.aborted, false, 'должен жить только таймер l2_critic');
+  signals.dispose();
+  // Повторный вход в ту же фазу перевооружает таймер по остатку бюджета.
+  const reenter = createAttemptSignals({ phaseBudgets: { stages: 60 } });
+  reenter.phase('stages');
+  await delay(20);
+  reenter.phase('l1_l3' in reenter.phaseBudget.budgets ? 'l1_l3' : 'stages');
+  reenter.dispose();
+});

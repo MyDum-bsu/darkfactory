@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { createBbStageObserver, matchesNativeStageWitness, pilotWriterWorkspaceReady,
   verifyBbStageTurn, writerWorkspaceReady } from './bb-stage-adapter.mjs';
 import { createAttemptSignals } from './signals.mjs';
-import { abEffectGuard, enrollAbPilot, guardAbBoard, inspectPilotDiff, pilotArtifacts, CASES } from './ab-pilot.mjs';
+import { abEffectGuard, enrollAbPilot, foremanArtifacts, guardAbBoard, inspectPilotDiff, pilotArtifacts, CASES } from './ab-pilot.mjs';
 import { resolveArbitration } from './worker-selector.mjs';
 
 const parentThread = 'thr_parent';
@@ -310,4 +310,88 @@ test('cleanup при abort/timeout: thread stop идёт даже при сбо�
     skills: [{ text: 's' }] };
   await assert.rejects(observer(req), /stage_wait_unconfirmed/);
   assert.equal(stopped, 1, 'подтверждённый дочерний тред обязан быть остановлен');
+});
+
+test('sandbox-путь без phaseBudgets: signals без бюджетов не ломает наблюдение', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'df-stage-nobudget-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'observer'), journal = join(root, 'journal');
+  await mkdir(workspace, { mode: 0o700 });
+  await mkdir(journal, { mode: 0o700 });
+  const artifact = Buffer.from(JSON.stringify({ type: 'inventory', inventory: 'a'.repeat(64), items: 1, unresolved: 0 }));
+  const signals = createAttemptSignals({ deadline: Date.now() + 60_000 });
+  const observer = await createBbStageObserver({ workspace, project, journal,
+    deadline: Date.now() + 60_000 }, {
+    assertCurrent() {}, readArtifact: () => ({ artifact, material: 'm' }),
+    record: () => {}, recordWitness: () => {},
+    execBb: async () => assert.fail('host bb spawn запрещён'),
+    sandboxTransport: { assertReadOnly: async () => true,
+      async observe(req) { return { verdict: 'PASS', transcript_file: null, witness: {
+        mode: 'read-only', transport: 'docker-ro-v1', snapshotDigest: 'c'.repeat(64),
+        worktreeFingerprint: {}, challenge: req.challenge, verdict: 'PASS',
+        artifactDigest: req.artifactDigest, transcript_sha256: 'e'.repeat(64), checkpoint: 'feed80ab',
+        actual: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' } } }; } },
+    signals,
+  });
+  const req = { stage: 'intake', role: 'r', verifier: 'inventory', registryDigest: 'a'.repeat(64),
+    playbook: 'p', model: { provider: 'openai', model: 'gpt-6.2-sol', reasoning: null },
+    binding: { task_id: '1', candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) },
+    skills: [{ text: 's' }] };
+  const got = await observer(req);
+  assert.equal(got.verdict, 'PASS', 'без phaseBudgets — maxSeconds и общий deadline');
+  signals.dispose();
+});
+
+test('сбой record() после подтверждённого spawn останавливает дочерний тред', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'df-stage-recstop-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'observer'), journal = join(root, 'journal');
+  await mkdir(workspace, { mode: 0o700 });
+  await mkdir(journal, { mode: 0o700 });
+  let stopped = 0;
+  const artifact = Buffer.from(JSON.stringify({ type: 'inventory', inventory: 'a'.repeat(64), items: 1, unresolved: 0 }));
+  const execBb = async argv => {
+    if (argv[1] === 'spawn') return { stdout: JSON.stringify({ id: threadId }) };
+    if (argv[1] === 'show') throw new Error('show unavailable');
+    if (argv[1] === 'stop') { stopped++; return { stdout: '{}' }; }
+    return { stdout: '{}' };
+  };
+  const observer = await createBbStageObserver({ workspace, project, journal, parentThread,
+    deadline: Date.now() + 60_000 }, {
+    assertCurrent() {}, assertReadOnly: () => true,
+    readArtifact: () => ({ artifact, material: 'm' }),
+    record: async () => { throw new Error('ENOSPC'); },
+    recordWitness: () => {}, execBb });
+  const req = { stage: 'intake', role: 'r', verifier: 'inventory', registryDigest: 'a'.repeat(64),
+    model: { provider, model, reasoning: null },
+    binding: { task_id: '1', candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) },
+    skills: [{ text: 's' }] };
+  await assert.rejects(observer(req), /ENOSPC/);
+  assert.equal(stopped, 1, 'дочерний тред обязан быть остановлен при сбое record');
+});
+
+test('foremanArtifacts: inventory измеряется из дерева кандидата, прочие verifier — fail-closed', async () => {
+  const candidate = 'a'.repeat(40);
+  const files = ['src/a.mjs', 'src/b.mjs'];
+  const git = async (...args) => args[0] === 'ls-tree' ? files.join('\n') : 'x';
+  const args = { candidate,
+    diff: { diffDigest: 'e'.repeat(64), files: ['src/a.mjs', 'src/b.mjs'] },
+    brief: 'Frozen task', review: 'Frozen check',
+    localEvidence: { ok: true, sha: candidate, evidence: [{ exit: 0, sha256: 'f'.repeat(64) }] },
+    git };
+  const read = foremanArtifacts(args);
+  const { artifact, material } = await read({ verifier: 'inventory' });
+  const inv = JSON.parse(artifact);
+  assert.equal(inv.type, 'inventory');
+  assert.equal(inv.items, 2);
+  assert.equal(inv.unresolved, 0);
+  assert.match(inv.inventory, /^[a-f0-9]{64}$/);
+  assert.match(material, /src\/a\.mjs/);
+  // Расхождение доказанного diff и листинга — измеряемый unresolved → REWORK.
+  const drifted = foremanArtifacts({ ...args,
+    diff: { diffDigest: 'e'.repeat(64), files: ['src/a.mjs', 'src/missing.mjs'] } });
+  assert.equal(JSON.parse((await drifted({ verifier: 'inventory' })).artifact).unresolved, 1);
+  // change-set делегируется pilotArtifacts (тот же гейт L1); прочие — отказ.
+  assert.deepEqual(JSON.parse((await read({ verifier: 'change-set' })).artifact).type, 'change-set');
+  await assert.rejects(read({ verifier: 'course-outline' }), /ab_pilot_artifact_not_available/);
 });

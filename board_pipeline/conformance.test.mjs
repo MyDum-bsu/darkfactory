@@ -32,6 +32,7 @@ import { tamperGate } from './tamper-gate.mjs';
 import { createTelemetryRecorder } from './telemetry.mjs';
 import { loadRoleRegistry } from './role-registry.mjs';
 import { runPlaybook } from './playbook-router.mjs';
+import { foremanArtifacts, foremanDiff } from './ab-pilot.mjs';
 import { PLAYBOOK_TRIAD, stageObservation } from './playbook-test-fixture.mjs';
 import { createBbStageObserver } from './bb-stage-adapter.mjs';
 import * as ws from './worker-selector.mjs';
@@ -453,7 +454,19 @@ test('V2-1: Foreman RO stage transport → L2 → native complete на одно�
       return createBbStageObserver({ project: 'proj_stage', workspace: stageDir, journal,
         deadline: Date.now() + 120_000 }, {
         assertCurrent: async () => {},
-        readArtifact: req => { const o = stageObservation(req); return { artifact: o.artifact, material: 'facts' }; },
+        // Первая стадия всех четырёх плейбуков — inventory: артефакт идёт
+        // продукционным foremanArtifacts (реальный git ls-tree + доказанный
+        // diff), а не заглушкой. Прочие verifier без доверенного адаптера —
+        // тестовая фикстура.
+        readArtifact: async req => req.verifier === 'inventory'
+          ? await foremanArtifacts({ candidate: x.candidate,
+              diff: await foremanDiff({ git: (...args) => git(x.tree, ...args), base: x.base,
+                candidate: x.candidate }),
+              localEvidence: { ok: true, sha: x.candidate,
+                evidence: [{ exit: 0, sha256: 'f'.repeat(64) }] },
+              brief: Buffer.from('Frozen task'), review: 'Frozen check',
+              git: (...args) => git(x.tree, ...args) })(req)
+          : { artifact: stageObservation(req).artifact, material: 'facts' },
         record: async () => {},
         recordWitness: async row => transport.witnesses.push(row),
         sandboxTransport: transport,

@@ -205,3 +205,68 @@ test('реальная сетевая изоляция: connect к :44100 вну
       's.on("connect",()=>process.exit(3));s.on("error",()=>process.exit(0));'] });
   assert.equal(run.code, 0, '--network=none: коннект к :44100 обязан быть недостижим');
 });
+
+test('отменённый вызов не запускает модель; abort во время — остановка и cleanup до отказа', async t => {
+  const { worktree, journal, piRoot, unpack } = await fixture(t);
+  // Abort ДО observe: ни проб-модели, ни дочернего процесса — сразу причина.
+  const pre = new AbortController();
+  pre.abort(new Error('kill_switch'));
+  let children = 0;
+  const aborted = createStageSandboxTransport({ worktree, journal, piRoot, unpack,
+    probeDocker: async () => true, worktreeFingerprintImpl: fp, signal: pre.signal,
+    dockerSandbox: async () => { children++; return { code: 0, stdout: 'T' }; } });
+  await assert.rejects(aborted.observe(request(sol)), /kill_switch/);
+  assert.equal(children, 0, 'отменённая стадия не запускает модель');
+
+  // Abort во время исполнения: сигнал передаётся раннеру, активный процесс
+  // останавливается, отказ возвращается только после cleanup раннера.
+  const live = new AbortController();
+  let seenSignal, cleaned = false;
+  const transport = createStageSandboxTransport({ worktree, journal, piRoot, unpack,
+    probeDocker: async () => true, worktreeFingerprintImpl: fp, signal: live.signal,
+    dockerSandbox: async opts => {
+      seenSignal = opts.signal;
+      try {
+        await new Promise(resolve => setTimeout(resolve, 15_000));
+        return { code: 0, stdout: 'T' };
+      } finally { cleaned = true; }
+    } });
+  const pending = transport.observe(request(sol));
+  await new Promise(resolve => setTimeout(resolve, 30));
+  live.abort(new Error('lease_lost'));
+  await assert.rejects(pending, /lease_lost/);
+  assert.equal(seenSignal, live.signal, 'signal передаётся в sandbox-раннер');
+  assert.equal(cleaned, true, 'cleanup раннера завершён до отказа');
+});
+
+test('закреплённый reasoning: docker исполняет и аттестует уровень, landlock отклоняет неподдерживаемый', async t => {
+  const { worktree, journal, piRoot, unpack } = await fixture(t);
+  // Docker: закреплённый 'high' уходит в --thinking и сверяется с actual.
+  const sandboxes = [];
+  const high = createStageSandboxTransport({ worktree, journal, piRoot, unpack,
+    probeDocker: async () => true, worktreeFingerprintImpl: fp,
+    dockerSandbox: async opts => { sandboxes.push(opts); return { code: 0, stdout: 'T' }; },
+    parsePi: () => ({ actual: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'high' },
+      toolsAdded: [], finalText: `${challenge} PASS` }) });
+  const { verdict } = await high.observe(request({ ...sol, reasoning: 'high' }));
+  assert.equal(verdict, 'PASS');
+  const argv = sandboxes[0].argv;
+  assert.equal(argv[argv.indexOf('--thinking') + 1], 'high', 'закреплённый уровень исполняется');
+  // Фактический уровень не совпал с закреплённым — fail-closed mismatch.
+  const mismatch = createStageSandboxTransport({ worktree, journal, piRoot, unpack,
+    probeDocker: async () => true, worktreeFingerprintImpl: fp,
+    dockerSandbox: async () => ({ code: 0, stdout: 'T' }),
+    parsePi: () => ({ actual: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' },
+      toolsAdded: [], finalText: `${challenge} PASS` }) });
+  await assert.rejects(mismatch.observe(request({ ...sol, reasoning: 'high' })),
+    /stage_reasoning_mismatch/);
+  // Landlock: контур аттестует только 'medium' — закреплённый 'high'
+  // отклоняется до запуска любого дочернего процесса.
+  let agyCalls = 0;
+  const landlock = createStageSandboxTransport({ worktree, journal, piRoot, unpack,
+    probeLandlock: async () => true, worktreeFingerprintImpl: fp,
+    agyTransport: async () => { agyCalls++; return { code: 0, stdout: '', cwd: '' }; } });
+  await assert.rejects(landlock.observe(request({ ...neon, reasoning: 'high' })),
+    /stage_reasoning_unsupported/);
+  assert.equal(agyCalls, 0, 'неподдерживаемый спек не доходит до запуска');
+});

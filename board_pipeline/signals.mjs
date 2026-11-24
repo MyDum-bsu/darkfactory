@@ -132,6 +132,17 @@ export function createAttemptSignals({ deadline, phaseBudgets, assertOpen, lease
     arm(() => setInterval(() => { poll().catch(error => abort(error)); }, pollMs).unref?.());
   }
 
+  // Таймер текущей вооружённой фазы: неиспользованный бюджет покинутой фазы
+  // не должен аборитить следующую. Перевход в другую фазу так же снимает
+  // таймер предыдущей (phase() вооружает заново по остатку бюджета).
+  let phaseTimer = null;
+  const disarmPhase = () => {
+    if (phaseTimer !== null) {
+      clearTimeout(phaseTimer);
+      timers.delete(phaseTimer);
+      phaseTimer = null;
+    }
+  };
   const api = {
     signal,
     phaseBudget: budget,
@@ -160,6 +171,7 @@ export function createAttemptSignals({ deadline, phaseBudgets, assertOpen, lease
     // Возвращает оставшееся время фазы в мс.
     phase(name) {
       if (!budget) throw new AttemptSignalError('phase_budget_unknown');
+      disarmPhase();
       budget.enter(name);
       const remaining = budget.remaining(name);
       if (remaining <= 0) {
@@ -167,10 +179,11 @@ export function createAttemptSignals({ deadline, phaseBudgets, assertOpen, lease
         abort(reason);
         throw reason;
       }
-      arm(() => setTimeout(() => abort(abortError(`phase_deadline_exceeded:${name}`)), remaining).unref?.());
+      phaseTimer = arm(() => setTimeout(() => abort(abortError(`phase_deadline_exceeded:${name}`)),
+        remaining).unref?.());
       return remaining;
     },
-    leavePhase() { budget?.leave(); },
+    leavePhase() { disarmPhase(); budget?.leave(); },
     checkDiskPreflight: () => checkDiskPreflight(disk?.path, { minBytes: disk?.minBytes ?? 1n, statfsImpl }),
     // Гарантированная очистка: все таймеры и опросы снимаются.
     dispose() {

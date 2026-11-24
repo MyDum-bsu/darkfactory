@@ -115,6 +115,29 @@ export function pilotArtifacts({ candidate, diff, localEvidence, brief, review }
   };
 }
 
+// Артефакты для foreman-пути (ab и общий): доверенное измерение под verifier
+// стадии, а не единый change-set. 'inventory' — реальный листинг дерева
+// кандидата (git ls-tree) плюс расхождение с доказанным diff; 'change-set' —
+// как pilotArtifacts (тот же гейт на зелёный L1). Прочие верификаторы —
+// fail-closed отказ до запуска модели: доверенного адаптера для них нет.
+export function foremanArtifacts({ candidate, diff, localEvidence, brief, review, git }) {
+  const changeSet = pilotArtifacts({ candidate, diff, localEvidence, brief, review });
+  const base = { brief: brief.toString('utf8'), rubric: review, changedPaths: diff.files,
+    checks: localEvidence.evidence.map(({ sha256, exit }) => ({ sha256, exit })) };
+  let listing;
+  return async request => {
+    if (request.verifier === 'inventory') {
+      listing ??= (await git('ls-tree', '-r', '--name-only', candidate))
+        .split('\n').map(entry => entry.trim()).filter(Boolean).sort();
+      const artifact = Buffer.from(JSON.stringify({ type: 'inventory',
+        inventory: sha(JSON.stringify(listing)), items: listing.length,
+        unresolved: diff.files.filter(file => !listing.includes(file)).length }));
+      return { artifact, material: JSON.stringify({ ...base, files: listing }) };
+    }
+    return changeSet(request);
+  };
+}
+
 // Доказательный diff base→candidate для общего (не ab) foreman-пути: без
 // ограничения CASES-скопом, та же форма {files, diffDigest}, что inspectPilotDiff.
 export async function foremanDiff({ git, base, candidate }) {

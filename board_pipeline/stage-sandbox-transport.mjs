@@ -102,7 +102,7 @@ const STAGE_EGRESS = new Map([
   ['deepseek', ['api.deepseek.com:443']],
 ]);
 
-function stageDockerSandbox({ allow, argv, env = {}, mounts = [], ...options }) {
+function stageDockerSandbox({ allow, argv, env = {}, mounts = [], signal, ...options }) {
   const { NODE_OPTIONS, ...bootEnv } = env;
   if (NODE_OPTIONS) bootEnv.DF_CHILD_NODE_OPTIONS = NODE_OPTIONS;
   return withModelProxy({ allow, beforeConnect: options.beforeEffect },
@@ -152,27 +152,31 @@ export function stageVerdictLine(text, challenge) {
   return match[2];
 }
 
-// Ожидание внутреннего вызова с учётом AbortSignal: при обрыве внутренний
-// промис ДОЖИДАЕТСЯ (его finally — гарантированный cleanup дочернего
-// процесса/контейнера), затем выбрасывается причина аборта. Осиротевших
-// процессов не остаётся: убийство делает сам транспорт по timeoutMs.
-async function settleWithAbort(promise, signal) {
+// Ожидание внутреннего вызова с учётом AbortSignal: при обрыве сначала
+// вызывается onAbort (остановка активного дочернего процесса/контейнера),
+// внутренний промис ДОЖИДАЕТСЯ (его finally — гарантированный cleanup),
+// затем выбрасывается причина аборта. Осиротевших процессов не остаётся.
+async function settleWithAbort(promise, signal, onAbort) {
   if (signal === undefined) return await promise;
+  const reason = () => signal.reason ?? new StageDenied('stage_aborted');
   if (signal.aborted) {
     await promise.catch(() => {});
-    throw signal.reason ?? new StageDenied('stage_aborted');
+    throw reason();
   }
   return await new Promise((resolve, reject) => {
-    const onAbort = () => Promise.resolve(promise).catch(() => {})
-      .finally(() => reject(signal.reason ?? new StageDenied('stage_aborted')));
-    signal.addEventListener('abort', onAbort, { once: true });
+    const onSignal = () => Promise.resolve()
+      .then(() => onAbort?.())
+      .catch(() => {})
+      .then(() => Promise.resolve(promise).catch(() => {}))
+      .finally(() => reject(reason()));
+    signal.addEventListener('abort', onSignal, { once: true });
     Promise.resolve(promise).then(
       value => {
-        signal.removeEventListener('abort', onAbort);
-        if (signal.aborted) reject(signal.reason ?? new StageDenied('stage_aborted'));
+        signal.removeEventListener('abort', onSignal);
+        if (signal.aborted) reject(reason());
         else resolve(value);
       },
-      cause => { signal.removeEventListener('abort', onAbort); reject(cause); });
+      cause => { signal.removeEventListener('abort', onSignal); reject(cause); });
   });
 }
 
@@ -245,7 +249,10 @@ export function createStageSandboxTransport({
     if (spec === null || typeof spec.model !== 'string' || !spec.model ||
         !STAGE_EGRESS.has(spec.provider)) throw new StageDenied('stage_model_denied');
     if (!SHA.test(binding?.candidate_sha ?? '')) throw new StageDenied('stage_requires_full_sha');
-    const effort = spec.reasoningLevel ?? 'medium';
+    // Закреплённый уровень reasoning стадии (router форме 'reasoning'):
+    // незакреплённый — проверенный дефолт 'medium', закреплённый — аттестуется
+    // фактическим reasoningLevel транскрипта (stage_reasoning_mismatch ниже).
+    const effort = model.reasoning ?? 'medium';
     const scratch = await freshScratch(worktree);
     try {
       const source = join(scratch, 'candidate');
@@ -302,8 +309,23 @@ export function createStageSandboxTransport({
 
       let run;
       try {
+        // Отменённый до запуска вызов не запускает модель: причина аборта —
+        // до любого дочернего процесса.
+        if (signal?.aborted) throw signal.reason ?? new StageDenied('stage_aborted');
+        // Остановка активного контейнера по сигналу: уникальный cfgDir
+        // (mkdtemp) идентифицирует ровно этот запуск — rm -f завершает
+        // docker run, cleanup выполняет finally самого раннера.
+        const stopRun = async () => {
+          try {
+            const { stdout: ps } = await exec('docker',
+              ['ps', '-aq', '--filter', `volume=${cfgDir}`], { timeout: 10_000 });
+            for (const id of ps.split('\n').map(line => line.trim()).filter(Boolean)) {
+              await exec('docker', ['rm', '-f', id], { timeout: 15_000 }).catch(() => {});
+            }
+          } catch { /* best effort: timeoutMs раннера — запасная граница */ }
+        };
         run = await settleWithAbort(dockerSandbox({ snapshot: source, argv, image, env, mounts,
-          allow, timeoutMs: effectiveTimeout(callMs), beforeEffect }), signal);
+          allow, timeoutMs: effectiveTimeout(callMs), beforeEffect, signal }), signal, stopRun);
       } finally {
         await driftCheck(async () => {
           const after = await snapshotDigestImpl(source);
@@ -337,6 +359,11 @@ export function createStageSandboxTransport({
 
   const observeLandlock = async ({ binding, model, prompt, challenge, artifactDigest, timeoutMs: callMs }) => {
     if (!SHA.test(binding?.candidate_sha ?? '')) throw new StageDenied('stage_requires_full_sha');
+    // agy-stream исполняет жёстко '--effort medium' и аттестует фактический
+    // reasoningLevel='medium'. Закреплённый спек с другим уровнем отклоняется
+    // ДО запуска: транспорт не исполняет неподдерживаемый уровень молча.
+    const effort = model.reasoning ?? 'medium';
+    if (effort !== 'medium') throw new StageDenied('stage_reasoning_unsupported');
     const scratch = await freshScratch(worktree);
     try {
       const staged = join(scratch, 'staged');
@@ -365,9 +392,27 @@ export function createStageSandboxTransport({
       ].join('\n\n');
       let live;
       try {
+        // Отменённый до запуска вызов не запускает модель.
+        if (signal?.aborted) throw signal.reason ?? new StageDenied('stage_aborted');
+        // Остановка активного agy-процесса по сигналу: launcher agy-landlock.py
+        // несёт boundary-JSON с уникальным scratch-путём этого запуска — группа
+        // процесса добивается SIGKILL, cleanup выполняет сам транспорт.
+        const stopRun = async () => {
+          try {
+            const { stdout: pids } = await exec('pgrep', ['-f', `agy-landlock.py.*${scratch}`],
+              { timeout: 8_000 });
+            for (const pid of pids.split('\n').map(line => Number(line.trim()))
+              .filter(pid => Number.isSafeInteger(pid) && pid > 1)) {
+              try { process.kill(-pid, 'SIGKILL'); }
+              catch {
+                try { process.kill(pid, 'SIGKILL'); } catch { /* уже завершён */ }
+              }
+            }
+          } catch { /* best effort: timeoutMs транспорта — запасная граница */ }
+        };
         live = await settleWithAbort(agyTransport({ prompt: instruction, snapshot: view,
           publishSnapshot: snapshot.publish, timeoutMs: effectiveTimeout(callMs), env,
-          beforeEffect }), signal);
+          beforeEffect, signal }), signal, stopRun);
       } finally {
         await driftCheck(async () => {
           if (!isDeepStrictEqual(await snapshotDigestImpl(published ? view : staged), fingerprint)) {
@@ -382,6 +427,7 @@ export function createStageSandboxTransport({
       }
       if (!published || live.cwd !== view) throw new StageDenied('agy_init_unattested');
       const observed = parseAgy(live.stdout, view);
+      if (observed.actual?.reasoningLevel !== 'medium') throw new StageDenied('stage_reasoning_mismatch');
       const verdict = stageVerdictLine(observed.text, challenge);
       const transcript = JSON.stringify({ evidence: observed.evidence, actual: observed.actual,
         requestSha256: sha256(instruction), reads: observed.verifiedReads, stream: live.stdout });
@@ -412,6 +458,9 @@ export function createStageSandboxTransport({
       }
       if (typeof prompt !== 'string' || !prompt.trim() || !DIGEST.test(challenge ?? '') ||
           !DIGEST.test(artifactDigest ?? '')) throw new StageDenied('stage_request_invalid');
+      // Отменённый вызов не запускает модель: причина аборта — до проб и
+      // любых дочерних процессов.
+      if (signal?.aborted) throw signal.reason ?? new StageDenied('stage_aborted');
       const kind = stageTransportKind(model);
       if (!await probeStageSandboxCapability(kind, probes).then(r => r.enrolled)) {
         throw new StageDenied('stage_read_only_transport_not_enrolled');

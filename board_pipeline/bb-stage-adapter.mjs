@@ -178,9 +178,16 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     // (Landlock/Docker) с криптографическим stage_witness, без host bb spawn.
     if (sandboxTransport !== undefined) {
       await assertCurrent(request.binding);
-      const budgetMs = phaseBudget ? phaseBudget.remaining('stages') : maxSeconds * 1000;
+      // Фазовый учёт только при настроенном бюджете: без phaseBudgets стадия
+      // ограничена maxSeconds и общим deadline — фазовый таймер не вооружается.
+      const budget = signals?.phaseBudget ?? phaseBudget ?? null;
+      const budgetMs = budget ? budget.remaining('stages') : maxSeconds * 1000;
       if (budgetMs < 1000) throw new Error('phase_deadline_exceeded:stages');
-      signals?.phase?.('stages');
+      const armPhase = budget === null ? null
+        : signals?.phaseBudget === budget && signals?.phase
+          ? () => { signals.phase('stages'); return () => signals.leavePhase(); }
+          : () => { budget.enter('stages'); return () => budget.leave(); };
+      const disarmPhase = armPhase?.() ?? null;
       try {
         const observed = await sandboxTransport.observe({ binding: request.binding,
           model: request.model, prompt: text, challenge, artifactDigest,
@@ -196,7 +203,7 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
           inputArtifactDigest: request.inputArtifactDigest, verdict: observed.verdict, artifact, artifactDigest,
           witness: observed.witness };
       } finally {
-        signals?.leavePhase?.();
+        disarmPhase?.();
       }
     }
     // Host-путь требует закреплённого parent-треда и bb-спеки модели.
@@ -209,17 +216,11 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     await checkTransport();
     const spawned = await run(argv, Math.min(35_000, deadline - Date.now()));
     if (!BB_ID.test(spawned?.id ?? '')) throw new Error('stage_spawn_unconfirmed');
-    await record({ threadId: spawned.id, stage: request.stage, role: request.role, taskId: request.binding.task_id, model: request.model });
-    try {
-      const seconds = Math.min(maxSeconds, Math.floor((deadline - Date.now()) / 1000));
-      if (seconds < 1) throw new Error('stage_dispatch_deadline');
-      await run(['thread', 'wait', '--status', 'idle', '--timeout', `${seconds}s`, spawned.id, '--json'], (seconds + 5) * 1000);
-    }
-    catch (cause) {
-      // Stop is cleanup of an already-launched, specifically identified child,
-      // not progression of the attempt; it remains needed after gate loss.
-      // Сбой промежуточного thread show не отменяет остановку: spawned.id —
-      // наш подтверждённый дочерний тред, осиротевших процессов быть не должно.
+    // Stop is cleanup of an already-launched, specifically identified child,
+    // not progression of the attempt; it remains needed after gate loss.
+    // Сбой промежуточного thread show не отменяет остановку: spawned.id —
+    // наш подтверждённый дочерний тред, осиротевших процессов быть не должно.
+    const stopSpawned = async () => {
       let current = null;
       try { current = await run(['thread', 'show', spawned.id, '--json']); } catch { /* show недоступен */ }
       if (current === null ||
@@ -227,18 +228,35 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
           current.environment?.path === workspace && current.thread?.id === spawned.id)) {
         await execBb(['thread', 'stop', spawned.id], { timeout: 12_000 }).catch(() => {});
       }
-      throw new Error('stage_wait_unconfirmed', { cause });
+    };
+    try {
+      await record({ threadId: spawned.id, stage: request.stage, role: request.role,
+        taskId: request.binding.task_id, model: request.model });
+      try {
+        const seconds = Math.min(maxSeconds, Math.floor((deadline - Date.now()) / 1000));
+        if (seconds < 1) throw new Error('stage_dispatch_deadline');
+        await run(['thread', 'wait', '--status', 'idle', '--timeout', `${seconds}s`, spawned.id, '--json'], (seconds + 5) * 1000);
+      }
+      catch (cause) {
+        throw new Error('stage_wait_unconfirmed', { cause });
+      }
+      const snapshot = await run(['thread', 'show', spawned.id, '--json']);
+      const events = await run(['thread', 'log', spawned.id, '--all', '--json']);
+      const witness = verifyBbStageTurn({ snapshot, events, threadId: spawned.id, parentThread,
+        project, workspace, provider, model, reasoning: request.model.reasoning, challenge, promptText: text });
+      await assertCurrent(request.binding);
+      if (witness.verdict !== 'BLOCKED' && witness.verdict !== expectedVerdict) throw new Error('stage_artifact_disputed');
+      await recordWitness({ threadId: spawned.id, stage: request.stage, artifactDigest, ...witness });
+      const { verdict } = witness;
+      return { binding: request.binding, registryDigest: request.registryDigest, playbook: request.playbook,
+        stage: request.stage, verifier: request.verifier, model: request.model,
+        inputArtifactDigest: request.inputArtifactDigest, verdict, artifact, artifactDigest };
     }
-    const snapshot = await run(['thread', 'show', spawned.id, '--json']);
-    const events = await run(['thread', 'log', spawned.id, '--all', '--json']);
-    const witness = verifyBbStageTurn({ snapshot, events, threadId: spawned.id, parentThread,
-      project, workspace, provider, model, reasoning: request.model.reasoning, challenge, promptText: text });
-    await assertCurrent(request.binding);
-    if (witness.verdict !== 'BLOCKED' && witness.verdict !== expectedVerdict) throw new Error('stage_artifact_disputed');
-    await recordWitness({ threadId: spawned.id, stage: request.stage, artifactDigest, ...witness });
-    const { verdict } = witness;
-    return { binding: request.binding, registryDigest: request.registryDigest, playbook: request.playbook,
-      stage: request.stage, verifier: request.verifier, model: request.model,
-      inputArtifactDigest: request.inputArtifactDigest, verdict, artifact, artifactDigest };
+    catch (error) {
+      // Любой сбой после подтверждённого spawn (record, wait, show/log,
+      // сверка, recordWitness) останавливает дочерний тред: 0 осиротевших.
+      await stopSpawned();
+      throw error;
+    }
   };
 }

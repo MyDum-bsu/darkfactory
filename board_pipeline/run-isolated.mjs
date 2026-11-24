@@ -38,7 +38,7 @@ import { aggregateScorecard } from './model-scorecard.mjs';
 import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
   loadLessons, validateDistilledLessons } from './rework-distiller.mjs';
 import * as workerSelector from './worker-selector.mjs';
-import { abEffectGuard, enrollAbPilot, foremanDiff, guardAbBoard, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
+import { abEffectGuard, enrollAbPilot, foremanArtifacts, foremanDiff, guardAbBoard, inspectPilotDiff, runPilotForeman } from './ab-pilot.mjs';
 import { writerWorkspaceReady } from './bb-stage-adapter.mjs';
 import { createStageSandboxTransport } from './stage-sandbox-transport.mjs';
 import { createAttemptSignals } from './signals.mjs';
@@ -688,6 +688,15 @@ async function execute() {
         taskId: attempt.task_id, epoch: attempt.epoch },
       disk: { path: tree },
     });
+    // Обязательный дисковый preflight ДО любых эффектов фазы проверок:
+    // невозможность измерить свободное место — fail-closed отказ.
+    await attemptSignals.checkDiskPreflight();
+    // Вход в фазу только когда она настроена: без phaseBudgets фазовый
+    // учёт выключен, с бюджетами незаданная фаза не трогается.
+    const enterPhase = name => {
+      const budget = attemptSignals.phaseBudget;
+      if (budget !== null && budget.budgets[name] !== undefined) attemptSignals.phase(name);
+    };
     let lost = false;
     let renewal = Promise.resolve();
     // Те же живые гейты повтора применяются и на границе запуска читателя:
@@ -780,17 +789,23 @@ async function execute() {
       let lastReviewReceipt = null;
       const inspect = worktreeInspector(policy);
       const runLocal = offlineProfileRunner(root, { beforeEffect });
+      const runVisual = offlineVisualRunner(root, { beforeEffect });
       let diff, localEvidence;
       const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', inspect),
-        local: telemetry.port('l1_local', (ab || foreman) ? async (binding, trusted) => {
+        local: telemetry.port('l1_local', async (binding, trusted) => {
+          enterPhase('l1_l3');
+          if (!ab && !foreman) return runLocal(binding, trusted);
           diff = ab ? await inspectPilotDiff(ab, { git: rawGit, base: route.base, candidate: binding.candidate_sha })
             : await foremanDiff({ git: rawGit, base: route.base, candidate: binding.candidate_sha });
           localEvidence = await runLocal(binding, trusted);
           return localEvidence;
-        } : runLocal),
+        }),
         tamper: telemetry.port('tamper', tamperGate),
-        visual: telemetry.port('l3_visual', offlineVisualRunner(root, { beforeEffect })),
+        visual: telemetry.port('l3_visual', async (binding, trusted) => {
+          enterPhase('l1_l3');
+          return runVisual(binding, trusted);
+        }),
         // Смена брифа/файлов политики во время проверок останавливает кандидата до complete.
         verifyPinned: assertPinned,
         review: async (handoff, trusted) => {
@@ -799,8 +814,10 @@ async function execute() {
           await assertPinned();
           await beforeEffect?.();
           if (ab?.arm === 'foreman' || foreman) {
-            const readArtifact = pilotArtifacts({ candidate: handoff.candidate_sha, diff, localEvidence,
-              brief: pinned.inputs.get(brief), review: reviewSpec });
+            // Доверенные артефакты под verifier каждой стадии: 'inventory'
+            // и 'change-set' измеряются фактически, прочие — fail-closed.
+            const readArtifact = foremanArtifacts({ candidate: handoff.candidate_sha, diff, localEvidence,
+              brief: pinned.inputs.get(brief), review: reviewSpec, git: rawGit });
             // Общий (без abPilot) foreman-контур: живая загрузка реестра и
             // сверка digest на каждом входе — тот же fail-closed, что у ab.
             const seat = ab?.arm === 'foreman' ? ab : await (async () => {
@@ -816,10 +833,16 @@ async function execute() {
                 deadline: foreman.deadlineMs === undefined ? Number.MAX_SAFE_INTEGER
                   : Date.now() + foreman.deadlineMs };
             })();
+            // Живые проверки допуска и без A/B-активации: без activation
+            // assertCurrent — свежие пины + нативный verifyHeld эпохи.
+            const assertCurrent = beforeEffect ?? (async () => {
+              await assertPinned();
+              await port.verifyHeld(attempt.task_id, attempt.epoch);
+            });
             await telemetry.phase('ab_foreman', () => runPilotForeman(seat, { attempt, handoff,
-              project: p.bb.project, journal: root, readArtifact, assertCurrent: beforeEffect, inspect,
+              project: p.bb.project, journal: root, readArtifact, assertCurrent, inspect,
               readState: state.load, signals: attemptSignals }));
-            await beforeEffect();
+            await assertCurrent();
           }
           // Один повтор того же критика/субъекта только по доказанному
           // таймауту раннера (exit 143 / host timeout). Перед повтором —
@@ -832,13 +855,20 @@ async function execute() {
           // публикуется до вызова — beforeEffect раннера проверяет гейты и
           // субъект заново непосредственно перед docker run каждого вызова.
           launchBinding = { ...handoff, worktree: tree, branch: profile.branch };
-          const receipt = await telemetry.phase('l2_critic', () => l2ReviewWithTransientRetry({
-            review, retry: retryReview, binding: handoff, profile: trusted,
-            beforeRetry: retryGuard,
-            verifySubject: b => assertRetrySubjectUnchanged({ ...b, worktree: tree,
-              branch: profile.branch }),
-            log: note => console.log(JSON.stringify(note)),
-          }));
+          const receipt = await telemetry.phase('l2_critic', () => {
+            enterPhase('l2_critic');
+            try {
+              return l2ReviewWithTransientRetry({
+                review, retry: retryReview, binding: handoff, profile: trusted,
+                beforeRetry: retryGuard,
+                verifySubject: b => assertRetrySubjectUnchanged({ ...b, worktree: tree,
+                  branch: profile.branch }),
+                log: note => console.log(JSON.stringify(note)),
+              });
+            } finally {
+              attemptSignals.leavePhase();
+            }
+          });
           lastReviewReceipt = receipt ?? null;
           telemetry.recordUsage('critic', receipt?.usage, neon ? 'agy_stream' : 'pi_stream');
           return receipt;
