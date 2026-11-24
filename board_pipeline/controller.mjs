@@ -3,6 +3,7 @@ import { createQuestion, questionBlockText } from './question-gate.mjs';
 import { advanceQuestion, QUESTION_PHASES } from './question-resume.mjs';
 import { createReleasePackage, releaseQuestionDetails, ReleaseDenied } from './release-contract.mjs';
 import { advanceRelease, RELEASE_PHASES } from './release-flow.mjs';
+import { roundGate, roundSignature, effectiveL2ReworkLimit, l2ReworkLimitExceeded } from './worker-selector.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
@@ -499,33 +500,39 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     let feedbackReason = result.reason;
     let feedbackEvidence = result.feedback;
     let feedbackSuffix = '';
+    // Раунд фиксируется в истории попытки независимо от селектора (#1666 r5):
+    // без workerSelector история и лимитный L2-ревью-стоп те же. Сходящаяся
+    // починка не ограничена счётчиком кругов — триггеры только содержательные.
+    // tree_sha берётся из реальной инспекции снимка (result.tree_sha), не из
+    // слов воркера.
+    const roundGateOf = workerSelector?.roundGate ?? roundGate;
+    const roundSignatureOf = workerSelector?.roundSignature ?? roundSignature;
+    const effectiveL2LimitOf = workerSelector?.effectiveL2ReworkLimit ?? effectiveL2ReworkLimit;
+    const l2LimitExceededOf = workerSelector?.l2ReworkLimitExceeded ?? l2ReworkLimitExceeded;
+    const roundFindings = Array.isArray(result.feedback?.findings)
+      ? result.feedback.findings : [];
+    const round = {
+      sha: submission.candidate_sha,
+      tree_sha: result.tree_sha ?? result.receipt?.tree_sha ?? null,
+      gate: roundGateOf(result),
+      signature: roundSignatureOf(result),
+      blocking: roundFindings.length ? roundFindings.length : null,
+      findings: roundFindings,
+      excerpt: result.feedback?.excerpt ?? null,
+      checkpoint: result.feedback?.checkpoint ?? result.checkpoint ?? null,
+      dispute: submission.dispute ?? null,
+      contradictory: result.contradictory === true,
+    };
+    roundsHistory = [...(record.roundsHistory ?? []), round];
+    // Circuit breaker L2 (Board #1666): лимитный L2-раунд останавливает
+    // попытку без следующего круга и до арбитража — directed_rework был бы
+    // пятым раундом. Эскалация — hold карточки владельцу с причиной.
+    const l2Limit = effectiveL2LimitOf(route.maxL2ReworkRounds);
+    if (l2LimitExceededOf({ roundsHistory, limit: l2Limit })) {
+      return stopWith('l2_rework_limit_exceeded', { roundsHistory },
+        JSON.stringify({ limit: l2Limit }));
+    }
     if (workerSelector) {
-      // Раунд фиксируется в истории попытки; сходящаяся починка не ограничена
-      // счётчиком кругов — триггеры только содержательные. tree_sha берётся из
-      // реальной инспекции снимка (result.tree_sha), не из слов воркера.
-      const roundFindings = Array.isArray(result.feedback?.findings)
-        ? result.feedback.findings : [];
-      const round = {
-        sha: submission.candidate_sha,
-        tree_sha: result.tree_sha ?? result.receipt?.tree_sha ?? null,
-        gate: workerSelector.roundGate(result),
-        signature: workerSelector.roundSignature(result),
-        blocking: roundFindings.length ? roundFindings.length : null,
-        findings: roundFindings,
-        excerpt: result.feedback?.excerpt ?? null,
-        checkpoint: result.feedback?.checkpoint ?? result.checkpoint ?? null,
-        dispute: submission.dispute ?? null,
-        contradictory: result.contradictory === true,
-      };
-      roundsHistory = [...(record.roundsHistory ?? []), round];
-      // Circuit breaker L2 (Board #1666): лимитный L2-раунд останавливает
-      // попытку без следующего круга и до арбитража — directed_rework был бы
-      // пятым раундом. Эскалация — hold карточки владельцу с причиной.
-      const l2Limit = workerSelector.effectiveL2ReworkLimit(route.maxL2ReworkRounds);
-      if (workerSelector.l2ReworkLimitExceeded({ roundsHistory, limit: l2Limit })) {
-        return stopWith('l2_rework_limit_exceeded', { roundsHistory },
-          JSON.stringify({ limit: l2Limit }));
-      }
       const progress = workerSelector.evaluateReworkProgress({ roundsHistory });
       if (progress.trigger === 'no_progress' && progress.deterministicGate) {
         // Красный детерминированный гейт без прогресса не арбитрируется.
