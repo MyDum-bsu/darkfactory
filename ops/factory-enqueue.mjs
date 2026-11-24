@@ -342,6 +342,7 @@ export async function buildEnqueuePlan(values) {
   // отклоняются до вызова vb, а не при приёмке.
   const selProfile = policyJson?.profiles?.[values.profile];
   for (const recipe of [...(selProfile?.checks ?? []),
+    ...(selProfile?.check === undefined ? [] : [selProfile.check]),
     ...(selProfile?.visual === undefined ? [] : [selProfile.visual])]) {
     if (recipe?.l1Profile !== undefined) {
       resolveL1Profile({ l1Profile: recipe.l1Profile });

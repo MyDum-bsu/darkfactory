@@ -265,6 +265,25 @@ test('acceptHeld: l1_profile попытки сверяется с профиле
     assert.equal(seen.localProfile.l1Profile, 'python-node');
     assert.equal(calls.local, 1);
     assert.equal(calls.review, 1);
+    // Смена закреплённого l1_profile той же попытки не переиспользует
+    // вердикт прежнего профиля: l1_profile входит в ключ контракта —
+    // повтор обязан пройти проверки заново, а не вернуть repeated.
+    const second = heldPorts({
+      repo_id: 'repo', profile_id: 'pilot', finish: 'verified',
+      spec_digest: HELD_SPEC, policy_digest: HELD_POL, l1_profile: 'node',
+    });
+    const rerun = await acceptHeld({
+      attempt: heldContractAttempt({ l1_profile: 'node' }),
+      submission: heldSubmission(),
+      policy: heldPolicy({}),
+      journal,
+      ports: second.ports,
+    });
+    assert.equal(rerun.outcome, 'verified');
+    assert.equal(rerun.repeated, undefined);
+    assert.equal(second.seen.localProfile.l1Profile, 'node');
+    assert.equal(second.calls.local, 1);
+    assert.equal(second.calls.review, 1);
   } finally {
     await rm(journal, { recursive: true, force: true });
   }
@@ -499,6 +518,26 @@ test('enqueue: l1Profile политики валидируется и сверя
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile }),
       /unknown_l1_profile:bogus/);
+    // Одиночный check — тот же контрактный источник, что checks/visual:
+    // конфликт и невалидное значение отклоняются до создания карточки.
+    const singlePolicy = l1 => writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate,
+      route: { checkProfile: 'prof' },
+      arbiter: { provider: 'google', model: 'gemini-4-neon' },
+      profiles: { prof: {
+        review: { provider: 'openai', model: 'gpt-6.2-sol',
+          reasoningLevel: 'medium' },
+        check: { l1Profile: l1, argv: ['npm', 'test'], cwd: '.',
+          timeoutMs: 1000 } } },
+    }));
+    await singlePolicy('python-node');
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile, 'l1-profile': 'node' }),
+      /l1_profile_mismatch/);
+    await singlePolicy('bogus');
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }),
+      /unknown_l1_profile:bogus/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -613,6 +652,21 @@ test('run: l1Profile — дефолт, авто-репозиторий, mismatch
     const recipeBadFile = join(dir, 'policy-recipe-bad.json');
     await writeFile(recipeBadFile, JSON.stringify(recipePinned));
     await assert.rejects(() => buildRunPlan(values(recipeBadFile), { env: {} }),
+      /unknown_l1_profile:bogus/);
+    // Одиночный check выбранного профиля — тот же контрактный источник:
+    // конфликт с --l1-profile и невалидное значение отклоняются до запуска.
+    const singlePinned = JSON.parse(await readFile(fPlain, 'utf8'));
+    singlePinned.profiles.default.check = { l1Profile: 'python-node',
+      argv: ['npm', 'test'], cwd: '.', timeoutMs: 1000 };
+    const singleFile = join(dir, 'policy-single.json');
+    await writeFile(singleFile, JSON.stringify(singlePinned));
+    await assert.rejects(() => buildRunPlan(
+      values(singleFile, { 'l1-profile': 'node' }), { env: {} }),
+      /l1_profile_mismatch/);
+    singlePinned.profiles.default.check.l1Profile = 'bogus';
+    const singleBadFile = join(dir, 'policy-single-bad.json');
+    await writeFile(singleBadFile, JSON.stringify(singlePinned));
+    await assert.rejects(() => buildRunPlan(values(singleBadFile), { env: {} }),
       /unknown_l1_profile:bogus/);
   } finally {
     await rm(dir, { recursive: true, force: true });

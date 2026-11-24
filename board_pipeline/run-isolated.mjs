@@ -259,6 +259,8 @@ async function execute() {
   // l1_profile карточки) известен только на попытку — сверяется в
   // verify до проверок.
   for (const recipe of [...(p.profiles[route.checkProfile].checks ?? []),
+    ...(p.profiles[route.checkProfile].check === undefined
+      ? [] : [p.profiles[route.checkProfile].check]),
     ...(p.profiles[route.checkProfile].visual === undefined
       ? [] : [p.profiles[route.checkProfile].visual])]) {
     if (recipe?.l1Profile !== undefined) {
@@ -705,6 +707,7 @@ async function execute() {
     // в factory-run/factory-enqueue. Иначе конфликтующий рецепт за
     // валидным исполнялся бы частично и выдавался за ошибку кандидата.
     for (const recipe of [...(profile.checks ?? []),
+      ...(profile.check === undefined ? [] : [profile.check]),
       ...(profile.visual === undefined ? [] : [profile.visual])]) {
       if (recipe?.l1Profile !== undefined) {
         resolveL1Profile({ l1Profile: recipe.l1Profile });

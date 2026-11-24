@@ -221,6 +221,7 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
       fail(`unknown_l1_profile:${String(profile.l1Profile)}`);
     }
     for (const recipe of [...(profile?.checks ?? []),
+      ...(profile?.check === undefined ? [] : [profile.check]),
       ...(profile?.visual === undefined ? [] : [profile.visual])]) {
       if (recipe?.l1Profile !== undefined && !isValidL1Profile(recipe.l1Profile)) {
         fail(`unknown_l1_profile:${String(recipe.l1Profile)}`);
@@ -302,6 +303,7 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     l1Profile: values['l1-profile'] ?? runProfile?.l1Profile,
     repoId: policy?.route?.repoId }).id;
   const runRecipes = [...(runProfile?.checks ?? []),
+    ...(runProfile?.check === undefined ? [] : [runProfile.check]),
     ...(runProfile?.visual === undefined ? [] : [runProfile.visual])];
   // Канонические источники маунтов сохраняются для границы против
   // worktree и handoffDir ниже (handoffDir вычисляется позже).

@@ -314,6 +314,7 @@ function contractKey(attempt) {
     release_target: attempt.release_target ?? null,
     finish: attempt.finish,
     has_ui: attempt.has_ui ?? null,
+    l1_profile: attempt.l1_profile ?? null,
   })).digest('hex');
 }
 
@@ -330,7 +331,8 @@ function sameContract(runEntry, attempt) {
     (recorded.fixtures_digest ?? null) === (attempt.fixtures_digest ?? null) &&
     (JSON.stringify(recorded.release_target ?? null) ===
       JSON.stringify(attempt.release_target ?? null)) &&
-    (recorded.has_ui ?? null) === (attempt.has_ui ?? null);
+    (recorded.has_ui ?? null) === (attempt.has_ui ?? null) &&
+    (recorded.l1_profile ?? null) === (attempt.l1_profile ?? null);
 }
 
 // Сверка сдачи с доверенной попыткой. Любое расхождение — отказ до эффекта.
@@ -1113,6 +1115,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       fixtures_digest: attempt.fixtures_digest ?? null,
       release_target: attempt.release_target ?? null,
       has_ui: attempt.has_ui ?? null,
+      l1_profile: attempt.l1_profile ?? null,
     } } : {}),
   });
 
