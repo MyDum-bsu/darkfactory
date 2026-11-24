@@ -192,6 +192,22 @@ function tokenize(words) {
   return argv;
 }
 
+// env -S/--split-string: значение — СТРОКА КОМАНДЫ (GNU env).
+// Возвращает { value, next } или null, если текущий токен не -S.
+function envSplitString(args, i) {
+  const w = args[i];
+  if (typeof w !== 'string') return null;
+  if (w.startsWith('--split-string')) {
+    if (w.includes('=')) return { value: w.slice(w.indexOf('=') + 1), next: i + 1 };
+    return { value: args[i + 1], next: i + 2 };
+  }
+  if (w.startsWith('--') || !/^-[^-]/.test(w)) return null;
+  const idx = w.indexOf('S');
+  if (idx < 0) return null;
+  const rest = w.slice(idx + 1);
+  return rest ? { value: rest, next: i + 1 } : { value: args[i + 1], next: i + 2 };
+}
+
 // Снятие обёрток: пути (/bin/rm → rm), sudo/command/env/xargs/sh -c —
 // рекурсивный разбор вложенных команд.
 function unwrap(argv, depth, state, visit) {
@@ -210,15 +226,38 @@ function unwrap(argv, depth, state, visit) {
     return [];
   }
   if (first === 'su') {
-    // su [-s shell] [-] [user] -c <cmd> — ищем -c/-s, остальное флаги/логин.
+    // su [-s shell] [-] [user] -c <cmd> | -c<cmd> | --command=<cmd>
+    // -lc/-mc и прочие кластеры коротких флагов содержат c.
     for (let i = 1; i < args.length; i++) {
       const w = args[i];
       if (w === '-c' || w === '--command') {
         if (i + 1 < args.length) visit(args[i + 1]);
         return [];
       }
-      if (['-s', '--shell', '-g', '--group', '-G', '--supp-group',
-        '--session-command'].includes(w)) { i++; continue; }
+      const inline = w.startsWith('--command=') ? w.slice('--command='.length)
+        : w.startsWith('-c') && !w.startsWith('--') ? w.slice(2) : null;
+      if (inline !== null) {
+        if (inline) visit(inline);
+        else if (i + 1 < args.length) visit(args[i + 1]);
+        return [];
+      }
+      if (/^-[^-]/.test(w) && w.includes('c')) {
+        // Комбинированный короткий флаг с c: `su -lc 'rm -rf /'`.
+        if (i + 1 < args.length) visit(args[i + 1]);
+        return [];
+      }
+      if (['-s', '--shell', '-g', '--group', '-G', '--supp-group'].includes(w)) {
+        i++; continue;
+      }
+      if (w === '--session-command') {
+        if (i + 1 < args.length) visit(args[i + 1]);
+        return [];
+      }
+      if (w.startsWith('--session-command=')) {
+        const inline = w.slice('--session-command='.length);
+        if (inline) visit(inline);
+        return [];
+      }
     }
     return [];
   }
@@ -242,6 +281,16 @@ function unwrap(argv, depth, state, visit) {
     while (i < args.length) {
       const w = args[i];
       if (first === 'env' && ASSIGNMENT.test(w)) { i++; continue; }
+      // env -S/--split-string принимает СТРОКУ команды, а не обычное
+      // значение флага: '-S rm -rf /' и '-S'rm -rf /'' исполняют её.
+      if (first === 'env') {
+        const split = envSplitString(args, i);
+        if (split) {
+          if (split.value) visit(split.value);
+          i = split.next;
+          continue;
+        }
+      }
       if (withArg.has(w.split('=')[0])) {
         i += w.includes('=') ? 1 : 2;
         continue;
@@ -272,7 +321,21 @@ function unwrap(argv, depth, state, visit) {
         continue;
       }
       if (w.startsWith('-') && w.includes('c') && !w.startsWith('--')) {
-        if (i + 1 < args.length) visit(args[i + 1]);
+        // -c / -lc / -ec / -xc: командная строка — ПЕРВЫЙ non-option
+        // операнд после флагов и '--' (bash -c -- 'cmd', bash -c -e 'cmd',
+        // bash -c -o pipefail 'cmd').
+        let j = i + 1;
+        while (j < args.length) {
+          const v = args[j];
+          if (v === '--') { j++; continue; }
+          if (v.startsWith('-') && v !== '-') {
+            const takesArg = SHELL_ARG_FLAGS.has(v.split('=')[0]) && !v.includes('=');
+            j += takesArg ? 2 : 1;
+            continue;
+          }
+          break;
+        }
+        if (j < args.length) visit(args[j]);
         return tag(args.slice(0, 0));
       }
       if (w === '--') return unwrap(args.slice(i + 1), depth + 1, state, visit);
@@ -478,7 +541,21 @@ function analyze(segments, state) {
   const analyzeArgv = (argv, fromPipe = false) => {
     if (!argv.length) return;
     // Ведущие ключевые слова shell — не команда: «if true; then ...».
-    while (argv.length && SHELL_KEYWORDS.has(argv[0])) argv = argv.slice(1);
+    // time — ключевое слово со своими флагами (time -p rm -rf /): после
+    // него пропускаются опции, чтобы дойти до самой команды.
+    while (argv.length && SHELL_KEYWORDS.has(argv[0])) {
+      const keyword = argv[0];
+      argv = argv.slice(1);
+      if (keyword !== 'time') continue;
+      while (argv.length && argv[0].startsWith('-') && argv[0] !== '-') {
+        const opt = argv[0];
+        argv = argv.slice(1);
+        if (['-f', '--format', '-o', '--output'].includes(opt.split('=')[0]) &&
+            !opt.includes('=') && argv.length) {
+          argv = argv.slice(1);
+        }
+      }
+    }
     if (!argv.length) return;
     const unwrapped = unwrap(argv, 0, state, inner => {
       if (FORK_BOMB.test(inner)) raise(hit(CRITICAL, 'fork_bomb', 'fork-бомба'));

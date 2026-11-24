@@ -82,7 +82,10 @@ export function sanitizeTerminalText(input) {
     // Прочие escape-последовательности (ESC + символ).
     .replace(/\x1b[@-Z\\-_]/g, '')
     // Control chars кроме табуляции и перевода строки.
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+    // Unicode bidi/zero-width маркеры — спуфинг порядка отображения
+    // (заголовки карточек/логов маскируют текст под другой).
+    .replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
 }
 
 export function escapeHtml(input) {

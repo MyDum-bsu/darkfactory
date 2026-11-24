@@ -88,6 +88,11 @@ test('sanitizeTerminalText: режет ANSI/OSC/control, сохраняет те
   assert.equal(sanitizeTerminalText('line\n\ttab'), 'line\n\ttab');
 });
 
+test('sanitizeTerminalText: режет bidi-спуфинг, сохраняет текст', () => {
+  const out = sanitizeTerminalText('a\u202Eb\u202Ac\u2066d\u200Ee\u061Cf\u200F');
+  assert.equal(out, 'abcdef');
+});
+
 test('escapeHtml экранирует XSS-векторы', () => {
   assert.equal(escapeHtml('<script>"x"</script>'),
     '&lt;script&gt;&quot;x&quot;&lt;/script&gt;');
@@ -385,27 +390,46 @@ test('createBranchDriftProvider: repo error is fail-closed, not silent clean', a
 
 // --- P1-3: Board observer ----------------------------------------------------
 
-test('createBoardObserver: Board 0.54.0 channel format → columns', async () => {
-  const channelReply = { threads: [
-    { message: { id: 'T1', channel: 'darkfactory', text: 'Задача раз',
-      labels: { project: 'df' },
-      task: { state: 'claimed', epoch: 3 } } },
-    { message: { id: 'T2', channel: 'darkfactory', text: 'Очередь',
-      task: { state: 'ready' } } },
-    { message: { id: 'T3', channel: 'darkfactory', text: 'Вопрос',
-      task: { state: 'blocked', blocked: { question: 'Ок?',
-        question_id: 'Q1' } } } },
-    { message: { id: 'T4', channel: 'darkfactory', text: 'Готово',
-      task: { state: 'completed' } } }] };
-  const fetchImpl = async url => ({
-    ok: true,
-    json: async () => url.includes('/tasks') ? { tasks: [] } : channelReply });
-  const observer = createBoardObserver({ boardUrl: 'http://board',
+test('createBoardObserver: Board 0.54.0 /api/board/tasks формат → колонки', async () => {
+  const urls = [];
+  const fetchImpl = async url => {
+    urls.push(url);
+    return {
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: async () => ({
+        tasks: [
+          { message: { id: '1672', channel: 'darkfactory', text: 'Задача раз',
+            labels: { 'board.task': 'claimed' },
+            task: { state: 'claimed', epoch: 2 } }, replies: 1, last: null },
+          { message: { id: '1673', channel: 'darkfactory', text: 'Очередь',
+            labels: { 'board.task': 'ready' }, task: { state: 'ready' } } },
+          { message: { id: '1674', channel: 'darkfactory', text: 'Вопрос',
+            labels: { 'board.task': 'blocked' },
+            task: { state: 'blocked',
+              blocked: { question: 'Ок?', question_id: 'Q1' } } } },
+          { message: { id: '1675', channel: 'darkfactory', text: 'Готово',
+            labels: { 'board.task': 'completed' },
+            task: { state: 'completed' } } },
+        ],
+      }),
+    };
+  };
+  const observer = createBoardObserver({ boardUrl: 'http://127.0.0.1:44100',
     channels: ['darkfactory'], fetchImpl });
-  const tasks = await observer();
-  assert.equal(tasks.length, 4);
-  await withServer({ boardTasksProvider: observer }, async (server, base) => {
+  // База без /api/board нормализуется до /api/board; других путей нет.
+  const result = await observer.fetchTasks();
+  assert.equal(result.ok, true);
+  assert.deepEqual(urls,
+    ['http://127.0.0.1:44100/api/board/tasks?channel=darkfactory&limit=500']);
+  assert.equal(result.tasks.length, 4);
+  assert.equal(result.tasks[0].task_id, '1672');
+  assert.equal(result.tasks[0].state, 'claimed');
+  assert.equal(result.tasks[0].epoch, 2);
+  await withServer({ boardTasksProvider: observer.fetchTasks }, async (server, base) => {
     const snap = JSON.parse((await httpGet(`${base}/api/snapshot`)).body);
+    assert.equal(snap.boardStatus.ok, true);
     assert.equal(snap.running.length, 1);
     assert.equal(snap.queued.length, 1);
     assert.equal(snap.needsOwner.length, 1);
@@ -414,26 +438,107 @@ test('createBoardObserver: Board 0.54.0 channel format → columns', async () =>
   });
 });
 
+test('createBoardObserver: дедупликация по message.id между каналами', async () => {
+  const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({
+    tasks: [{ message: { id: '900', channel: 'darkfactory', text: 'x',
+      task: { state: 'ready' } } }] }) });
+  const observer = createBoardObserver({ boardUrl: 'http://b',
+    channels: ['darkfactory', 'intake'], fetchImpl });
+  const result = await observer.fetchTasks();
+  assert.equal(result.ok, true);
+  assert.equal(result.tasks.length, 1);
+});
+
+test('createBoardObserver: явный /api/board в boardUrl не дублируется', async () => {
+  const seen = [];
+  const fetchImpl = async url => {
+    seen.push(url);
+    return { ok: true, status: 200, json: async () => ({ tasks: [] }) };
+  };
+  const observer = createBoardObserver({
+    boardUrl: 'http://127.0.0.1:44100/api/board/', channels: ['c1', 'c2'],
+    fetchImpl });
+  const result = await observer.fetchTasks();
+  assert.equal(result.ok, true);
+  assert.deepEqual(seen, [
+    'http://127.0.0.1:44100/api/board/tasks?channel=c1&limit=500',
+    'http://127.0.0.1:44100/api/board/tasks?channel=c2&limit=500']);
+});
+
 test('createBoardObserver: {"version":"0.54.0","sync":[]} — не сбой, пусто', async () => {
   const fetchImpl = async () => ({
-    ok: true, json: async () => ({ version: '0.54.0', url: 'x', sync: [] }) });
+    ok: true, status: 200,
+    json: async () => ({ version: '0.54.0', url: 'x', sync: [] }) });
   const observer = createBoardObserver({ boardUrl: 'http://board',
     channels: ['darkfactory'], fetchImpl });
-  const tasks = await observer();
-  assert.deepEqual(tasks, []);
+  const result = await observer.fetchTasks();
+  assert.deepEqual(result.tasks, []);
+  assert.equal(result.ok, true);
+});
+
+test('createBoardObserver: 401/404/не-JSON/fetch-сбой — явный boardStatus', async () => {
+  const cases = [
+    [{ ok: false, status: 401,
+      headers: new Headers({ 'content-type': 'application/json' }) },
+    'board_unauthorized', 401],
+    [{ ok: false, status: 404,
+      headers: new Headers({ 'content-type': 'text/plain' }) },
+    'board_not_found', 404],
+    [{ ok: true, status: 200,
+      headers: new Headers({ 'content-type': 'text/html' }),
+      json: async () => { throw new SyntaxError('Unexpected token <'); } },
+    'board_not_json', 200],
+    [() => { throw new Error('ECONNREFUSED 127.0.0.1:44100'); },
+      'board_fetch_failed', null],
+  ];
+  for (const [response, code, status] of cases) {
+    const fetchImpl = typeof response === 'function' ? response : async () => response;
+    const observer = createBoardObserver({ boardUrl: 'http://127.0.0.1:44100',
+      channels: ['darkfactory'], fetchImpl });
+    const result = await observer.fetchTasks();
+    assert.equal(result.ok, false, code);
+    assert.equal(result.code, code);
+    assert.equal(result.status, status);
+    assert.equal(result.tasks.length, 0);
+    assert.ok(result.error && result.error.length > 0, `${code}: error обязателен`);
+    // Read-only сервер жив: 200 на снапшот, сбой виден флагом.
+    await withServer({ boardTasksProvider: observer.fetchTasks },
+      async (server, base) => {
+        const res = await httpGet(`${base}/api/snapshot`);
+        assert.equal(res.status, 200);
+        const snap = JSON.parse(res.body);
+        assert.equal(snap.boardStatus.ok, false);
+        assert.equal(snap.boardStatus.code, code);
+        assert.equal(snap.health.board.ok, false);
+        assert.equal(typeof snap.boardStatus.error, 'string');
+        assert.equal(snap.running.length, 0);
+        assert.equal(snap.queued.length, 0);
+      });
+  }
+});
+
+test('createBoardObserver: нет задачи — не оправдание тихого []', async () => {
+  // Промах провайдера (не объект) тоже виден в снапшоте.
+  await withServer({ boardTasksProvider: async () => null },
+    async (server, base) => {
+      const snap = JSON.parse((await httpGet(`${base}/api/snapshot`)).body);
+      assert.equal(snap.boardStatus.ok, false);
+      assert.equal(snap.boardStatus.code, 'board_bad_provider');
+    });
 });
 
 test('createBoardObserver: GET only + observer headers', async () => {
   const seen = [];
   const fetchImpl = async (url, opts) => {
     seen.push({ url, method: opts.method, headers: opts.headers });
-    return { ok: true, json: async () => ({ threads: [] }) };
+    return { ok: true, status: 200, json: async () => ({ tasks: [] }) };
   };
   await createBoardObserver({ boardUrl: 'http://b', token: 'TOK',
     channels: ['darkfactory'], fetchImpl })();
-  assert.ok(seen.length >= 1);
+  assert.equal(seen.length, 1);
   for (const r of seen) {
     assert.equal(r.method, 'GET');
+    assert.ok(r.url.startsWith('http://b/api/board/tasks?'));
     assert.equal(r.headers.authorization, 'Bearer TOK');
     assert.equal(r.headers['x-board-profile'], 'control-room-observer');
     assert.equal(r.headers['x-board-can'], 'darkfactory=read');

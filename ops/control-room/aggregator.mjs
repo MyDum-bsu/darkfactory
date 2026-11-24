@@ -50,40 +50,95 @@ const jsonHeaders = extra => ({
 
 // --- провайдеры по умолчанию (read-only) -------------------------------------
 
-// RO-опрос Board :44100 — только GET чтение очереди.
-export async function loadBoardTasksFromApi(boardUrl, { fetchImpl } = {}) {
-  const fetcher = fetchImpl ?? fetch;
-  const res = await fetcher(new URL('/api/board', boardUrl),
-    { signal: AbortSignal.timeout(5000) });
-  if (!res.ok) return [];
-  const body = await res.json();
-  return Array.isArray(body?.tasks) ? body.tasks : Array.isArray(body) ? body : [];
+// Board 0.54.0 монтирует HTTP API под /api/board. База нормализуется,
+// поэтому 'http://127.0.0.1:44100' и 'http://127.0.0.1:44100/api/board'
+// указывают на один endpoint.
+export const BOARD_API_PATH = '/api/board';
+
+export function normalizeBoardBaseUrl(boardUrl) {
+  if (typeof boardUrl !== 'string' || !boardUrl.trim()) {
+    throw new TypeError('boardUrl is required');
+  }
+  const url = new URL(boardUrl.trim());
+  const pathname = url.pathname.replace(/\/+$/, '');
+  if (!pathname.endsWith(BOARD_API_PATH)) url.pathname = `${pathname}${BOARD_API_PATH}`;
+  url.search = '';
+  url.hash = '';
+  return url.href.replace(/\/+$/, '');
+}
+
+// RO-опрос Board :44100 — только GET чтение очереди. Сбой чтения —
+// явная ошибка (не тихий []): вызывающий видит причину, а не пустую
+// очередь.
+export async function loadBoardTasksFromApi(boardUrl, { fetchImpl, token = null,
+  channel = 'darkfactory', timeoutMs = 5000 } = {}) {
+  const observer = createBoardObserver({ boardUrl, token, channels: [channel],
+    fetchImpl, timeoutMs });
+  const result = await observer.fetchTasks();
+  if (!result.ok) {
+    throw Object.assign(
+      new Error(`board read failed: ${result.error ?? result.code ?? 'unknown'}`),
+      { code: result.code ?? 'board_fetch_failed', status: result.status ?? null });
+  }
+  return result.tasks;
 }
 
 // RO-наблюдатель Board 0.54.0: строго GET, профиль control-room-observer,
-// capability <channel>=read. Разбирает реальные форматы:
-//   /channels/<ch> → { threads: [{ message: { id, text, labels, task, channel } }] }
-//                  или { messages: [...] }
-//   /tasks         → { tasks: [...] }
-// Ответ {"version":"0.54.0","sync":[]} без задач — корректный пустой срез,
-// а не тихий сбой.
+// capability <channel>=read. Board 0.54.0 не имеет GET /channels/<ch>:
+// единственный источник — GET /tasks?channel=<ch>&limit=500 с реальным
+// форматом { tasks: [{ message: { id, channel, text, labels, task,
+// ... }, replies, last }] }; упрощённый вид { message: { state, ... } }
+// тоже принимается (совместимость с тестовыми объектами).
+// Сбои (401/403, 404, не-JSON, упавший fetch) не глотаются: fetchTasks()
+// возвращает { ok: false, tasks, status, code, error }, что видно в
+// снапшоте как boardStatus. Ответ {"version":"0.54.0","sync":[]} без
+// задач — корректный пустой срез, а не сбой.
 export function createBoardObserver({ boardUrl, token = null,
   channels = ['darkfactory'], fetchImpl, timeoutMs = 5000 } = {}) {
   const fetcher = fetchImpl ?? fetch;
+  const channelList = (Array.isArray(channels) ? channels : [channels])
+    .filter(c => typeof c === 'string' && c);
+  if (!channelList.length) throw new Error('board observer requires a channel');
+  const base = normalizeBoardBaseUrl(boardUrl);
   const headers = {
     accept: 'application/json',
     'x-board-profile': 'control-room-observer',
-    'x-board-can': channels.map(c => `${c}=read`).join(';'),
+    'x-board-can': channelList.map(c => `${c}=read`).join(';'),
     ...(token ? { authorization: `Bearer ${token}` } : {}),
   };
-  const base = String(boardUrl).replace(/\/+$/, '');
 
-  const readJson = async path => {
-    const res = await fetcher(`${base}${path}`, { method: 'GET', headers,
-      redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return null;
-    const data = await res.json().catch(() => null);
-    return data && typeof data === 'object' ? data : null;
+  // Один канал → либо { ok: true, status, body }, либо явный сбой.
+  const readChannel = async channel => {
+    let res;
+    try {
+      res = await fetcher(
+        `${base}/tasks?channel=${encodeURIComponent(channel)}&limit=500`,
+        { method: 'GET', headers, redirect: 'error',
+          signal: AbortSignal.timeout(timeoutMs) });
+    } catch (error) {
+      return { ok: false, status: null, code: 'board_fetch_failed',
+        error: `board fetch failed: ${error?.message ?? error}` };
+    }
+    const status = Number.isSafeInteger(res?.status) ? res.status : null;
+    if (res?.ok !== true) {
+      const code = status === 401 || status === 403 ? 'board_unauthorized'
+        : status === 404 ? 'board_not_found' : 'board_http_error';
+      return { ok: false, status, code,
+        error: `GET /tasks → ${status ?? 'request failed'} (${code})` };
+    }
+    let body;
+    try {
+      body = await res.json();
+    } catch {
+      body = undefined;
+    }
+    if (body === undefined || body === null) {
+      const type = typeof res.headers?.get === 'function'
+        ? res.headers.get('content-type') : null;
+      return { ok: false, status, code: 'board_not_json',
+        error: `GET /tasks → не JSON (content-type: ${type ?? 'unknown'})` };
+    }
+    return { ok: true, status, body };
   };
 
   const toTask = raw => {
@@ -105,21 +160,67 @@ export function createBoardObserver({ boardUrl, token = null,
     };
   };
 
-  return async () => {
+  // Явный результат чтения: { ok, tasks, status, code, error }.
+  const fetchTasks = async () => {
     const found = new Map();
-    for (const channel of channels) {
-      const enc = encodeURIComponent(channel);
-      const [channelData, taskData] = await Promise.all([
-        readJson(`/channels/${enc}?limit=500`).catch(() => null),
-        readJson(`/tasks?channel=${enc}&limit=500`).catch(() => null)]);
-      for (const entry of [...(channelData?.threads ?? []),
-          ...(channelData?.messages ?? []), ...(taskData?.tasks ?? [])]) {
+    let failure = null;
+    for (const channel of channelList) {
+      const outcome = await readChannel(channel);
+      if (!outcome.ok) {
+        failure ??= { ...outcome, channel };
+        continue;
+      }
+      const body = outcome.body;
+      const entries = Array.isArray(body?.tasks) ? body.tasks
+        : Array.isArray(body) ? body : [];
+      for (const entry of entries) {
         const task = toTask(entry);
         if (task?.task_id != null) found.set(String(task.task_id), task);
       }
     }
-    return [...found.values()];
+    const tasks = [...found.values()];
+    if (failure) {
+      return { ok: false, tasks, status: failure.status, code: failure.code,
+        error: `${failure.error} (channel ${failure.channel})` };
+    }
+    return { ok: true, tasks, status: 200, code: null, error: null };
   };
+
+  // История вызовов: наблюдённые задачи (совместимость с провайдером).
+  const observer = async () => (await fetchTasks()).tasks;
+  observer.fetchTasks = fetchTasks;
+  observer.boardUrl = base;
+  observer.channels = [...channelList];
+  return observer;
+}
+
+// Провайдер задач возвращает либо массив (упрощённый/тестовый вид), либо
+// результат observer.fetchTasks(). Второй случай сохраняет явный статус:
+// сбой Board виден в снапшоте (boardStatus.ok === false), а сервер
+// остаётся read-only и продолжает отвечать 200.
+async function readBoardTasks(provider) {
+  let result;
+  try {
+    result = await provider();
+  } catch (error) {
+    return { tasks: [], boardStatus: { ok: false, status: null,
+      code: error?.code ?? 'board_fetch_failed',
+      error: sanitizeTerminalText(String(error?.message ?? error ?? 'board fetch failed')) } };
+  }
+  if (Array.isArray(result)) {
+    return { tasks: result, boardStatus: { ok: true, status: 200, code: null, error: null } };
+  }
+  if (result && Array.isArray(result.tasks)) {
+    const success = result.ok !== false;
+    return { tasks: result.tasks, boardStatus: {
+      ok: success,
+      status: Number.isSafeInteger(result.status) ? result.status : null,
+      code: success ? null : (result.code ?? 'board_error'),
+      error: success ? null
+        : sanitizeTerminalText(String(result.error ?? result.code ?? 'board error')) } };
+  }
+  return { tasks: [], boardStatus: { ok: false, status: null,
+    code: 'board_bad_provider', error: 'board provider returned no task list' } };
 }
 
 // TTL-кэшированный провайдер Branch Drift по списку репозиториев:
@@ -326,10 +427,11 @@ export function createControlRoomAggregator({
   };
 
   async function snapshot() {
-    const [tasks, threads, telemetry] = await Promise.all([
-      boardTasksProvider().catch(() => []),
+    const [board, threads, telemetry] = await Promise.all([
+      readBoardTasks(boardTasksProvider),
       bbThreadsProvider().catch(() => []),
       telemetryProvider().catch(() => null)]);
+    const tasks = board.tasks;
     const net = netHealth ? await netHealth.snapshot().catch(() => null) : null;
     const drift = branchDriftProvider
       ? await branchDriftProvider().catch(() => ({ driftDetected: null, error: true }))
@@ -342,6 +444,8 @@ export function createControlRoomAggregator({
       ts: new Date(now()).toISOString(),
       reconcile: reconciled,
       ...columns(tasks),
+      boardStatus: board.boardStatus,
+      health: { board: board.boardStatus },
       sessions: { active: sessions.active, archivedCount: sessions.archived.length },
       shiva,
       branchDrift: drift,
@@ -521,7 +625,8 @@ async function cli(argv) {
       return { name: spec.slice(0, i), url: spec.slice(i + 1) };
     }),
     cloudStatePath: values['cloud-state'] ?? null });
-  const boardUrl = values['board-url'] ?? process.env.BOARD_URL ?? 'http://127.0.0.1:44100';
+  const boardUrl = values['board-url'] ?? process.env.BOARD_URL ??
+    `http://127.0.0.1:44100${BOARD_API_PATH}`;
   const channels = (values['board-channels'] ?? 'darkfactory')
     .split(',').map(c => c.trim()).filter(Boolean);
   const boardToken = await loadBoardToken(values['board-token']);
@@ -534,12 +639,13 @@ async function cli(argv) {
   const aggregator = createControlRoomAggregator({
     port, socketPath, stateDirs: values['state-dir'] ?? [],
     netHealth,
-    boardTasksProvider: observeBoard,
+    boardTasksProvider: observeBoard.fetchTasks,
     bbThreadsProvider: () => loadBbThreadsFromCli(),
     branchDriftProvider: driftProvider });
   const { port: actual } = await aggregator.start();
   console.log(JSON.stringify({ control_room: 'listening', host: '127.0.0.1', port: actual,
-    socket: socketPath, boardChannels: channels, driftRepos }));
+    socket: socketPath, boardApi: observeBoard.boardUrl, boardChannels: channels,
+    driftRepos }));
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

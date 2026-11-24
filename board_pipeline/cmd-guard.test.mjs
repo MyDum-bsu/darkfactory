@@ -155,6 +155,32 @@ for (const [cmd, severity] of evasions) {
   test(`evasion: ${cmd}`, () => expectBlock(cmd, severity));
 }
 
+// --- P1-5: обходы Round 2 (su -lc/-mc/--command=, shell -c с флагами,
+// env -S/--split-string, time -p) -------------------------------------------
+
+const round2Evasions = [
+  ['su -lc \'rm -rf /\'', 'critical'],
+  ['su --command=\'rm -rf /\'', 'critical'],
+  ['bash -c -- \'rm -rf /\'', 'critical'],
+  ['bash -c -e \'rm -rf /\'', 'critical'],
+  ['sh -c -x \'rm -rf /\'', 'critical'],
+  ['env -S \'rm -rf /\'', 'critical'],
+  ['env -S\'rm -rf /\'', 'critical'],
+  ['env --split-string=\'rm -rf /\'', 'critical'],
+  ['time -p rm -rf /', 'critical'],
+];
+for (const [cmd, severity] of round2Evasions) {
+  test(`evasion (round 2): ${cmd}`, () => expectBlock(cmd, severity));
+}
+
+test('round 2: варианты обвёрток не ломают safe-команды', () => {
+  for (const cmd of ['bash -c \'echo hi\'', 'env -S \'echo hi\'',
+    'env -u FOO ls', 'time -p ls', 'su -s /bin/zsh -c \'echo hi\'',
+    'bash -c -o pipefail \'echo hi\'']) {
+    expectAllow(cmd);
+  }
+});
+
 // --- 0 false positives ------------------------------------------------------
 
 const allowed = [
