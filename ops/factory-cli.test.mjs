@@ -749,6 +749,15 @@ test('run: --worktree обязан совпадать с policy.route.worktree',
       { ...mountRecipe, mounts: [{ from: deps, to: '/deps' }] }]));
     const mountPlan = await runPlan(runValues(okMountPolicy, state));
     assert.equal(mountPlan.worktree, wt);
+    // Граница worktree/handoffDir для mounts[].from: источник маунта —
+    // операторский путь зависимости, он не может лежать внутри дерева
+    // воркера (и не пересекается с handoffDir) — отказ до Git-конфига.
+    const innerDeps = join(wt, 'site-packages');
+    await mkdir(innerDeps);
+    const innerMountPolicy = await withPolicy(dir, withChecks([
+      { ...mountRecipe, mounts: [{ from: innerDeps, to: '/deps' }] }]));
+    await assert.rejects(() => runPlan(runValues(innerMountPolicy, state)),
+      /path_inside_worktree/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

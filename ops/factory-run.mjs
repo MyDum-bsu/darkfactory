@@ -275,6 +275,9 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   const runProfile = policy?.profiles?.[policy?.route?.checkProfile];
   const runRecipes = [...(runProfile?.checks ?? []),
     ...(runProfile?.visual === undefined ? [] : [runProfile.visual])];
+  // Канонические источники маунтов сохраняются для границы против
+  // worktree и handoffDir ниже (handoffDir вычисляется позже).
+  const mountFroms = [];
   for (const recipe of runRecipes) {
     for (const mount of recipe?.mounts ?? []) {
       const from = mount?.from;
@@ -294,6 +297,7 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
              basename(from) === 'node_modules'))) {
         fail('mount_outside_allowlist');
       }
+      mountFroms.push(real);
     }
   }
   // Эффективный kill-switch демона (--switch > pilot.killSwitch): как у
@@ -416,6 +420,15 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     if (storage === null) continue;
     if (inside(handoff, storage) || inside(storage, handoff) ||
         (isFile && inside(dirname(storage), handoff))) {
+      fail('path_inside_worktree');
+    }
+  }
+  // Источники маунтов — те же операторские пути: каталог from не
+  // пересекается с worktree ни в одну сторону и с handoffDir (inbox
+  // сдачи контроллера) в обе стороны, иначе отказ до Git-конфига.
+  for (const mountFrom of mountFroms) {
+    if (treeAliases.some(t => inside(t, mountFrom) || inside(mountFrom, t)) ||
+        inside(handoff, mountFrom) || inside(mountFrom, handoff)) {
       fail('path_inside_worktree');
     }
   }
