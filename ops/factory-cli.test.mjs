@@ -249,6 +249,17 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile }),
       /path_inside_worktree|symlink|review_skill/);
+    // route.worktree через симлинк — неканонический операторский путь:
+    // отказ до границы, хэширования и вызова vb.
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate,
+      route: { checkProfile: 'p', worktree: extAlias },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } },
+    }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }),
+      /non_canonical_or_symlink_path/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -414,15 +425,25 @@ test('run: --worktree обязан совпадать с policy.route.worktree',
   try {
     const wt = join(dir, 'wt');
     const other = join(dir, 'other');
-    const state = join(dir, 'st-root', 'state');
+    const state = join(dir, 'state');
     await mkdir(wt);
     await mkdir(other);
-    await mkdir(state, { recursive: true });
+    await mkdir(state);
     const policy = await withPolicy(dir, policySpec(wt));
     const plan = await buildRunPlan(runValues(policy, state, { worktree: wt }));
     assert.equal(plan.worktree, wt);
     await assert.rejects(() => buildRunPlan(runValues(policy, 's', { worktree: other })),
       /worktree_mismatch/);
+    // route.worktree и --worktree через симлинк на то же дерево —
+    // неканонические операторские пути, отказ (равенство realpath
+    // недостаточно).
+    const wtLink = join(dir, 'wt-link');
+    await symlink(wt, wtLink);
+    const linkPolicy = await withPolicy(dir, policySpec(wtLink));
+    await assert.rejects(() => buildRunPlan(runValues(linkPolicy, state)),
+      /non_canonical_or_symlink_path/);
+    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+      { worktree: wtLink })), /non_canonical_or_symlink_path/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -433,8 +454,8 @@ test('run: валидный dry-run печатает план без вызов�
   try {
     const wt = join(dir, 'wt');
     await mkdir(wt);
-    const state = join(dir, 'st-root', 'state');
-    await mkdir(state, { recursive: true });
+    const state = join(dir, 'state');
+    await mkdir(state);
     const policy = await withPolicy(dir, policySpec(wt));
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50'];
@@ -481,8 +502,8 @@ test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
     const wt = join(dir, 'wt');
     await mkdir(wt);
     const git = await initGitRepo(wt);
-    const state = join(dir, 'st-root', 'state');
-    await mkdir(state, { recursive: true });
+    const state = join(dir, 'state');
+    await mkdir(state);
     const policy = await withPolicy(dir, policySpec(wt));
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', policy, '--state', state];
@@ -525,8 +546,8 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await writeFile(insideLedger, '');
     const link = join(ops, 'link');
     await symlink(ledger, link);
-    const state = join(dir, 'st-root', 'st');
-    await mkdir(state, { recursive: true });
+    const state = join(dir, 'st');
+    await mkdir(state);
 
     // Путь политики внутрь worktree — отказ даже при внешнем CLI-флаге.
     const badPolicy = { ...policySpec(wt), decisionLedger: insideLedger };
@@ -656,6 +677,15 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
       decisionLedger: join(dir, 'alias2', 'wt', 'out', 'ledger.jsonl') };
     const fChain = await withPolicy(dir, chainPolicy);
     await assert.rejects(() => buildRunPlan(runValues(fChain, state)),
+      /non_canonical_or_symlink_path/);
+    // Вложенный policy.brief через ту же цепочку симлинков (конечная цель
+    // вне worktree) — неканонический операторский вход: отказ до
+    // Git-конфига и запуска.
+    await writeFile(join(extOps, 'brief.md'), 'x');
+    const briefChain = { ...policySpec(wt),
+      brief: join(dir, 'alias2', 'wt', 'out', 'brief.md') };
+    const fBriefChain = await withPolicy(dir, briefChain);
+    await assert.rejects(() => buildRunPlan(runValues(fBriefChain, state)),
       /non_canonical_or_symlink_path/);
     // --policy внутри собственного route.worktree — операторский файл в
     // дереве воркера: отказ до Git-конфига и запуска (dry-run тоже).

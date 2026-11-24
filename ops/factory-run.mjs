@@ -96,11 +96,12 @@ const inside = (root, p) => {
 // без '..'/'.' (realpath совпадает со строкой пути). Любая цепочка
 // симлинков (D/alias/wt/out/..., alias -> wt/link, op/link/../x)
 // отклоняется до записи Git-конфига и запуска — ручной обход хопов не
-// нужен. Затем та же двусторонняя граница, что у контроллера
-// (decision-ledger.mjs, project-memory.mjs, assertLedgerOutside/
-// assertStoreOutside): ни путь, ни его родительский каталог не
-// пересекаются с worktree ни в одну сторону — против всех алиасов дерева.
-async function canonicalOutside(path, treeAliases, mustBe) {
+// нужен. Затем двусторонняя граница против всех алиасов дерева; сверка
+// родительского каталога (dirTarget/targetDir контроллера,
+// assertLedgerOutside/assertStoreOutside) действует только для
+// decisionLedger/projectMemory — sibling-каталог состояния рядом с
+// worktree допустим.
+async function canonicalOutside(path, treeAliases, mustBe, { parent = true } = {}) {
   if (!isAbsolute(path ?? '')) fail('path_not_absolute');
   const real = await realpath(path).catch(() => fail('path_missing'));
   if (real !== path) fail('non_canonical_or_symlink_path');
@@ -109,10 +110,24 @@ async function canonicalOutside(path, treeAliases, mustBe) {
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   if (treeAliases.some(t =>
-    inside(t, real) || inside(real, t) || inside(dirname(real), t))) {
+    inside(t, real) || inside(real, t) || (parent && inside(dirname(real), t)))) {
     fail('path_inside_worktree');
   }
   return real;
+}
+
+// Вложенный операторский файл политики (brief, reviewPrompt, reviewGate,
+// reviewSkillFiles — как в readOperatorInputs контроллера): строго
+// канонический файл строго вне worktree. Без файла — пропуск.
+async function nestedPolicyFile(path, treeAliases) {
+  if (path === undefined || path === null) return;
+  if (!isAbsolute(path)) fail('path_not_absolute');
+  const real = await realpath(path).catch(() => fail('path_missing'));
+  if (real !== path) fail('non_canonical_or_symlink_path');
+  const st = await lstat(real);
+  if (st.isSymbolicLink()) fail('non_canonical_or_symlink_path');
+  if (!st.isFile()) fail('path_not_file');
+  if (treeAliases.some(t => inside(t, real))) fail('path_inside_worktree');
 }
 
 const PASSTHROUGH_BOOL = ['stop-on-idle', 'daemon', 'allow-live-pilot',
@@ -162,10 +177,17 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // route.worktree, --worktree может лишь подтвердить тот же путь.
   const policyTree = policy?.route?.worktree;
   if (typeof policyTree !== 'string' || !policyTree) fail('worktree_required');
+  // route.worktree и --worktree — тоже операторские пути: строго
+  // канонические абсолютные (realpath обязан совпасть с исходной строкой),
+  // а не просто resolve'имые в один каталог.
+  if (!isAbsolute(policyTree)) fail('path_not_absolute');
   const worktreeReal = await realpath(policyTree).catch(() => fail('worktree_missing'));
-  if (values.worktree !== undefined &&
-      await realpath(values.worktree).catch(() => fail('worktree_missing')) !== worktreeReal) {
-    fail('worktree_mismatch');
+  if (worktreeReal !== policyTree) fail('non_canonical_or_symlink_path');
+  if (values.worktree !== undefined) {
+    if (!isAbsolute(values.worktree)) fail('path_not_absolute');
+    const cliTree = await realpath(values.worktree).catch(() => fail('worktree_missing'));
+    if (cliTree !== values.worktree) fail('non_canonical_or_symlink_path');
+    if (cliTree !== worktreeReal) fail('worktree_mismatch');
   }
 
   const ledger = effectivePath({ explicit: values['ledger-path'],
@@ -181,11 +203,19 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // Сам файл политики — операторский вход: не может лежать внутри дерева
   // воркера (контроллер отклонил бы его позже — отказ до Git-конфига).
   if (treeAliases.some(t => inside(t, policyPathReal))) fail('path_inside_worktree');
+  // Вложенные операторские входы политики — та же каноничность, что и у
+  // --policy: исходная строка brief/reviewPrompt/reviewGate/skillFiles
+  // обязана совпадать с realpath и лежать вне worktree.
+  for (const p of [policy.brief, policy.reviewPrompt, policy.reviewGate,
+    ...Object.values(policy.reviewSkillFiles ?? {})]) {
+    await nestedPolicyFile(p, treeAliases);
+  }
   if (ledger !== null) await canonicalOutside(ledger, treeAliases, 'file');
   if (memory !== null) await canonicalOutside(memory, treeAliases, 'dir');
   // --state — тоже операторский путь: контроллер делает лишь realpath без
-  // сверки со строкой; каноничность и граница worktree проверяются здесь.
-  const state = await canonicalOutside(values.state, treeAliases, 'dir');
+  // сверки со строкой; каноничность и двусторонняя граница worktree
+  // проверяются здесь (parent-граница относится к ledger/memory).
+  const state = await canonicalOutside(values.state, treeAliases, 'dir', { parent: false });
 
   // CLI-override без конфликта с политикой передаётся контроллеру через
   // тот же env-канал (DF_DECISION_LEDGER_PATH / DF_PROJECT_MEMORY_DIR):

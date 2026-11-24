@@ -132,8 +132,14 @@ export async function buildEnqueuePlan(values) {
     policyFile = await canonicalInput(values.policy, { worktrees, mustBe: 'file' });
     policyJson = JSON.parse(await readFile(policyFile, 'utf8'));
     if (typeof policyJson?.route?.worktree === 'string' && policyJson.route.worktree) {
-      worktrees.push(await realpath(policyJson.route.worktree)
-        .catch(() => fail('worktree_missing')));
+      // route.worktree — операторский путь: строго канонический абсолютный
+      // (realpath обязан совпасть с исходной строкой), иначе граница
+      // проверялась бы не по тому пути, что задал оператор.
+      if (!isAbsolute(policyJson.route.worktree)) fail('path_not_absolute');
+      const wtReal = await realpath(policyJson.route.worktree)
+        .catch(() => fail('worktree_missing'));
+      if (wtReal !== policyJson.route.worktree) fail('non_canonical_or_symlink_path');
+      worktrees.push(wtReal);
       // И сам файл политики обязан лежать вне дерева воркера.
       policyFile = await canonicalInput(values.policy, { worktrees, mustBe: 'file' });
     }
