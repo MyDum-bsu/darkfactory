@@ -298,11 +298,15 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   if (policy?.projectMemory?.trustedReceiptDir !== undefined) {
     await canonicalOutside(policy.projectMemory.trustedReceiptDir, treeAliases, 'dir');
   }
-  for (const dir of [policy?.questionGate?.inbox, policy?.release?.directory]) {
-    if (dir !== undefined) {
-      await canonicalOutside(dir, treeAliases, 'dir', { parent: false });
-    }
-  }
+  // Канонические пути сохраняются для перекрёстных границ ниже:
+  // ownerAnswerSource отделяет questionGate.inbox от handoffDir, а
+  // releaseSetup — release.directory от tree, inbox и --state.
+  const qgInbox = policy?.questionGate?.inbox !== undefined
+    ? await canonicalOutside(policy.questionGate.inbox, treeAliases, 'dir', { parent: false })
+    : null;
+  const relDir = policy?.release?.directory !== undefined
+    ? await canonicalOutside(policy.release.directory, treeAliases, 'dir', { parent: false })
+    : null;
   // --state — тоже операторский путь: контроллер делает лишь realpath без
   // сверки со строкой; каноничность и двусторонняя граница worktree
   // проверяются здесь (parent-граница относится к ledger/memory).
@@ -320,6 +324,19 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     // контроллер отклонил бы («Operator files must be outside worker
     // paths») уже после записи Git-конфига; отказ здесь, до эффекта.
     if (operatorFiles.some(f => inside(handoff, f))) fail('path_inside_worktree');
+  }
+  // Перекрёстные границы опциональных каталогов политики (как у
+  // ownerAnswerSource/releaseSetup контроллера): questionGate.inbox
+  // отделён от handoffDir, release.directory — от state и handoffDir,
+  // в обе стороны. Отказ до Git-конфига и в dry-run.
+  if (qgInbox !== null && handoff !== null &&
+      (inside(qgInbox, handoff) || inside(handoff, qgInbox))) {
+    fail('path_inside_worktree');
+  }
+  if (relDir !== null &&
+      (inside(relDir, state) || inside(state, relDir) ||
+       (handoff !== null && (inside(relDir, handoff) || inside(handoff, relDir))))) {
+    fail('path_inside_worktree');
   }
   // Каталоги стоп-файлов — та же двусторонняя permitDirectory-граница
   // против state и handoffDir (inbox сдачи контроллера), когда он задан.

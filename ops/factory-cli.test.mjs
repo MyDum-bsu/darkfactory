@@ -773,6 +773,25 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const fHbBrief = await withPolicy(dir, hbBrief);
     await assert.rejects(() => runPlan(runValues(fHbBrief, state)),
       /path_inside_worktree/);
+    // Пересечения опциональных каталогов (ownerAnswerSource/releaseSetup
+    // контроллера): questionGate.inbox = handoffDir и
+    // release.directory = state отклоняются при построении плана.
+    const qgSame = { ...policySpec(wt), handoffDir: inbox,
+      questionGate: { inbox } };
+    const fQgSame = await withPolicy(dir, qgSame);
+    await assert.rejects(() => runPlan(runValues(fQgSame, state)),
+      /path_inside_worktree/);
+    const relSame = { ...policySpec(wt), release: { directory: state } };
+    const fRelSame = await withPolicy(dir, relSame);
+    await assert.rejects(() => runPlan(runValues(fRelSame, state)),
+      /path_inside_worktree/);
+    const relDir = join(inbox, 'rel');
+    await mkdir(relDir);
+    const relInbox = { ...policySpec(wt), handoffDir: inbox,
+      release: { directory: relDir } };
+    const fRelInbox = await withPolicy(dir, relInbox);
+    await assert.rejects(() => runPlan(runValues(fRelInbox, state)),
+      /path_inside_worktree/);
     // Путь контроллера не переопределяется флагами.
     await assert.rejects(() => runFactory(['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', ok, '--state', state, '--run-isolated', join(dir, 'evil.mjs')], {}),
