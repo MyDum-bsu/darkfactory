@@ -708,6 +708,30 @@ test('run: --worktree обязан совпадать с policy.route.worktree',
       /non_canonical_or_symlink_path/);
     await assert.rejects(() => runPlan(runValues(policy, state,
       { worktree: wtLink })), /non_canonical_or_symlink_path/);
+    // mounts[].from выбранного профиля — операторский путь зависимости:
+    // неканонический (через симлинк) отклоняется при построении плана,
+    // до записи Git-конфига — как его отклонил бы sandboxExtras
+    // рантайма при обязательной локальной проверке. Канонический каталог
+    // проходит.
+    const deps = join(dir, 'site-packages');
+    await mkdir(deps);
+    const depsLink = join(dir, 'deps-link');
+    await symlink(deps, depsLink);
+    const mountRecipe = { image: 'sha256:' + 'a'.repeat(64),
+      argv: ['pytest'], cwd: '.', timeout: 60,
+      mounts: [{ from: depsLink, to: '/deps' }] };
+    const mountPolicy = await withPolicy(dir, { ...policySpec(wt),
+      profiles: { default: { branch: 'b',
+        review: { provider: 'google', model: 'gemini-4-neon' },
+        checks: [mountRecipe] } } });
+    await assert.rejects(() => runPlan(runValues(mountPolicy, state)),
+      /non_canonical_or_symlink_path/);
+    const okMountPolicy = await withPolicy(dir, { ...policySpec(wt),
+      profiles: { default: { branch: 'b',
+        review: { provider: 'google', model: 'gemini-4-neon' },
+        checks: [{ ...mountRecipe, mounts: [{ from: deps, to: '/deps' }] }] } } });
+    const mountPlan = await runPlan(runValues(okMountPolicy, state));
+    assert.equal(mountPlan.worktree, wt);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

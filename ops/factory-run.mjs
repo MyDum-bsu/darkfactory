@@ -259,6 +259,24 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     operatorFiles.push(await nestedPolicyFile(
       join(dirname(policy.reviewGate), 'routes.json'), treeAliases));
   }
+  // mounts[].from проверок выбранного профиля (route.checkProfile) —
+  // операторские пути зависимостей: та же каноничность, что у
+  // sandboxExtras рантайма ('An operator dependency mount must be a
+  // canonical directory'). Без проверки при построении плана dry-run
+  // ложно подтверждал бы конфигурацию, которую обязательная локальная
+  // проверка отклонит уже при выполнении воркером.
+  for (const recipe of
+    policy?.profiles?.[policy?.route?.checkProfile]?.checks ?? []) {
+    for (const mount of recipe?.mounts ?? []) {
+      const from = mount?.from;
+      if (typeof from !== 'string' || !isAbsolute(from)) fail('path_not_absolute');
+      const real = await realpath(from).catch(() => fail('path_missing'));
+      if (real !== from) fail('non_canonical_or_symlink_path');
+      const st = await lstat(real);
+      if (st.isSymbolicLink()) fail('non_canonical_or_symlink_path');
+      if (!st.isDirectory()) fail('path_not_dir');
+    }
+  }
   // Эффективный kill-switch демона (--switch > pilot.killSwitch): как у
   // createPilotSwitch — абсолютный путь вне дерева воркера; родительский
   // каталог каноничен (сам стоп-файл может ещё не существовать, но
