@@ -141,9 +141,10 @@ const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 
 // Путь из политики в форме контроллера: строка или объект ({path} для
 // ledger; {storeDir|dir|path} для memory — resolveMemoryStoreDir).
-// Как и ?? -цепочка контроллера, берётся первое значение, отличное от
-// null/undefined: нестроковое значение приоритетного поля (false, число)
-// проверяется и отклоняется здесь, а не проскакивает к следующему ключу.
+// Берётся первое заданное (не undefined) значение: явный null — не
+// «отсутствует» (контроллер подставил бы следующий ключ или env, а
+// dry-run подтвердил бы нерабочую конфигурацию), как и нестроковое
+// значение приоритетного поля — отклоняется здесь, до Git-конфига.
 const policyPath = (cfg, keys) => {
   if (cfg === undefined || cfg === null) return undefined;
   if (typeof cfg === 'string') return cfg;
@@ -151,7 +152,11 @@ const policyPath = (cfg, keys) => {
   // бы её в ledgerPolicyConfig/memoryPolicyConfig после записи
   // Git-конфига; L2 отклоняет такой вход при построении плана.
   if (typeof cfg !== 'object' || Array.isArray(cfg)) fail('policy_invalid');
-  return keys.map(k => cfg[k]).find(v => v !== undefined && v !== null);
+  for (const k of keys) {
+    if (cfg[k] === null) fail('path_not_absolute');
+    if (cfg[k] !== undefined) return cfg[k];
+  }
+  return undefined;
 };
 
 // Чистый старт: резолвит тот же путь, что реально использует контроллер

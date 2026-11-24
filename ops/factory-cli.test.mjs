@@ -1003,6 +1003,16 @@ test('run: нестроковое значение приоритетного п
       const fBad = await withPolicy(dir, { ...policySpec(wt), ...bad });
       await assert.rejects(() => runPlan(runValues(fBad, state)), /policy_invalid/);
     }
+    // Явный null в поле пути — не «отсутствует»: контроллер подставил бы
+    // следующий ключ или env; отказ при построении плана, до Git-конфига.
+    for (const bad of [
+      { decisionLedger: { path: null } },
+      { projectMemory: { storeDir: null } },
+      { projectMemory: { storeDir: null, dir: extMem } },
+    ]) {
+      const fBad = await withPolicy(dir, { ...policySpec(wt), ...bad });
+      await assert.rejects(() => runPlan(runValues(fBad, state)), /path_not_absolute/);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
