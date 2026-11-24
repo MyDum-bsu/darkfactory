@@ -146,7 +146,8 @@ const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 // dry-run подтвердил бы нерабочую конфигурацию), как и нестроковое
 // значение приоритетного поля — отклоняется здесь, до Git-конфига.
 const policyPath = (cfg, keys) => {
-  if (cfg === undefined || cfg === null) return undefined;
+  if (cfg === undefined) return undefined;
+  if (cfg === null) fail('path_not_absolute');
   if (typeof cfg === 'string') return cfg;
   // Скалярное значение или массив — не форма пути: контроллер отклонил
   // бы её в ledgerPolicyConfig/memoryPolicyConfig после записи
@@ -164,6 +165,9 @@ const policyPath = (cfg, keys) => {
 // политике путём — отказ: проверять одно, а исполнять другое нельзя.
 function effectivePath({ explicit, policyValue, env, name }) {
   const policyRaw = policyValue ?? env;
+  // Явная пустая строка в CLI или политике — не «не задано» (только
+  // пустой/отсутствующий env означает отсутствие пути): отклоняется.
+  if (explicit === '' || policyValue === '') fail('path_not_absolute');
   if (explicit !== undefined && policyValue !== undefined && explicit !== policyValue) {
     fail(`${name}_mismatch`);
   }

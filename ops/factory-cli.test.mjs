@@ -1013,6 +1013,21 @@ test('run: нестроковое значение приоритетного п
       const fBad = await withPolicy(dir, { ...policySpec(wt), ...bad });
       await assert.rejects(() => runPlan(runValues(fBad, state)), /path_not_absolute/);
     }
+    // Явный null на месте всей конфигурации пути — не «отсутствует»:
+    // контроллер подставил бы env или значение по умолчанию; отказ при
+    // построении плана, до Git-конфига.
+    for (const bad of [
+      { decisionLedger: null },
+      { projectMemory: null },
+    ]) {
+      const fBad = await withPolicy(dir, { ...policySpec(wt), ...bad });
+      await assert.rejects(() => runPlan(runValues(fBad, state)), /path_not_absolute/);
+    }
+    // Явная пустая строка — тоже заданное значение, а не «не задано»:
+    // отклоняется, не превращаясь молча в отсутствие пути.
+    const fEmpty = await withPolicy(dir, { ...policySpec(wt),
+      decisionLedger: '' });
+    await assert.rejects(() => runPlan(runValues(fEmpty, state)), /path_not_absolute/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
