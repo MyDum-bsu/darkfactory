@@ -333,6 +333,10 @@ async function withPolicy(dir, policy) {
 const runValues = (policy, state, extra = {}) => ({
   provider: 'acp-devin', model: 'swe-2-high', policy, state, ...extra });
 
+// Тесты не зависят от окружения хоста: DF_DECISION_LEDGER_PATH /
+// DF_PROJECT_MEMORY_DIR задаются явно только в env-fallback сценарии.
+const runPlan = (values, opts = {}) => buildRunPlan(values, { env: {}, ...opts });
+
 test('run: матрица моделей — жёсткая блокировка', () => {
   for (const spec of [
     'openai/gpt-6.1-terra',
@@ -356,19 +360,19 @@ test('run: отказ без явных --provider/--model и при несов�
     const noBb = policySpec(join(dir, 'wt'));
     delete noBb.bb;
     const fNoBb = await withPolicy(dir, noBb);
-    await assert.rejects(() => buildRunPlan(runValues(fNoBb, 's')), /policy_bb_missing/);
+    await assert.rejects(() => runPlan(runValues(fNoBb, 's')), /policy_bb_missing/);
     const noTree = policySpec(undefined);
     delete noTree.route.worktree;
     const fNoTree = await withPolicy(dir, noTree);
-    await assert.rejects(() => buildRunPlan(runValues(fNoTree, 's',
+    await assert.rejects(() => runPlan(runValues(fNoTree, 's',
       { worktree: join(dir, 'wt') })), /worktree_required/);
-    await assert.rejects(() => buildRunPlan({ model: 'm', policy, state: 's' }),
+    await assert.rejects(() => runPlan({ model: 'm', policy, state: 's' }),
       /provider_required/);
-    await assert.rejects(() => buildRunPlan({ provider: 'p', policy, state: 's' }),
+    await assert.rejects(() => runPlan({ provider: 'p', policy, state: 's' }),
       /model_required/);
-    await assert.rejects(() => buildRunPlan(
+    await assert.rejects(() => runPlan(
       runValues(policy, 's', { model: 'swe-2-low' })), /cli_spec_mismatch_policy_bb/);
-    await assert.rejects(() => buildRunPlan(
+    await assert.rejects(() => runPlan(
       runValues(policy, 's', { provider: 'pi' })), /cli_spec_mismatch_policy_bb/);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -381,43 +385,43 @@ test('run: запрещённая модель в CLI, критике, арби�
     const wt = join(dir, 'wt');
     await mkdir(wt);
     const policy = await withPolicy(dir, policySpec(wt));
-    await assert.rejects(() => buildRunPlan(
+    await assert.rejects(() => runPlan(
       runValues(policy, 's', { model: 'gpt-6.1-terra' })), /cli_spec_mismatch_policy_bb|disallowed/);
     const badCritic = policySpec(wt);
     badCritic.profiles.default.review = { provider: 'openai', model: 'gpt-6.1-terra' };
     const f1 = await withPolicy(dir, badCritic);
-    await assert.rejects(() => buildRunPlan(runValues(f1, 's')), /disallowed:profiles\.default/);
+    await assert.rejects(() => runPlan(runValues(f1, 's')), /disallowed:profiles\.default/);
     // Запрещённый спек в невыбранном профиле — тот же запрет матрицы.
     const otherProfile = policySpec(wt);
     otherProfile.profiles.other = { branch: 'b2',
       review: { provider: 'openai', model: 'gpt-6.1-terra' } };
     const f4 = await withPolicy(dir, otherProfile);
-    await assert.rejects(() => buildRunPlan(runValues(f4, 's')),
+    await assert.rejects(() => runPlan(runValues(f4, 's')),
       /disallowed:profiles\.other/);
     // route.critic — то же поле модели маршрута, тот же запрет.
     const badRoute = { ...policySpec(wt),
       route: { ...policySpec(wt).route,
         critic: { provider: 'openai', model: 'gpt-6.1-terra' } } };
     const f5 = await withPolicy(dir, badRoute);
-    await assert.rejects(() => buildRunPlan(runValues(f5, 's')),
+    await assert.rejects(() => runPlan(runValues(f5, 's')),
       /disallowed:route\.critic/);
     // route.arbiter распознаётся контроллером — тот же запрет матрицы.
     const badRouteArb = { ...policySpec(wt),
       route: { ...policySpec(wt).route,
         arbiter: { provider: 'openai', model: 'gpt-6.1-terra' } } };
     const f6 = await withPolicy(dir, badRouteArb);
-    await assert.rejects(() => buildRunPlan(runValues(f6, 's')),
+    await assert.rejects(() => runPlan(runValues(f6, 's')),
       /disallowed:route\.arbiter/);
     const badArbiter = { ...policySpec(wt), arbiter: { provider: 'pi', model: 'acp-zcode-start/x' } };
     const f2 = await withPolicy(dir, badArbiter);
-    await assert.rejects(() => buildRunPlan(runValues(f2, 's')), /zcode.*:arbiter/);
+    await assert.rejects(() => runPlan(runValues(f2, 's')), /zcode.*:arbiter/);
     // Кандидат в routing.allowlist.critic с активным роутингом — тот же запрет.
     const routed = { ...policySpec(wt),
       routing: { mode: 'active', allowlist: {
         critic: [{ provider: 'openai', model: 'gpt-6.2-sol' },
           { provider: 'openai', model: 'gpt-6.1-terra' }] } } };
     const f3 = await withPolicy(dir, routed);
-    await assert.rejects(() => buildRunPlan(runValues(f3, 's')),
+    await assert.rejects(() => runPlan(runValues(f3, 's')),
       /disallowed:routing\.allowlist\.critic/);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -434,9 +438,9 @@ test('run: --worktree обязан совпадать с policy.route.worktree',
     await mkdir(other);
     await mkdir(state);
     const policy = await withPolicy(dir, policySpec(wt));
-    const plan = await buildRunPlan(runValues(policy, state, { worktree: wt }));
+    const plan = await runPlan(runValues(policy, state, { worktree: wt }));
     assert.equal(plan.worktree, wt);
-    await assert.rejects(() => buildRunPlan(runValues(policy, 's', { worktree: other })),
+    await assert.rejects(() => runPlan(runValues(policy, 's', { worktree: other })),
       /worktree_mismatch/);
     // route.worktree и --worktree через симлинк на то же дерево —
     // неканонические операторские пути, отказ (равенство realpath
@@ -444,9 +448,9 @@ test('run: --worktree обязан совпадать с policy.route.worktree',
     const wtLink = join(dir, 'wt-link');
     await symlink(wt, wtLink);
     const linkPolicy = await withPolicy(dir, policySpec(wtLink));
-    await assert.rejects(() => buildRunPlan(runValues(linkPolicy, state)),
+    await assert.rejects(() => runPlan(runValues(linkPolicy, state)),
       /non_canonical_or_symlink_path/);
-    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+    await assert.rejects(() => runPlan(runValues(policy, state,
       { worktree: wtLink })), /non_canonical_or_symlink_path/);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -466,14 +470,14 @@ test('run: валидный dry-run печатает план без вызов�
     // git-вызов dry-run — только read-only rev-parse; мокаем.
     const gitCalls = [];
     const git = async a => { gitCalls.push(a); return a.includes('--show-toplevel') ? wt : 'true'; };
-    const dry = await runFactory([...args, '--dry-run'], { git });
+    const dry = await runFactory([...args, '--dry-run'], { git, env: {} });
     assert.equal(dry.dryRun, true);
     assert.deepEqual(dry.plan.argv.slice(1),
       ['--execute', '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50']);
     assert.deepEqual(gitCalls, [['-C', wt, 'rev-parse', '--show-toplevel']]);
     // Не-git worktree в dry-run — отказ.
     const notGit = async () => 'false';
-    await assert.rejects(() => runFactory([...args, '--dry-run'], { git: notGit }),
+    await assert.rejects(() => runFactory([...args, '--dry-run'], { git: notGit, env: {} }),
       /worktree_not_git/);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -512,7 +516,7 @@ test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', policy, '--state', state];
     const calls = [];
-    const result = await runFactory(args, { run: async (cmd, argv, env) => {
+    const result = await runFactory(args, { env: {}, run: async (cmd, argv, env) => {
       calls.push({ argv, env }); return { code: 0 };
     } });
     assert.equal(result.dryRun, false);
@@ -525,7 +529,7 @@ test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
     await mkdir(sub);
     const subPolicy = await withPolicy(dir, policySpec(sub));
     await assert.rejects(() => runFactory(['--provider', 'acp-devin', '--model', 'swe-2-high',
-      '--policy', subPolicy, '--state', state], { run: async () => ({ code: 0 }) }),
+      '--policy', subPolicy, '--state', state], { env: {}, run: async () => ({ code: 0 }) }),
       /worktree_not_git/);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -556,19 +560,19 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     // Путь политики внутрь worktree — отказ даже при внешнем CLI-флаге.
     const badPolicy = { ...policySpec(wt), decisionLedger: insideLedger };
     const f1 = await withPolicy(dir, badPolicy);
-    await assert.rejects(() => buildRunPlan(runValues(f1, state)),
+    await assert.rejects(() => runPlan(runValues(f1, state)),
       /path_inside_worktree/);
     // CLI-флаг против закреплённого в политике пути — mismatch, не молчаливый override.
-    await assert.rejects(() => buildRunPlan(runValues(f1, state, { 'ledger-path': ledger })),
+    await assert.rejects(() => runPlan(runValues(f1, state, { 'ledger-path': ledger })),
       /decision_ledger_mismatch|path_inside_worktree/);
     // Симлинк — отказ (не канонический путь).
     const ok = await withPolicy(dir, policySpec(wt));
-    await assert.rejects(() => buildRunPlan(runValues(ok, state, { 'ledger-path': link })),
+    await assert.rejects(() => runPlan(runValues(ok, state, { 'ledger-path': link })),
       /non_canonical_or_symlink_path/);
     // storeDir projectMemory внутри worktree — отказ.
     const badMem = { ...policySpec(wt), projectMemory: { storeDir: join(wt, 'mem') } };
     const f2 = await withPolicy(dir, badMem);
-    await assert.rejects(() => buildRunPlan(runValues(f2, state)), /path_missing|inside/);
+    await assert.rejects(() => runPlan(runValues(f2, state)), /path_missing|inside/);
     // Обратная вложенность: родительский каталог файла ledger содержит
     // worktree (<tmp>/ledger.jsonl при <tmp>/wt) — отказ, как и каталог
     // projectMemory, содержащий дерево (<tmp>/memory нельзя — внутри wt;
@@ -577,7 +581,7 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await writeFile(siblingLedger, '');
     const sibPolicy = { ...policySpec(wt), decisionLedger: siblingLedger };
     const fSib = await withPolicy(dir, sibPolicy);
-    await assert.rejects(() => buildRunPlan(runValues(fSib, state)),
+    await assert.rejects(() => runPlan(runValues(fSib, state)),
       /path_inside_worktree/);
     // Соседний <tmp>/memory рядом с <tmp>/wt: dirname хранилища содержит
     // worktree — контроллер отклонил бы на assertStoreOutside.
@@ -585,7 +589,7 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await mkdir(siblingMemory);
     const memParent = { ...policySpec(wt), projectMemory: { storeDir: siblingMemory } };
     const fMem = await withPolicy(dir, memParent);
-    await assert.rejects(() => buildRunPlan(runValues(fMem, state)),
+    await assert.rejects(() => runPlan(runValues(fMem, state)),
       /path_inside_worktree/);
     // '..' и симлинк-компоненты в пути — не канонический путь, отказ до
     // записи Git-конфига и запуска.
@@ -598,7 +602,7 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const dotdot = { ...policySpec(wt),
       decisionLedger: `${operator}/link/../ledger.jsonl` };
     const fDot = await withPolicy(dir, dotdot);
-    await assert.rejects(() => buildRunPlan(runValues(fDot, state)),
+    await assert.rejects(() => runPlan(runValues(fDot, state)),
       /non_canonical_or_symlink_path/);
     // Тот же '..' со снова-внешней конечной целью — тоже не канонический.
     await writeFile(join(operator, 'ledger2.jsonl'), '');
@@ -606,7 +610,7 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const dotdot2 = { ...policySpec(wt),
       decisionLedger: `${operator}/link/../ledger2.jsonl` };
     const fDot2 = await withPolicy(dir, dotdot2);
-    await assert.rejects(() => buildRunPlan(runValues(fDot2, state)),
+    await assert.rejects(() => runPlan(runValues(fDot2, state)),
       /non_canonical_or_symlink_path/);
     // Alias общего корня (root-alias -> <root>, wt в <root>/worktrees/wt):
     // путь через симлинк-алиас не канонический — отказ; каноническая форма
@@ -623,36 +627,36 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await writeFile(canonLedger, '');
     const aliasOk = { ...policySpec(wt2), decisionLedger: aliasLedger };
     const fAlias = await withPolicy(dir, aliasOk);
-    await assert.rejects(() => buildRunPlan(runValues(fAlias, state)),
+    await assert.rejects(() => runPlan(runValues(fAlias, state)),
       /non_canonical_or_symlink_path/);
     const canonOk = { ...policySpec(wt2), decisionLedger: canonLedger };
     const fCanon = await withPolicy(dir, canonOk);
-    const aliasPlan = await buildRunPlan(runValues(fCanon, state));
+    const aliasPlan = await runPlan(runValues(fCanon, state));
     assert.equal(aliasPlan.ledger, canonLedger);
     // Полный канон: строковый ledger, объектный memory — проходят; env-fallback тоже.
     const okPolicy = { ...policySpec(wt), decisionLedger: ledger,
       projectMemory: { storeDir: memory } };
     const f3 = await withPolicy(dir, okPolicy);
-    const plan = await buildRunPlan(runValues(f3, state));
+    const plan = await runPlan(runValues(f3, state));
     assert.equal(plan.ledger, ledger);
     assert.equal(plan.memory, memory);
     assert.equal(plan.env.DF_DECISION_LEDGER_PATH, undefined);
     // CLI-флаг при отсутствии пути в политике → передаётся контроллеру через env.
-    const plan2 = await buildRunPlan(runValues(ok, state, { 'ledger-path': ledger }));
+    const plan2 = await runPlan(runValues(ok, state, { 'ledger-path': ledger }));
     assert.equal(plan2.env.DF_DECISION_LEDGER_PATH, ledger);
     // env-fallback контроллера учитывается при проверке.
     const envLedger = join(wt, 'env-ledger.jsonl');
     await writeFile(envLedger, '');
-    await assert.rejects(() => buildRunPlan(runValues(ok, state),
+    await assert.rejects(() => runPlan(runValues(ok, state),
       { env: { DF_DECISION_LEDGER_PATH: envLedger } }), /path_inside_worktree/);
     // Относительный путь — отказ (resolveLedgerPath контроллера требует absolute).
     const relPolicy = { ...policySpec(wt), decisionLedger: 'rel-ledger.jsonl' };
     const f4 = await withPolicy(dir, relPolicy);
-    await assert.rejects(() => buildRunPlan(runValues(f4, state)), /path_not_absolute/);
+    await assert.rejects(() => runPlan(runValues(f4, state)), /path_not_absolute/);
     // Симлинк-предок внутри worktree — не канонический путь, отказ.
     const linkDir = join(wt, 'ld');
     await symlink(dir, linkDir);
-    await assert.rejects(() => buildRunPlan(runValues(ok, state,
+    await assert.rejects(() => runPlan(runValues(ok, state,
       { 'ledger-path': join(linkDir, 'ledger.jsonl') })),
       /non_canonical_or_symlink_path/);
     // Алиас worktree: путь через симлинк, разрешающийся внутрь дерева, —
@@ -663,7 +667,7 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await symlink(dir, linkInWt);
     const aliasPolicy = { ...policySpec(alias), decisionLedger: ledger };
     const f5 = await withPolicy(dir, aliasPolicy);
-    await assert.rejects(() => buildRunPlan(runValues(f5, state,
+    await assert.rejects(() => runPlan(runValues(f5, state,
       { 'memory-dir': join(alias, 'via', 'memory') })),
       /non_canonical_or_symlink_path/);
     // Цепочка D/alias/wt/out/ledger.jsonl: D/alias -> D/repo,
@@ -680,7 +684,7 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const chainPolicy = { ...policySpec(wt),
       decisionLedger: join(dir, 'alias2', 'wt', 'out', 'ledger.jsonl') };
     const fChain = await withPolicy(dir, chainPolicy);
-    await assert.rejects(() => buildRunPlan(runValues(fChain, state)),
+    await assert.rejects(() => runPlan(runValues(fChain, state)),
       /non_canonical_or_symlink_path/);
     // Вложенный policy.brief через ту же цепочку симлинков (конечная цель
     // вне worktree) — неканонический операторский вход: отказ до
@@ -689,26 +693,26 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const briefChain = { ...policySpec(wt),
       brief: join(dir, 'alias2', 'wt', 'out', 'brief.md') };
     const fBriefChain = await withPolicy(dir, briefChain);
-    await assert.rejects(() => buildRunPlan(runValues(fBriefChain, state)),
+    await assert.rejects(() => runPlan(runValues(fBriefChain, state)),
       /non_canonical_or_symlink_path/);
     // --policy внутри собственного route.worktree — операторский файл в
     // дереве воркера: отказ до Git-конфига и запуска (dry-run тоже).
     await mkdir(join(wt, 'policies'));
     const innerPolicy = join(wt, 'policies', 'policy.json');
     await writeFile(innerPolicy, JSON.stringify(policySpec(wt)));
-    await assert.rejects(() => buildRunPlan(runValues(innerPolicy, state)),
+    await assert.rejects(() => runPlan(runValues(innerPolicy, state)),
       /path_inside_worktree/);
     // --state: относительный путь, симлинк-предок и каталог внутри
     // worktree — отказ до эффекта; канонический каталог вне дерева проходит.
-    await assert.rejects(() => buildRunPlan(runValues(ok, 'relative-state')),
+    await assert.rejects(() => runPlan(runValues(ok, 'relative-state')),
       /path_not_absolute/);
     const stateLink = join(dir, 'state-link');
     await symlink(state, stateLink);
-    await assert.rejects(() => buildRunPlan(runValues(ok, stateLink)),
+    await assert.rejects(() => runPlan(runValues(ok, stateLink)),
       /non_canonical_or_symlink_path/);
     const innerState = join(wt, 'state');
     await mkdir(innerState);
-    await assert.rejects(() => buildRunPlan(runValues(ok, innerState)),
+    await assert.rejects(() => runPlan(runValues(ok, innerState)),
       /path_inside_worktree/);
     // routes.json — закрепляемый вход рядом с каноническим reviewGate:
     // симлинк (даже на внешнюю цель) отклоняется до Git-конфига.
@@ -719,17 +723,17 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await symlink(join(ops, 'routes-real.json'), join(gateDir, 'routes.json'));
     const gatePolicy = { ...policySpec(wt), reviewGate: join(gateDir, 'board-review.mjs') };
     const fGate = await withPolicy(dir, gatePolicy);
-    await assert.rejects(() => buildRunPlan(runValues(fGate, state)),
+    await assert.rejects(() => runPlan(runValues(fGate, state)),
       /non_canonical_or_symlink_path/);
     // --switch: относительный путь и симлинк-родитель — отказ в плане;
     // канонический путь (ещё несуществующий стоп-файл) проходит.
-    await assert.rejects(() => buildRunPlan(runValues(ok, state, { switch: './stop' })),
+    await assert.rejects(() => runPlan(runValues(ok, state, { switch: './stop' })),
       /path_not_absolute/);
     const swLink = join(dir, 'sw-link');
     await symlink(ops, swLink);
-    await assert.rejects(() => buildRunPlan(runValues(ok, state,
+    await assert.rejects(() => runPlan(runValues(ok, state,
       { switch: join(swLink, 'stop') })), /non_canonical_or_symlink_path/);
-    const swPlan = await buildRunPlan(runValues(ok, state,
+    const swPlan = await runPlan(runValues(ok, state,
       { switch: join(ops, 'stop') }));
     assert.ok(swPlan.argv.includes('--switch'));
     // handoffDir: симлинк — отказ; канонический каталог вне worktree и
@@ -738,21 +742,21 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await symlink(ops, handoffLink);
     const hbLink = { ...policySpec(wt), handoffDir: join(handoffLink, 'inbox') };
     const fHbLink = await withPolicy(dir, hbLink);
-    await assert.rejects(() => buildRunPlan(runValues(fHbLink, state)),
+    await assert.rejects(() => runPlan(runValues(fHbLink, state)),
       /non_canonical_or_symlink_path|path_missing/);
     const inbox = join(ops, 'inbox');
     await mkdir(inbox);
     const hbOk = { ...policySpec(wt), handoffDir: inbox };
     const fHbOk = await withPolicy(dir, hbOk);
-    const hbPlan = await buildRunPlan(runValues(fHbOk, state));
+    const hbPlan = await runPlan(runValues(fHbOk, state));
     assert.equal(hbPlan.handoff, inbox);
     const hbInner = { ...policySpec(wt), handoffDir: join(wt, 'inbox') };
     const fHbInner = await withPolicy(dir, hbInner);
-    await assert.rejects(() => buildRunPlan(runValues(fHbInner, state)),
+    await assert.rejects(() => runPlan(runValues(fHbInner, state)),
       /path_inside_worktree|path_missing/);
     // Путь контроллера не переопределяется флагами.
     await assert.rejects(() => runFactory(['--provider', 'acp-devin', '--model', 'swe-2-high',
-      '--policy', ok, '--state', state, '--run-isolated', '/tmp/evil.mjs'], {}),
+      '--policy', ok, '--state', state, '--run-isolated', join(dir, 'evil.mjs')], {}),
       /Unknown option|run-isolated/);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -770,24 +774,24 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     await mkdir(state);
     const policy = await withPolicy(dir, policySpec(wt));
     // Завершающий '/' — неканоническая строка: отказ до lstat и запуска.
-    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+    await assert.rejects(() => runPlan(runValues(policy, state,
       { switch: `${ops}/` })), /non_canonical_or_symlink_path/);
     // '.', '..' и повторные '//' — та же неканоничность.
-    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+    await assert.rejects(() => runPlan(runValues(policy, state,
       { switch: `${ops}/./stop` })), /non_canonical_or_symlink_path/);
-    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+    await assert.rejects(() => runPlan(runValues(policy, state,
       { switch: `${ops}/sub/../stop` })), /non_canonical_or_symlink_path/);
-    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+    await assert.rejects(() => runPlan(runValues(policy, state,
       { switch: `${ops}//stop` })), /non_canonical_or_symlink_path/);
     // Родительский компонент — обычный файл: lstat даёт ENOTDIR, а не
     // ENOENT — отказ (ещё несозданный стоп-файл в каноническом
     // каталоге по-прежнему проходит).
     const notDir = join(ops, 'file');
     await writeFile(notDir, 'x');
-    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+    await assert.rejects(() => runPlan(runValues(policy, state,
       { switch: join(notDir, 'stop') })),
       /non_canonical_or_symlink_path|path_missing/);
-    const ok = await buildRunPlan(runValues(policy, state,
+    const ok = await runPlan(runValues(policy, state,
       { switch: join(ops, 'stop') }));
     assert.ok(ok.argv.includes('--switch'));
     // Явный --switch не маскирует pilot.killSwitch: контроллер использует
@@ -797,12 +801,12 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     const pilotBad = { ...policySpec(wt), scope: 'pilot',
       pilot: { killSwitch: `${pilotStop}/` } };
     const fPilotBad = await withPolicy(dir, pilotBad);
-    await assert.rejects(() => buildRunPlan(runValues(fPilotBad, state,
+    await assert.rejects(() => runPlan(runValues(fPilotBad, state,
       { switch: join(ops, 'daemon-stop') })), /non_canonical_or_symlink_path/);
     const pilotOk = { ...policySpec(wt), scope: 'pilot',
       pilot: { killSwitch: pilotStop } };
     const fPilotOk = await withPolicy(dir, pilotOk);
-    const pilotPlan = await buildRunPlan(runValues(fPilotOk, state,
+    const pilotPlan = await runPlan(runValues(fPilotOk, state,
       { switch: join(ops, 'daemon-stop') }));
     assert.ok(pilotPlan.argv.includes('--switch'));
   } finally {
@@ -854,7 +858,7 @@ test('run: policy operator dirs — trustedReceiptDir/questionGate.inbox/release
       projectMemory: { trustedReceiptDir: receipts },
       questionGate: { inbox }, release: { directory: releaseDir } };
     const fOk = await withPolicy(dir, okPolicy);
-    await buildRunPlan(runValues(fOk, state));
+    await runPlan(runValues(fOk, state));
     // Соседние каталоги рядом с worktree (общий родитель <dir> содержит
     // wt): parent-граница на них не действует — контроллер допускает
     // такую раскладку для questionGate.inbox и release.directory.
@@ -864,7 +868,7 @@ test('run: policy operator dirs — trustedReceiptDir/questionGate.inbox/release
     await mkdir(sibRelease);
     const fSib = await withPolicy(dir, { ...base,
       questionGate: { inbox: sibInbox }, release: { directory: sibRelease } });
-    await buildRunPlan(runValues(fSib, state));
+    await runPlan(runValues(fSib, state));
     // trustedReceiptDir через симлинк-предка — неканонический операторский
     // каталог: отказ до Git-конфига и запуска.
     const linkOps = join(dir, 'ops-link');
@@ -872,17 +876,46 @@ test('run: policy operator dirs — trustedReceiptDir/questionGate.inbox/release
     const bad = { ...base,
       projectMemory: { trustedReceiptDir: join(linkOps, 'receipts') } };
     const fBad = await withPolicy(dir, bad);
-    await assert.rejects(() => buildRunPlan(runValues(fBad, state)),
+    await assert.rejects(() => runPlan(runValues(fBad, state)),
       /non_canonical_or_symlink_path/);
     // questionGate.inbox / release.directory внутри worktree — отказ.
     const wtInbox = join(wt, 'inbox');
     await mkdir(wtInbox);
     const fInbox = await withPolicy(dir, { ...base, questionGate: { inbox: wtInbox } });
-    await assert.rejects(() => buildRunPlan(runValues(fInbox, state)),
+    await assert.rejects(() => runPlan(runValues(fInbox, state)),
       /path_inside_worktree/);
     const fRel = await withPolicy(dir, { ...base, release: { directory: join(linkOps, 'release') } });
-    await assert.rejects(() => buildRunPlan(runValues(fRel, state)),
+    await assert.rejects(() => runPlan(runValues(fRel, state)),
       /non_canonical_or_symlink_path/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run: нестроковое значение приоритетного поля пути отклоняется', async () => {
+  const dir = await tempdir();
+  try {
+    const wt = join(dir, 'wt');
+    const ops = join(dir, 'ops');
+    const state = join(dir, 'state');
+    await mkdir(wt);
+    await mkdir(ops);
+    await mkdir(state);
+    // Контроллер берёт первое non-nullish значение ?? -цепочки:
+    // {storeDir: false, dir: <каноничный>} резолвится в false и
+    // отклоняется до записи Git-конфига, а не проскакивает к dir.
+    const extMem = join(ops, 'mem');
+    await mkdir(extMem);
+    const fMem = await withPolicy(dir, { ...policySpec(wt),
+      projectMemory: { storeDir: false, dir: extMem } });
+    await assert.rejects(() => runPlan(runValues(fMem, state)), /path_not_absolute/);
+    const fLedger = await withPolicy(dir, { ...policySpec(wt),
+      decisionLedger: { path: false } });
+    await assert.rejects(() => runPlan(runValues(fLedger, state)), /path_not_absolute/);
+    // Число — тоже нестроковый приоритетный путь: отказ до эффекта.
+    const fNum = await withPolicy(dir, { ...policySpec(wt),
+      decisionLedger: { path: 42 } });
+    await assert.rejects(() => runPlan(runValues(fNum, state)), /path_not_absolute/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -102,7 +102,7 @@ const inside = (root, p) => {
 // decisionLedger/projectMemory — sibling-каталог состояния рядом с
 // worktree допустим.
 async function canonicalOutside(path, treeAliases, mustBe, { parent = true } = {}) {
-  if (!isAbsolute(path ?? '')) fail('path_not_absolute');
+  if (typeof path !== 'string' || !isAbsolute(path)) fail('path_not_absolute');
   const real = await realpath(path).catch(() => fail('path_missing'));
   if (real !== path) fail('non_canonical_or_symlink_path');
   const st = await lstat(real);
@@ -121,7 +121,7 @@ async function canonicalOutside(path, treeAliases, mustBe, { parent = true } = {
 // канонический файл строго вне worktree. Без файла — пропуск.
 async function nestedPolicyFile(path, treeAliases) {
   if (path === undefined || path === null) return;
-  if (!isAbsolute(path)) fail('path_not_absolute');
+  if (typeof path !== 'string' || !isAbsolute(path)) fail('path_not_absolute');
   const real = await realpath(path).catch(() => fail('path_missing'));
   if (real !== path) fail('non_canonical_or_symlink_path');
   const st = await lstat(real);
@@ -138,8 +138,11 @@ const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 
 // Путь из политики в форме контроллера: строка или объект ({path} для
 // ledger; {storeDir|dir|path} для memory — resolveMemoryStoreDir).
+// Как и ?? -цепочка контроллера, берётся первое значение, отличное от
+// null/undefined: нестроковое значение приоритетного поля (false, число)
+// проверяется и отклоняется здесь, а не проскакивает к следующему ключу.
 const policyPath = (cfg, keys) =>
-  typeof cfg === 'string' ? cfg : keys.map(k => cfg?.[k]).find(v => typeof v === 'string');
+  typeof cfg === 'string' ? cfg : keys.map(k => cfg?.[k]).find(v => v !== undefined && v !== null);
 
 // Чистый старт: резолвит тот же путь, что реально использует контроллер
 // (explicit > policy > env). Расхождение CLI-флага с закреплённым в
