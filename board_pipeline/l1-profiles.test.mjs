@@ -78,6 +78,7 @@ test('доверенный образ: Dockerfile и requirements без host-п
   const dir = join(ROOT, 'ops', 'l1-profiles', 'python-node');
   const dockerfile = await readFile(join(dir, 'Dockerfile'), 'utf8');
   const requirements = await readFile(join(dir, 'requirements.txt'), 'utf8');
+  const readme = await readFile(join(dir, 'README.md'), 'utf8');
   // Python 3.12 + Node 22 из pinned-баз, не-root, рабочий каталог кандидата.
   for (const needle of ['python:3.12-slim-bookworm',
     'node:22.23.2-bookworm-slim', 'USER 65534:65534', 'WORKDIR /candidate',
@@ -90,7 +91,7 @@ test('доверенный образ: Dockerfile и requirements без host-п
     assert.match(requirements, new RegExp(`^${pkg}==`, 'm'), pkg);
   }
   // Ноль абсолютных host-путей в новых файлах профиля.
-  for (const text of [dockerfile, requirements]) {
+  for (const text of [dockerfile, requirements, readme]) {
     assert.doesNotMatch(text, /\/home\/|\/media\/|\/Users\//);
   }
 });
@@ -179,6 +180,21 @@ test('runtime: runner отклоняет неизвестный l1Profile до �
         { l1Default: 'python-node', check: recipe, checks: [recipe] }),
         /full SHA/);
     }
+    // Список рецептов валидируется до первого вызова docker: дефект
+    // второго рецепта за валидным первым отклоняется сразу — иначе при
+    // исполнении первый ушёл бы в docker и упал с ошибкой среды, а не
+    // с диагнозом политики.
+    const profRunner = offlineProfileRunner(journal);
+    await assert.rejects(() => profRunner(handoff,
+      { l1Profile: 'node',
+        checks: [recipe, { ...recipe, l1Profile: 'python-node' }] }),
+      /l1_profile_mismatch/);
+    await assert.rejects(() => profRunner(handoff,
+      { checks: [recipe, { ...recipe, l1Profile: 'bogus' }] }),
+      /unknown_l1_profile:bogus/);
+    await assert.rejects(() => profRunner(handoff,
+      { checks: [recipe, { ...recipe, l1Profile: null }] }),
+      /unknown_l1_profile:null/);
     // Тот же контракт у визуального гейта: недопустимое или
     // конфликтующее visual.l1Profile отклоняется до docker.
     const visual = offlineVisualRunner(journal);

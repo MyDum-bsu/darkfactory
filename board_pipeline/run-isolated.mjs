@@ -253,6 +253,24 @@ async function execute() {
     cliProfile: values['l1-profile'],
     profileL1: p.profiles[route.checkProfile].l1Profile,
     repoId: route.repoId });
+  // Явный l1Profile рецептов выбранного профиля сверяется с CLI и
+  // закреплённым l1Profile уже на старте — до захвата карточки и
+  // запуска воркера, как в factory-run. Третий явный источник (метка
+  // l1_profile карточки) известен только на попытку — сверяется в
+  // verify до проверок.
+  for (const recipe of [...(p.profiles[route.checkProfile].checks ?? []),
+    ...(p.profiles[route.checkProfile].visual === undefined
+      ? [] : [p.profiles[route.checkProfile].visual])]) {
+    if (recipe?.l1Profile !== undefined) {
+      resolveL1Profile({ l1Profile: recipe.l1Profile });
+      if ((values['l1-profile'] !== undefined &&
+            values['l1-profile'] !== recipe.l1Profile) ||
+          (p.profiles[route.checkProfile].l1Profile !== undefined &&
+            p.profiles[route.checkProfile].l1Profile !== recipe.l1Profile)) {
+        throw new Error('l1_profile_mismatch');
+      }
+    }
+  }
   if (!Number.isSafeInteger(p.waitMs) || p.waitMs < 1) throw new Error('Configure the pilot wait time');
   delete process.env.BOARD_TOKEN;
   process.env.BOARD_URL = p.boardUrl;

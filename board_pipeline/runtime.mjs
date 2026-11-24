@@ -323,6 +323,19 @@ export function offlineProfileRunner(journal, options) {
   const check = offlineDockerRunner(journal, options);
   return async (handoff, profile) => {
     if (!Array.isArray(profile.checks) || !profile.checks.length) throw new Error('An approved check list is required');
+    // Все рецепты валидируются до первого вызова docker: недопустимое
+    // или конфликтующее l1Profile за валидным рецептом не должно
+    // допускать частичное исполнение (иначе дефект политики
+    // маскировался бы под ошибку локальных проверок).
+    const l1Pinned = profile.l1Profile === undefined ? undefined
+      : resolveL1Profile({ l1Profile: profile.l1Profile });
+    for (const recipe of profile.checks) {
+      const l1Recipe = recipe?.l1Profile === undefined ? undefined
+        : resolveL1Profile({ l1Profile: recipe.l1Profile });
+      if (l1Pinned !== undefined && l1Recipe !== undefined && l1Pinned.id !== l1Recipe.id) {
+        throw new Error('l1_profile_mismatch');
+      }
+    }
     const evidence = [];
     for (const recipe of profile.checks) {
       // l1Profile профиля и рецепта передаются раздельно: сверка и
