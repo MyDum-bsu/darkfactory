@@ -5,6 +5,7 @@ import { homedir, tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ReviewDenied } from './review-runner.mjs';
+import { killProcessGroupByMarker } from './signals.mjs';
 import { withModelProxy } from './model-proxy.mjs';
 import agyStream from './agy-stream.cjs';
 
@@ -97,12 +98,29 @@ async function snapshotBoundary(cwd, scratch, home, runtime) {
 
 // Host model transport over the offline snapshot; no ambient env or worker path.
 export async function hostAgyTransport({ prompt, snapshot, publishSnapshot, timeoutMs = 210_000, env = process.env,
-  launch = agyStream.runAgy, beforeEffect }) {
+  launch = agyStream.runAgy, beforeEffect, signal }) {
+  if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
   const binary = await ownedFile(env.DF_AGY_BINARY ?? join(homedir(), '.local', 'opt', 'antigravity-cli', 'agy'),
     'agy_binary_not_enrolled');
   const scope = await ownedFile(env.DF_AGY_SCOPE_FILE ?? join(homedir(), '.config', 'antigravity', 'credential-user-scope'),
     'agy_scope_not_enrolled');
   const scratch = await mkdtemp(join(tmpdir(), 'df-agy-'));
+  // Отмена добивает группу процесса именно этого запуска: уникальный
+  // scratch-путь находится в /proc по cmdline/environ — после execv
+  // лаунчера agy-landlock.py процесс по-прежнему виден. Цикл повторяется,
+  // чтобы накрыть асинхронное окно до реального старта процесса; cleanup
+  // (снятие слушателя и дожидание цикла) завершается до возврата.
+  let stopped = false;
+  let stopping = null;
+  const onAbort = () => {
+    stopping ??= (async () => {
+      while (!stopped) {
+        try { await killProcessGroupByMarker(scratch); } catch { /* best effort */ }
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    })();
+  };
+  signal?.addEventListener?.('abort', onAbort, { once: true });
   const cwd = snapshot;
   try {
     if (!isAbsolute(cwd ?? '') || typeof publishSnapshot !== 'function') throw new ReviewDenied('agy_snapshot_workspace_invalid');
@@ -136,6 +154,9 @@ export async function hostAgyTransport({ prompt, snapshot, publishSnapshot, time
     }
     return result;
   } finally {
+    stopped = true;
+    signal?.removeEventListener?.('abort', onAbort);
+    await stopping;
     await rm(scratch, { recursive: true, force: true });
   }
 }

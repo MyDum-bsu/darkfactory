@@ -725,17 +725,29 @@ async function execute() {
     // как в allowlist, — canonical modelKey сопоставляет обе формы.
     telemetry.recordModel('critic', attempt.triad?.critic ?? reviewSetup.critic);
     telemetry.recordModel('arbiter', attempt.triad?.arbiter ?? reviewSetup.arbiter);
+    // Единый сигнал попытки: abort до/во время критика добивает контейнер
+    // или agy-группу внутри раннера, а перед каждым (пере)запуском гейт
+    // отклоняет эффект — повтор после отмены не стартует.
+    const signalGuard = () => {
+      if (attemptSignals?.signal?.aborted) {
+        throw attemptSignals.signal.reason ?? new Error('stage_aborted');
+      }
+    };
     const { review, retry: retryReview } = l2CriticRunners({
       makeRunner: neon ? isolatedNeonReviewRunner : isolatedPiReviewRunner,
-      options: { journal: root, prompt: criticPrompt },
+      options: { journal: root, prompt: criticPrompt,
+        // attemptSignals создаётся внутри try ниже; раннеры ленивы —
+        // геттер читается в момент конструирования читателя.
+        get signal() { return attemptSignals?.signal; } },
       // Читатели конструируются лениво при вызове — после проверок
       // review-порта ниже, а не на этой строке. Первый читатель — прежний
-      // пре-эффект, как до DF-OPS-1.
-      beforeEffect,
+      // пре-эффект, как до DF-OPS-1, плюс гейт единого сигнала.
+      beforeEffect: async () => { signalGuard(); return beforeEffect?.(); },
       // Пре-эффект второго читателя — вся граница запуска: свежее
       // доказательство lease/допуска/контракта/пинов, чистый закреплённый
       // checkout и финальный стоп-файл — в продукционном l2LaunchBoundary.
       retryBeforeEffect: async () => {
+        signalGuard();
         if (launchBinding) await launchBoundary();
       } });
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
@@ -889,7 +901,7 @@ async function execute() {
             try {
               const critic = await l2ReviewWithTransientRetry({
                 review, retry: retryReview, binding: handoff, profile: trusted,
-                beforeRetry: retryGuard,
+                beforeRetry: async () => { signalGuard(); return retryGuard(); },
                 verifySubject: b => assertRetrySubjectUnchanged({ ...b, worktree: tree,
                   branch: profile.branch }),
                 log: note => console.log(JSON.stringify(note)),

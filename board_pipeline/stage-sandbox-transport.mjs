@@ -15,7 +15,7 @@
 
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, relative } from 'node:path';
 import { promisify } from 'node:util';
@@ -25,6 +25,7 @@ import { withModelProxy } from './model-proxy.mjs';
 import { assertToolsAllowed, parseReviewTranscript, ReviewDenied, REVIEW_IMAGE,
   runInReadOnlySandbox, runnerReviewSpec, snapshotDigest, worktreeFingerprint } from './review-runner.mjs';
 import { hostAgyTransport } from './agy-transport.mjs';
+import { killProcessGroupByMarker } from './signals.mjs';
 import { opencodeGoPolicyViolation, retiredProviderViolation } from './worker-selector.mjs';
 import agyStream from './agy-stream.cjs';
 
@@ -147,8 +148,13 @@ async function sandboxedPiConfig(file, src) {
 // Вердикт stage: ровно одна строка "<challenge> PASS|REWORK|BLOCKED" из
 // финального ответа модели. Чужой challenge — не доказательство.
 export function stageVerdictLine(text, challenge) {
-  const match = /^\s*([a-f0-9]{64}) (PASS|REWORK|BLOCKED)\s*$/m.exec(String(text ?? ''));
-  if (!match || match[1] !== challenge) throw new StageDenied('stage_verdict_unconfirmed');
+  // Ровно одна строка вердикта во всём ответе: две подходящие строки
+  // (даже с одним challenge) — неоднозначность, отказ до аттестации.
+  const lines = String(text ?? '')
+    .match(/^\s*[a-f0-9]{64} (?:PASS|REWORK|BLOCKED)\s*$/gm) ?? [];
+  if (lines.length !== 1) throw new StageDenied('stage_verdict_unconfirmed');
+  const match = /^\s*([a-f0-9]{64}) (PASS|REWORK|BLOCKED)\s*$/.exec(lines[0]);
+  if (match[1] !== challenge) throw new StageDenied('stage_verdict_unconfirmed');
   return match[2];
 }
 
@@ -159,15 +165,28 @@ export function stageVerdictLine(text, challenge) {
 async function settleWithAbort(promise, signal, onAbort) {
   if (signal === undefined) return await promise;
   const reason = () => signal.reason ?? new StageDenied('stage_aborted');
+  // Остановка повторяется до завершения внутреннего промиса: в момент
+  // отмены дочерний процесс может ещё не существовать (асинхронное окно
+  // подготовки запуска) — одноразовое сканирование пропустило бы его, и
+  // модель стартовала бы уже после отмены.
+  const stopUntilSettled = async () => {
+    let live = true;
+    const stopping = (async () => {
+      while (live) {
+        try { await onAbort?.(); } catch { /* best effort */ }
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    })();
+    await Promise.resolve(promise).catch(() => {});
+    live = false;
+    await stopping;
+  };
   if (signal.aborted) {
-    await promise.catch(() => {});
+    await stopUntilSettled();
     throw reason();
   }
   return await new Promise((resolve, reject) => {
-    const onSignal = () => Promise.resolve()
-      .then(() => onAbort?.())
-      .catch(() => {})
-      .then(() => Promise.resolve(promise).catch(() => {}))
+    const onSignal = () => stopUntilSettled()
       .finally(() => reject(reason()));
     signal.addEventListener('abort', onSignal, { once: true });
     Promise.resolve(promise).then(
@@ -220,6 +239,14 @@ export function createStageSandboxTransport({
     throw new StageDenied('stage_transport_config_invalid');
   }
 
+  // beforeEffect — последняя граница перед запуском модели внутри обоих
+  // транспортов (перед docker run и перед beforeConnect model-proxy):
+  // отмена в асинхронном окне подготовки не допускает запуска модели.
+  const launchGate = async () => {
+    if (signal?.aborted) throw signal.reason ?? new StageDenied('stage_aborted');
+    return beforeEffect?.();
+  };
+
   const probes = { probeLandlock, probeDocker };
   const enrolled = async model =>
     (await probeStageSandboxCapability(stageTransportKind(model), probes)).enrolled;
@@ -264,7 +291,7 @@ export function createStageSandboxTransport({
 
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
-      const credential = await stagePiCredential(piRoot, spec.provider, beforeEffect);
+      const credential = await stagePiCredential(piRoot, spec.provider, launchGate);
       await writeFile(join(cfgDir, 'auth.json'), JSON.stringify({ [spec.provider]: credential }),
         { mode: 0o600 });
       for (const file of PI_CONFIG_FILES) {
@@ -334,7 +361,7 @@ export function createStageSandboxTransport({
           }
         };
         run = await settleWithAbort(dockerSandbox({ snapshot: source, argv, image, env, mounts,
-          allow, timeoutMs: effectiveTimeout(callMs), beforeEffect, signal }), signal, stopRun);
+          allow, timeoutMs: effectiveTimeout(callMs), beforeEffect: launchGate, signal }), signal, stopRun);
       } finally {
         await driftCheck(async () => {
           const after = await snapshotDigestImpl(source);
@@ -406,44 +433,12 @@ export function createStageSandboxTransport({
         // Остановка активного agy-процесса по сигналу: уникальный scratch-путь
         // (mkdtemp) этого запуска ищется в /proc/*/cmdline и environ — так
         // процесс находится и после того, как launcher заменил себя через
-        // execv (agy-landlock.py больше нет в argv). Из /proc/pid/stat
-        // берётся группа процесса и добивается SIGKILL; cleanup выполняет
-        // сам транспорт.
-        const stopRun = async () => {
-          const zap = target => {
-            try { process.kill(target, 'SIGKILL'); } catch { /* уже завершён */ }
-          };
-          try {
-            const ownStat = await readFile('/proc/self/stat', 'utf8');
-            const ownPgrp = Number(ownStat.slice(ownStat.lastIndexOf(')') + 2).trim()
-              .split(' ')[2]);
-            const needle = Buffer.from(scratch);
-            const groups = new Set();
-            for (const pid of await readdir('/proc')) {
-              if (!/^\d+$/.test(pid)) continue;
-              let stat, touched = false;
-              try {
-                const [cmdline, environ] = await Promise.all([
-                  readFile(`/proc/${pid}/cmdline`).catch(() => Buffer.alloc(0)),
-                  readFile(`/proc/${pid}/environ`).catch(() => Buffer.alloc(0)),
-                ]);
-                touched = cmdline.includes(needle) || environ.includes(needle);
-                if (!touched) continue;
-                stat = await readFile(`/proc/${pid}/stat`, 'utf8');
-              } catch { continue; /* процесс ушёл между чтениями */ }
-              // Формат stat: pid (comm) state ppid pgrp ... — comm может
-              // содержать пробелы, поэтому разбор после последней ')'.
-              const rest = stat.slice(stat.lastIndexOf(')') + 2).trim().split(' ');
-              const pgrp = Number(rest[2]);
-              if (Number.isSafeInteger(pgrp) && pgrp > 1 && pgrp !== ownPgrp) groups.add(pgrp);
-              else zap(Number(pid));
-            }
-            for (const pgrp of groups) zap(-pgrp);
-          } catch { /* best effort: timeoutMs транспорта — запасная граница */ }
-        };
+        // execv (agy-landlock.py больше нет в argv). Группа процесса
+        // добивается SIGKILL; cleanup выполняет сам транспорт.
+        const stopRun = () => killProcessGroupByMarker(scratch);
         live = await settleWithAbort(agyTransport({ prompt: instruction, snapshot: view,
           publishSnapshot: snapshot.publish, timeoutMs: effectiveTimeout(callMs), env,
-          beforeEffect, signal }), signal, stopRun);
+          beforeEffect: launchGate, signal }), signal, stopRun);
       } finally {
         await driftCheck(async () => {
           if (!isDeepStrictEqual(await snapshotDigestImpl(published ? view : staged), fingerprint)) {

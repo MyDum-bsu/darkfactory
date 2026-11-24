@@ -87,7 +87,7 @@ async function freshScratch(worktree) {
   return mkdtemp(join(tempRoot, 'neon-review-'));
 }
 
-async function prepareSnapshot(binding, scratch, sandbox, beforeEffect) {
+async function prepareSnapshot(binding, scratch, sandbox, beforeEffect, signal) {
   const staged = join(scratch, 'staged');
   const view = join(scratch, 'review');
   const source = join(staged, 'candidate');
@@ -96,7 +96,8 @@ async function prepareSnapshot(binding, scratch, sandbox, beforeEffect) {
   const { stdout: diff } = await exec('git', ['--no-pager', '-C', binding.worktree, 'diff',
     '--no-textconv', '--no-ext-diff', '--no-color', '--binary', binding.base_sha, binding.candidate_sha, '--'],
   { timeout: 30_000, maxBuffer: PATCH_LIMIT, encoding: 'buffer' });
-  const run = await sandbox({ snapshot: source, argv: ['node', '-e', inventory], timeoutMs: 30_000, beforeEffect });
+  const run = await sandbox({ snapshot: source, argv: ['node', '-e', inventory], timeoutMs: 30_000,
+    beforeEffect, signal });
   if (run.code !== 0) throw new ReviewDenied(run.code === 3 ? 'review_snapshot_unsafe_link' : 'review_neon_snapshot_failed');
   const files = JSON.parse(run.stdout);
   await writeFile(join(staged, 'diff.patch'), diff, { mode: 0o400 });
@@ -126,7 +127,7 @@ async function prepareSnapshot(binding, scratch, sandbox, beforeEffect) {
 }
 
 export function isolatedNeonReviewRunner({ journal, prompt = '', timeoutMs = 480_000,
-  sandbox = runInReadOnlySandbox, transport = hostAgyTransport, beforeEffect }) {
+  sandbox = runInReadOnlySandbox, transport = hostAgyTransport, beforeEffect, signal }) {
   if (!isAbsolute(journal ?? '')) throw new ReviewDenied('review_runner_misconfigured');
   return async (binding, profile) => {
     if (!isNeonReview(profile?.review)) throw new ReviewDenied('review_profile_not_approved');
@@ -140,13 +141,13 @@ export function isolatedNeonReviewRunner({ journal, prompt = '', timeoutMs = 480
     try {
       const before = await worktreeFingerprint(binding.worktree);
       if (before.head !== binding.candidate_sha) throw new ReviewDenied('review_worktree_head_mismatch');
-      const snapshot = await prepareSnapshot(binding, scratch, sandbox, beforeEffect);
+      const snapshot = await prepareSnapshot(binding, scratch, sandbox, beforeEffect, signal);
       const body = neonBody(binding, prompt, snapshot.files);
       if (Buffer.byteLength(body) > PROMPT_LIMIT) throw new ReviewDenied('review_neon_prompt_too_large');
       let live;
       try {
         live = await transport({ prompt: body, snapshot: snapshot.view, publishSnapshot: snapshot.publish,
-          timeoutMs, beforeEffect });
+          timeoutMs, beforeEffect, signal });
       } finally {
         await snapshot.verify();
         if (!isDeepStrictEqual(await worktreeFingerprint(binding.worktree), before)) {

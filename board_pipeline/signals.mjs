@@ -5,7 +5,7 @@
 // висящих setTimeout/setInterval после выхода попытки не остаётся.
 // Только встроенные модули Node.
 
-import { statfs } from 'node:fs/promises';
+import { readdir, readFile, statfs } from 'node:fs/promises';
 
 export const PHASES = Object.freeze(['writer', 'l1_l3', 'stages', 'l2_critic']);
 
@@ -202,4 +202,38 @@ export function createAttemptSignals({ deadline, phaseBudgets, phaseSpent, asser
     },
   };
   return api;
+}
+
+// Остановка процессной группы по уникальному маркеру запуска (путь mkdtemp).
+// Процесс ищется в /proc по cmdline и environ — так он находится и после
+// execv, когда имя лаунчера уже отсутствует в argv. Из /proc/pid/stat берётся
+// группа (поле после comm — comm может содержать пробелы, разбор после
+// последней ')'), группа добивается SIGKILL; собственная группа исключена.
+export async function killProcessGroupByMarker(marker) {
+  const zap = target => {
+    try { process.kill(target, 'SIGKILL'); } catch { /* уже завершён */ }
+  };
+  try {
+    const ownStat = await readFile('/proc/self/stat', 'utf8');
+    const ownPgrp = Number(ownStat.slice(ownStat.lastIndexOf(')') + 2).trim().split(' ')[2]);
+    const needle = Buffer.from(marker);
+    const groups = new Set();
+    for (const pid of await readdir('/proc')) {
+      if (!/^\d+$/.test(pid)) continue;
+      let stat;
+      try {
+        const [cmdline, environ] = await Promise.all([
+          readFile(`/proc/${pid}/cmdline`).catch(() => Buffer.alloc(0)),
+          readFile(`/proc/${pid}/environ`).catch(() => Buffer.alloc(0)),
+        ]);
+        if (!cmdline.includes(needle) && !environ.includes(needle)) continue;
+        stat = await readFile(`/proc/${pid}/stat`, 'utf8');
+      } catch { continue; /* процесс ушёл между чтениями */ }
+      const rest = stat.slice(stat.lastIndexOf(')') + 2).trim().split(' ');
+      const pgrp = Number(rest[2]);
+      if (Number.isSafeInteger(pgrp) && pgrp > 1 && pgrp !== ownPgrp) groups.add(pgrp);
+      else zap(Number(pid));
+    }
+    for (const pgrp of groups) zap(-pgrp);
+  } catch { /* best effort: таймаут раннера — запасная граница */ }
 }

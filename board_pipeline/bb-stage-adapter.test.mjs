@@ -395,12 +395,14 @@ test('foremanArtifacts: inventory измеряется из дерева кан�
   // verifier получают честно измеренный артефакт той же формы, что CHECKS.
   assert.deepEqual(JSON.parse((await read({ verifier: 'change-set' })).artifact).type, 'change-set');
   for (const verifier of ['course-outline', 'conjecture', 'falsification', 'lean-proof',
-      'source-review', 'experiment', 'frozen-pipeline', 'blind-panel', 'technical-copy',
-      'rubric-review']) {
+      'source-review', 'experiment', 'technical-copy', 'rubric-review']) {
     const { artifact: built } = await read({ verifier });
     const parsed = JSON.parse(built);
     assert.equal(parsed.type, verifier, verifier);
   }
-  // Незнакомый verifier — fail-closed отказ до запуска модели.
-  await assert.rejects(read({ verifier: 'unknown-verifier' }), /ab_pilot_artifact_not_available/);
+  // Без реального повторного прогона и независимой панели доверенного
+  // измерения нет — fail-closed отказ, а не сфабрикованный PASS.
+  for (const verifier of ['frozen-pipeline', 'blind-panel', 'visual-report', 'unknown-verifier']) {
+    await assert.rejects(read({ verifier }), /ab_pilot_artifact_not_available/, verifier);
+  }
 });

@@ -576,10 +576,11 @@ export function assertToolsAllowed(toolsAdded) {
 
 // Both snapshot tools and model clients have an isolated network namespace.
 export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAGE,
-  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate', beforeEffect }) {
+  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate', beforeEffect, signal }) {
   if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length) {
     throw new ReviewDenied('sandbox_request_invalid');
   }
+  if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
   const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
     timeout: 12_000,
   })).stdout);
@@ -608,7 +609,24 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   let stdout = '';
   let stderr = '';
   let timedOut = false;
+  // Отмена добивает именованный контейнер этого запуска: опрос повторяется,
+  // чтобы накрыть окно между docker info и созданием контейнера. Финальный
+  // rm -f в finally самого раннера остаётся второй гарантией.
+  let stopping = null;
+  const onAbort = () => {
+    stopping ??= (async () => {
+      for (let poll = 0; poll < 8; poll++) {
+        try {
+          await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
+          return;
+        } catch { /* контейнера ещё нет — повтор */ }
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    })();
+  };
   await beforeEffect?.();
+  if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
+  signal?.addEventListener?.('abort', onAbort, { once: true });
   try {
     const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
     stdout = run.stdout;
@@ -621,6 +639,7 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
     stdout = error.stdout ?? '';
     stderr = error.stderr ?? '';
   } finally {
+    signal?.removeEventListener?.('abort', onAbort);
     try {
       await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
     } catch (failure) {
@@ -628,7 +647,9 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
         throw new ReviewDenied('sandbox_cleanup_failed', { cause: failure });
       }
     }
+    await stopping;
   }
+  if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
   return { code, stdout, stderr, timedOut };
 }
 
@@ -849,7 +870,7 @@ async function sandboxPiCredential(piRoot, provider, kind, beforeEffect) {
 
 // Legacy Pi/Sol ReviewPort on the hardened snapshot; VS-2 uses the Neon adapter.
 export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
-  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect }) {
+  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect, signal }) {
   if (!isAbsolute(journal ?? '') || !isAbsolute(piRoot ?? '')) {
     throw new ReviewDenied('review_runner_misconfigured');
   }
@@ -968,7 +989,8 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         '--no-approve', '--tools', READ_ONLY_TOOLS.join(','),
         '--session-dir', '/tmp/session', instruction];
 
-      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs, beforeEffect });
+      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs,
+        beforeEffect, signal });
       const dirtyExit = run.code !== 0;
       if (dirtyExit) {
         // Сырой вывод — только в приватный журнал (0600), не в причину Board.

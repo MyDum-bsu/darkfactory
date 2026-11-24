@@ -183,14 +183,13 @@ export function foremanArtifacts({ candidate, diff, localEvidence, brief, review
       case 'experiment':
         return encode({ type: 'experiment', metrics: checksSha,
           frames: checks.length, violations: failed });
+      // Без реального повторного прогона пайплайна (artifact !== replay) и
+      // без результатов независимой панели второго кандидата доверенного
+      // измерения нет — стадия закрывается до запуска модели, а не PASS на
+      // сфабрикованных значениях.
       case 'frozen-pipeline':
-        return encode({ type: 'frozen-pipeline',
-          recipe: sha(JSON.stringify({ registry: request.registryDigest, playbook: request.playbook })),
-          artifact: sha(candidate), replay: sha(candidate) });
       case 'blind-panel':
-        return encode({ type: 'blind-panel', protocol: reviewSha,
-          candidates: 1 + (request.inputArtifactDigest === null ? 0 : 1),
-          votes: checks.length + 1, anonymous: true });
+        throw new Error('ab_pilot_artifact_not_available');
       case 'course-outline':
         return encode({ type: 'course-outline', outline: sha(material),
           lessons: request.skills?.length ?? 0, uncoveredGoals: defectMarks(material) });

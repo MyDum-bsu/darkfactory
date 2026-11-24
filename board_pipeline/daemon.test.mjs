@@ -235,8 +235,9 @@ async function startBoard(cli, t) {
 
 async function daemonFixture(t, url, { pilot = false } = {}) {
   // Фикстура на ФС с реальными правами и >= 8 GiB (state/switch требуют 0700,
-  // дисковый preflight проверяет tree): worktree-раздел может не давать 0700.
-  const base = await mkdtemp(join(homedir(), '.df-daemon-it-'));
+  // дисковый preflight проверяет tree): worktree-раздел (fuseblk) не даёт 0700,
+  // а home-раздел может оказаться заполнен — tmpdir подходит по обоим.
+  const base = await mkdtemp(join(tmpdir(), 'df-daemon-it-'));
   t.after(() => rm(base, { recursive: true, force: true }));
   const tree = join(base, 'tree');
   await mkdir(tree, { mode: 0o700 });

@@ -178,15 +178,23 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     // (Landlock/Docker) с криптографическим stage_witness, без host bb spawn.
     if (sandboxTransport !== undefined) {
       await assertCurrent(request.binding);
-      // Фазовый учёт только при настроенном бюджете: без phaseBudgets стадия
-      // ограничена maxSeconds и общим deadline — фазовый таймер не вооружается.
+      // Фазовый учёт только при настроенном бюджете stages: частичный набор
+      // budgets без stages (phase_budget_unknown) — как полное отсутствие
+      // бюджета: стадия ограничена maxSeconds и общим deadline.
       const budget = signals?.phaseBudget ?? phaseBudget ?? null;
-      const budgetMs = budget ? budget.remaining('stages') : maxSeconds * 1000;
+      let budgetMs = maxSeconds * 1000;
+      let armPhase = null;
+      if (budget !== null) {
+        try {
+          budgetMs = budget.remaining('stages');
+          armPhase = signals?.phaseBudget === budget && signals?.phase
+            ? () => { signals.phase('stages'); return () => signals.leavePhase(); }
+            : () => { budget.enter('stages'); return () => budget.leave(); };
+        } catch (cause) {
+          if (!String(cause?.message ?? '').startsWith('phase_budget_unknown')) throw cause;
+        }
+      }
       if (budgetMs < 1000) throw new Error('phase_deadline_exceeded:stages');
-      const armPhase = budget === null ? null
-        : signals?.phaseBudget === budget && signals?.phase
-          ? () => { signals.phase('stages'); return () => signals.leavePhase(); }
-          : () => { budget.enter('stages'); return () => budget.leave(); };
       const disarmPhase = armPhase?.() ?? null;
       try {
         const observed = await sandboxTransport.observe({ binding: request.binding,
@@ -216,8 +224,56 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     await checkTransport();
     // Отменённый до spawn вызов не запускает дочерний тред.
     if (signals?.signal?.aborted) throw signals.signal.reason ?? new Error('stage_aborted');
-    const spawned = await run(argv, Math.min(35_000, deadline - Date.now()));
-    if (!BB_ID.test(spawned?.id ?? '')) throw new Error('stage_spawn_unconfirmed');
+    // Отказ thread stop не подавляется молча: одна повторная попытка, затем
+    // фиксация факта возможно живого дочернего треда.
+    const stopThread = async id => {
+      try {
+        await execBb(['thread', 'stop', id], { timeout: 12_000 });
+      } catch (first) {
+        try {
+          await execBb(['thread', 'stop', id], { timeout: 12_000 });
+        } catch (second) {
+          console.error(JSON.stringify({ kind: 'stage_stop_unconfirmed', threadId: id,
+            error: String(second?.message ?? second) }));
+        }
+      }
+    };
+    // Подтверждение spawn потеряно (обрыв/таймаут CLI) — дочерний тред мог
+    // быть создан. Read-only сверка списка: показанные show атрибуты нашего
+    // треда (parent, project, environment workspace или ещё не назначено)
+    // → остановка, затем исходная ошибка.
+    const stopLostSpawn = async () => {
+      const args = ['thread', 'list', '--json'];
+      if (project) args.push('--project', project);
+      const listed = JSON.parse((await execBb(args, { timeout: 15_000 })).stdout);
+      const items = Array.isArray(listed) ? listed : (Array.isArray(listed?.threads) ? listed.threads : []);
+      let shown = 0;
+      for (const item of items) {
+        if (!BB_ID.test(item?.id ?? '')) continue;
+        if (item.parentThreadId !== undefined && item.parentThreadId !== parentThread) continue;
+        if (item.environmentPath !== undefined && item.environmentPath !== workspace) continue;
+        if (shown >= 40) break;
+        shown++;
+        let current = null;
+        try { current = await run(['thread', 'show', item.id, '--json']); } catch { continue; }
+        if (current?.thread?.parentThreadId === parentThread && current?.thread?.projectId === project &&
+            (current?.environment === null || current?.environment === undefined ||
+              current?.environment?.path === workspace)) {
+          await stopThread(item.id);
+        }
+      }
+    };
+    let spawned;
+    try {
+      spawned = await run(argv, Math.min(35_000, deadline - Date.now()));
+    } catch (cause) {
+      await stopLostSpawn().catch(() => {});
+      throw cause;
+    }
+    if (!BB_ID.test(spawned?.id ?? '')) {
+      await stopLostSpawn().catch(() => {});
+      throw new Error('stage_spawn_unconfirmed');
+    }
     // Stop is cleanup of an already-launched, specifically identified child,
     // not progression of the attempt; it remains needed after gate loss.
     // Сбой промежуточного thread show не отменяет остановку: spawned.id —
@@ -231,7 +287,7 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
           (current.environment === null || current.environment === undefined ||
             current.environment?.path === workspace) &&
           current.thread?.id === spawned.id)) {
-        await execBb(['thread', 'stop', spawned.id], { timeout: 12_000 }).catch(() => {});
+        await stopThread(spawned.id);
       }
     };
     try {
