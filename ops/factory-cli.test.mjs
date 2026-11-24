@@ -246,6 +246,11 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     // политикой не создаётся и без CLI-флага.
     const wtLedger = join(wt, 'ledger.jsonl');
     await writeFile(wtLedger, '');
+    // Критик закреплён явно (legacy Sol): выбор ревью-профиля не зависит
+    // от DF_AGY_KEYRING_ITEM окружения оператора.
+    const pinnedReview = { route: { checkProfile: 'p', worktree: wt },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } } };
     for (const embedded of [
       { decisionLedger: wtLedger },
       { decisionLedger: { path: wtLedger } },
@@ -253,15 +258,14 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
       { projectMemory: { storeDir: dir } },
     ]) {
       await writeFile(policyFile, JSON.stringify({
-        brief, reviewPrompt, reviewGate: gate, route: { worktree: wt },
-        ...embedded }));
+        brief, reviewPrompt, reviewGate: gate, ...pinnedReview, ...embedded }));
       await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
         'policy-digest': undefined, policy: policyFile }),
         /path_inside_worktree/);
     }
     // Канонические хранилища вне дерева в политике проходят.
     await writeFile(policyFile, JSON.stringify({
-      brief, reviewPrompt, reviewGate: gate, route: { worktree: wt },
+      brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
       decisionLedger: storeLedger, projectMemory: { storeDir: store } }));
     const embeddedPlan = await buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile });
@@ -625,12 +629,17 @@ test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', policy, '--state', state];
     const calls = [];
-    const result = await runFactory(args, { env: {}, run: async (cmd, argv, env) => {
+    // Окружение с GIT_*-перенаправлением конфига: контроллеру оно не
+    // наследуется — его git-команды работали бы с чужим effective-значением.
+    const result = await runFactory(args, { env: {
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fileMode',
+      GIT_CONFIG_VALUE_0: 'true' }, run: async (cmd, argv, env) => {
       calls.push({ argv, env }); return { code: 0 };
     } });
     assert.equal(result.dryRun, false);
     assert.equal(calls.length, 1);
     assert.ok(calls[0].argv[0].endsWith('run-isolated.mjs'));
+    assert.ok(!Object.keys(calls[0].env).some(k => k.startsWith('GIT_')));
     assert.equal((await git(['config', '--local', 'core.fileMode'])).stdout.trim(), 'false');
     // Подкаталог внутри git-репозитория — не точный корень worktree:
     // отказ до записи core.fileMode и запуска контроллера.
@@ -657,6 +666,9 @@ test('run: NTFS guard не наследует GIT_DIR/GIT_WORK_TREE окруже
     await mkdir(other);
     const gitA = await initGitRepo(wt);
     const gitB = await initGitRepo(other);
+    // Исходное значение в другом репозитории фиксируется явно: на ФС без
+    // надёжного executable-бита init мог бы выставить core.fileMode=false.
+    await gitB(['config', '--local', 'core.fileMode', 'true']);
     // Унаследованное перенаправление: --show-toplevel читался бы из
     // GIT_WORK_TREE (= wt, проверка проходит), а config --local писал бы
     // в конфиг GIT_DIR (= other). Guard снимает GIT_*: rev-parse и запись
@@ -668,8 +680,8 @@ test('run: NTFS guard не наследует GIT_DIR/GIT_WORK_TREE окруже
     delete process.env.GIT_WORK_TREE;
     assert.equal((await gitA(['config', '--local', '--get', 'core.fileMode']))
       .stdout.trim(), 'false');
-    // Конфиг другого репозитория не тронут: init выставил fileMode=true,
-    // перезапись через перенаправленный GIT_DIR не произошла.
+    // Конфиг другого репозитория не тронут: перезапись через
+    // перенаправленный GIT_DIR не произошла, исходное значение сохранено.
     assert.equal((await gitB(['config', '--local', '--get', 'core.fileMode']))
       .stdout.trim(), 'true');
   } finally {

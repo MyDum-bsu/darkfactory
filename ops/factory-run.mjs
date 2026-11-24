@@ -535,8 +535,11 @@ export async function runFactory(argv, deps = {}) {
   }
   await ensureFilemodeGuard(plan.worktree, { git: deps.git ?? defaultGit });
   const run = deps.run ?? defaultRun;
+  // Контроллер получает окружение без GIT_*-перенаправлений: иначе его
+  // git-команды (как и у guard до очистки) работали бы с чужим конфигом —
+  // унаследованный GIT_CONFIG_* переопределил бы подтверждённый guard.
   const result = await run(plan.node, plan.argv,
-    { ...(deps.env ?? process.env), ...plan.env });
+    { ...cleanGitEnv(deps.env ?? process.env), ...plan.env });
   return { dryRun: false, plan, result };
 }
 
