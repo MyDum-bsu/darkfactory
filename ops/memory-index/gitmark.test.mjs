@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -133,4 +133,27 @@ test('secrets detects private key and BOARD_TOKEN', async () => {
   const rules = JSON.parse(r.stdout).secrets.map(s => s.rule);
   assert.ok(rules.includes('board_token'));
   assert.ok(rules.includes('private_key'));
+});
+
+test('lint --baseline starting with - fails closed (2)', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-bref-')));
+  await put(root, 'a.md', '# A\n');
+  // '--baseline=--all' — argparse видит значение, git отвергает ref.
+  const r = await run(['lint', root, '--baseline=--all', '--json']);
+  assert.equal(r.code, 2);
+  assert.equal(JSON.parse(r.stdout).error, 'baseline_invalid');
+});
+
+test('symlink escaping root is not indexed nor read', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-link-')));
+  const outside = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-out-')));
+  await put(outside, 'secret.md', '# Out\n\nfindmeoutside\n');
+  await put(root, 'ok.md', '# A\n');
+  await symlink(join(outside, 'secret.md'), join(root, 'link.md'));
+  const r = await run(['index', root, '--json']);
+  assert.equal(r.code, 0);
+  const found = await run(['search', root, 'findmeoutside', '--json']);
+  assert.equal(JSON.parse(found.stdout).results.length, 0);
+  const sec = await run(['secrets', root, '--json']);
+  assert.equal(sec.code, 0);
 });

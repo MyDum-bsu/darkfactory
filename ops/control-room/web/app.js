@@ -217,11 +217,17 @@ async function refresh() {
 
 function connectSse() {
   const es = new EventSource('/api/events');
+  let refreshTimer = null;
+  // Debounce ~250ms: лавина событий не долбит /api/snapshot.
+  const debouncedRefresh = () => {
+    if (refreshTimer) return;
+    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 250);
+  };
   es.onmessage = ev => {
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === 'snapshot') render(msg.data);
-      else if (msg.type === 'event') refresh();
+      else if (msg.type === 'event') debouncedRefresh();
     } catch { /* noop */ }
   };
   es.onerror = () => { es.close(); setTimeout(connectSse, 3000); };

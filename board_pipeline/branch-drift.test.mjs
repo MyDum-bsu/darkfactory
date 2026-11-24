@@ -47,7 +47,7 @@ const baseGit = ({ dirty = {}, unmerged = [], diffs = {} } = {}) => fakeGit([
   [(a) => a.join(' ') === 'worktree list --porcelain', () => WORKTREE_LIST],
   [(a, cwd) => a.join(' ') === 'status --porcelain', (a, cwd) => dirty[cwd] ?? ''],
   [(a) => a[0] === 'branch', () => unmerged.join('\n') + (unmerged.length ? '\n' : '')],
-  [(a, cwd) => a[0] === 'diff', (a) => (diffs[a.at(-1)] ?? []).join('\n')],
+  [(a, cwd) => a[0] === 'diff', (a) => (diffs[a[a.indexOf('--') - 1]] ?? []).join('\n')],
 ]);
 
 test('clean repo: no drift detected', async () => {
@@ -123,6 +123,53 @@ test('unavailable worktree status treated as dirty (fail-closed)', async () => {
     repoDir: '/repo/main', baseRef: 'main', execGit: wrapped });
   assert.equal(report.driftDetected, true);
   assert.equal(report.dirtyWorktrees[0].dirtyFiles[0], '<status_unavailable>');
+});
+
+test('P1: git branch --no-merged failure throws drift_check_unavailable', async () => {
+  const execGit = baseGit();
+  const wrapped = async (args, cwd) => {
+    if (args[0] === 'branch') throw new Error('fatal: not a valid object');
+    return execGit(args, cwd);
+  };
+  await assert.rejects(() => inspectWorktreesAndBranches({
+    repoDir: '/repo/main', baseRef: 'main', execGit: wrapped }),
+    /drift_check_unavailable/);
+});
+
+test('P1: git diff failure counts branch as overlapping (fail-closed)', async () => {
+  const execGit = baseGit({ unmerged: ['feat/x'] });
+  const wrapped = async (args, cwd) => {
+    if (args[0] === 'diff') throw new Error('diff broke');
+    return execGit(args, cwd);
+  };
+  const report = await inspectWorktreesAndBranches({
+    repoDir: '/repo/main', baseRef: 'main', touchPaths: ['no/match/here'],
+    execGit: wrapped });
+  assert.equal(report.driftDetected, true);
+  assert.equal(report.unmergedBranches.length, 1);
+  assert.equal(report.unmergedBranches[0].files[0], '<diff_unavailable>');
+});
+
+test('P1: touches() normalizes ./, trailing / and dot segments identically', async () => {
+  for (const tp of ['ops', 'ops/', './ops', './ops/', 'a/../ops']) {
+    const report = await inspectWorktreesAndBranches({
+      repoDir: '/repo/main', baseRef: 'main', touchPaths: [tp],
+      execGit: baseGit({ unmerged: ['feat/a'],
+        diffs: { 'main...feat/a': ['ops/control-room/x.mjs'] } }) });
+    assert.equal(report.unmergedBranches.length, 1, `touch=${tp}`);
+  }
+  // А непересекающийся touch не считается.
+  const report = await inspectWorktreesAndBranches({
+    repoDir: '/repo/main', baseRef: 'main', touchPaths: ['opsx'],
+    execGit: baseGit({ unmerged: ['feat/a'],
+      diffs: { 'main...feat/a': ['ops/control-room/x.mjs'] } }) });
+  assert.equal(report.unmergedBranches.length, 0);
+});
+
+test('P1: baseRef starting with - rejected (no git option injection)', async () => {
+  await assert.rejects(() => inspectWorktreesAndBranches({
+    repoDir: '/repo/main', baseRef: '--all', execGit: baseGit() }),
+    /base_ref_invalid/);
 });
 
 // --- интеграция в ops/factory-enqueue.mjs -----------------------------------

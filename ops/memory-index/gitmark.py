@@ -60,12 +60,24 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
 
+def _escapes_root(path: Path, root: Path) -> bool:
+    """Симлинк, указывающий за пределы root, — файл не читаем."""
+    try:
+        path.resolve().relative_to(root)
+        return False
+    except (OSError, ValueError):
+        return True
+
+
 def iter_files(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in sorted(filenames):
-            if Path(name).suffix.lower() in INDEXABLE:
-                yield Path(dirpath) / name
+            path = Path(dirpath) / name
+            if path.is_symlink() and _escapes_root(path, root):
+                continue
+            if path.suffix.lower() in INDEXABLE:
+                yield path
 
 
 def chunk_md(path: Path, rel: str):
@@ -269,6 +281,9 @@ def cmd_lint(root: Path, baseline: str, as_json: bool):
     new_violations = list(current)
     baseline_n = 0
     if baseline:
+        # ref, начинающийся с '-', — инъекция git-опции: fail-closed (2).
+        if str(baseline).startswith('-'):
+            return 2, {'error': 'baseline_invalid', 'baseline': baseline}
         with tempfile.TemporaryDirectory() as tmp:
             try:
                 git_archive(root, baseline, Path(tmp))
@@ -297,6 +312,8 @@ def cmd_secrets(root: Path, as_json: bool):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in sorted(filenames):
             path = Path(dirpath) / name
+            if path.is_symlink() and _escapes_root(path, root):
+                continue
             try:
                 text = path.read_text(encoding='utf-8', errors='replace')
             except OSError:

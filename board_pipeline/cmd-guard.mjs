@@ -20,7 +20,24 @@ const REGEN_DIRS = new Set(['node_modules', '.next', 'dist', 'build', '.cache',
 const FORK_BOMB = /([^\s()]+)\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;?\s*\1/;
 const SQL_DESTRUCTIVE = /\b(drop\s+(table|database|schema)|truncate\s+(table\s+)?[\w`"'])/i;
 const SHELL_WRAPPERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ash', 'ksh']);
-const SIMPLE_WRAPPERS = new Set(['command', 'builtin', 'exec', 'nohup', 'time', 'stdbuf', 'nice', 'ionice', 'busybox', 'chrt', 'taskset']);
+// Флаги оболочек, принимающие ОТДЕЛЬНЫЙ аргумент до -c (bash -o pipefail -c).
+const SHELL_ARG_FLAGS = new Set(['-o', '-O', '--init-file', '--rcfile']);
+// Ведущие ключевые слова shell пропускаются: if/for/while — не команды.
+const SHELL_KEYWORDS = new Set(['if', 'then', 'elif', 'else', 'fi', 'do',
+  'done', 'while', 'until', 'for', 'in', 'case', 'esac', 'time', '!',
+  'coproc', 'select', 'function']);
+const SIMPLE_WRAPPERS = new Set(['command', 'builtin', 'exec', 'nohup', 'time', 'stdbuf', 'nice', 'ionice', 'busybox', 'chrt', 'taskset', 'timeout', 'setsid', 'watch']);
+// Флаги обёрток с ОТДЕЛЬНЫМ аргументом (exec -c/-a различаются, timeout -s).
+const WRAPPER_ARG_FLAGS = {
+  exec: new Set(['-a', '--argv0']),
+  nice: new Set(['-n', '--adjustment']),
+  stdbuf: new Set(['-o', '-e', '-i']),
+  taskset: new Set(['-c']),
+  chrt: new Set(['-p']),
+  ionice: new Set(['-c', '-n', '-p', '-t']),
+  timeout: new Set(['-s', '-k', '--signal', '--kill-after']),
+  watch: new Set(['-n', '--interval']),
+};
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 // Глобальные флаги со значением (следующий токен — значение, если флаг без =).
@@ -30,6 +47,7 @@ const GLOBAL_FLAGS = {
   kubectl: new Set(['-n', '--namespace', '--context', '--kubeconfig', '-s', '--server', '--as', '--cluster', '--user', '--token']),
   gcloud: new Set(['--project', '--account', '--configuration', '--format']),
   sudo: new Set(['-u', '-g', '-h', '-p', '-r', '-t', '-C', '-T', '-D', '-R', '-U', '--askpass']),
+  doas: new Set(['-u', '-C', '-D', '-n']),
   env: new Set(['-u', '--unset', '-C', '--chdir', '-S', '--split-string']),
   xargs: new Set(['-I', '-n', '-P', '-d', '-s', '-L', '-a', '-E', '-J', '-R', '--max-procs', '--max-args', '--delimiter', '--arg-file']),
 };
@@ -55,8 +73,19 @@ function lexCommands(line, state, depth) {
   let words = [];
   let cur = '';
   let inWord = false;
+  let pipePending = false;
   const pushWord = () => { if (inWord) words.push(cur); cur = ''; inWord = false; };
-  const pushSegment = () => { pushWord(); if (words.length) segments.push(words); words = []; };
+  // pipePending: сегмент — приёмник '|' → «что-то | sh» детектируется
+  // отдельным правилом (поток в интерпретатор — критично).
+  const pushSegment = () => {
+    pushWord();
+    if (words.length) {
+      words.fromPipe = pipePending;
+      pipePending = false;
+      segments.push(words);
+    }
+    words = [];
+  };
   for (let i = 0; i < line.length; i++) {
     state.check();
     const c = line[i];
@@ -83,7 +112,19 @@ function lexCommands(line, state, depth) {
     if ((c === '&' && line[i + 1] === '&') || (c === '|' && line[i + 1] === '|')) {
       pushSegment(); i++; continue;
     }
-    if (c === ';' || c === '|' || c === '\n' || c === '&') { pushSegment(); continue; }
+    if (c === '|') { pushSegment(); pipePending = true; continue; }
+    // Групповые операторы — границы команд: (rm -rf /), { rm -rf /; }.
+    // '{'/'}' — только как отдельные слова (зарезервированные в shell);
+    // '{}' в find -exec остаётся словом.
+    if (c === '(' || c === ')') { pushSegment(); continue; }
+    if (c === '{' || c === '}') {
+      const next = line[i + 1];
+      if (!inWord && (next === undefined || /[\s;]/.test(next))) {
+        pushSegment(); continue;
+      }
+      cur += c; inWord = true; continue;
+    }
+    if (c === ';' || c === '\n' || c === '&') { pushSegment(); continue; }
     if (/\s/.test(c)) { pushWord(); continue; }
     cur += c;
     inWord = true;
@@ -163,19 +204,39 @@ function unwrap(argv, depth, state, visit) {
   if (!first) return args.slice(1);
   args[0] = first;
 
+  if (first === 'eval') {
+    // eval объединяет аргументы и исполняет — разбираем рекурсивно.
+    if (args.length > 1) visit(args.slice(1).join(' '));
+    return [];
+  }
+  if (first === 'su') {
+    // su [-s shell] [-] [user] -c <cmd> — ищем -c/-s, остальное флаги/логин.
+    for (let i = 1; i < args.length; i++) {
+      const w = args[i];
+      if (w === '-c' || w === '--command') {
+        if (i + 1 < args.length) visit(args[i + 1]);
+        return [];
+      }
+      if (['-s', '--shell', '-g', '--group', '-G', '--supp-group',
+        '--session-command'].includes(w)) { i++; continue; }
+    }
+    return [];
+  }
   if (SIMPLE_WRAPPERS.has(first)) {
-    // nice -n 5, taskset -c 0, stdbuf -o0 — флаги со значением.
-    const withArg = new Set(['-n', '-c', '-o', '-e', '-i', '--adjustment']);
+    // timeout -s KILL 5 rm → 5 — длительность; watch -n 1; setsid -f.
+    const withArg = WRAPPER_ARG_FLAGS[first] ?? new Set();
+    let positional = false;
     let i = 1;
     while (i < args.length) {
       const w = args[i];
-      if (withArg.has(w)) { i += 2; continue; }
+      if (withArg.has(w.split('=')[0])) { i += w.includes('=') ? 1 : 2; continue; }
       if (w.startsWith('-')) { i++; continue; }
+      if (first === 'timeout' && !positional) { positional = true; i++; continue; }
       break;
     }
     return unwrap(args.slice(i), depth + 1, state, visit);
   }
-  if (first === 'sudo' || first === 'env' || first === 'xargs') {
+  if (first === 'sudo' || first === 'doas' || first === 'env' || first === 'xargs') {
     const withArg = GLOBAL_FLAGS[first];
     let i = 1;
     while (i < args.length) {
@@ -188,21 +249,37 @@ function unwrap(argv, depth, state, visit) {
       if (w.startsWith('-')) { i++; continue; }
       break;
     }
-    return unwrap(args.slice(i), depth + 1, state, visit);
+    const inner = unwrap(args.slice(i), depth + 1, state, visit);
+    // xargs берёт цели из stdin: помечаем вложенную команду, чтобы
+    // «xargs rm -rf» без явных целей тоже блокировался.
+    if (first === 'xargs') {
+      try { Object.defineProperty(inner, 'viaXargs', { value: true }); } catch { /* noop */ }
+    }
+    return inner;
   }
   if (SHELL_WRAPPERS.has(first)) {
+    // Помечаем, что ведущая команда — интерпретатор shell: «| sh» без
+    // аргументов оставляет пустой argv, но pipe_to_shell должен сработать.
+    const tag = out => {
+      try { Object.defineProperty(out, 'shellConsumed', { value: true }); } catch { /* noop */ }
+      return out;
+    };
     let i = 1;
     while (i < args.length) {
       const w = args[i];
+      if (SHELL_ARG_FLAGS.has(w.split('=')[0])) {
+        i += w.includes('=') ? 1 : 2;
+        continue;
+      }
       if (w.startsWith('-') && w.includes('c') && !w.startsWith('--')) {
         if (i + 1 < args.length) visit(args[i + 1]);
-        return args.slice(0, 0);
+        return tag(args.slice(0, 0));
       }
       if (w === '--') return unwrap(args.slice(i + 1), depth + 1, state, visit);
       if (w.startsWith('-')) { i++; continue; }
       break;
     }
-    return args.slice(i);
+    return tag(args.slice(i));
   }
   return args;
 }
@@ -240,7 +317,9 @@ function ruleRm(args) {
   if (targets.some(t => BLOCKED_FS_ROOTS.has(norm(t)) || t === '-')) {
     return hit(CRITICAL, 'rm_root', 'rm -rf по корню/домашней/текущей директории');
   }
-  if (targets.every(t => REGEN_DIRS.has(norm(t).split('/').pop()))) {
+  // REGEN_DIRS — только относительные/проектные цели: rm -rf /tmp и
+  // ~/build — системные/домашние пути, allow по basename не работает.
+  if (targets.every(t => !/^[\/~$]/.test(t) && REGEN_DIRS.has(norm(t).split('/').pop()))) {
     return hit('allow', 'rm_regen', 'rm -rf по регенерируемой директории');
   }
   return hit(ORDINARY, 'rm_rf', 'rm -rf по не регенерируемой директории');
@@ -254,6 +333,14 @@ function ruleGit(args) {
     if (flags.some(f => f === '-f' || f === '--force' || f === '--force-all' ||
         f === '--mirror' || /^-[^-].*f/.test(f))) {
       return hit(CRITICAL, 'git_push_force', 'git push --force перезаписывает историю');
+    }
+    // '+refspec' — force-push без слова --force: git push origin +main.
+    if (rest.slice(1).some(w => w.startsWith('+'))) {
+      return hit(CRITICAL, 'git_push_plus', 'git push +refspec перезаписывает историю');
+    }
+    // push --delete / push origin :branch — удаление удалённой ветки.
+    if (rest.slice(1).some(w => w === '--delete' || w === '-d' || w.startsWith(':'))) {
+      return hit(ORDINARY, 'git_push_delete', 'git push удаляет удалённую ветку');
     }
     // --force-with-lease / --force-if-includes — безопасные форс-пуши.
     return null;
@@ -388,7 +475,10 @@ function analyze(segments, state) {
   const raise = h => {
     if (h && SEVERITY_RANK[h.severity] > SEVERITY_RANK[worst.severity]) worst = h;
   };
-  const analyzeArgv = argv => {
+  const analyzeArgv = (argv, fromPipe = false) => {
+    if (!argv.length) return;
+    // Ведущие ключевые слова shell — не команда: «if true; then ...».
+    while (argv.length && SHELL_KEYWORDS.has(argv[0])) argv = argv.slice(1);
     if (!argv.length) return;
     const unwrapped = unwrap(argv, 0, state, inner => {
       if (FORK_BOMB.test(inner)) raise(hit(CRITICAL, 'fork_bomb', 'fork-бомба'));
@@ -397,8 +487,27 @@ function analyze(segments, state) {
       }
       raise(analyze(lexCommands(inner, state, 0).segments, state));
     });
-    if (!unwrapped.length) return;
+    if (!unwrapped.length) {
+      if (fromPipe && unwrapped.shellConsumed === true) {
+        raise(hit(CRITICAL, 'pipe_to_shell', 'поток данных в интерпретатор shell'));
+      }
+      return;
+    }
     const cmd = unwrapped[0];
+    // Поток в интерпретатор без видимого тела команды: curl x | bash,
+    // echo "rm -rf /" | sh, ... | bash -o pipefail — критично.
+    if (fromPipe && (SHELL_WRAPPERS.has(cmd) || unwrapped.shellConsumed === true)) {
+      raise(hit(CRITICAL, 'pipe_to_shell', 'поток данных в интерпретатор shell'));
+      return;
+    }
+    // xargs исполняет команду с целями из stdin — явных целей нет, но
+    // деструктивная команда всё равно блокируется.
+    if (unwrapped.viaXargs === true && ['rm', 'rmdir', 'shred', 'dd'].includes(cmd)) {
+      const innerHit = cmd === 'rm' ? ruleRm(unwrapped) : null;
+      raise(innerHit ?? hit(ORDINARY, 'xargs_destructive',
+        `${cmd} с целями из stdin через xargs`));
+      return;
+    }
     if (cmd === 'rm') raise(ruleRm(unwrapped));
     else if (cmd === 'git') raise(ruleGit(unwrapped));
     else if (cmd === 'dd') raise(ruleDd(unwrapped));
@@ -434,7 +543,7 @@ function analyze(segments, state) {
       }
       raise(analyze(lexCommands(inner, state, 0).segments, state));
     }
-    analyzeArgv(tokenize(words));
+    analyzeArgv(tokenize(words), words.fromPipe === true);
     if (worst.severity === CRITICAL) return worst;
   }
   return worst;

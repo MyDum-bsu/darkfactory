@@ -60,6 +60,100 @@ export async function loadBoardTasksFromApi(boardUrl, { fetchImpl } = {}) {
   return Array.isArray(body?.tasks) ? body.tasks : Array.isArray(body) ? body : [];
 }
 
+// RO-наблюдатель Board 0.54.0: строго GET, профиль control-room-observer,
+// capability <channel>=read. Разбирает реальные форматы:
+//   /channels/<ch> → { threads: [{ message: { id, text, labels, task, channel } }] }
+//                  или { messages: [...] }
+//   /tasks         → { tasks: [...] }
+// Ответ {"version":"0.54.0","sync":[]} без задач — корректный пустой срез,
+// а не тихий сбой.
+export function createBoardObserver({ boardUrl, token = null,
+  channels = ['darkfactory'], fetchImpl, timeoutMs = 5000 } = {}) {
+  const fetcher = fetchImpl ?? fetch;
+  const headers = {
+    accept: 'application/json',
+    'x-board-profile': 'control-room-observer',
+    'x-board-can': channels.map(c => `${c}=read`).join(';'),
+    ...(token ? { authorization: `Bearer ${token}` } : {}),
+  };
+  const base = String(boardUrl).replace(/\/+$/, '');
+
+  const readJson = async path => {
+    const res = await fetcher(`${base}${path}`, { method: 'GET', headers,
+      redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    return data && typeof data === 'object' ? data : null;
+  };
+
+  const toTask = raw => {
+    const message = raw?.message ?? raw;
+    if (!message || typeof message !== 'object') return null;
+    const task = message.task ?? (message.state ? message : null);
+    if (!task || typeof task.state !== 'string') return null;
+    return {
+      task_id: task.task_id ?? message.id ?? task.id,
+      state: task.state,
+      title: task.title ?? String(message.text ?? '').split('\n')[0] ?? '',
+      labels: message.labels ?? task.labels ?? {},
+      epoch: task.epoch ?? null,
+      channel: message.channel ?? null,
+      ...(task.blocked && typeof task.blocked === 'object' ? { blocked: task.blocked } : {}),
+      ...(task.executor ? { executor: task.executor } : {}),
+      ...(task.question ? { question: task.question } : {}),
+      ...(task.reason ? { reason: task.reason } : {}),
+    };
+  };
+
+  return async () => {
+    const found = new Map();
+    for (const channel of channels) {
+      const enc = encodeURIComponent(channel);
+      const [channelData, taskData] = await Promise.all([
+        readJson(`/channels/${enc}?limit=500`).catch(() => null),
+        readJson(`/tasks?channel=${enc}&limit=500`).catch(() => null)]);
+      for (const entry of [...(channelData?.threads ?? []),
+          ...(channelData?.messages ?? []), ...(taskData?.tasks ?? [])]) {
+        const task = toTask(entry);
+        if (task?.task_id != null) found.set(String(task.task_id), task);
+      }
+    }
+    return [...found.values()];
+  };
+}
+
+// TTL-кэшированный провайдер Branch Drift по списку репозиториев:
+// агрегирует unmergedBranches/dirtyWorktrees/bbThreadWorktrees. Ошибка
+// инспекции репо — fail-closed (driftDetected: true + repo error).
+export function createBranchDriftProvider(repos, {
+  ttlMs = 20_000, execGit, now = () => Date.now() } = {}) {
+  let cached = null;
+  let cachedAt = -Infinity;
+  return async () => {
+    if (cached && now() - cachedAt < ttlMs) return cached;
+    const merged = { driftDetected: false, repos: [], unmergedBranches: [],
+      dirtyWorktrees: [], bbThreadWorktrees: [] };
+    for (const repoDir of repos) {
+      try {
+        const report = await inspectWorktreesAndBranches({ repoDir, execGit });
+        merged.repos.push({ repoDir, ok: report.ok });
+        for (const k of ['unmergedBranches', 'dirtyWorktrees', 'bbThreadWorktrees']) {
+          merged[k].push(...report[k].map(e => ({ ...e, repoDir })));
+        }
+        if (report.driftDetected) merged.driftDetected = true;
+      } catch (error) {
+        // Недоступная проверка — не «чисто»: индикатор горит.
+        merged.repos.push({ repoDir, ok: false,
+          error: sanitizeTerminalText(error.message) });
+        merged.driftDetected = true;
+      }
+    }
+    cached = merged;
+    cachedAt = now();
+    return merged;
+  };
+}
+
 // RO-список BB-тредов через CLI (bb thread list --json).
 export async function loadBbThreadsFromCli({ execImpl } = {}) {
   const exec = execImpl ?? (async (args) =>
@@ -139,6 +233,8 @@ export function createControlRoomAggregator({
     const prev = attempts.get(key) ?? { key, events: 0 };
     const next = { ...prev, ...event, key, events: prev.events + 1 };
     attempts.set(key, next);
+    // Ограничение памяти: FIFO-выталкивание старейших ключей попыток.
+    while (attempts.size > 500) attempts.delete(attempts.keys().next().value);
     broadcast({ type: 'event', event });
     return event;
   };
@@ -180,7 +276,8 @@ export function createControlRoomAggregator({
   function shivaCounter(threads, tasks) {
     const leadOf = new Map();
     for (const t of threads) {
-      const lead = t.lead_session_id ?? t.leadSessionId ?? t.parent_id ?? null;
+      const lead = t.lead_session_id ?? t.leadSessionId ?? t.parent_id ??
+        t.parentThreadId ?? null;
       const task = t.task_id ?? t.taskId ?? null;
       if (lead && task) {
         if (!leadOf.has(lead)) leadOf.set(lead, new Set());
@@ -199,10 +296,15 @@ export function createControlRoomAggregator({
     const recentlyCompleted = [];
     for (const task of tasks) {
       const card = { task_id: task.task_id ?? task.id, state: task.state,
-        title: task.title ?? '', labels: task.labels ?? {}, epoch: task.epoch ?? null };
+        title: sanitizeTerminalText(String(task.title ?? '')),
+        labels: task.labels ?? {}, epoch: task.epoch ?? null };
       if (task.state === 'claimed' || task.state === 'working') {
-        const key = [...attempts.values()]
-          .find(a => String(a.task_id) === String(card.task_id));
+        // Самая свежая попытка по task_id (по ts события).
+        let key = null;
+        for (const a of attempts.values()) {
+          if (String(a.task_id) !== String(card.task_id)) continue;
+          if (!key || String(a.ts ?? '') >= String(key.ts ?? '')) key = a;
+        }
         running.push({ ...card, phase: key?.phase ?? null,
           model: key?.model ?? task.executor?.model ?? null,
           role: key?.role ?? null, round: key?.round ?? null,
@@ -300,9 +402,11 @@ export function createControlRoomAggregator({
         const taskId = decodeURIComponent(url.pathname.slice(13));
         const data = await inspectProvider(taskId).catch(() => ({ text: '', artifacts: [] }));
         res.writeHead(200, jsonHeaders());
-        res.end(JSON.stringify({ taskId,
+        res.end(JSON.stringify({ taskId: sanitizeTerminalText(taskId),
           text: sanitizeTerminalText(String(data.text ?? '')),
-          artifacts: Array.isArray(data.artifacts) ? data.artifacts.slice(0, 64) : [] }));
+          artifacts: Array.isArray(data.artifacts)
+            ? data.artifacts.slice(0, 64).map(a => sanitizeTerminalText(String(a)))
+            : [] }));
       } else if (url.pathname === '/' || url.pathname === '/index.html') {
         const file = await staticFile('index.html', 'text/html');
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
@@ -370,12 +474,41 @@ export function createControlRoomAggregator({
 }
 
 // CLI: node aggregator.mjs [--port N] [--socket PATH] [--state-dir DIR]
-//   [--board-url URL] [--net-probe name=url ...]
+//   [--board-url URL] [--board-channels a,b] [--board-token TOK]
+//   [--drift-repo DIR ...] [--net-probe name=url ...]
+async function loadBoardToken(flagValue) {
+  if (typeof flagValue === 'string' && flagValue) return flagValue;
+  if (typeof process.env.BOARD_TOKEN === 'string' && process.env.BOARD_TOKEN) {
+    return process.env.BOARD_TOKEN;
+  }
+  // Токен из конфигурации: $XDG_CONFIG_HOME/darkfactory/board-token.
+  const confDir = process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config');
+  const token = await readFile(join(confDir, 'darkfactory', 'board-token'), 'utf8')
+    .catch(() => null);
+  return token?.trim() || null;
+}
+
+// Репозитории для Branch Drift: --drift-repo (повторяемый) + DF_DRIFT_REPOS
+// (':'-разделённый). Без заданных — process.cwd() только если это git-репо.
+async function resolveDriftRepos(flagRepos) {
+  const repos = [...(flagRepos ?? []),
+    ...(process.env.DF_DRIFT_REPOS ?? '').split(':').filter(Boolean)];
+  if (repos.length) return repos;
+  const inside = await execFileAsync('git',
+    ['rev-parse', '--is-inside-work-tree'], { timeout: 5000 })
+    .then(r => r.stdout.trim() === 'true').catch(() => false);
+  return inside ? [process.cwd()] : [];
+}
+
 async function cli(argv) {
   const { values } = parseArgs({ args: argv, options: {
     port: { type: 'string' }, socket: { type: 'string' },
     'state-dir': { type: 'string', multiple: true },
     'board-url': { type: 'string' },
+    'board-channels': { type: 'string' },
+    'board-token': { type: 'string' },
+    'drift-repo': { type: 'string', multiple: true },
+    'drift-ttl': { type: 'string' },
     'net-probe': { type: 'string', multiple: true },
     'cloud-state': { type: 'string' } } });
   const port = values.port !== undefined ? Number(values.port)
@@ -390,14 +523,24 @@ async function cli(argv) {
     }),
     cloudStatePath: values['cloud-state'] ?? null });
   const boardUrl = values['board-url'] ?? process.env.BOARD_URL ?? 'http://127.0.0.1:44100';
+  const channels = (values['board-channels'] ?? 'darkfactory')
+    .split(',').map(c => c.trim()).filter(Boolean);
+  const boardToken = await loadBoardToken(values['board-token']);
+  const observeBoard = createBoardObserver({ boardUrl, token: boardToken, channels });
+  const driftRepos = await resolveDriftRepos(values['drift-repo']);
+  const driftProvider = driftRepos.length
+    ? createBranchDriftProvider(driftRepos,
+      { ttlMs: Number(values['drift-ttl'] ?? 20_000) })
+    : null;
   const aggregator = createControlRoomAggregator({
     port, socketPath, stateDirs: values['state-dir'] ?? [],
     netHealth,
-    boardTasksProvider: () => loadBoardTasksFromApi(boardUrl),
-    bbThreadsProvider: () => loadBbThreadsFromCli() });
+    boardTasksProvider: observeBoard,
+    bbThreadsProvider: () => loadBbThreadsFromCli(),
+    branchDriftProvider: driftProvider });
   const { port: actual } = await aggregator.start();
   console.log(JSON.stringify({ control_room: 'listening', host: '127.0.0.1', port: actual,
-    socket: socketPath }));
+    socket: socketPath, boardChannels: channels, driftRepos }));
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

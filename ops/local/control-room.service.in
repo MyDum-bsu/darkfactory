@@ -10,7 +10,7 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=@REPO@
-ExecStart=@NODE@ @REPO@/ops/control-room/aggregator.mjs --port 44110 --board-url @BOARD@ --state-dir @STATEDIR@
+ExecStart=@NODE@ @REPO@/ops/control-room/aggregator.mjs --port 44110 --board-url @BOARD@ --state-dir @STATEDIR@ --drift-repo @REPO@
 # Read-only пульт: нет сетевого egress кроме Board, нет записи в worktree.
 Restart=on-failure
 RestartSec=10

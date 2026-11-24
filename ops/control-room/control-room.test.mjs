@@ -15,7 +15,8 @@ import { test } from 'node:test';
 import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
   escapeHtml, SECURITY_HEADERS } from './origin-guard.mjs';
 import { createNetHealthMonitor } from './net-health.mjs';
-import { createControlRoomAggregator, RING_LIMIT } from './aggregator.mjs';
+import { createControlRoomAggregator, createBoardObserver,
+  createBranchDriftProvider, RING_LIMIT } from './aggregator.mjs';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -346,4 +347,146 @@ test('df-herd --once печатает кадр без ANSI-уязвимосте�
   } finally {
     await server.stop();
   }
+});
+
+// --- P1-2: real drift provider ------------------------------------------------
+
+test('createBranchDriftProvider: real git repo with dirty bb/thr_* worktree', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-drift-'));
+  const git = (args, cwd = dir) => execFileAsync('git', args, { cwd });
+  try {
+    await git(['init', '-b', 'main']);
+    await git(['config', 'user.email', 't@t']);
+    await git(['config', 'user.name', 't']);
+    await writeFile(join(dir, 'a.txt'), 'x');
+    await git(['add', '-A']);
+    await git(['commit', '-m', 'init']);
+    const wt = join(dir, 'wt-thread');
+    await git(['worktree', 'add', wt, '-b', 'bb/thr_test']);
+    await writeFile(join(wt, 'dirty.txt'), 'd');
+    const provider = createBranchDriftProvider([dir]);
+    const report = await provider();
+    assert.equal(report.driftDetected, true);
+    assert.equal(report.bbThreadWorktrees.length, 1);
+    assert.equal(report.dirtyWorktrees.some(w => w.isBbThread), true);
+    // TTL-кэш: повторный вызов — тот же объект.
+    assert.equal(await provider(), report);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('createBranchDriftProvider: repo error is fail-closed, not silent clean', async () => {
+  const provider = createBranchDriftProvider(['/nonexistent/repo/path']);
+  const report = await provider();
+  assert.equal(report.driftDetected, true);
+  assert.equal(report.repos[0].ok, false);
+});
+
+// --- P1-3: Board observer ----------------------------------------------------
+
+test('createBoardObserver: Board 0.54.0 channel format → columns', async () => {
+  const channelReply = { threads: [
+    { message: { id: 'T1', channel: 'darkfactory', text: 'Задача раз',
+      labels: { project: 'df' },
+      task: { state: 'claimed', epoch: 3 } } },
+    { message: { id: 'T2', channel: 'darkfactory', text: 'Очередь',
+      task: { state: 'ready' } } },
+    { message: { id: 'T3', channel: 'darkfactory', text: 'Вопрос',
+      task: { state: 'blocked', blocked: { question: 'Ок?',
+        question_id: 'Q1' } } } },
+    { message: { id: 'T4', channel: 'darkfactory', text: 'Готово',
+      task: { state: 'completed' } } }] };
+  const fetchImpl = async url => ({
+    ok: true,
+    json: async () => url.includes('/tasks') ? { tasks: [] } : channelReply });
+  const observer = createBoardObserver({ boardUrl: 'http://board',
+    channels: ['darkfactory'], fetchImpl });
+  const tasks = await observer();
+  assert.equal(tasks.length, 4);
+  await withServer({ boardTasksProvider: observer }, async (server, base) => {
+    const snap = JSON.parse((await httpGet(`${base}/api/snapshot`)).body);
+    assert.equal(snap.running.length, 1);
+    assert.equal(snap.queued.length, 1);
+    assert.equal(snap.needsOwner.length, 1);
+    assert.equal(snap.needsOwner[0].cli.includes('Q1'), true);
+    assert.equal(snap.recentlyCompleted.length, 1);
+  });
+});
+
+test('createBoardObserver: {"version":"0.54.0","sync":[]} — не сбой, пусто', async () => {
+  const fetchImpl = async () => ({
+    ok: true, json: async () => ({ version: '0.54.0', url: 'x', sync: [] }) });
+  const observer = createBoardObserver({ boardUrl: 'http://board',
+    channels: ['darkfactory'], fetchImpl });
+  const tasks = await observer();
+  assert.deepEqual(tasks, []);
+});
+
+test('createBoardObserver: GET only + observer headers', async () => {
+  const seen = [];
+  const fetchImpl = async (url, opts) => {
+    seen.push({ url, method: opts.method, headers: opts.headers });
+    return { ok: true, json: async () => ({ threads: [] }) };
+  };
+  await createBoardObserver({ boardUrl: 'http://b', token: 'TOK',
+    channels: ['darkfactory'], fetchImpl })();
+  assert.ok(seen.length >= 1);
+  for (const r of seen) {
+    assert.equal(r.method, 'GET');
+    assert.equal(r.headers.authorization, 'Bearer TOK');
+    assert.equal(r.headers['x-board-profile'], 'control-room-observer');
+    assert.equal(r.headers['x-board-can'], 'darkfactory=read');
+  }
+});
+
+// --- P1-4: sanitize artifacts ---------------------------------------------------
+
+test('aggregator: artifacts and taskId sanitized (OSC 52 stripped)', async () => {
+  await withServer({
+    inspectProvider: async () => ({
+      text: 'log \x1b]52;c;Y2xpcA==\x07 end',
+      artifacts: ['a\x1b[2Jb.md', '\x1b]8;;http://x\x07l\x1b\\'] }) },
+    async (server, base) => {
+      const res = await httpGet(`${base}/api/inspect/T%1B[31m1`);
+      const data = JSON.parse(res.body);
+      assert.equal(data.text.includes('\x1b'), false);
+      for (const a of data.artifacts) assert.equal(a.includes('\x1b'), false);
+      assert.equal(data.taskId.includes('\x1b'), false);
+    });
+});
+
+// --- P2: shiva parentThreadId + attempts bound + latest attempt ----------------
+
+test('aggregator: shiva uses parentThreadId (bb thread list --json field)', async () => {
+  const threads = [
+    { id: 't1', status: 'running', parentThreadId: 'L1', task_id: 'A' },
+    { id: 't2', status: 'running', parentThreadId: 'L1', task_id: 'B' }];
+  await withServer({ bbThreadsProvider: async () => threads },
+    async (server, base) => {
+      const snap = JSON.parse((await httpGet(`${base}/api/snapshot`)).body);
+      assert.equal(snap.shiva.dirty, 1);
+    });
+});
+
+test('aggregator: attempts map bounded (FIFO ≤ 500)', async () => {
+  const server = createControlRoomAggregator({ port: 0 });
+  for (let i = 0; i < 600; i++) {
+    server.ingest({ kind: 'attempt.phase', seq: i + 1, task_id: `T${i}`,
+      attempt_id: `a${i}`, phase: 'working' });
+  }
+  const snap = await server.snapshot();
+  assert.equal(snap.attemptsTracked, 500);
+});
+
+test('aggregator: columns pick the latest attempt per task_id', async () => {
+  const server = createControlRoomAggregator({ port: 0,
+    boardTasksProvider: async () => [{ task_id: 'T', state: 'claimed', title: 't' }] });
+  server.ingest({ kind: 'attempt.phase', seq: 1, task_id: 'T', attempt_id: 'old',
+    ts: '2024-01-01T00:00:00Z', phase: 'working', model: 'm1' });
+  server.ingest({ kind: 'attempt.phase', seq: 2, task_id: 'T', attempt_id: 'new',
+    ts: '2024-01-02T00:00:00Z', phase: 'checking', model: 'm2' });
+  const snap = await server.snapshot();
+  assert.equal(snap.running[0].phase, 'checking');
+  assert.equal(snap.running[0].model, 'm2');
 });

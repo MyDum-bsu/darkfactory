@@ -7,6 +7,7 @@
 // execGit — инъекция для тестов: (args, cwd) => Promise<stdout>.
 // Дефолт — реальный `git` с таймаутом.
 import { execFile } from 'node:child_process';
+import { posix } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -44,10 +45,21 @@ export function parseWorktreeList(text) {
 const parsePorcelainStatus = text =>
   text.split('\n').filter(line => line.trim()).map(line => line.slice(3).trim());
 
+// Канонизация touch-пути: убрать ведущий ./ и завершающий /, нормализовать
+// posix-разделители — './ops', 'ops/' и 'ops' ведут себя идентично.
+const normalizeTouchPath = tp => {
+  let p = posix.normalize(String(tp));
+  while (p.startsWith('./')) p = p.slice(2);
+  if (p !== '/') p = p.replace(/\/+$/, '');
+  return p;
+};
+
 // Пересечение изменённого файла с touchPaths (директория или файл).
 const touches = (file, touchPaths) =>
-  touchPaths.some(tp => file === tp || file.startsWith(`${tp}/`) ||
-    tp === '.' || tp === '');
+  touchPaths.some(raw => {
+    const tp = normalizeTouchPath(raw);
+    return file === tp || file.startsWith(`${tp}/`) || tp === '.' || tp === '';
+  });
 
 export async function inspectWorktreesAndBranches({
   repoDir,
@@ -57,6 +69,8 @@ export async function inspectWorktreesAndBranches({
 } = {}) {
   if (typeof repoDir !== 'string' || !repoDir) throw new Error('repo_dir_required');
   if (!Array.isArray(touchPaths)) throw new Error('touch_paths_invalid');
+  // baseRef начинающийся с '-' — инъекция git-опции, fail-closed.
+  if (String(baseRef).startsWith('-')) throw new Error('base_ref_invalid');
 
   const worktreeText = await execGit(['worktree', 'list', '--porcelain'], repoDir);
   const worktrees = parseWorktreeList(worktreeText);
@@ -80,17 +94,25 @@ export async function inspectWorktreesAndBranches({
     }
   }
 
+  // Ошибка инспекции веток — fail-closed, не «нет дрейфа».
   const branchText = await execGit(['branch', '--no-merged', baseRef,
-    '--format=%(refname:short)'], repoDir).catch(() => '');
+    '--format=%(refname:short)'], repoDir)
+    .catch(error => { throw Object.assign(new Error('drift_check_unavailable'),
+      { cause: error }); });
   const unmergedBranches = [];
   for (const branch of branchText.split('\n').map(b => b.trim()).filter(Boolean)) {
     // Текущая HEAD-ветка сама себе «влита»; git уже её отфильтровал.
-    const diffText = await execGit(['diff', '--name-only', `${baseRef}...${branch}`], repoDir)
-      .catch(() => null);
+    // '--' отделяет ревизии от путей — ветка не может притвориться опцией/путём.
+    const diffText = await execGit(['diff', '--name-only', `${baseRef}...${branch}`,
+      '--'], repoDir).catch(() => null);
     const files = diffText === null ? ['<diff_unavailable>'] : diffText.split('\n').filter(Boolean);
-    const intersects = touchPaths.length === 0 || files.some(f => touches(f, touchPaths));
+    // diff недоступен → считаем пересечением (fail-closed), не тихий ok:true.
+    const intersects = diffText === null || touchPaths.length === 0 ||
+      files.some(f => touches(f, touchPaths));
     if (intersects) {
-      unmergedBranches.push({ branch, files: touchPaths.length ? files.filter(f => touches(f, touchPaths)) : files,
+      unmergedBranches.push({ branch,
+        files: touchPaths.length && diffText !== null
+          ? files.filter(f => touches(f, touchPaths)) : files,
         fileCount: files.length, isBbThread: BB_THREAD_BRANCH.test(branch) });
     }
   }

@@ -200,7 +200,11 @@ async function main(argv) {
       if (item) {
         try {
           const data = await fetchJson(`${base}/api/inspect/${encodeURIComponent(item.task_id)}`);
-          state.inspect = `#${item.task_id} ${item.title}\n\n${data.text || '(пусто)'}${data.artifacts?.length ? `\n\n${data.artifacts.join('\n')}` : ''}`;
+          // Весь недоверенный текст — через clean(): title/artifacts/text.
+          state.inspect = clean(`#${item.task_id} ${item.title}\n\n` +
+            `${data.text || '(пусто)'}` +
+            (data.artifacts?.length
+              ? `\n\n${data.artifacts.map(clean).join('\n')}` : ''));
         } catch (error) {
           state.inspect = `ошибка: ${clean(error.message)}`;
         }

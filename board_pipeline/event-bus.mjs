@@ -156,6 +156,8 @@ class SocketPush {
     if (this.connecting || this.socket || this.closed || Date.now() < this.backoffUntil) return;
     this.connecting = true;
     const socket = createConnection(this.path);
+    // Сокет не удерживает процесс: контроллер выходит без живого пульта.
+    socket.unref?.();
     socket.setTimeout(this.connectTimeoutMs);
     socket.once('connect', () => {
       this.connecting = false;
@@ -181,6 +183,13 @@ class SocketPush {
 
   writeLine(line) {
     try {
+      // Медленный читатель: буфер ядра растёт — рвём соединение и
+      // возвращаем строку в ограниченную очередь (журнал — источник истины).
+      if (this.socket.writableLength > 1024 * 1024) {
+        this.drop(this.socket);
+        this.push(line);
+        return;
+      }
       this.socket.write(line, () => {});
     } catch {
       this.drop(this.socket);
@@ -196,7 +205,10 @@ class SocketPush {
     this.closed = true;
     this.queue = [];
     if (this.socket) {
-      try { this.socket.end(); } catch { /* noop */ }
+      try {
+        this.socket.unref?.();
+        this.socket.end();
+      } catch { /* noop */ }
       this.socket = null;
     }
   }
