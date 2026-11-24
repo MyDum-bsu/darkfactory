@@ -105,3 +105,48 @@ test('явный Pi/Sol без keyring допускается', async () => {
   assert.deepEqual(setup.critic, PI_SOL);
   assert.deepEqual(setup.arbiter, NEON_PI_ARBITER);
 });
+
+// Board #1666 DF-OPS-1.5 r2: pinAttemptTriad — триада попытки поверх
+// resolveTriad. Дефолтный Neon medium доходит до L2 с привязкой навыка
+// (спеки allowlist её не несут), а явный Neon без keyring — fail-closed до
+// spawn, без подмены другим критиком.
+import { pinAttemptTriad } from './review-setup.mjs';
+
+const DEEPSEEK = { provider: 'acp-antigravity-acp', model: 'deepseek-reasoner', reasoningLevel: 'medium' };
+const ALLOWLIST_NEON = { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' };
+
+test('pinAttemptTriad: выбранный роутингом Neon наследует навыки допуска', () => {
+  const routed = { outcome: 'routed', plan: [BB],
+    selected: { worker: BB, critic: ALLOWLIST_NEON, arbiter: SOL_ARBITER } };
+  const pinned = pinAttemptTriad({ routed, reviewSetup: { critic: { ...NEON_CRITIC, skills: ['logika'] }, arbiter: SOL_ARBITER },
+    env: { DF_AGY_KEYRING_ITEM: KEYRING } });
+  assert.deepEqual(pinned.critic, { ...ALLOWLIST_NEON, skills: ['logika'] });
+  assert.deepEqual(pinned.arbiter, SOL_ARBITER);
+  assert.deepEqual(pinned.plan, [BB]);
+  // Собственный список навыков у выбранного критика сильнее привязки setup.
+  const own = { ...ALLOWLIST_NEON, skills: ['logika'] };
+  assert.deepEqual(pinAttemptTriad({ routed: { ...routed, selected: { worker: BB, critic: own, arbiter: SOL_ARBITER } },
+    reviewSetup: { critic: { ...NEON_CRITIC, skills: ['chukovsky'] }, arbiter: SOL_ARBITER },
+    env: { DF_AGY_KEYRING_ITEM: KEYRING } }).critic, own);
+});
+
+test('pinAttemptTriad: явный Neon без keyring — fail-closed до spawn', () => {
+  // Скоркард выбирает DeepSeek, но подмена явно закреплённого Neon без
+  // зачисленного DF_AGY_KEYRING_ITEM не допускается.
+  const routed = { outcome: 'routed', plan: [BB],
+    selected: { worker: BB, critic: DEEPSEEK, arbiter: SOL_ARBITER } };
+  const reviewSetup = { critic: { ...NEON_CRITIC, skills: ['logika'] }, arbiter: SOL_ARBITER };
+  assert.deepEqual(pinAttemptTriad({ routed, reviewSetup, env: {} }),
+    { outcome: 'rejected', reason: 'agy_keyring_item_not_enrolled' });
+  // Выбранный роутингом Neon без keyring — тот же отказ до spawn.
+  assert.deepEqual(pinAttemptTriad({ routed: { ...routed, selected: { worker: BB, critic: ALLOWLIST_NEON, arbiter: SOL_ARBITER } },
+    reviewSetup, env: { DF_AGY_KEYRING_ITEM: '' } }),
+    { outcome: 'rejected', reason: 'agy_keyring_item_not_enrolled' });
+  // С keyring явный Neon допускается; незачисленный Neon не блокирует
+  // legacy Pi/Sol-маршрут.
+  const piSetup = { critic: PI_SOL, arbiter: NEON_PI_ARBITER };
+  assert.equal(pinAttemptTriad({ routed: { outcome: 'routed', plan: [BB],
+      selected: { worker: BB, critic: PI_SOL, arbiter: NEON_PI_ARBITER } },
+    reviewSetup: piSetup, env: {} }).critic.provider, 'openai');
+  assert.equal(pinAttemptTriad({ routed: { outcome: 'rejected', reason: 'x' }, reviewSetup: piSetup, env: {} }).outcome, 'rejected');
+});

@@ -287,7 +287,8 @@ async function daemonFixture(t, url, { pilot = false } = {}) {
     const child = spawnProcess(process.execPath,
       [join(repoRoot, 'board_pipeline', 'run-isolated.mjs'), '--execute', '--daemon',
         '--policy', policy, '--state', state, '--interval-ms', '300', '--switch', switchFile],
-      { env: { ...process.env, ...env, DF_PILOT_CHANNEL: 'fixture-pilot', XDG_STATE_HOME: xdg },
+      { env: { ...process.env, DF_AGY_KEYRING_ITEM: '/org/freedesktop/secrets/collection/fixture/0',
+          ...env, DF_PILOT_CHANNEL: 'fixture-pilot', XDG_STATE_HOME: xdg },
         stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     child.stdout.on('data', d => { output += String(d); });

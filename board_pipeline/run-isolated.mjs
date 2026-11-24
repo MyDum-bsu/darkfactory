@@ -18,7 +18,7 @@ import { assertRetrySubjectUnchanged, isolatedArbiterRunner, isolatedPiReviewRun
   l2ReviewRetryGuard, l2ReviewWithTransientRetry, runnerReviewSpec } from './review-runner.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { isNeonReview } from './review-policy.mjs';
-import { operatorReviewSetup } from './review-setup.mjs';
+import { operatorReviewSetup, pinAttemptTriad } from './review-setup.mjs';
 import { MAX_QUESTION_TTL_MS, readSignedAnswer, signedAnswerVerifier } from './question-gate.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 import { reconcileFeedbackFromBb, reconcileSpawnFromBb } from './bb-reconcile.mjs';
@@ -792,10 +792,7 @@ async function execute() {
             critic: reviewSetup.critic, arbiter: reviewSetup.arbiter },
           log: note => console.log(JSON.stringify(note)),
         });
-        if (routed.outcome === 'rejected') return { outcome: 'rejected', reason: routed.reason };
-        return { plan: routed.plan,
-          critic: routed.selected.critic ?? reviewSetup.critic,
-          arbiter: routed.selected.arbiter ?? reviewSetup.arbiter };
+        return pinAttemptTriad({ routed, reviewSetup });
       } },
     decisionLedger });
   const observeTick = result => {

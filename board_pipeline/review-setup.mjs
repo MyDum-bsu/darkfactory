@@ -4,8 +4,9 @@
 // политики без подъёма всего контроллера.
 import { realpath } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
-import { defaultReviewRoles, isLegacyPiReview, isNeonReview, isReviewSkillList,
+import { agyKeyringEnrolled, defaultReviewRoles, isLegacyPiReview, isNeonReview, isReviewSkillList,
   isSolArbiter, NEON_PI_ARBITER, SOL_ARBITER } from './review-policy.mjs';
+import { l2CriticSpec } from './review-runner.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
 export async function operatorReviewSetup(policy, { env = process.env } = {}) {
@@ -42,4 +43,28 @@ export async function operatorReviewSetup(policy, { env = process.env } = {}) {
   }));
   workerSelector.assertTriadIndependent({ executor: policy.bb, critic, arbiter });
   return { critic, arbiter, neon, skills: skills ?? [], skillPaths };
+}
+
+// Триада попытки поверх resolveTriad (Board #1666 DF-OPS-1.5 r2). Два
+// дополнительных правила к прозрачному откату routed.selected:
+// 1. Навыки Neon-критика — операторская привязка из допуска setup: спеки
+//    allowlist/скоркарда их не несут, и без возврата привязки acceptHeld
+//    отклонит профиль приёмки (denied / review_profile_not_approved).
+// 2. Явно выбранный или выбранный роутингом Neon без зачисленного
+//    DF_AGY_KEYRING_ITEM — fail-closed agy_keyring_item_not_enrolled до
+//    spawn: подмена другим критиком не допускается.
+export function pinAttemptTriad({ routed, reviewSetup, env = process.env } = {}) {
+  if (routed?.outcome === 'rejected') return { outcome: 'rejected', reason: routed.reason };
+  const critic = routed.selected.critic ?? reviewSetup.critic;
+  const arbiter = routed.selected.arbiter ?? reviewSetup.arbiter;
+  const neonCritic = isNeonReview(l2CriticSpec(critic,
+    { defaultReasoningLevel: reviewSetup.critic?.reasoningLevel }));
+  const configuredNeon = isNeonReview(l2CriticSpec(reviewSetup.critic));
+  if ((neonCritic || configuredNeon) && !agyKeyringEnrolled(env)) {
+    return { outcome: 'rejected', reason: 'agy_keyring_item_not_enrolled' };
+  }
+  const skills = reviewSetup.critic?.skills;
+  const pinnedCritic = neonCritic && critic.skills === undefined && Array.isArray(skills) && skills.length
+    ? { ...critic, skills } : critic;
+  return { plan: routed.plan, critic: pinnedCritic, arbiter };
 }
