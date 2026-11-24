@@ -331,7 +331,7 @@ async function enrollBetaPlaybook(x, registry, playbook, {
 test('VS-5 beta: four role DAGs on native Board and exact Git subject before independent acceptance', { timeout: 60_000 }, async t => {
   const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
   const packs = {
-    ui: ['materials-reader', 'ui-builder', 'visual-verifier'],
+    ui: ['materials-reader', 'ui-builder', 'ux-visual-critic'],
     'math-lean': ['materials-reader', 'conjecturer', 'falsify-first-oracle', 'lean-prover', 'literature-radar'],
     'dsp-audio': ['materials-reader', 'dsp-experimenter', 'pipeline-freezer', 'blind-panel'],
     'writer-course': ['materials-reader', 'course-designer', 'technical-writer', 'sparring-critic'],

@@ -1355,6 +1355,8 @@ test('полная квитанция L3 с sha256 артефактов прив
   const { ports } = stubs();
   const artifact = { name: 'shot.png', sha256: 'e'.repeat(64), bytes: 42 };
   const journal = await tmpJournal();
+  const captureDir = path.join(journal, 'captures');
+  let reviewCapturesDir;
   const res = await acceptHeld({
     attempt: contractAttempt(id, epoch, { has_ui: true }),
     submission: submission(id, epoch),
@@ -1362,9 +1364,15 @@ test('полная квитанция L3 с sha256 артефактов прив
     journal,
     ports: { ...ports, board: port,
       visual: async (binding) => ({ ok: true, status: 'pass', sha: binding.candidate_sha,
-        artifacts: [artifact], evidence: { file: 'v.log', sha256: 'f'.repeat(64), exit: 0 } }) },
+        artifacts: [artifact], evidence: { file: 'v.log', sha256: 'f'.repeat(64), exit: 0 },
+        capture_dir: captureDir, capture_count: 1 }),
+      review: async (binding, profile) => {
+        reviewCapturesDir = profile.capturesDir;
+        return ports.review(binding, profile);
+      } },
   });
   assert.equal(res.outcome, 'verified');
+  assert.equal(reviewCapturesDir, captureDir, 'L3 capture package reaches the review profile');
   assert.deepEqual(res.receipt.visual.artifacts, [artifact], 'полный VisualReceipt в квитанции');
   assert.equal(res.receipt.visual.evidence.sha256, 'f'.repeat(64));
   assert.equal(res.receipt.tamper.digest, 't'.repeat(64), 'полный tamper-отчёт в квитанции');

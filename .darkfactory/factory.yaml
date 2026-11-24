@@ -164,7 +164,7 @@ playbooks:
         role: ui-builder
         next: { pass: visual, rework: hold }
       - id: visual
-        role: visual-verifier
+        role: ux-visual-critic
         next: { pass: ready, rework: diagnose }
       - id: diagnose
         role: sparring-critic

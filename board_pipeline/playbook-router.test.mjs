@@ -72,7 +72,7 @@ test('visual report selects corrective sparring but cannot turn REWORK into acce
   });
   assert.equal(result.status, 'hold');
   assert.deepEqual(result.history.map(x => [x.role, x.verdict]), [
-    ['materials-reader', 'PASS'], ['ui-builder', 'PASS'], ['visual-verifier', 'REWORK'], ['sparring-critic', 'PASS'],
+    ['materials-reader', 'PASS'], ['ui-builder', 'PASS'], ['ux-visual-critic', 'REWORK'], ['sparring-critic', 'PASS'],
   ]);
 });
 

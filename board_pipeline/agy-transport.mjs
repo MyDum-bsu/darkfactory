@@ -8,6 +8,7 @@ import { ReviewDenied } from './review-runner.mjs';
 import { killProcessGroupByMarker } from './signals.mjs';
 import { withModelProxy } from './model-proxy.mjs';
 import agyStream from './agy-stream.cjs';
+import { assertPackagedCaptures } from './visual-captures.mjs';
 
 const BUS_ROOT = '/org/freedesktop/secrets';
 const BUS_SERVICE = 'org.freedesktop.secrets';
@@ -139,7 +140,11 @@ export async function hostAgyTransport({ prompt, snapshot, publishSnapshot, time
     const result = await withAgyKeyring({ address: env.DBUS_SESSION_BUS_ADDRESS, path: keyring, item: env.DF_AGY_KEYRING_ITEM },
       revokeKeyring => withModelProxy({ allow: EGRESS, bootstrap: BOOTSTRAP, env: proxyEnv,
         hostClient: true, beforeConnect: beforeEffect },
-        (proxy, sealModelBootstrap) => launch({ binary, cwd, prompt, timeoutMs, beforeEffect, publishSnapshot,
+        (proxy, sealModelBootstrap) => launch({ binary, cwd, prompt, timeoutMs, beforeEffect,
+          publishSnapshot: async () => {
+            await publishSnapshot();
+            await assertPackagedCaptures(cwd);
+          },
           boundary: { ...boundary, proxyPort: Number(new URL(proxy).port) },
           sealBootstrap: () => { sealModelBootstrap(); return revokeKeyring(); },
           env: { PATH: '/usr/bin:/bin', HOME: home, XDG_CONFIG_HOME: config, XDG_RUNTIME_DIR: runtime,

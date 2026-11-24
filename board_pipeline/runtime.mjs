@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join, posix } from 'node:path';
 import { promisify } from 'node:util';
 import { resolveL1Profile } from './l1-profiles.mjs';
+import { holdoutDigest, sanitizeHoldoutFeedback, validateHoldoutDir } from './holdout-runner.mjs';
+import { validatePngFile } from './visual-captures.mjs';
 
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
@@ -55,6 +57,164 @@ const HOST_SYSTEM_DIRS = new Set(['/usr', '/etc/fonts', '/etc/texmf', '/var/lib/
 export const SANDBOX_ENV = new Set(['PYTHONPATH', 'PYTHONDONTWRITEBYTECODE',
   'RUFF_CACHE_DIR', 'PYTEST_ADDOPTS', 'MO_TRACKER_DATA', 'MO_TRACKER_DB']);
 
+
+export const MO_TRACKER_VIEWPORTS = Object.freeze([
+  Object.freeze({ width: 1440, height: 900, label: 'desktop' }),
+  Object.freeze({ width: 1024, height: 768, label: 'compact-laptop' }),
+]);
+
+const SATISFACTION_COUNTERS = Object.freeze([
+  ['unstyledControls', 'unstyled-control'],
+  ['uncollapsedLongLists', 'uncollapsed-long-list'],
+  ['missingStates', 'missing-state'],
+  ['consoleErrors', 'console-error'],
+  ['a11yViolations', 'a11y-violation'],
+  ['a11yCritical', 'a11y-critical'],
+  ['holdoutFailures', 'holdout-failure'],
+]);
+
+function viewportOf(value) {
+  if (typeof value === 'string') {
+    const match = /^([1-9][0-9]{2,4})x([1-9][0-9]{2,4})$/.exec(value);
+    if (match) return { width: Number(match[1]), height: Number(match[2]) };
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value) &&
+      Number.isSafeInteger(value.width) && Number.isSafeInteger(value.height)) {
+    return { width: value.width, height: value.height };
+  }
+  return null;
+}
+
+function requiredViewportsCovered(report) {
+  const seen = new Set();
+  const add = value => {
+    const viewport = viewportOf(value);
+    if (viewport) seen.add(`${viewport.width}x${viewport.height}`);
+  };
+  if (Array.isArray(report?.viewports)) for (const viewport of report.viewports) add(viewport);
+  if (Array.isArray(report?.viewportResults)) {
+    for (const result of report.viewportResults) add(result?.viewport ?? result);
+  }
+  add(report?.viewport);
+  // Legacy machine artifacts encode only a count. Two or more captures satisfy
+  // the generic contract; exact labels are enforced whenever they are supplied.
+  if (!seen.size && Number.isSafeInteger(report?.viewports)) return report.viewports >= 2;
+  return MO_TRACKER_VIEWPORTS.every(required => seen.has(`${required.width}x${required.height}`));
+}
+
+function counterValue(report, key) {
+  const value = report?.[key];
+  if (value === undefined && key === 'a11yCritical') return 0;
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function detailCategory(value) {
+  if (typeof value !== 'string') return '';
+  const hyphenated = value.replaceAll('_', '-').replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+  return {
+    'unstyled-controls': 'unstyled-control',
+    'uncollapsed-long-lists': 'uncollapsed-long-list',
+    'missing-states': 'missing-state',
+    'console-errors': 'console-error',
+    'a11y-violations': 'a11y-violation',
+    'a11y-criticals': 'a11y-critical',
+    'holdout-failures': 'holdout-failure',
+  }[hyphenated] ?? hyphenated;
+}
+
+// Deterministic UX satisfaction gate. It never consults prose: counters decide,
+// and worker-facing defects carry only structured viewport/selector/coordinates.
+export function evaluateSatisfactionReport(report) {
+  const defects = [];
+  if (!report || typeof report !== 'object' || Array.isArray(report)) {
+    return Object.freeze({ verdict: 'REWORK', status: 'REWORK', defects: Object.freeze([
+      Object.freeze({ category: 'malformed-report' })]) });
+  }
+  const sanitizedDetails = sanitizeHoldoutFeedback({ violations: report.violations }).failures;
+  const detailed = category => sanitizedDetails.filter(item =>
+    detailCategory(item.failed_assertion_category) === category || detailCategory(item.category) === category);
+  let malformed = false;
+  for (const [key, category] of SATISFACTION_COUNTERS) {
+    const value = counterValue(report, key);
+    if (value === null) {
+      malformed = true;
+      continue;
+    }
+    if (!value) continue;
+    const matches = detailed(category);
+    for (let index = 0; index < value; index++) {
+      const detail = matches[index] ?? matches[0];
+      defects.push(Object.freeze({ category,
+        ...(detail?.viewport ? { viewport: detail.viewport } : {}),
+        ...(detail?.selector ? { selector: detail.selector } : {}),
+        ...(detail?.coordinates ? { coordinates: detail.coordinates } : {}) }));
+    }
+  }
+  const score = report.satisfactionScore;
+  if (!Number.isSafeInteger(score) || score < 0 || score > 100) malformed = true;
+  else if (score < 85) defects.push(Object.freeze({ category: 'low-satisfaction-score' }));
+  if (!requiredViewportsCovered(report)) defects.push(Object.freeze({ category: 'viewport-coverage-missing' }));
+  if (malformed) defects.push(Object.freeze({ category: 'malformed-report' }));
+  const verdict = defects.length ? 'REWORK' : 'PASS';
+  return Object.freeze({ verdict, status: verdict, defects: Object.freeze(defects) });
+}
+
+function forbiddenTrackerDb(value) {
+  if (typeof value !== 'string') return true;
+  const normalized = value.replaceAll('\\', '/').replace(/\/+/g, '/').replace(/^\.\//, '');
+  return normalized === 'tracker/data/tracker.db' || normalized.endsWith('/tracker/data/tracker.db') ||
+    /\/(?:home|Users|media)\//.test(normalized) || /production|live|pii/i.test(normalized);
+}
+
+export function assertSyntheticMoTrackerDb(path) {
+  if (forbiddenTrackerDb(path)) throw new Error('mo_tracker_live_db_forbidden');
+  if (isAbsolute(path) && !path.startsWith('/tmp/')) throw new Error('mo_tracker_synthetic_db_invalid');
+  return path;
+}
+
+function pushOnce(argv, ...args) {
+  if (!args.every(arg => argv.includes(arg))) argv.push(...args);
+}
+
+// Operator-facing recipe constructor for the MO Tracker UI L3 gate. The only
+// database contract it can emit is an in-container synthetic SQLite path; a
+// real tracker/data/tracker.db spelling, host path, production-looking path or
+// PII-marked input is rejected before Docker is even considered.
+export function buildUiVisualL3Profile({ image, argv, cwd = 'tracker/web', timeoutMs = 120_000,
+  syntheticDbPath, databasePath, trackerDb, dbPath, syntheticDataDir = '/tmp/mo-tracker-synthetic',
+  holdoutDir, l1Profile } = {}) {
+  const supplied = [syntheticDbPath, databasePath, trackerDb, dbPath].filter(value => value !== undefined);
+  if (new Set(supplied).size > 1) throw new Error('mo_tracker_synthetic_db_conflict');
+  const db = assertSyntheticMoTrackerDb(supplied[0] ?? '/tmp/mo-tracker-synthetic/tracker.db');
+  if (!Array.isArray(argv) || !argv.length || !argv.every(arg => typeof arg === 'string' && arg.length > 0) ||
+      argv.some(arg => forbiddenTrackerDb(arg))) {
+    throw new Error('mo_tracker_visual_recipe_invalid');
+  }
+  if (typeof syntheticDataDir !== 'string' || forbiddenTrackerDb(syntheticDataDir) ||
+      (isAbsolute(syntheticDataDir) && !syntheticDataDir.startsWith('/tmp/'))) {
+    throw new Error('mo_tracker_synthetic_data_invalid');
+  }
+  const visualArgv = [...argv];
+  for (const viewport of MO_TRACKER_VIEWPORTS) {
+    pushOnce(visualArgv, '--viewport', `${viewport.width}x${viewport.height}`);
+  }
+  pushOnce(visualArgv, '--capture-dir', '/artifacts/captures');
+  pushOnce(visualArgv, '--axe-core-dump', '/artifacts/axe-core.json');
+  pushOnce(visualArgv, '--require-states', 'loading,empty,error,ready');
+  const visual = checkCommand({ image, argv: visualArgv, cwd, timeoutMs,
+    env: { MO_TRACKER_DATA: syntheticDataDir, MO_TRACKER_DB: db },
+    ...(holdoutDir !== undefined ? { holdoutDir } : {}),
+    ...(l1Profile !== undefined ? { l1Profile } : {}) });
+  return Object.freeze({
+    id: 'mo-tracker-ui', has_ui: true,
+    viewports: MO_TRACKER_VIEWPORTS,
+    database: Object.freeze({ kind: 'synthetic', pii: false, containerPath: db }),
+    capturePolicy: Object.freeze({ directory: 'captures', format: 'png', maxFileBytes: 2 * 1024 * 1024 }),
+    a11y: Object.freeze({ tool: 'axe-core', dump: '/artifacts/axe-core.json', criticalLimit: 0 }),
+    visual: Object.freeze({ ...visual, argv: Object.freeze([...visual.argv]), env: Object.freeze({ ...visual.env }) }),
+  });
+}
+
 async function sandboxExtras(recipe, source) {
   const args = [];
   for (const { from, to } of recipe.mounts ?? []) {
@@ -104,9 +264,9 @@ export async function unpackExact(worktree, sha, archive, source) {
   }
 }
 
-async function cleanupContainer(name) {
+async function cleanupContainer(name, execDocker = exec) {
   try {
-    await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
+    await execDocker('docker', ['rm', '-f', name], { timeout: 15_000 });
   } catch (error) {
     if (!String(error.stderr).includes('No such container')) throw error;
   }
@@ -240,33 +400,66 @@ const ARTIFACT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 // Сбор артефактов из rw-каталога контейнера в приватный журнал: только регулярные
 // файлы, побайтово, с sha256 и лимитами. Перебор идёт потоково через opendir —
 // список имён не загружается целиком и обрывается на первом превышении лимита.
-export async function collectVisualArtifacts(dropped, journal, binding) {
+// Каталог captures/ обходится рекурсивно, но symlink не является ни файлом, ни
+// каталогом и поэтому не может увести сбор за пределы tmpfs-выгрузки.
+export async function collectVisualArtifacts(dropped, journal, binding, observeCapture) {
   const { opendir } = await import('node:fs/promises');
   const entries = [];
-  for await (const entry of await opendir(dropped)) {
-    if (entries.length >= ARTIFACT_MAX_FILES) {
-      throw new Error('Visual artifacts exceed the count or byte limits');
+  let seen = 0;
+  async function walk(dir, prefix) {
+    for await (const entry of await opendir(dir)) {
+      if (seen >= ARTIFACT_MAX_FILES) {
+        throw new Error('Visual artifacts exceed the count or byte limits');
+      }
+      seen++;
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const from = join(dir, entry.name);
+      const info = await lstat(from);
+      if (info.isDirectory()) {
+        await walk(from, rel);
+      } else {
+        entries.push({ rel, from, info });
+      }
     }
-    entries.push(entry.name);
   }
+  await walk(dropped, '');
   const artifacts = [];
   let total = 0;
-  for (const entry of entries.sort()) {
-    const from = join(dropped, entry);
-    const info = await lstat(from);
+  for (const entry of entries.sort((a, b) => a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0)) {
+    const { rel, from, info } = entry;
     if (!info.isFile()) continue;
     if (info.size < 1 || info.size > ARTIFACT_MAX_FILE_BYTES ||
         total + info.size > ARTIFACT_MAX_TOTAL_BYTES) {
       throw new Error('Visual artifacts exceed the count or byte limits');
     }
     const data = await readFile(from);
-    const safe = basename(entry).replace(/[^A-Za-z0-9_.-]/g, '_');
+    const safe = rel.replace(/[^A-Za-z0-9_.-]/g, '_');
     const stored = `visual-artifact-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}-${safe}`;
     await writeFile(join(journal, stored), data, { flag: 'wx', mode: 0o600 });
     total += data.length;
-    artifacts.push({ name: stored, sha256: createHash('sha256').update(data).digest('hex'), bytes: data.length });
+    const artifact = { name: stored, sha256: createHash('sha256').update(data).digest('hex'), bytes: data.length };
+    artifacts.push(artifact);
+    if (rel.startsWith('captures/')) await observeCapture?.({ rel, data, artifact });
   }
   return artifacts;
+}
+
+async function persistVisualCaptures(journal, binding, captures) {
+  if (!captures.length) return null;
+  if (captures.length > 16) throw new Error('visual_capture_count_limit');
+  const canonicalJournal = await realpath(journal);
+  const dir = join(canonicalJournal, `visual-captures-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}`);
+  await mkdir(dir, { mode: 0o700 });
+  const names = new Set();
+  for (const capture of captures) {
+    const match = /^captures\/([A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.png)$/.exec(capture.rel);
+    if (!match || names.has(match[1])) throw new Error('visual_capture_invalid');
+    names.add(match[1]);
+    const target = join(dir, match[1]);
+    await writeFile(target, capture.data, { flag: 'wx', mode: 0o600 });
+    await validatePngFile(target);
+  }
+  return { capture_dir: dir, capture_count: captures.length };
 }
 
 // L3 визуальный гейт: та же изоляция rootless Docker, плюс каталог артефактов,
@@ -290,6 +483,16 @@ export function offlineVisualRunner(journal, { beforeEffect, execDocker } = {}) 
     const l1Default = profile.l1Default === undefined ? undefined
       : resolveL1Profile({ l1Profile: profile.l1Default });
     if (!SHA.test(binding.candidate_sha)) throw new Error('Visual runner requires a full SHA');
+    const holdoutInput = recipe.holdoutDir ?? recipe.holdout_dir ?? recipe.holdouts;
+    let holdoutMount = [];
+    let holdoutProvenance = null;
+    if (holdoutInput !== undefined) {
+      if (typeof holdoutInput !== 'string') throw new Error('holdout_dir_invalid');
+      const canonicalHoldout = await validateHoldoutDir(holdoutInput, binding.worktree);
+      const provenance = await holdoutDigest(canonicalHoldout);
+      holdoutProvenance = { holdout_digest: provenance.holdout_digest, holdout_files: provenance.files.length };
+      holdoutMount = ['--mount', `type=bind,src=${canonicalHoldout},dst=/holdouts,readonly`];
+    }
     const security = JSON.parse((await dockerExec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
       timeout: 12_000,
     })).stdout);
@@ -326,17 +529,17 @@ export function offlineVisualRunner(journal, { beforeEffect, execDocker } = {}) 
         '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,size=64m', '-e', 'HOME=/tmp',
         '--tmpfs=/artifacts:rw,nosuid,nodev,noexec,mode=1777,' +
           `size=${ARTIFACT_MAX_TOTAL_BYTES},nr_inodes=${ARTIFACT_MAX_FILES + 2}`,
-        '--mount', `type=bind,src=${source},dst=/candidate,readonly`, ...extras,
+        '--mount', `type=bind,src=${source},dst=/candidate,readonly`, ...extras, ...holdoutMount,
         '--workdir', posix.join('/candidate', cwd), image,
         '/bin/sh', '-c', 'sleep 3600'];
       let output;
       let exit;
       await beforeEffect?.();
       try {
-        await exec('docker', args, { timeout: 15_000 });
+        await dockerExec('docker', args, { timeout: 15_000 });
         await beforeEffect?.();
         try {
-          const run = await exec('docker',
+          const run = await dockerExec('docker',
             ['exec', '--workdir', posix.join('/candidate', cwd), name, ...argv],
             { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
           output = `${run.stdout}${run.stderr}`;
@@ -352,7 +555,7 @@ export function offlineVisualRunner(journal, { beforeEffect, execDocker } = {}) 
         // Выгрузка из tmpfs живого контейнера; сбой tar — это ошибка, не тихий pass.
         const bundle = join(scratch, 'artifacts.tar');
         await beforeEffect?.();
-        const packed = await exec('docker',
+        const packed = await dockerExec('docker',
           ['exec', name, 'tar', '-C', '/artifacts', '-cf', '-', '.'],
           { timeout: 30_000, maxBuffer: ARTIFACT_MAX_TOTAL_BYTES + 2 * 1024 * 1024,
             encoding: 'buffer' });
@@ -360,13 +563,18 @@ export function offlineVisualRunner(journal, { beforeEffect, execDocker } = {}) 
         await exec('tar', ['-xf', bundle, '-C', dropped,
           '--no-same-owner', '--no-same-permissions'], { timeout: 30_000 });
       } finally {
-        await cleanupContainer(name);
+        await cleanupContainer(name, dockerExec);
       }
       const file = `visual-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}.log`;
       await writeFile(join(journal, file), output, { flag: 'wx', mode: 0o600 });
-      const artifacts = await collectVisualArtifacts(dropped, journal, binding);
+      const captured = [];
+      const artifacts = await collectVisualArtifacts(dropped, journal, binding,
+        capture => { captured.push(capture); });
+      const captureReceipt = await persistVisualCaptures(journal, binding, captured);
       return {
         sha: binding.candidate_sha, ok: exit === 0, status: exit === 0 ? 'pass' : 'fail',
+        ...(holdoutProvenance ?? {}),
+        ...(captureReceipt ?? {}),
         artifacts,
         evidence: { file, sha256: createHash('sha256').update(output).digest('hex'), exit },
       };

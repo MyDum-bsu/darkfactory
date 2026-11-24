@@ -793,7 +793,8 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     // Рецензент получает subject_digest манифеста в запросе; квитанция обязана
     // вернуть тот же digest (проверка ниже).
     const digestForReview = typeof subjectDigest === 'function' ? subjectDigest() : null;
-    rev = await ports.review({ ...binding, subject_digest: digestForReview }, profile);
+    const reviewProfile = visual?.capture_dir ? { ...profile, capturesDir: visual.capture_dir } : profile;
+    rev = await ports.review({ ...binding, subject_digest: digestForReview }, reviewProfile);
     await step('review', true, rev);
   } catch (e) {
     await step('review', false, messageOf(e));
