@@ -86,6 +86,15 @@ test('enqueue: отказы до эффекта', async () => {
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       label: [`${key}=spoofed`] }), /label_invalid/);
   }
+  // fixtures_digest — контрактная метка приёмки: не-HEX64 значение
+  // отклоняется до вызова vb (как в contractLabelsValid нативной очереди).
+  for (const bad of ['bad', 'zz' + '0'.repeat(62), '0'.repeat(63), '']) {
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      label: [`fixtures_digest=${bad}`] }), /label_invalid/);
+  }
+  const fdOk = await buildEnqueuePlan({ ...baseValues(),
+    label: [`fixtures_digest=${'c'.repeat(64)}`] });
+  assert.equal(fdOk.labels.fixtures_digest, 'c'.repeat(64));
 });
 
 test('enqueue: brief/policy файлы, симлинк и путь внутри worktree отклоняются', async () => {
@@ -879,6 +888,18 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     // Каталог стоп-файла не пересекается и со state.
     await assert.rejects(() => runPlan(runValues(policy, state,
       { switch: join(state, 'stop') })), /path_inside_worktree/);
+    // abPilot.switch — тот же стоп-файл контроллера (createPilotSwitch):
+    // путь внутри worktree отклоняется до Git-конфига, как и явный
+    // --switch рядом с ним его не маскирует.
+    const abInTree = { ...policySpec(wt),
+      abPilot: { switch: join(wt, 'ab-stop') } };
+    const fAbInTree = await withPolicy(dir, abInTree);
+    await assert.rejects(() => runPlan(runValues(fAbInTree, state)),
+      /path_inside_worktree/);
+    // Канонический путь вне worktree/state/handoff проходит.
+    const abOk = { ...policySpec(wt), abPilot: { switch: join(ops, 'ab-stop') } };
+    const fAbOk = await withPolicy(dir, abOk);
+    await runPlan(runValues(fAbOk, state));
     // Явный pilot.killSwitch: null и нестроковое значение — не
     // «отсутствует»: отказ до Git-конфига, а не молчаливый пропуск.
     const pilotNull = { ...policySpec(wt), pilot: { killSwitch: null } };

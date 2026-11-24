@@ -186,7 +186,12 @@ export async function buildEnqueuePlan(values) {
     const i = item.indexOf('=');
     const key = i < 0 ? item : item.slice(0, i);
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(key) || RESERVED_LABELS.has(key)) fail('label_invalid');
-    labels[key] = item.slice(i + 1);
+    const value = item.slice(i + 1);
+    // fixtures_digest — контрактная метка приёмки: как в
+    // contractLabelsValid нативной очереди значение обязано быть
+    // 64-hex дайджестом, иначе карточка отклоняется до вызова vb.
+    if (key === 'fixtures_digest' && !HEX64.test(value)) fail('label_invalid');
+    labels[key] = value;
   }
 
   // Реальный синтаксис vb: `vb --url URL tasks create CHANNEL TITLE --label k=v --json`.

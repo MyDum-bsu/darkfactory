@@ -264,7 +264,8 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // --switch (или pilot.killSwitch при его отсутствии) — как daemon-стоп.
   // Поэтому явный --switch не маскирует pilot.killSwitch из проверки.
   const swDirs = [];
-  for (const daemonSwitch of new Set([values.switch, policy?.pilot?.killSwitch])) {
+  for (const daemonSwitch of new Set(
+    [values.switch, policy?.pilot?.killSwitch, policy?.abPilot?.switch])) {
     // Явный null (или нестроковое значение, отличное от undefined) — не
     // «отсутствует»: контроллер подставил бы его в daemonSwitchPath, а
     // L2 обязан отклонить такой вход до Git-конфига, а не пропустить.
@@ -351,6 +352,30 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   for (const swDir of swDirs) {
     if (inside(state, swDir) || inside(swDir, state) ||
         inside(handoff, swDir) || inside(swDir, handoff)) {
+      fail('path_inside_worktree');
+    }
+  }
+  // abPilot.catalog и abPilot.observerWorkspace — операторские пути
+  // foreman-пилота: контроллер требует их realpath-каноничность и
+  // separate() против [tree, root, inbox] (каталог наблюдателя — ещё и
+  // против catalog). Та же двусторонняя граница здесь, до Git-конфига:
+  // явно заданное значение (включая null) обязано быть каноническим
+  // каталогом вне worktree, state и handoffDir.
+  const abCatalog = policy?.abPilot?.catalog !== undefined
+    ? await canonicalOutside(policy.abPilot.catalog, treeAliases, 'dir', { parent: false })
+    : null;
+  if (abCatalog !== null &&
+      (inside(state, abCatalog) || inside(abCatalog, state) ||
+       inside(handoff, abCatalog) || inside(abCatalog, handoff))) {
+    fail('path_inside_worktree');
+  }
+  if (policy?.abPilot?.observerWorkspace !== undefined) {
+    const abWorkspace = await canonicalOutside(
+      policy.abPilot.observerWorkspace, treeAliases, 'dir', { parent: false });
+    if (inside(state, abWorkspace) || inside(abWorkspace, state) ||
+        inside(handoff, abWorkspace) || inside(abWorkspace, handoff) ||
+        (abCatalog !== null &&
+         (inside(abCatalog, abWorkspace) || inside(abWorkspace, abCatalog)))) {
       fail('path_inside_worktree');
     }
   }
