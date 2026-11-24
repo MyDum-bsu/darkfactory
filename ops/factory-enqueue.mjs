@@ -70,17 +70,9 @@ const sha256File = async path =>
 // Каждый вложенный вход проходит ту же проверку, что и --brief/--policy:
 // не симлинк и строго вне worktree — контроллер отклонил бы такую политику
 // ('Operator files must be outside worker paths'), карточка не создаётся.
-async function pinnedPolicyDigest(policyFile, { worktrees = [] } = {}) {
-  const file = await realpath(policyFile);
-  const policy = JSON.parse(await readFile(file, 'utf8'));
-  // Граница — не только --worktree CLI: policy.route.worktree — то же
-  // дерево, которое контроллер объявит рабочим.
-  const boundaries = [...worktrees];
-  if (typeof policy?.route?.worktree === 'string' && policy.route.worktree) {
-    boundaries.push(await realpath(policy.route.worktree).catch(() => fail('worktree_missing')));
-  }
+async function pinnedPolicyDigest(file, policy, { worktrees = [] } = {}) {
   const reviewSetup = await operatorReviewSetup(policy);
-  const check = p => canonicalInput(p, { worktrees: boundaries, mustBe: 'file' });
+  const check = p => canonicalInput(p, { worktrees, mustBe: 'file' });
   const gate = await check(policy.reviewGate);
   // Исходные пути навыков проверяются до realpath, который заранее делает
   // operatorReviewSetup: иначе wt/link/skill.md проходит через симлинк
@@ -93,7 +85,15 @@ async function pinnedPolicyDigest(policyFile, { worktrees = [] } = {}) {
   const files = [file, await check(policy.brief), await check(policy.reviewPrompt),
     gate, await check(join(dirname(gate), 'routes.json')), ...skillFiles];
   const hashes = await Promise.all(files.map(sha256File));
-  return createHash('sha256').update(JSON.stringify(hashes)).digest('hex');
+  const computed = createHash('sha256').update(JSON.stringify(hashes)).digest('hex');
+  // Как у контроллера (p.policyDigest ?? route.policyDigest): закреплённый
+  // в политике дайджест первичен, но границы входов выше проверены всё
+  // равно — закрепление дайджеста проверку путей не отменяет.
+  if (policy?.policyDigest !== undefined) {
+    if (!HEX64.test(policy.policyDigest)) fail('policy_digest_invalid');
+    return policy.policyDigest;
+  }
+  return computed;
 }
 
 // Собирает проверенный план вызова `vb tasks create`. Ничего не исполняет.
@@ -118,6 +118,22 @@ export async function buildEnqueuePlan(values) {
 
   const worktrees = values.worktree === undefined ? []
     : [await canonicalInput(values.worktree, { mustBe: 'dir' })];
+  // Граница policy.route.worktree — то же дерево, которое контроллер
+  // объявит рабочим: она действует на ВСЕ входы (сам файл --policy,
+  // --brief, --memory-dir, --ledger-path и вложенные файлы политики),
+  // поэтому политика читается первой — до хэширования и до вызова vb.
+  let policyJson;
+  let policyFile;
+  if (values.policy !== undefined) {
+    policyFile = await canonicalInput(values.policy, { worktrees, mustBe: 'file' });
+    policyJson = JSON.parse(await readFile(policyFile, 'utf8'));
+    if (typeof policyJson?.route?.worktree === 'string' && policyJson.route.worktree) {
+      worktrees.push(await realpath(policyJson.route.worktree)
+        .catch(() => fail('worktree_missing')));
+      // И сам файл политики обязан лежать вне дерева воркера.
+      policyFile = await canonicalInput(values.policy, { worktrees, mustBe: 'file' });
+    }
+  }
   let specDigest = values['spec-digest'];
   if (values.brief !== undefined) {
     specDigest = await sha256File(
@@ -125,8 +141,11 @@ export async function buildEnqueuePlan(values) {
   }
   let policyDigest = values['policy-digest'];
   if (values.policy !== undefined) {
-    policyDigest = await pinnedPolicyDigest(
-      await canonicalInput(values.policy, { worktrees, mustBe: 'file' }), { worktrees });
+    const pinned = await pinnedPolicyDigest(policyFile, policyJson, { worktrees });
+    // Явный --policy-digest обязан совпадать с вычисленным/закреплённым
+    // значением — иначе в Board ушла бы метка, не сходящаяся с приёмкой.
+    if (policyDigest !== undefined && policyDigest !== pinned) fail('policy_digest_mismatch');
+    policyDigest = pinned;
   }
   if (!HEX64.test(specDigest ?? '')) fail('spec_digest_invalid');
   if (!HEX64.test(policyDigest ?? '')) fail('policy_digest_invalid');

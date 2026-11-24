@@ -77,22 +77,28 @@ export function assertModelMatrix({ cli, policy }) {
   }
 }
 
-// Та же граница, что у контроллера: путь абсолютный (resolveLedgerPath
-// отклоняет относительный), не симлинк и вне worktree как буквально, так и
-// после realpath — симлинк-предок внутри worktree (wt/link -> наружу)
-// отсекается буквальной сверкой до записи Git-конфига и запуска.
-async function canonicalOutside(path, worktreeReal, mustBe) {
+const inside = (root, p) => p === root || p.startsWith(`${root}/`);
+
+// Та же двусторонняя граница, что у контроллера (decision-ledger.mjs,
+// project-memory.mjs): путь абсолютный (resolveLedgerPath отклоняет
+// относительный), не симлинк и не пересекается с worktree ни в одну
+// сторону — ни буквально, ни после realpath, против всех алиасов дерева.
+// Симлинк-предок внутри worktree (wt/link -> наружу) отсекается
+// буквальной сверкой до записи Git-конфига и запуска. Для файла ledger
+// (parent: true) проверяется и родительский каталог: dirname, содержащий
+// worktree, ставит журнал рядом с деревом воркера — контроллер отклонил
+// бы его на assertLedgerOutside.
+async function canonicalOutside(path, treeAliases, mustBe, { parent = false } = {}) {
   if (!isAbsolute(path ?? '')) fail('path_not_absolute');
-  const inside = p => worktreeReal && (p === worktreeReal || p.startsWith(`${worktreeReal}/`));
+  const overlap = p => treeAliases.some(t => inside(t, p) || inside(p, t));
+  const parentHoldsTree = p => treeAliases.some(t => inside(dirname(p), t));
   const literal = resolve(path);
-  if (inside(literal)) fail('path_inside_worktree');
-  // Симлинк-предок, разрешающийся внутрь worktree (alias -> wt при пути
-  // alias/link/...): исходный путь контроллера шёл бы через дерево воркера
-  // даже при внешнем realpath — отказ до записи Git-конфига и запуска.
+  if (overlap(literal) || (parent && parentHoldsTree(literal))) fail('path_inside_worktree');
   for (let probe = dirname(literal), prev; probe !== prev; prev = probe, probe = dirname(probe)) {
     const st = await lstat(probe).catch(() => null);
-    if (st?.isSymbolicLink() && inside(await realpath(probe).catch(() => probe))) {
-      fail('path_inside_worktree');
+    if (st?.isSymbolicLink()) {
+      const target = await realpath(probe).catch(() => probe);
+      if (treeAliases.some(t => inside(t, target))) fail('path_inside_worktree');
     }
   }
   const st = await lstat(literal).catch(() => fail('path_missing'));
@@ -100,7 +106,7 @@ async function canonicalOutside(path, worktreeReal, mustBe) {
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   const real = await realpath(literal);
-  if (inside(real)) fail('path_inside_worktree');
+  if (overlap(real) || (parent && parentHoldsTree(real))) fail('path_inside_worktree');
   return real;
 }
 
@@ -161,8 +167,14 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   const memory = effectivePath({ explicit: values['memory-dir'],
     policyValue: policyPath(policy?.projectMemory, ['storeDir', 'dir', 'path']),
     env: env[MEMORY_DIR_ENV], name: 'project_memory' });
-  if (ledger !== null) await canonicalOutside(ledger, worktreeReal, 'file');
-  if (memory !== null) await canonicalOutside(memory, worktreeReal, 'dir');
+  // Все алиасы дерева: канонический путь и буквальные формы из политики и
+  // CLI — пересечение по любому из них отклоняется.
+  const treeAliases = [...new Set([worktreeReal, resolve(policyTree),
+    ...(values.worktree === undefined ? [] : [resolve(values.worktree)])])];
+  if (ledger !== null) {
+    await canonicalOutside(ledger, treeAliases, 'file', { parent: true });
+  }
+  if (memory !== null) await canonicalOutside(memory, treeAliases, 'dir');
 
   // CLI-override без конфликта с политикой передаётся контроллеру через
   // тот же env-канал (DF_DECISION_LEDGER_PATH / DF_PROJECT_MEMORY_DIR):
@@ -189,13 +201,16 @@ async function defaultGit(args) {
   return (await execFileAsync('git', args, { timeout: 30_000 })).stdout.trim();
 }
 
-// NTFS guard: worktree обязан быть валидным git worktree; затем локально
-// выставляется core.fileMode=false (checkout на не-POSIX ФС не должен
-// ломать учёт executable-бита и diff).
+// NTFS guard: worktree обязан быть точным корнем git worktree — та же
+// сверка, что authorize в run-isolated.mjs (`rev-parse --show-toplevel`
+// === канонический worktree), иначе guard менял бы конфиг чужого
+// репозитория по его подкаталогу. Затем локально выставляется
+// core.fileMode=false (checkout на не-POSIX ФС не должен ломать учёт
+// executable-бита и diff).
 export async function ensureFilemodeGuard(worktree, { git = defaultGit } = {}) {
-  const inside = await git(['-C', worktree, 'rev-parse', '--is-inside-work-tree'])
+  const top = await git(['-C', worktree, 'rev-parse', '--show-toplevel'])
     .catch(() => fail('worktree_not_git'));
-  if (inside !== 'true') fail('worktree_not_git');
+  if (top !== worktree) fail('worktree_not_git');
   await git(['-C', worktree, 'config', '--local', 'core.fileMode', 'false']);
   // Эффективное значение важнее записанного: более приоритетный
   // worktree-конфиг (extensions.worktreeConfig) может перекрывать --local.
@@ -233,11 +248,12 @@ export async function runFactory(argv, deps = {}) {
     'dry-run': { type: 'boolean' }, json: { type: 'boolean' } } });
   const plan = await buildRunPlan(values, { env: deps.env ?? process.env });
   if (values['dry-run']) {
-    // Dry-run без эффектов: только read-only сверка, что цель — git worktree.
+    // Dry-run без эффектов: только read-only сверка, что цель — точный
+    // корень git worktree.
     const git = deps.git ?? defaultGit;
-    const inside = await git(['-C', plan.worktree, 'rev-parse', '--is-inside-work-tree'])
+    const top = await git(['-C', plan.worktree, 'rev-parse', '--show-toplevel'])
       .catch(() => fail('worktree_not_git'));
-    if (inside !== 'true') fail('worktree_not_git');
+    if (top !== plan.worktree) fail('worktree_not_git');
     return { dryRun: true, plan };
   }
   await ensureFilemodeGuard(plan.worktree, { git: deps.git ?? defaultGit });

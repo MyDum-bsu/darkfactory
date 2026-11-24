@@ -167,6 +167,29 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     }));
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile }), /path_inside_worktree/);
+    // Та же граница действует на --brief, --memory-dir и сам файл
+    // политики — тоже без флага --worktree.
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate,
+      route: { checkProfile: 'p', worktree: wt },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } },
+    }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, 'spec-digest': undefined,
+      brief: innerBrief, policy: policyFile }), /path_inside_worktree/);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile, 'memory-dir': wt }),
+      /path_inside_worktree/);
+    const innerPolicy = join(wt, 'policy.json');
+    await writeFile(innerPolicy, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate,
+      route: { checkProfile: 'p', worktree: wt },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } },
+    }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: innerPolicy }), /path_inside_worktree/);
     // Исходный путь review skill через симлинк внутри worktree — отказ.
     const skill = join(wt, 'skill.md');
     await writeFile(join(dir, 'skill-real.md'), 's');
@@ -180,6 +203,45 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile }),
       /path_inside_worktree|symlink|review_skill/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// policy.policyDigest — закреплённый дайджест первичен, как у контроллера
+// (p.policyDigest ?? route.policyDigest); явный --policy-digest обязан
+// совпадать с ним, иначе метка карточки не сойдётся с приёмкой.
+test('enqueue: policy.policyDigest закреплён и сверяется с --policy-digest', async () => {
+  const dir = await tempdir();
+  try {
+    const brief = join(dir, 'brief.md');
+    const reviewPrompt = join(dir, 'review.md');
+    const gate = join(dir, 'gate', 'board-review.mjs');
+    const routes = join(dir, 'gate', 'routes.json');
+    const policyFile = join(dir, 'policy.json');
+    await mkdir(join(dir, 'gate'));
+    await writeFile(brief, 'b');
+    await writeFile(reviewPrompt, 'r');
+    await writeFile(gate, 'g');
+    await writeFile(routes, '{}');
+    const write = digest => writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, policyDigest: digest,
+      route: { checkProfile: 'p' },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } },
+    }));
+    await write(HEX);
+    const plan = await buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile });
+    assert.equal(plan.labels.policy_digest, HEX);
+    const ok = await buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': HEX, policy: policyFile });
+    assert.equal(ok.labels.policy_digest, HEX);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': HEX2, policy: policyFile }), /policy_digest_mismatch/);
+    await write('zz');
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }), /policy_digest_invalid/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -300,12 +362,12 @@ test('run: валидный dry-run печатает план без вызов�
       '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50'];
     // git-вызов dry-run — только read-only rev-parse; мокаем.
     const gitCalls = [];
-    const git = async a => { gitCalls.push(a); return 'true'; };
+    const git = async a => { gitCalls.push(a); return a.includes('--show-toplevel') ? wt : 'true'; };
     const dry = await runFactory([...args, '--dry-run'], { git });
     assert.equal(dry.dryRun, true);
     assert.deepEqual(dry.plan.argv.slice(1),
       ['--execute', '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50']);
-    assert.deepEqual(gitCalls, [['-C', wt, 'rev-parse', '--is-inside-work-tree']]);
+    assert.deepEqual(gitCalls, [['-C', wt, 'rev-parse', '--show-toplevel']]);
     // Не-git worktree в dry-run — отказ.
     const notGit = async () => 'false';
     await assert.rejects(() => runFactory([...args, '--dry-run'], { git: notGit }),
@@ -354,6 +416,14 @@ test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
     assert.equal(calls.length, 1);
     assert.ok(calls[0].argv[0].endsWith('run-isolated.mjs'));
     assert.equal((await git(['config', '--local', 'core.fileMode'])).stdout.trim(), 'false');
+    // Подкаталог внутри git-репозитория — не точный корень worktree:
+    // отказ до записи core.fileMode и запуска контроллера.
+    const sub = join(wt, 'sub');
+    await mkdir(sub);
+    const subPolicy = await withPolicy(dir, policySpec(sub));
+    await assert.rejects(() => runFactory(['--provider', 'acp-devin', '--model', 'swe-2-high',
+      '--policy', subPolicy, '--state', state], { run: async () => ({ code: 0 }) }),
+      /worktree_not_git/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -364,13 +434,18 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
   try {
     const wt = join(dir, 'wt');
     await mkdir(wt);
-    const ledger = join(dir, 'ledger.jsonl');
+    // Хранилища кладём в отдельный каталог: <tmp>/ledger.jsonl при
+    // <tmp>/wt — обратная вложенность (dirname содержит worktree), которую
+    // контроллер отклоняет так же, как и путь внутри дерева.
+    const ops = join(dir, 'ops');
+    await mkdir(ops);
+    const ledger = join(ops, 'ledger.jsonl');
     await writeFile(ledger, '');
-    const memory = join(dir, 'memory');
+    const memory = join(ops, 'memory');
     await mkdir(memory);
     const insideLedger = join(wt, 'ledger.jsonl');
     await writeFile(insideLedger, '');
-    const link = join(dir, 'link');
+    const link = join(ops, 'link');
     await symlink(ledger, link);
     const state = join(dir, 'st');
 
@@ -390,6 +465,20 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const badMem = { ...policySpec(wt), projectMemory: { storeDir: join(wt, 'mem') } };
     const f2 = await withPolicy(dir, badMem);
     await assert.rejects(() => buildRunPlan(runValues(f2, state)), /path_missing|inside/);
+    // Обратная вложенность: родительский каталог файла ledger содержит
+    // worktree (<tmp>/ledger.jsonl при <tmp>/wt) — отказ, как и каталог
+    // projectMemory, содержащий дерево (<tmp>/memory нельзя — внутри wt;
+    // проверяем сам <tmp>).
+    const siblingLedger = join(dir, 'ledger.jsonl');
+    await writeFile(siblingLedger, '');
+    const sibPolicy = { ...policySpec(wt), decisionLedger: siblingLedger };
+    const fSib = await withPolicy(dir, sibPolicy);
+    await assert.rejects(() => buildRunPlan(runValues(fSib, state)),
+      /path_inside_worktree/);
+    const memParent = { ...policySpec(wt), projectMemory: { storeDir: dir } };
+    const fMem = await withPolicy(dir, memParent);
+    await assert.rejects(() => buildRunPlan(runValues(fMem, state)),
+      /path_inside_worktree/);
     // Полный канон: строковый ledger, объектный memory — проходят; env-fallback тоже.
     const okPolicy = { ...policySpec(wt), decisionLedger: ledger,
       projectMemory: { storeDir: memory } };
@@ -437,6 +526,7 @@ test('run-isolated: заголовок DF #, без Пилот #', async () => {
   const source = await readFile(
     join(new URL('.', import.meta.url).pathname, '..', 'board_pipeline', 'run-isolated.mjs'),
     'utf8');
-  assert.match(source, /`DF #\$\{attempt\.task_id\}\$\{ticket\}`/);
+  assert.match(source, /'--title', `DF #\$\{attempt\.task_id\}`,/);
+  assert.doesNotMatch(source, /route\?\.ticket/);
   assert.doesNotMatch(source, /Пилот #\$\{attempt\.task_id\}/);
 });

@@ -32,15 +32,20 @@ node ops/factory-enqueue.mjs \
 (`readOperatorInputs`): sha256 JSON-массива sha256-хэшей файлов маршрута
 `[policyFile, brief, reviewPrompt, reviewGate, routes.json, ...skillPaths]`.
 Только так метка карточки сходится с отпечатком приёмки — иначе seal
-завершится `policy_digest_drift` после всех проверок.
+завершится `policy_digest_drift` после всех проверок. Если в политике
+задан явный `policyDigest` (64-hex), он первичен — как у контроллера
+(`p.policyDigest ?? route.policyDigest`); переданный одновременно
+`--policy-digest` обязан совпадать, иначе отказ до вызова `vb`.
 
 **Проверки путей** до эффекта: `lstat` на конечном пути (симлинк — отказ),
 сверка буквального и resolved пути с `--worktree` **и** `route.worktree` из
-`--policy` — вход внутри worktree (включая через симлинк-предок
-`wt/link/...` или alias worktree) отклоняется до чтения файла. Те же
-проверки применяются к вложенным входам политики (`brief`, `reviewPrompt`,
-`reviewGate`, `routes.json`, исходные пути review-скиллов) — дайджест
-непригодной политики не попадает на Board.
+`--policy` — граница политики действует даже без флага `--worktree` и
+применяется ко **всем** входам: самому файлу `--policy`, `--brief`,
+`--memory-dir`, `--ledger-path` и вложенным входам политики (`brief`,
+`reviewPrompt`, `reviewGate`, `routes.json`, исходные пути review-скиллов).
+Вход внутри worktree (включая через симлинк-предок `wt/link/...` или alias
+worktree) отклоняется до чтения файла и хэширования — дайджест непригодной
+политики не попадает на Board.
 
 ## Запуск контроллера — `ops/factory-run.mjs`
 
@@ -75,10 +80,12 @@ Worktree берётся из `policy.route.worktree`; `--worktree` может т
 подтвердить тот же канонический путь — несовпадающий override отклоняется
 (`worktree_mismatch`), иначе guard менял бы конфиг чужого репозитория.
 Политика обязана закрепить `bb` (совпадает с CLI-спекой) и
-`route.worktree`. До запуска проверяется `git rev-parse
---is-inside-work-tree`, затем выставляется `core.fileMode false` и
-сверяется **эффективное** значение: при перекрытии worktree-конфигом
-ставится `--worktree`-уровень; если `false` не действует — отказ.
+`route.worktree`. До записи конфига проверяется точный корень: `git
+rev-parse --show-toplevel` обязан строго равняться каноническому worktree
+(как `authorize` в `run-isolated.mjs`) — подкаталог чужого репозитория
+отклоняется. Затем выставляется `core.fileMode false` и сверяется
+**эффективное** значение: при перекрытии worktree-конфигом ставится
+`--worktree`-уровень; если `false` не действует — отказ.
 
 ### Чистый старт с Project Memory и Owner Decision Ledger
 
@@ -88,8 +95,12 @@ Worktree берётся из `policy.route.worktree`; `--worktree` может т
 `DF_PROJECT_MEMORY_DIR`. CLI-флаг против закреплённого в политике пути —
 `*_mismatch`, отказ. CLI-override без конфликта передаётся контроллеру
 через соответствующий env. Каждый путь — абсолютный, каноничный (не
-симлинк) и строго вне worktree как буквально, так и после `realpath` —
-симлинк-предок `wt/link -> наружу` или alias worktree отсекается до
+симлинк) и не пересекается с worktree **ни в одну сторону** — как
+буквально, так и после `realpath`, против всех алиасов дерева:
+хранилище внутри worktree, worktree внутри хранилища и — для файла
+ledger — родительский каталог, содержащий worktree, отклоняются так же,
+как их отклоняют `assertLedgerOutside`/`assertStoreOutside` контроллера.
+Симлинк-предок `wt/link -> наружу` или alias worktree отсекается до
 запуска.
 
 ### Делегирование
@@ -103,6 +114,7 @@ node board_pipeline/run-isolated.mjs --execute --policy <policy> --state <state>
 через `spawn` со `stdio:'inherit'` — вывод контроллера виден по мере
 работы, буферизованный `execFile` убивал бы долгий демон по maxBuffer.
 Путь контроллера и запускаемый бинарник флагами не переопределяются.
+Заголовок треда исполнителя — строго `DF #<task_id>`, без суффиксов.
 `--dry-run` печатает валидированный JSON-план без вызова; в план входят
 только env-переопределения, унаследованное окружение не сериализуется.
 
