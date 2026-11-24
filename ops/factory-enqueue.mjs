@@ -98,9 +98,15 @@ const policyStoragePath = (cfg, keys) => {
 // Каждый вложенный вход проходит ту же проверку, что и --brief/--policy:
 // не симлинк и строго вне worktree — контроллер отклонил бы такую политику
 // ('Operator files must be outside worker paths'), карточка не создаётся.
-async function pinnedPolicyDigest(file, policy, { worktrees = [] } = {}) {
+async function pinnedPolicyDigest(file, policy, { worktrees = [], separate = [] } = {}) {
   const reviewSetup = await operatorReviewSetup(policy);
-  const check = p => canonicalInput(p, { worktrees, mustBe: 'file' });
+  const check = async p => {
+    const real = await canonicalInput(p, { worktrees, mustBe: 'file' });
+    // Вложенный операторский вход внутри handoffDir (inbox сдачи —
+    // рабочего пути воркера) контроллер отклонил бы при запуске.
+    if (separate.some(d => within(d, real))) fail('path_inside_worktree');
+    return real;
+  };
   const gate = await check(policy.reviewGate);
   // Исходные пути навыков проверяются до realpath, который заранее делает
   // operatorReviewSetup: иначе wt/link/skill.md проходит через симлинк
@@ -156,6 +162,7 @@ export async function buildEnqueuePlan(values) {
   // поэтому политика читается первой — до хэширования и до вызова vb.
   let policyJson;
   let policyFile;
+  let handoff;
   if (values.policy !== undefined) {
     policyFile = await canonicalInput(values.policy, { worktrees, mustBe: 'file' });
     policyJson = JSON.parse(await readFile(policyFile, 'utf8'));
@@ -191,11 +198,24 @@ export async function buildEnqueuePlan(values) {
     if (policyMemory !== undefined) {
       await canonicalInput(policyMemory, { worktrees, mustBe: 'dir', storage: true });
     }
-    // handoffDir — inbox сдачи контроллера: каталог внутри worktree он
-    // отклонил бы при запуске ('Handoff inbox must be separate');
-    // карточка с незапускаемой политикой на Board не создаётся.
+    // projectMemory.trustedReceiptDir — то же семейство хранилищ, что и
+    // storeDir (проверка factory-run/контроллера): та же двусторонняя
+    // storage-граница вне worktree.
+    if (policyJson?.projectMemory?.trustedReceiptDir !== undefined) {
+      await canonicalInput(policyJson.projectMemory.trustedReceiptDir,
+        { worktrees, mustBe: 'dir', storage: true });
+    }
+    // handoffDir — inbox сдачи контроллера: двусторонняя граница против
+    // worktree ('Handoff inbox must be separate') и операторские файлы
+    // (сам файл политики, brief, reviewPrompt, reviewGate, routes.json,
+    // reviewSkillFiles) вне него ('Operator files must be outside worker
+    // paths'); карточка с незапускаемой политикой не создаётся.
     if (policyJson.handoffDir !== undefined) {
-      await canonicalInput(policyJson.handoffDir, { worktrees, mustBe: 'dir' });
+      handoff = await canonicalInput(policyJson.handoffDir, { worktrees, mustBe: 'dir' });
+      if (worktrees.some(w => within(handoff, w)) ||
+          within(handoff, policyFile)) {
+        fail('path_inside_worktree');
+      }
     }
   }
   let specDigest = values['spec-digest'];
@@ -205,7 +225,8 @@ export async function buildEnqueuePlan(values) {
   }
   let policyDigest = values['policy-digest'];
   if (values.policy !== undefined) {
-    const pinned = await pinnedPolicyDigest(policyFile, policyJson, { worktrees });
+    const pinned = await pinnedPolicyDigest(policyFile, policyJson,
+      { worktrees, separate: handoff === undefined ? [] : [handoff] });
     // Явный --policy-digest обязан совпадать с вычисленным/закреплённым
     // значением — иначе в Board ушла бы метка, не сходящаяся с приёмкой.
     if (policyDigest !== undefined && policyDigest !== pinned) fail('policy_digest_mismatch');

@@ -258,7 +258,14 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
       { decisionLedger: { path: wtLedger } },
       { projectMemory: { storeDir: wt } },
       { projectMemory: { storeDir: dir } },
+      // projectMemory.trustedReceiptDir — то же семейство хранилищ, что
+      // и storeDir: внутри worktree отказ до вызова vb.
+      { projectMemory: { trustedReceiptDir: wt } },
+      { projectMemory: { trustedReceiptDir: dir } },
       { handoffDir: wtInbox },
+      // handoffDir — двусторонняя граница: родительский каталог,
+      // содержащий worktree (и операторские файлы политики), тоже отказ.
+      { handoffDir: dir },
     ]) {
       await writeFile(policyFile, JSON.stringify({
         brief, reviewPrompt, reviewGate: gate, ...pinnedReview, ...embedded }));
@@ -612,7 +619,11 @@ async function initGitRepo(dir) {
   await writeFile(join(dir, 'f.txt'), 'x');
   await git(['add', 'f.txt']);
   await git(['commit', '-m', 'init']);
-  return args => execFileAsync('git', ['-C', dir, ...args]);
+  // Возвращаемая обёртка — то же очищенное окружение: ни одна
+  // Git-команда теста не затрагивает внешний репозиторий при запуске
+  // из Git-хука (унаследованные GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/
+  // GIT_COMMON_DIR/GIT_CONFIG_*).
+  return args => execFileAsync('git', ['-C', dir, ...args], { env });
 }
 
 let gitAvailable;
