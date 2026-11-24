@@ -379,16 +379,24 @@ export async function runEnqueue(argv, deps = {}) {
   return { dryRun: false, plan, stdout };
 }
 
+// Текст результата постановки для stdout: в --dry-run — собранный план;
+// после реального вызова vb — его вывод (в --json-режиме vb это JSON
+// созданной карточки с идентификатором, который обязан дойти до
+// оператора, а не подменяться планом).
+export function enqueueOutput(result, { json = false } = {}) {
+  if (result.dryRun) return `${JSON.stringify(result.plan ?? result, null, 2)}\n`;
+  const stdout = result.stdout ?? '';
+  if (json && stdout !== '' && !stdout.endsWith('\n')) return `${stdout}\n`;
+  return stdout;
+}
+
 async function cli(argv) {
   try {
     const result = await runEnqueue(argv);
     const { values } = parseArgs({ args: argv, options: {
       json: { type: 'boolean' }, 'dry-run': { type: 'boolean' } }, strict: false });
-    if (result.dryRun || values.json) {
-      process.stdout.write(`${JSON.stringify(result.plan ?? result, null, 2)}\n`);
-    } else if (result.stdout) {
-      process.stdout.write(result.stdout);
-    }
+    const out = enqueueOutput(result, { json: values.json });
+    if (out !== '') process.stdout.write(out);
   } catch (error) {
     process.stderr.write(`factory-enqueue: ${error.message}\n`);
     process.exitCode = 2;

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildEnqueuePlan, runEnqueue } from './factory-enqueue.mjs';
+import { buildEnqueuePlan, enqueueOutput, runEnqueue } from './factory-enqueue.mjs';
 import { buildRunPlan, ensureFilemodeGuard, forbiddenModelViolation,
   modelViolation, runFactory } from './factory-run.mjs';
 
@@ -61,6 +61,24 @@ test('enqueue: mocked runner получает собранные argv', async ()
   assert.equal(result.dryRun, false);
   assert.equal(calls.length, 1);
   assert.ok(calls[0][1].includes('body'));
+});
+
+test('enqueue: --json без --dry-run выводит результат vb с id карточки', async () => {
+  const plan = await buildEnqueuePlan(baseValues());
+  const card = '{"id":7,"channel":"ops"}';
+  // Успешная постановка: вывод vb (JSON созданной карточки) доходит до
+  // оператора, а не подменяется планом — иначе идентификатор карточки
+  // теряется и результат нельзя связать с записью в Board.
+  assert.equal(enqueueOutput({ dryRun: false, plan, stdout: card }, { json: true }),
+    `${card}\n`);
+  assert.equal(enqueueOutput({ dryRun: false, plan, stdout: `${card}\n` }, { json: true }),
+    `${card}\n`);
+  // План печатается только в --dry-run.
+  const dry = enqueueOutput({ dryRun: true, plan }, { json: true });
+  assert.equal(dry, `${JSON.stringify(plan, null, 2)}\n`);
+  assert.doesNotMatch(dry, /"id":7/);
+  // Без --json — тот же stdout vb как есть.
+  assert.equal(enqueueOutput({ dryRun: false, plan, stdout: 'created' }), 'created');
 });
 
 test('enqueue: отказы до эффекта', async () => {
