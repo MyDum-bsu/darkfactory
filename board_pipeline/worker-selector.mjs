@@ -400,9 +400,15 @@ function contradicting(prev, latest) {
 // невалидное одинаково откатываются к дефолту, четвёртый REWORK всегда
 // лимитный.
 export const DEFAULT_L2_REWORK_LIMIT = 4;
+// Фактически применённый лимит: валидное значение маршрута, прижатое к
+// потолку; невалидное и отсутствующее — дефолт. Причина остановки владецу
+// сообщает именно это число, не сырое значение маршрута (#1666 r4).
+export function effectiveL2ReworkLimit(limit = DEFAULT_L2_REWORK_LIMIT) {
+  if (!Number.isSafeInteger(limit) || limit < 1) return DEFAULT_L2_REWORK_LIMIT;
+  return Math.min(limit, DEFAULT_L2_REWORK_LIMIT);
+}
 export function l2ReworkLimitExceeded({ roundsHistory = [], limit = DEFAULT_L2_REWORK_LIMIT } = {}) {
-  if (!Number.isSafeInteger(limit) || limit < 1) limit = DEFAULT_L2_REWORK_LIMIT;
-  return roundsHistory.filter(r => r?.gate === 'l2').length >= Math.min(limit, DEFAULT_L2_REWORK_LIMIT);
+  return roundsHistory.filter(r => r?.gate === 'l2').length >= effectiveL2ReworkLimit(limit);
 }
 
 // Детектор отсутствия прогресса и содержательного спора. roundsHistory —

@@ -602,6 +602,9 @@ test('route.maxL2ReworkRounds выше дефолта не отменяет ос
   assert.equal(stopped.phase, 'hold');
   assert.equal(stopped.reason, 'l2_rework_limit_exceeded');
   assert.equal(x.effects.feedback.length, 3);
+  // Причина владельцу сообщает фактически применённый лимит, а не сырое
+  // значение маршрута выше потолка (#1666 r4).
+  assert.match((await x.inspect()).blocked?.reason ?? '', /\{"limit":4\}/);
 });
 
 // Пункт 6: L1 починил тест A, упал тест B — разные сигнатуры, починка сходится.

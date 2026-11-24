@@ -521,7 +521,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       // Circuit breaker L2 (Board #1666): лимитный L2-раунд останавливает
       // попытку без следующего круга и до арбитража — directed_rework был бы
       // пятым раундом. Эскалация — hold карточки владельцу с причиной.
-      const l2Limit = route.maxL2ReworkRounds ?? workerSelector.DEFAULT_L2_REWORK_LIMIT;
+      const l2Limit = workerSelector.effectiveL2ReworkLimit(route.maxL2ReworkRounds);
       if (workerSelector.l2ReworkLimitExceeded({ roundsHistory, limit: l2Limit })) {
         return stopWith('l2_rework_limit_exceeded', { roundsHistory },
           JSON.stringify({ limit: l2Limit }));
