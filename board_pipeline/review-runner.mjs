@@ -640,6 +640,10 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
     stderr = error.stderr ?? '';
   } finally {
     signal?.removeEventListener?.('abort', onAbort);
+    // Сначала дождаться уже начатого удаления обработчиком отмены: повторный
+    // rm -f во время активного удаления получил бы «removal ... is already
+    // in progress» и отказ вернулся бы до завершения cleanup.
+    await stopping;
     try {
       await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
     } catch (failure) {
@@ -647,7 +651,6 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
         throw new ReviewDenied('sandbox_cleanup_failed', { cause: failure });
       }
     }
-    await stopping;
   }
   if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
   return { code, stdout, stderr, timedOut };

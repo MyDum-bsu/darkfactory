@@ -259,10 +259,14 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
         if (current?.thread?.parentThreadId !== parentThread || current?.thread?.projectId !== project ||
             !(current?.environment === null || current?.environment === undefined ||
               current?.environment?.path === workspace)) continue;
+        // Маркер доказывает запуск только в исходном запросе на старт треда:
+        // поздняя цитата challenge в другом событии соседнего треда — не
+        // подтверждение нашего spawn.
         let events = null;
         try { events = await run(['thread', 'log', item.id, '--all', '--json']); } catch { continue; }
         const entries = Array.isArray(events) ? events : (Array.isArray(events?.events) ? events.events : []);
-        if (!entries.some(entry => JSON.stringify(entry).includes(challenge))) continue;
+        if (!entries.some(entry => entry?.type === 'client/turn/requested' &&
+            JSON.stringify(entry).includes(challenge))) continue;
         await stopThread(item.id);
       }
     };

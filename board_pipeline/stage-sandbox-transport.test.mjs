@@ -293,3 +293,24 @@ test('stageDockerSandbox пробрасывает signal в runInReadOnlySandbox
   assert.deepEqual(seen.mounts.map(m => m.dst), ['/pi-cfg', '/model-proxy/client.cjs', '/model-proxy/upstream.sock']);
   assert.deepEqual(result, { code: 0, stdout: '' });
 });
+
+test('abort во время docker run: отказ возвращается только после завершения удаления контейнера', async t => {
+  const { enrolled } = await probeStageSandboxCapability('docker-ro-v1');
+  if (!enrolled) return t.skip('rootless Docker недоступен на хосте');
+  const image = await exec('docker', ['image', 'inspect', REVIEW_IMAGE], { timeout: 10_000 }).catch(() => null);
+  if (!image) return t.skip('закреплённый образ ревью отсутствует локально');
+  const empty = await mkdtemp(join(tmpdir(), 'df-stage-abort-'));
+  t.after(() => rm(empty, { recursive: true, force: true }));
+  const controller = new AbortController();
+  const pending = runInReadOnlySandbox({ snapshot: empty, timeoutMs: 60_000,
+    argv: ['node', '-e', 'setTimeout(()=>{},60000)'], signal: controller.signal });
+  // Даём контейнеру стартовать, затем абортируем — обработчик отмены
+  // начинает rm -f именованного контейнера.
+  await new Promise(resolve => setTimeout(resolve, 1500));
+  controller.abort(new Error('kill_switch'));
+  await assert.rejects(pending, /kill_switch/);
+  // Отказ пришёл только после завершения cleanup: контейнера уже нет.
+  const { stdout } = await exec('docker', ['ps', '-aq', '--filter', 'name=board-review-'],
+    { timeout: 10_000 });
+  assert.equal(stdout.trim(), '', 'осиротевших board-review контейнеров не остаётся');
+});
