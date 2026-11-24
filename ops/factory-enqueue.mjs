@@ -19,8 +19,8 @@
 // policy_digest не сойдётся с отпечатком и seal вернёт policy_digest_drift.
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstat, readFile, readlink, realpath } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { lstat, readFile, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
@@ -37,11 +37,11 @@ const RESERVED_LABELS = new Set(
 
 function fail(code) { throw new Error(code); }
 
-// Канонический путь существующего входа: без симлинка на конечном пути, и
-// ни буквальный, ни resolved путь не лежат внутри ни одного worktree из
-// списка. Симлинк-предок, разрешающийся внутрь worktree (alias -> wt при
-// пути alias/link/...), тоже отсекается: исходный путь контроллера проходил
-// бы через дерево воркера даже при внешнем realpath.
+// Инвариант каноничности операторских путей (как у контроллера): вход
+// обязан быть строго каноническим абсолютным путём — без симлинк-компонентов
+// и без '..'/'.' (realpath совпадает со строкой пути). Любая цепочка
+// симлинков (D/alias/wt/out/..., alias1 -> alias2 -> wt/link, op/link/../x)
+// отклоняется до хэширования и до вызова vb — ручной обход хопов не нужен.
 // Семантика inside() контроллера (relative, а не префикс): корректна и
 // для корня ФС — '/' содержит любой абсолютный путь.
 const within = (root, p) => {
@@ -51,40 +51,14 @@ const within = (root, p) => {
 
 async function canonicalInput(path, { worktrees = [], mustBe } = {}) {
   if (typeof path !== 'string' || !path) fail('path_required');
-  const inside = p => worktrees.some(w => within(w, p));
-  const literal = resolve(path);
-  if (inside(literal)) fail('path_inside_worktree');
-  // Полный обход цепочки симлинков: каждый симлинк-предок каждого звена
-  // расширяется до readlink-цели, и каждый буквальный хоп сверяется с
-  // worktree — alias1 -> alias2 -> wt/link -> наружу отклоняется, хотя
-  // realpath конечной цели внешний.
-  const seen = new Set();
-  const queue = [dirname(literal)];
-  while (queue.length) {
-    for (let probe = queue.pop(), prev; probe !== prev;
-      prev = probe, probe = dirname(probe)) {
-      if (seen.has(probe)) break;
-      seen.add(probe);
-      const st = await lstat(probe).catch(() => null);
-      if (st?.isSymbolicLink()) {
-        const hop = resolve(dirname(probe), await readlink(probe).catch(() => probe));
-        if (inside(hop)) fail('path_inside_worktree');
-        queue.push(hop);
-      }
-    }
-  }
-  // Фактический родитель и конечный компонент: resolve() сворачивает '..'
-  // лексически, а ФС раскрывает симлинк-предков до '..' — op/link/../x при
-  // link -> wt/deep фактически wt/x; конечный симлинк внутри дерева
-  // отклоняется, даже если его цель снаружи.
-  const dirReal = await realpath(dirname(path)).catch(() => fail('path_missing'));
-  if (inside(dirReal)) fail('path_inside_worktree');
-  const st = await lstat(join(dirReal, basename(path))).catch(() => fail('path_missing'));
-  if (st.isSymbolicLink()) fail('path_symlink_refused');
+  if (!isAbsolute(path)) fail('path_not_absolute');
+  const real = await realpath(path).catch(() => fail('path_missing'));
+  if (real !== path) fail('non_canonical_or_symlink_path');
+  const st = await lstat(real);
+  if (st.isSymbolicLink()) fail('non_canonical_or_symlink_path');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
-  const real = await realpath(path);
-  if (inside(real)) fail('path_inside_worktree');
+  if (worktrees.some(w => within(w, real))) fail('path_inside_worktree');
   return real;
 }
 

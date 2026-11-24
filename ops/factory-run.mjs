@@ -16,8 +16,8 @@
 //     [--interval-ms N] [--allow-live-pilot] [--recheck-rejected-handoff] \
 //     [--dry-run] [--json]
 import { execFile, spawn } from 'node:child_process';
-import { lstat, realpath, readFile, readlink } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { lstat, realpath, readFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { opencodeGoPolicyViolation, retiredProviderViolation }
@@ -91,60 +91,27 @@ const inside = (root, p) => {
   return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
 
-// Та же двусторонняя граница, что у контроллера (decision-ledger.mjs,
-// project-memory.mjs): путь абсолютный (resolveLedgerPath отклоняет
-// относительный), не симлинк и не пересекается с worktree ни в одну
-// сторону — ни буквально, ни после realpath, против всех алиасов дерева.
-// Симлинк-предок внутри worktree (wt/link -> наружу) отсекается
-// буквальной сверкой до записи Git-конфига и запуска. Родительский
-// каталог тоже не пересекается с деревом (assertLedgerOutside/
-// assertStoreOutside проверяют dirTarget/targetDir): dirname, содержащий
-// worktree, ставит хранилище рядом с деревом воркера.
+// Инвариант каноничности операторских путей (как у контроллера): путь
+// обязан быть строго каноническим абсолютным — без симлинк-компонентов и
+// без '..'/'.' (realpath совпадает со строкой пути). Любая цепочка
+// симлинков (D/alias/wt/out/..., alias -> wt/link, op/link/../x)
+// отклоняется до записи Git-конфига и запуска — ручной обход хопов не
+// нужен. Затем та же двусторонняя граница, что у контроллера
+// (decision-ledger.mjs, project-memory.mjs, assertLedgerOutside/
+// assertStoreOutside): ни путь, ни его родительский каталог не
+// пересекаются с worktree ни в одну сторону — против всех алиасов дерева.
 async function canonicalOutside(path, treeAliases, mustBe) {
   if (!isAbsolute(path ?? '')) fail('path_not_absolute');
-  const overlap = p => treeAliases.some(t =>
-    inside(t, p) || inside(p, t) || inside(dirname(p), t) || inside(t, dirname(p)));
-  const literal = resolve(path);
-  if (overlap(literal)) fail('path_inside_worktree');
-  // Цепочки симлинк-предков — только в сторону worktree: контроллер
-  // сверяет сам путь и его родителя, а не произвольного общего предка,
-  // но симлинк, разрешающийся внутрь дерева (непосредственно или
-  // промежуточным хопом alias -> wt/link -> наружу), — отказ до
-  // Git-конфига и запуска.
-  const seen = new Set();
-  const queue = [dirname(literal)];
-  while (queue.length) {
-    for (let probe = queue.pop(), prev; probe !== prev;
-      prev = probe, probe = dirname(probe)) {
-      if (seen.has(probe)) break;
-      seen.add(probe);
-      const st = await lstat(probe).catch(() => null);
-      if (st?.isSymbolicLink()) {
-        const hop = resolve(dirname(probe), await readlink(probe).catch(() => probe));
-        const target = await realpath(probe).catch(() => probe);
-        if (treeAliases.some(t => inside(t, hop) || inside(t, target))) {
-          fail('path_inside_worktree');
-        }
-        queue.push(hop);
-      }
-    }
-  }
-  // Фактический родитель исходного пути (dirTarget контроллера):
-  // resolve() сворачивает '..' лексически, а ФС раскрывает
-  // симлинк-предков до '..' — op/link/../x при link -> wt/deep даёт
-  // dirname -> wt, который и отклоняет контроллер.
-  const dirReal = await realpath(dirname(path)).catch(() => fail('path_missing'));
-  if (treeAliases.some(t => inside(t, dirReal) || inside(dirReal, t))) {
-    fail('path_inside_worktree');
-  }
-  // Фактический конечный компонент — не лексически свёрнутый: симлинк
-  // внутри worktree отклоняется, даже если его цель снаружи.
-  const st = await lstat(join(dirReal, basename(path))).catch(() => fail('path_missing'));
-  if (st.isSymbolicLink()) fail('path_symlink_refused');
+  const real = await realpath(path).catch(() => fail('path_missing'));
+  if (real !== path) fail('non_canonical_or_symlink_path');
+  const st = await lstat(real);
+  if (st.isSymbolicLink()) fail('non_canonical_or_symlink_path');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
-  const real = await realpath(path);
-  if (overlap(real)) fail('path_inside_worktree');
+  if (treeAliases.some(t =>
+    inside(t, real) || inside(real, t) || inside(dirname(real), t))) {
+    fail('path_inside_worktree');
+  }
   return real;
 }
 
@@ -179,7 +146,9 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   if (typeof values.model !== 'string' || !values.model.trim()) fail('model_required');
   if (!values.policy || !values.state) fail('policy_and_state_required');
 
-  const policyPathReal = await realpath(values.policy);
+  if (!isAbsolute(values.policy)) fail('path_not_absolute');
+  const policyPathReal = await realpath(values.policy).catch(() => fail('path_missing'));
+  if (policyPathReal !== values.policy) fail('non_canonical_or_symlink_path');
   const policy = JSON.parse(await readFile(policyPathReal, 'utf8'));
   // CLI-спека обязана совпасть с закреплённой policy.bb: без bb проверять
   // нечего — политика недопустима, контроллер отклонил бы её позже.
