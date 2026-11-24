@@ -17,8 +17,8 @@ node ops/factory-enqueue.mjs \
   --finish verified \
   --brief /path/spec/brief.md --policy /path/policy/operator.json \
   --label domain=pipeline --ticket DF-OPS-2 \
-  --worktree /path/wt --memory-dir /path/memory --ledger-path /path/ledger.jsonl \
-  --dry-run
+  --worktree /path/wt --memory-dir /path/store/memory \
+  --ledger-path /path/store/ledger.jsonl --dry-run
 ```
 
 Все файловые пути — строго канонические абсолютные: `realpath` обязан
@@ -54,6 +54,14 @@ node ops/factory-enqueue.mjs \
 `reviewPrompt`, `reviewGate`, `routes.json`, исходные пути review-скиллов).
 Вход внутри worktree отклоняется до чтения файла и хэширования —
 дайджест непригодной политики не попадает на Board.
+
+Для путей хранилищ (`--memory-dir`, `--ledger-path`) граница
+двусторонняя — та же, что у factory-run и контроллера: каталог
+Project Memory и родительский каталог файла Owner Decision Ledger не
+должны содержать worktree (в примере выше оба хранилища лежат в
+`/path/store`, а не непосредственно в `/path` рядом с `/path/wt`),
+равно как и worktree не должен содержать хранилище. Нарушение
+отклоняется `path_inside_worktree` до вызова `vb`.
 
 ## Запуск контроллера — `ops/factory-run.mjs`
 
