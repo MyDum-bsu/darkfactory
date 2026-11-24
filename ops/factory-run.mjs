@@ -263,6 +263,12 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // activation.killSwitch (pilot.killSwitch) для допуска пилота, а
   // --switch (или pilot.killSwitch при его отсутствии) — как daemon-стоп.
   // Поэтому явный --switch не маскирует pilot.killSwitch из проверки.
+  // abPilot без switch — не «отсутствует»: enrollAbPilot контроллера
+  // безусловно передаёт config.switch в createPilotSwitch и отклонил бы
+  // конфигурацию уже после записи Git-конфига; отказ здесь.
+  if (policy?.abPilot !== undefined && policy.abPilot?.switch === undefined) {
+    fail('path_not_absolute');
+  }
   const swDirs = [];
   for (const daemonSwitch of new Set(
     [values.switch, policy?.pilot?.killSwitch, policy?.abPilot?.switch])) {
@@ -294,6 +300,9 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     const swSt = await lstat(daemonSwitch).catch(err =>
       err?.code === 'ENOENT' ? null : fail('non_canonical_or_symlink_path'));
     if (swSt?.isSymbolicLink()) fail('non_canonical_or_symlink_path');
+    // Существующий стоп-путь обязан быть обычным файлом: контроллер
+    // отклоняет каталог/спецфайл при проверке стоп-файла (isFile()).
+    if (swSt !== null && !swSt.isFile()) fail('path_not_file');
     if (treeAliases.some(t => inside(t, daemonSwitch))) fail('path_inside_worktree');
   }
   if (ledger !== null) await canonicalOutside(ledger, treeAliases, 'file');

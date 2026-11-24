@@ -900,6 +900,23 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     const abOk = { ...policySpec(wt), abPilot: { switch: join(ops, 'ab-stop') } };
     const fAbOk = await withPolicy(dir, abOk);
     await runPlan(runValues(fAbOk, state));
+    // abPilot без switch: контроллер безусловно передаёт config.switch в
+    // createPilotSwitch — обязательное поле отклоняется до Git-конфига.
+    const abNoSwitch = { ...policySpec(wt), abPilot: { arm: 'linear' } };
+    const fAbNoSwitch = await withPolicy(dir, abNoSwitch);
+    await assert.rejects(() => runPlan(runValues(fAbNoSwitch, state)),
+      /path_not_absolute/);
+    // Существующий каталог вместо стоп-файла: контроллер отклоняет
+    // не-файл (isFile() === false) — отказ до Git-конфига для всех
+    // источников стоп-пути.
+    const swDir = join(ops, 'swdir');
+    await mkdir(swDir);
+    const abDirStop = { ...policySpec(wt), abPilot: { switch: swDir } };
+    const fAbDirStop = await withPolicy(dir, abDirStop);
+    await assert.rejects(() => runPlan(runValues(fAbDirStop, state)),
+      /path_not_file/);
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { switch: swDir })), /path_not_file/);
     // Явный pilot.killSwitch: null и нестроковое значение — не
     // «отсутствует»: отказ до Git-конфига, а не молчаливый пропуск.
     const pilotNull = { ...policySpec(wt), pilot: { killSwitch: null } };
