@@ -186,7 +186,12 @@ export async function buildEnqueuePlan(values) {
   const argv = ['--url', url, 'tasks', 'create', values.channel, title];
   for (const [key, value] of Object.entries(labels)) argv.push('--label', `${key}=${value}`);
   argv.push('--json');
-  return { tool: values.vb ?? 'vb', argv, labels,
+  // --vb без флага — команда по умолчанию 'vb'; явный путь исполняемого
+  // файла — тот же инвариант каноничности вне worktree, что и у прочих
+  // операторских входов: проверка до вызова vb.
+  const tool = values.vb === undefined ? 'vb'
+    : await canonicalInput(values.vb, { worktrees, mustBe: 'file' });
+  return { tool, argv, labels,
     meta: { boardUrl: url, channel: values.channel, finish: values.finish } };
 }
 

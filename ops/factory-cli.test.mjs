@@ -759,6 +759,110 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
   }
 });
 
+test('run: --switch неканоническая строка и lstat-ошибки отклоняются', async () => {
+  const dir = await tempdir();
+  try {
+    const wt = join(dir, 'wt');
+    const ops = join(dir, 'ops');
+    const state = join(dir, 'state');
+    await mkdir(wt);
+    await mkdir(ops);
+    await mkdir(state);
+    const policy = await withPolicy(dir, policySpec(wt));
+    // Завершающий '/' — неканоническая строка: отказ до lstat и запуска.
+    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+      { switch: `${ops}/` })), /non_canonical_or_symlink_path/);
+    // '.', '..' и повторные '//' — та же неканоничность.
+    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+      { switch: `${ops}/./stop` })), /non_canonical_or_symlink_path/);
+    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+      { switch: `${ops}/sub/../stop` })), /non_canonical_or_symlink_path/);
+    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+      { switch: `${ops}//stop` })), /non_canonical_or_symlink_path/);
+    // Родительский компонент — обычный файл: lstat даёт ENOTDIR, а не
+    // ENOENT — отказ (ещё несозданный стоп-файл в каноническом
+    // каталоге по-прежнему проходит).
+    const notDir = join(ops, 'file');
+    await writeFile(notDir, 'x');
+    await assert.rejects(() => buildRunPlan(runValues(policy, state,
+      { switch: join(notDir, 'stop') })),
+      /non_canonical_or_symlink_path|path_missing/);
+    const ok = await buildRunPlan(runValues(policy, state,
+      { switch: join(ops, 'stop') }));
+    assert.ok(ok.argv.includes('--switch'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('enqueue: явный --vb через симлинк отклоняется, default vb — нет', async () => {
+  const dir = await tempdir();
+  try {
+    const realVb = join(dir, 'vb-real');
+    await writeFile(realVb, '#!/bin/sh\n');
+    const linkVb = join(dir, 'vb-link');
+    await symlink(realVb, linkVb);
+    // Без --vb — команда по умолчанию 'vb', проверка пути не применяется.
+    const plan = await buildEnqueuePlan({ ...baseValues() });
+    assert.equal(plan.tool, 'vb');
+    // Явный --vb через симлинк — неканонический путь: отказ до вызова vb.
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), vb: linkVb }),
+      /non_canonical_or_symlink_path/);
+    // Канонический явный --vb вне worktree проходит.
+    const ok = await buildEnqueuePlan({ ...baseValues(), vb: realVb });
+    assert.equal(ok.tool, realVb);
+    // Относительный --vb — отказ.
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), vb: 'vb-real' }),
+      /path_not_absolute/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run: policy operator dirs — trustedReceiptDir/questionGate.inbox/release.directory', async () => {
+  const dir = await tempdir();
+  try {
+    const wt = join(dir, 'wt');
+    const ops = join(dir, 'ops');
+    const state = join(dir, 'state');
+    await mkdir(wt);
+    await mkdir(ops);
+    await mkdir(state);
+    const receipts = join(ops, 'receipts');
+    await mkdir(receipts);
+    const inbox = join(ops, 'qg-inbox');
+    await mkdir(inbox);
+    const releaseDir = join(ops, 'release');
+    await mkdir(releaseDir);
+    const base = policySpec(wt);
+    const okPolicy = { ...base,
+      projectMemory: { trustedReceiptDir: receipts },
+      questionGate: { inbox }, release: { directory: releaseDir } };
+    const fOk = await withPolicy(dir, okPolicy);
+    await buildRunPlan(runValues(fOk, state));
+    // trustedReceiptDir через симлинк-предка — неканонический операторский
+    // каталог: отказ до Git-конфига и запуска.
+    const linkOps = join(dir, 'ops-link');
+    await symlink(ops, linkOps);
+    const bad = { ...base,
+      projectMemory: { trustedReceiptDir: join(linkOps, 'receipts') } };
+    const fBad = await withPolicy(dir, bad);
+    await assert.rejects(() => buildRunPlan(runValues(fBad, state)),
+      /non_canonical_or_symlink_path/);
+    // questionGate.inbox / release.directory внутри worktree — отказ.
+    const wtInbox = join(wt, 'inbox');
+    await mkdir(wtInbox);
+    const fInbox = await withPolicy(dir, { ...base, questionGate: { inbox: wtInbox } });
+    await assert.rejects(() => buildRunPlan(runValues(fInbox, state)),
+      /path_inside_worktree/);
+    const fRel = await withPolicy(dir, { ...base, release: { directory: join(linkOps, 'release') } });
+    await assert.rejects(() => buildRunPlan(runValues(fRel, state)),
+      /non_canonical_or_symlink_path/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('run-isolated: заголовок DF #, без Пилот #', async () => {
   const source = await readFile(
     join(new URL('.', import.meta.url).pathname, '..', 'board_pipeline', 'run-isolated.mjs'),

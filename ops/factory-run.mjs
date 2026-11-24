@@ -17,7 +17,7 @@
 //     [--dry-run] [--json]
 import { execFile, spawn } from 'node:child_process';
 import { lstat, realpath, readFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { opencodeGoPolicyViolation, retiredProviderViolation }
@@ -223,15 +223,32 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   const daemonSwitch = values.switch ?? policy?.pilot?.killSwitch;
   if (daemonSwitch !== undefined && daemonSwitch !== null) {
     if (!isAbsolute(daemonSwitch)) fail('path_not_absolute');
+    // Неканоническая строка (завершающий '/', '.', '..', повторные '//')
+    // отклоняется до lstat: нормализация обязана быть тождественной.
+    if (daemonSwitch !== posix.normalize(daemonSwitch) || daemonSwitch.endsWith('/')) {
+      fail('non_canonical_or_symlink_path');
+    }
     const swDir = dirname(daemonSwitch);
     const swDirReal = await realpath(swDir).catch(() => fail('path_missing'));
     if (swDirReal !== swDir) fail('non_canonical_or_symlink_path');
-    const swSt = await lstat(daemonSwitch).catch(() => null);
+    // Стоп-файл может ещё не существовать (ENOENT), но любая другая
+    // ошибка — включая ENOTDIR (родительский компонент не каталог) —
+    // отказ до Git-конфига и запуска контроллера.
+    const swSt = await lstat(daemonSwitch).catch(err =>
+      err?.code === 'ENOENT' ? null : fail('non_canonical_or_symlink_path'));
     if (swSt?.isSymbolicLink()) fail('non_canonical_or_symlink_path');
     if (treeAliases.some(t => inside(t, daemonSwitch))) fail('path_inside_worktree');
   }
   if (ledger !== null) await canonicalOutside(ledger, treeAliases, 'file');
   if (memory !== null) await canonicalOutside(memory, treeAliases, 'dir');
+  // Опциональные операторские каталоги политики — та же строгая проверка
+  // канонического каталога вне worktree, включая родителя (как storeDir).
+  for (const dir of [policy?.projectMemory?.trustedReceiptDir,
+    policy?.questionGate?.inbox, policy?.release?.directory]) {
+    if (dir !== undefined && dir !== null) {
+      await canonicalOutside(dir, treeAliases, 'dir');
+    }
+  }
   // --state — тоже операторский путь: контроллер делает лишь realpath без
   // сверки со строкой; каноничность и двусторонняя граница worktree
   // проверяются здесь (parent-граница относится к ledger/memory).
