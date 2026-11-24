@@ -420,8 +420,69 @@ test('runtime: закреплённый образ обязан аттестов
   assert.match(dockerfile, /LABEL df\.l1\.profile="python-node"/);
   assert.match(source, /image', 'inspect', recipe\.image/);
   assert.match(source, /labels\?\.\[L1_IMAGE_LABEL\] !== l1\.id/);
-  assert.match(source, /assertL1Image\(recipe, l1\)/);
-  assert.match(source, /assertL1Image\(recipe, l1Profile \?\? l1Recipe \?\? l1Default\)/);
+  // Аттестация — только по явному выбору (профиль или рецепт), неявный
+  // l1Default в сверку OCI-метки не попадает ни в одном раннере.
+  assert.equal(source.match(/assertL1Image\(recipe, l1Profile \?\? l1Recipe\)/g).length, 2);
+  assert.equal(/assertL1Image\([^)]*l1Default/.test(source), false);
+});
+
+// Реальная совместимость политики l1Default с фейковым docker: при
+// неявном дефолте 'python-node' образ без OCI-метки не отклоняется, при
+// явном l1Profile — отклоняется с l1_image_mismatch до любого эффекта.
+test('runtime: OCI-метка обязательна лишь при явном l1Profile, не из l1Default', async () => {
+  const dir = await tempdir();
+  const savedPath = process.env.PATH;
+  const savedLog = process.env.DOCKER_LOG;
+  const savedLabels = process.env.DOCKER_LABELS;
+  try {
+    const log = join(dir, 'docker.log');
+    // docker info — rootless, image inspect — метки из DOCKER_LABELS;
+    // каждый вызов пишется в лог для проверки «inspect не вызывался».
+    await writeFile(join(dir, 'docker'),
+      '#!/bin/sh\n' +
+      'echo "$@" >> "$DOCKER_LOG"\n' +
+      'case "$1" in\n' +
+      '  info) echo \'["name=rootless"]\' ;;\n' +
+      '  image) echo "$DOCKER_LABELS" ;;\n' +
+      '  *) exit 1 ;;\n' +
+      'esac\n', { mode: 0o755 });
+    process.env.PATH = `${dir}:${savedPath}`;
+    process.env.DOCKER_LOG = log;
+    process.env.DOCKER_LABELS = '{}';
+    const journal = join(dir, 'journal');
+    await mkdir(journal);
+    // worktree — не Git-репозиторий: после снятия аттестации следующий
+    // отказ идёт из unpackExact и никогда не совпадает с l1_image_*.
+    const handoff = { candidate_sha: SHA, worktree: dir, task_id: '1' };
+    const recipe = { image: `sha256:${HEX}`, argv: ['pytest'], cwd: '.', timeoutMs: 1000 };
+    const notL1Image = error => !/l1_image_/.test(String(error));
+    for (const runner of [offlineDockerRunner(journal), offlineProfileRunner(journal)]) {
+      await assert.rejects(() => runner(handoff,
+        { l1Default: 'python-node', check: recipe, checks: [recipe] }), notL1Image);
+      await assert.rejects(() => runner(handoff,
+        { l1Profile: 'python-node', check: recipe, checks: [recipe] }),
+        /l1_image_mismatch:python-node/);
+    }
+    const visual = offlineVisualRunner(journal);
+    await assert.rejects(() => visual(handoff,
+      { l1Default: 'python-node', visual: recipe }), notL1Image);
+    await assert.rejects(() => visual(handoff,
+      { l1Profile: 'python-node', visual: recipe }), /l1_image_mismatch:python-node/);
+    // Явный выбор + метка на образе — аттестация проходит, отказ дальше.
+    process.env.DOCKER_LABELS = '{"df.l1.profile":"python-node"}';
+    await assert.rejects(() => visual(handoff,
+      { l1Profile: 'python-node', visual: recipe }), notL1Image);
+    // Ни один вызов при неявном дефолте не дошёл до image inspect:
+    // в логе inspect остался только от явных случаев.
+    const calls = (await readFile(log, 'utf8')).split('\n')
+      .filter(line => line.startsWith('image inspect'));
+    assert.equal(calls.length, 4);
+  } finally {
+    process.env.PATH = savedPath;
+    process.env.DOCKER_LABELS = savedLabels;
+    process.env.DOCKER_LOG = savedLog;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('accept/acceptHeld: visual.l1Profile=bogus отклоняется при has_ui=false до портов', async () => {

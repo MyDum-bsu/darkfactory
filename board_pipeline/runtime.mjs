@@ -113,9 +113,13 @@ async function cleanupContainer(name) {
 }
 
 // Доверенный образ профиля аттестует себя OCI-меткой L1_IMAGE_LABEL,
-// встроенной его Dockerfile: эффективный выбор среды (явный или дефолт
-// репозитория) обязан реально соответствовать закреплённому recipe.image,
-// иначе Node-only образ молча выполнил бы проверки под python-node.
+// встроенной его Dockerfile: ЯВНЫЙ выбор среды (profile.l1Profile или
+// recipe.l1Profile) обязан реально соответствовать закреплённому
+// recipe.image, иначе Node-only образ молча выполнил бы проверки под
+// python-node. Неявный дефолт репозитория (l1Default) проверку не
+// запускает: старые политики без явного l1Profile сохраняют прежний
+// pinned образ без метки и продолжают работать — defaultEnv дефолта
+// при этом подмешивается как раньше.
 async function assertL1Image(recipe, l1) {
   if (l1?.dockerfile === undefined) return;
   let labels;
@@ -161,7 +165,9 @@ export function offlineDockerRunner(journal, { beforeEffect } = {}) {
       timeout: 12_000,
     })).stdout);
     if (!security.includes('name=rootless')) throw new Error('The test runner requires rootless Docker');
-    await assertL1Image(recipe, l1);
+    // Аттестация образа — только при явном выборе: l1Default неявен,
+    // его образ без OCI-метки не отклоняется (обратная совместимость).
+    await assertL1Image(recipe, l1Profile ?? l1Recipe);
 
     const scratch = await mkdtemp(join(tmpdir(), 'board-check-'));
     const name = `board-check-${randomUUID()}`;
@@ -265,8 +271,11 @@ export function offlineVisualRunner(journal, { beforeEffect } = {}) {
     })).stdout);
     if (!security.includes('name=rootless')) throw new Error('The visual runner requires rootless Docker');
     // Тот же инвариант образа, что у проверочного раннера: visual-гейт под
-    // профилем с доверенным Dockerfile обязан идти в аттестованном образе.
-    await assertL1Image(recipe, l1Profile ?? l1Recipe ?? l1Default);
+    // ЯВНО выбранным профилем с доверенным Dockerfile обязан идти в
+    // аттестованном образе. Неявный l1Default отдельный образ гейта не
+    // аттестует — как и у проверочного раннера, дефолт репозитория не
+    // отклоняет прежний pinned образ без метки.
+    await assertL1Image(recipe, l1Profile ?? l1Recipe);
 
     const scratch = await mkdtemp(join(tmpdir(), 'board-visual-'));
     const name = `board-visual-${randomUUID()}`;
