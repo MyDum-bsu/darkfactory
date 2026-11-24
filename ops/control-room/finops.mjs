@@ -4,7 +4,7 @@
 // aggregator. Сам budget-файл symlink'ом быть не должен; symlink родительского
 // каталога допустим (проверяется lstat конечного пути).
 
-import { lstat, readFile, stat } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,16 +49,20 @@ function stateHome() {
 async function resolveBudgetPath(explicitPath) {
   if (typeof explicitPath === 'string' && explicitPath) return explicitPath;
   const userPath = join(configHome(), 'darkfactory', 'resources-budget.yaml');
-  return (await stat(userPath).catch(() => null))?.isFile() ? userPath : EXAMPLE_BUDGET_PATH;
+  const lst = await lstat(userPath).catch(() => null);
+  // Битый или живой symlink пользовательского файла — явная ошибка в
+  // readYamlFile, а не тихий откат на example. Symlink родителя допустим.
+  return lst?.isFile() || lst?.isSymbolicLink() ? userPath : EXAMPLE_BUDGET_PATH;
 }
 
 async function readYamlFile(path) {
   const lst = await lstat(path);
   if (lst.isSymbolicLink()) throw new Error(`finops_budget_symlink_rejected: ${path}`);
   if (!lst.isFile()) throw new Error(`finops_budget_not_file: ${path}`);
+  if (lst.size > 256 * 1024) throw new Error(`finops_budget_too_large: ${path}`);
   let parsed;
   try {
-    parsed = parse(await readFile(path, 'utf8'));
+    parsed = parse(await readFile(path, 'utf8'), { maxAliasCount: 0 });
   } catch (cause) {
     throw new Error(`finops_budget_yaml_invalid: ${path}`, { cause });
   }
@@ -142,13 +146,20 @@ function flattenWorkspace(raw, alerts, group = null) {
   return result;
 }
 
-function usageFor(vm, usage) {
+const meteredVm = vm => vm.metered === true || text(vm.usage_key ?? vm.id) === 'cloud-bb-worker';
+
+function usageFor(vm, usage, { allowRootUsage = true } = {}) {
   if (!isRecord(usage)) return null;
   const key = text(vm.usage_key ?? vm.id);
   const nested = isRecord(usage.vms) && key ? usage.vms[key] : null;
-  const source = isRecord(nested) ? { ...usage, ...nested } : usage;
-  const metered = vm.metered === true || key === 'cloud-bb-worker' || key === text(usage.vmId);
+  const explicitRoot = key === text(usage.vmId);
+  const metered = meteredVm(vm) || explicitRoot;
   if (!metered) return null;
+  // Плоский корневой usage относится к одной машине. При нескольких metered
+  // VM он применяется только к явно названной (vmId/вложенный ключ); иначе
+  // одни и те же минуты были бы посчитаны несколько раз.
+  if (!nested && !explicitRoot && !allowRootUsage) return null;
+  const source = isRecord(nested) ? { ...usage, ...nested } : usage;
   return {
     runningMinutesToday: Math.max(0, num(source.runningMinutesToday) ?? 0),
     runningMinutesMonth: Math.max(0, num(source.runningMinutesMonth) ?? 0),
@@ -184,12 +195,15 @@ function normalize(raw, usage, sourcePath, at) {
   let spentTodayCostEur = 0;
   let runningMinutesMonth = 0;
   let runningMinutesToday = 0;
-  const computeVms = entries(raw.compute_vms).map((entry, index) => {
+  const vmEntries = entries(raw.compute_vms);
+  const meteredCount = vmEntries.filter(meteredVm).length;
+  const computeVms = vmEntries.map((entry, index) => {
     const id = text(entry.id) ?? `vm-${index + 1}`;
     const hourlyUsd = num(entry.hourly_cost_usd ?? entry.hourlyCostUsd);
     const hourlyEur = num(entry.hourly_cost_eur ?? entry.hourlyCostEur) ??
       (hourlyUsd == null ? 0 : hourlyUsd * usdToEur);
-    const live = usageFor({ ...entry, id }, usage);
+    const live = usageFor({ ...entry, id }, usage,
+      { allowRootUsage: meteredCount <= 1 });
     const monthMinutes = live?.runningMinutesMonth ?? 0;
     const todayMinutes = live?.runningMinutesToday ?? 0;
     const monthCost = hourlyEur * monthMinutes / 60;

@@ -78,26 +78,52 @@ function statusLine(snap, width) {
 const visibleLen = s => s.replace(/\x1b\[[0-9;]*m/g, '').length;
 
 function fitAnsi(s, w) {
-  // Обрезка доверенной строки с уже вставленными CSI-color кодами. Динамические
-  // поля до этого проходят clean()/trunc(); функция нужна только для layout.
-  let out = '';
+  // Сначала строим безопасную строку: разрешены только наши SGR-коды, каждый
+  // видимый символ дополнительно проходит clean(). Затем, только если visible
+  // width действительно превышает w, обрезаем до w-1 и добавляем '…'.
+  const sgrAt = (text, at) =>
+    text.slice(at, at + 5).match(/^\x1b\[(?:0|1|2|7|31|32|33|36)m/)?.[0] ?? null;
+  let built = '';
   let visible = 0;
-  let cut = false;
+  let open = false;
   for (let i = 0; i < s.length;) {
     if (s[i] === '\x1b') {
-      const sequence = s.slice(i, i + 5).match(/^\x1b\[(?:0|1|2|7|31|32|33|36)m/)?.[0];
-      if (sequence) { out += sequence; i += sequence.length; continue; }
-      i++; // неизвестный escape никогда не уходит в терминал
+      const sequence = sgrAt(s, i);
+      if (sequence) {
+        built += sequence;
+        open = sequence !== C.reset;
+        i += sequence.length;
+      } else {
+        i++; // неизвестный escape никогда не уходит в терминал
+      }
       continue;
     }
-    if (visible >= w) { cut = true; break; }
     const safe = clean(s[i]);
-    out += safe;
+    built += safe;
     if (safe) visible++;
     i++;
   }
-  if (!cut && visible >= w && s.length > out.length) cut = true;
-  return cut ? out + '…' : out;
+  if (visible <= w) return built + (open ? C.reset : '');
+
+  let out = '';
+  let outVisible = 0;
+  open = false;
+  const limit = Math.max(0, w - 1);
+  for (let i = 0; i < built.length && outVisible < limit;) {
+    if (built[i] === '\x1b') {
+      const sequence = sgrAt(built, i);
+      if (sequence) {
+        out += sequence;
+        open = sequence !== C.reset;
+        i += sequence.length;
+        continue;
+      }
+    }
+    out += built[i];
+    outVisible++;
+    i++;
+  }
+  return `${out}…${open ? C.reset : ''}`;
 }
 
 const money = n => n == null ? '—' : eur(n);
@@ -117,7 +143,10 @@ function cardLine(cardData, width, selected) {
 }
 
 function renderOps(snap, { width = 100, selected = 0, projectFilter = null, driftOpen = false } = {}) {
-  const colW = [Math.floor(width * 0.42), Math.floor(width * 0.28), width - Math.floor(width * 0.42) - Math.floor(width * 0.28)];
+  const available = Math.max(12, width - 6); // два разделителя ' │ ' = 6 visible chars
+  const first = Math.floor(available * 0.42);
+  const second = Math.floor(available * 0.28);
+  const colW = [first, second, available - first - second];
   const filter = cardData => projectFilter === null ||
     (cardData.labels?.project ?? cardData.labels?.repo_id ?? 'default') === projectFilter;
   const cols = [
@@ -132,7 +161,7 @@ function renderOps(snap, { width = 100, selected = 0, projectFilter = null, drif
     const cells = [];
     for (let c = 0; c < 3; c++) {
       const [title, items, kind] = cols[c];
-      if (row === 0) cells.push(trunc(`${C.bold}${title} (${items.length})${C.reset}`, colW[c] + 20));
+      if (row === 0) cells.push(fitAnsi(`${C.bold}${clean(title)} (${items.length})${C.reset}`, colW[c]));
       else if (row === 1) cells.push(trunc('─'.repeat(Math.min(colW[c], 40)), colW[c]));
       else {
         const item = items[row - 2];
@@ -141,18 +170,18 @@ function renderOps(snap, { width = 100, selected = 0, projectFilter = null, drif
           selectable.push({ ...item, kind });
           cells.push(cardLine(item, colW[c], idx === selected));
         } else if (row === 2) {
-          cells.push(trunc(`${C.dim}—${C.reset}`, colW[c] + 10));
+          cells.push(fitAnsi(`${C.dim}—${C.reset}`, colW[c]));
         } else cells.push('');
       }
     }
     lines.push(cells.map((cell, i) => pad(cell, colW[i])).join(' │ '));
   }
   const done = (snap.recentlyCompleted ?? []).filter(filter);
-  lines.push('', trunc(`${C.bold}RECENTLY COMPLETED (${done.length})${C.reset}`, width + 20));
+  lines.push('', fitAnsi(`${C.bold}RECENTLY COMPLETED (${done.length})${C.reset}`, width));
   for (const item of done.slice(0, 8)) lines.push(trunc(`  #${item.task_id} ${item.title}`, width));
   if (done.length > 8) lines.push(trunc(`  … ещё ${done.length - 8}`, width));
   if (driftOpen && snap.branchDrift?.driftDetected === true) {
-    lines.push('', trunc(`${C.warn}BRANCH DRIFT${C.reset}`, width + 10));
+    lines.push('', fitAnsi(`${C.warn}BRANCH DRIFT${C.reset}`, width));
     for (const b of snap.branchDrift.unmergedBranches ?? []) {
       lines.push(trunc(`  unmerged ${b.branch} (${b.fileCount}f)`, width));
     }
@@ -160,7 +189,7 @@ function renderOps(snap, { width = 100, selected = 0, projectFilter = null, drif
       lines.push(trunc(`  dirty ${w.path} (${w.dirtyCount}f)`, width));
     }
   }
-  lines.push('', trunc(`${C.dim}1-4/Tab:вкладки j/k:выбор Enter:инспекция d:drift r:refresh ?:help q:quit${C.reset}`, width + 20));
+  lines.push('', fitAnsi(`${C.dim}1-4/Tab:вкладки j/k:выбор Enter:инспекция d:drift r:refresh ?:help q:quit${C.reset}`, width));
   return { lines, selectable };
 }
 
@@ -177,16 +206,45 @@ function statusPaint(status) {
   return label;
 }
 
+function modelLayout(width) {
+  if (width >= 105) {
+    const fixed = { id: 22, provider: 18, family: 10, status: 12, until: 10 };
+    return { ...fixed,
+      model: Math.max(10, width - fixed.id - fixed.provider - fixed.family -
+        fixed.status - fixed.until - 5),
+      showProvider: true, showUntil: true };
+  }
+  const fixed = { id: 20, family: 10, status: 12 };
+  const showUntil = width >= 100;
+  const until = showUntil ? 10 : 0;
+  const separators = showUntil ? 4 : 3;
+  return { ...fixed, until,
+    model: Math.max(8, width - fixed.id - fixed.family - fixed.status - until - separators),
+    showProvider: false, showUntil };
+}
+
 function modelRow(model, width) {
-  const cols = [
-    pad(trunc(model.id, 22), 22),
-    pad(trunc(model.provider, 18), 18),
-    pad(trunc(model.model, 28), 28),
-    pad(trunc(model.family, 10), 10),
-    pad(statusPaint(model.effectiveStatus ?? model.status), 12),
-    trunc(model.until ?? '—', 10),
-  ];
+  const layout = modelLayout(width);
+  const cols = [pad(trunc(model.id, layout.id), layout.id)];
+  if (layout.showProvider) cols.push(pad(trunc(model.provider, layout.provider), layout.provider));
+  cols.push(pad(trunc(model.model, layout.model), layout.model));
+  cols.push(pad(trunc(model.family, layout.family), layout.family));
+  const status = pad(statusPaint(model.effectiveStatus ?? model.status), layout.status);
+  if (layout.showUntil) {
+    cols.push(status, trunc(model.until ?? '—', layout.until));
+  } else {
+    cols.push(status);
+  }
   return fitAnsi(cols.join(' '), width);
+}
+
+function modelHeader(width) {
+  const layout = modelLayout(width);
+  const cols = [pad('id', layout.id)];
+  if (layout.showProvider) cols.push(pad('provider', layout.provider));
+  cols.push(pad('model', layout.model), pad('family', layout.family), pad('status', layout.status));
+  if (layout.showUntil) cols.push('until');
+  return cols.join(' ');
 }
 
 function renderModels(snap, { width = 100 } = {}) {
@@ -203,8 +261,8 @@ function renderModels(snap, { width = 100 } = {}) {
       : `${role}: —`;
     lines.push(trunc(`  ${value}`, width));
   }
-  lines.push('', trunc(`${C.bold}MODEL REGISTRY${C.reset}`, width + 20));
-  lines.push(fitAnsi(`${C.dim}${pad('id', 22)} ${pad('provider', 18)} ${pad('model', 28)} ${pad('family', 10)} ${pad('status', 12)} until${C.reset}`, width));
+  lines.push('', fitAnsi(`${C.bold}MODEL REGISTRY${C.reset}`, width));
+  lines.push(fitAnsi(`${C.dim}${modelHeader(width)}${C.reset}`, width));
   for (const model of models.models ?? []) lines.push(modelRow(model, width));
   lines.push('', fitAnsi(`${C.dim}CLI: df-models set <role> <model> · df-models mode economy|balanced|sprint${C.reset}`, width));
   return { lines, selectable: [] };
@@ -223,31 +281,31 @@ function renderFinops(snap, { width = 100 } = {}) {
   if (!finops?.ok) return { lines: [`${C.bad}finops: ${clean(finops?.error ?? 'нет данных')}${C.reset}`], selectable: [] };
   const lines = [];
   const totals = finops.totals ?? {};
-  lines.push(trunc(`${C.bold}MONEY / CREDITS${C.reset}  month spend ${money(totals.spentMonthCostEur)}  today ${money(totals.spentTodayCostEur)}  budget ${money(totals.monthlyBudgetEur)}  credits ${money(totals.remainingCreditsEur)}  runway ${finops.creditRunway?.days ?? '—'}d`, width + 30), '');
-  lines.push(trunc(`${C.bold}GCP credits${C.reset}`, width + 10));
+  lines.push(fitAnsi(`${C.bold}MONEY / CREDITS${C.reset}  month spend ${money(totals.spentMonthCostEur)}  today ${money(totals.spentTodayCostEur)}  budget ${money(totals.monthlyBudgetEur)}  credits ${money(totals.remainingCreditsEur)}  runway ${finops.creditRunway?.days ?? '—'}d`, width), '');
+  lines.push(fitAnsi(`${C.bold}GCP credits${C.reset}`, width));
   for (const credit of finops.cloudCredits ?? []) {
     lines.push(trunc(`  ${credit.id}: total ${money(credit.totalEur)} remaining ${money(credit.remainingEur)}${credit.monthlyEur != null ? ` monthly ${money(credit.monthlyEur)}` : ''}${credit.expires ? ` expires ${credit.expires}` : ''}`, width));
   }
-  lines.push('', trunc(`${C.bold}Compute VMs${C.reset}`, width + 10));
+  lines.push('', fitAnsi(`${C.bold}Compute VMs${C.reset}`, width));
   for (const vm of finops.computeVms ?? []) {
     lines.push(trunc(`  ${vm.id}: ${vm.machineType ?? '—'} ${vm.state ?? '—'}  today ${money(vm.costTodayEur)} month ${money(vm.costMonthEur)} hours ${((vm.runningMinutesMonth ?? 0) / 60).toFixed(1)}  ${vm.pricing ?? ''}`, width));
   }
-  lines.push('', trunc(`${C.bold}Compute quotas${C.reset}`, width + 10));
+  lines.push('', fitAnsi(`${C.bold}Compute quotas${C.reset}`, width));
   for (const quota of finops.computeQuotas ?? []) {
     const token = quota.status === 'underutilized' ? 'IDLE / UNDERUTILIZED' : 'OK';
     const plain = trunc(`  ${quota.id}: ${progressBar(quota.utilizationPct)} of ${quota.totalUnits ?? '—'}${quota.unit ? ` ${quota.unit}` : ''}  ${token}`, width);
     const color = quota.status === 'underutilized' ? C.warn : C.ok;
     lines.push(plain.replace(token, `${color}${token}${C.reset}`));
   }
-  lines.push('', trunc(`${C.bold}AI subscriptions${C.reset}`, width + 10));
+  lines.push('', fitAnsi(`${C.bold}AI subscriptions${C.reset}`, width));
   for (const sub of finops.aiSubscriptions ?? []) {
     lines.push(trunc(`  ${sub.id}: ${sub.model ?? sub.label ?? '—'}  ${String(sub.status ?? '—').replaceAll('_', ' ').toUpperCase()}${sub.quota ? ` quota:${sub.quota}` : ''}${sub.reset ? ` reset:${sub.reset}` : ''}`, width));
   }
   if (finops.alerts?.length) {
-    lines.push('', trunc(`${C.warn}ALERTS${C.reset}`, width + 10));
+    lines.push('', fitAnsi(`${C.warn}ALERTS${C.reset}`, width));
     for (const alert of finops.alerts) {
       const color = alert.severity === 'bad' ? C.bad : C.warn;
-      lines.push(trunc(`  ${alert.code} ${alert.message}`, width).replace(clean(alert.code), `${color}${clean(alert.code)}${C.reset}`));
+      lines.push(fitAnsi(trunc(`  ${alert.code} ${alert.message}`, width), width).replace(clean(alert.code), () => `${color}${clean(alert.code)}${C.reset}`));
     }
   }
   return { lines, selectable: [] };
@@ -258,7 +316,7 @@ function renderFinops(snap, { width = 100 } = {}) {
 function renderWorkspace(snap, { width = 100 } = {}) {
   const finops = snap.finops;
   if (!finops?.ok) return { lines: [`${C.bad}workspace: ${clean(finops?.error ?? 'нет данных')}${C.reset}`], selectable: [] };
-  const lines = [trunc(`${C.bold}WORKSPACE MAP${C.reset}`, width + 20), ''];
+  const lines = [fitAnsi(`${C.bold}WORKSPACE MAP${C.reset}`, width), ''];
   const groups = new Map();
   for (const link of finops.workspaceLinks ?? []) {
     const group = clean(link.group ?? 'workspace');
@@ -266,16 +324,16 @@ function renderWorkspace(snap, { width = 100 } = {}) {
     groups.get(group).push(link);
   }
   for (const [group, links] of groups) {
-    lines.push(trunc(`${C.accent}${group.replaceAll('_', ' ').toUpperCase()}${C.reset}`, width + 20));
+    lines.push(fitAnsi(`${C.accent}${clean(group.replaceAll('_', ' ').toUpperCase())}${C.reset}`, width));
     for (const link of links) {
       const target = link.url ?? link.path ?? '—';
       const cmd = link.command ? `  cmd:${link.command}` : '';
       lines.push(trunc(`  ${link.title}: ${target}${cmd}`, width));
-      if (link.notes) lines.push(trunc(`    ${C.dim}${link.notes}${C.reset}`, width + 10));
+      if (link.notes) lines.push(fitAnsi(`    ${C.dim}${clean(link.notes)}${C.reset}`, width));
     }
     lines.push('');
   }
-  lines.push(trunc(`${C.bold}QUICK COMMANDS${C.reset}`, width + 20));
+  lines.push(fitAnsi(`${C.bold}QUICK COMMANDS${C.reset}`, width));
   for (const cmd of ['df-herd', 'df-models', 'vb', 'cloud-brain']) {
     lines.push(trunc(`  ${cmd}`, width));
   }

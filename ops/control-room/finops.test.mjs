@@ -148,3 +148,72 @@ test('finops: javascript: workspace link отбрасывается и виде�
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+
+test('finops: user config broken symlink не откатывается тихо на example', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-user-link-'));
+  const previous = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = dir;
+  try {
+    const configDir = join(dir, 'darkfactory');
+    await mkdir(configDir, { recursive: true });
+    await symlink(join(dir, 'missing-target.yaml'), join(configDir, 'resources-budget.yaml'));
+    const snap = await createFinopsProvider()();
+    assert.equal(snap.ok, false);
+    assert.match(snap.error, /finops_budget_symlink_rejected/);
+  } finally {
+    if (previous === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('finops: YAML ограничен 256 KiB и alias resolution disabled', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-limits-'));
+  try {
+    const large = join(dir, 'large.yaml');
+    await writeFile(large, `#${'x'.repeat(257 * 1024)}\nversion: 1\n`);
+    const largeSnap = await createFinopsProvider({ budgetPath: large })();
+    assert.equal(largeSnap.ok, false);
+    assert.match(largeSnap.error, /finops_budget_too_large/);
+
+    const aliased = join(dir, 'aliased.yaml');
+    await writeFile(aliased, 'version: 1\nbase: &base\n  x: 1\ncloud_credits:\n  - <<: *base\n');
+    const aliasSnap = await createFinopsProvider({ budgetPath: aliased })();
+    assert.equal(aliasSnap.ok, false);
+    assert.match(aliasSnap.error, /finops_budget_yaml_invalid/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('finops: плоский root usage не дублируется на несколько metered VM', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-multi-vm-'));
+  try {
+    const budget = join(dir, 'budget.yaml');
+    const usage = join(dir, 'usage.json');
+    await writeFile(budget, `version: 1
+compute_vms:
+  - id: worker-a
+    hourly_cost_usd: 0.10
+    metered: true
+  - id: worker-b
+    hourly_cost_usd: 0.10
+    metered: true
+workspace_links: {}
+`);
+    await writeFile(usage, JSON.stringify({ runningMinutesMonth: 600 }));
+    const snap = await createFinopsProvider({ budgetPath: budget, workerUsagePath: usage })();
+    assert.equal(snap.ok, true);
+    assert.equal(snap.totals.runningMinutesMonth, 0);
+    assert.equal(snap.estimatedMonthCostEur, 0);
+
+    await writeFile(usage, JSON.stringify({ vmId: 'worker-b', runningMinutesMonth: 600 }));
+    const pinned = await createFinopsProvider({ budgetPath: budget, workerUsagePath: usage })();
+    assert.equal(pinned.computeVms.find(v => v.id === 'worker-a').runningMinutesMonth, 0);
+    assert.equal(pinned.computeVms.find(v => v.id === 'worker-b').runningMinutesMonth, 600);
+    assert.equal(pinned.totals.runningMinutesMonth, 600);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -336,6 +336,53 @@ function renderFinops(snap) {
       `${alert.code}: ${alert.message}`)), 'Алертов нет');
 }
 
+
+function fallbackCopyText(value) {
+  const area = el('textarea', 'clipboard-helper');
+  area.value = value;
+  area.setAttribute('readonly', '');
+  document.body.append(area);
+  area.select();
+  try {
+    document.execCommand?.('copy');
+  } catch { /* clipboard может быть недоступен в insecure context */ }
+  area.remove();
+}
+
+function copyCommandChip(value, tag = 'div') {
+  const node = el(tag, 'cmd copyable', value);
+  node.tabIndex = 0;
+  node.setAttribute('role', 'button');
+  node.title = 'Клик — скопировать команду';
+  const copied = () => {
+    node.classList.add('copied');
+    setTimeout(() => node.classList.remove('copied'), 900);
+  };
+  const copy = ev => {
+    ev?.stopPropagation?.();
+    ev?.preventDefault?.();
+    try {
+      const write = navigator.clipboard?.writeText;
+      if (write) {
+        write.call(navigator.clipboard, value)
+          .then(copied)
+          .catch(() => { fallbackCopyText(value); copied(); });
+      } else {
+        fallbackCopyText(value);
+        copied();
+      }
+    } catch {
+      fallbackCopyText(value);
+      copied();
+    }
+  };
+  node.addEventListener('click', copy);
+  node.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter' || ev.key === ' ') copy(ev);
+  });
+  return node;
+}
+
 function renderWorkspace(snap) {
   const box = $('workspace-links');
   const commands = $('workspace-commands');
@@ -366,16 +413,16 @@ function renderWorkspace(snap) {
         anchor.rel = 'noopener noreferrer';
         cardNode.append(anchor);
       } else if (link.path) {
-        cardNode.append(el('div', 'cmd', link.path));
+        cardNode.append(copyCommandChip(link.path));
       }
-      if (link.command) cardNode.append(el('div', 'cmd', link.command));
+      if (link.command) cardNode.append(copyCommandChip(link.command));
       if (link.notes) cardNode.append(el('div', 'last', link.notes));
       section.append(cardNode);
     }
     box.append(section);
   }
   for (const cmd of ['df-herd', 'df-models', 'vb', 'cloud-brain']) {
-    commands.append(el('span', 'cmd', cmd));
+    commands.append(copyCommandChip(cmd, 'span'));
   }
 }
 

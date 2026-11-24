@@ -725,4 +725,55 @@ test('web app: 4 вкладки, safe URL validation и mobile CSS присут�
   assert.equal(app.includes("url.protocol === 'https:' || url.protocol === 'http:'"), true);
   assert.equal(app.includes('javascript:'), false);
   assert.equal(css.includes('@media (max-width: 720px)'), true);
+  assert.equal(app.includes('navigator.clipboard?.writeText'), true);
+  assert.equal(app.includes('fallbackCopyText'), true);
+  assert.equal(app.includes('copyCommandChip'), true);
+});
+
+
+test('df-herd: width contract 80/120 на всех вкладках, ANSI закрыт', async () => {
+  const catalogPath = join(MODULE_DIR, '..', 'local', 'models-catalog.example.yaml');
+  const policyPath = join(MODULE_DIR, '..', 'local', 'routing-policy.example.yaml');
+  const budgetPath = join(MODULE_DIR, '..', 'local', 'resources-budget.example.yaml');
+  const stripSgr = text => text.replace(/\x1b\[[0-9;]*m/g, '');
+  const unclosedSgr = line => {
+    let open = 0;
+    for (const match of line.matchAll(/\x1b\[([0-9;]*)m/g)) {
+      if (match[1] === '0') open = Math.max(0, open - 1);
+      else open++;
+    }
+    return open;
+  };
+  await withServer({
+    boardTasksProvider: async () => [
+      { task_id: 'WIDTH-RUN', state: 'claimed', title: `running-${'x'.repeat(160)}` },
+      { task_id: 'WIDTH-QUEUE', state: 'ready', title: `queued-${'y'.repeat(160)}` },
+      { task_id: 'WIDTH-OWNER', state: 'blocked', title: `owner-${'z'.repeat(160)}` }],
+    modelsProvider: createModelsProvider({ catalogPath, policyPath }),
+    finopsProvider: createFinopsProvider({ budgetPath,
+      now: new Date('2026-11-24T12:00:00Z') }) },
+    async (server, base) => {
+      for (const width of [80, 120]) {
+        for (const tab of ['ops', 'models', 'finops', 'workspace']) {
+          const { stdout } = await execFileAsync('node', [
+            join(MODULE_DIR, 'df-herd.mjs'), '--once', '--tab', tab,
+            '--width', String(width), '--url', base], { timeout: 15_000 });
+          const lines = stdout.split('\n');
+          for (const line of lines) {
+            assert.ok(stripSgr(line).length <= width,
+              `${tab}@${width}: visible width ${stripSgr(line).length}: ${stripSgr(line)}`);
+            assert.equal(unclosedSgr(line), 0,
+              `${tab}@${width}: unclosed SGR in ${JSON.stringify(line)}`);
+          }
+          if (tab === 'models' && width === 80) {
+            const plain = stripSgr(stdout);
+            assert.ok(plain.includes('PROMO FREE'));
+            assert.ok(plain.includes('ACTIVE'));
+          }
+          if (tab === 'models' && width === 120) {
+            assert.ok(stripSgr(stdout).includes('2026-12-08'));
+          }
+        }
+      }
+    });
 });
