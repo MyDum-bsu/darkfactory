@@ -419,11 +419,14 @@ test('runtime: закреплённый образ обязан аттестов
     join(ROOT, 'ops', 'l1-profiles', 'python-node', 'Dockerfile'), 'utf8');
   assert.match(dockerfile, /LABEL df\.l1\.profile="python-node"/);
   assert.match(source, /image', 'inspect', recipe\.image/);
-  assert.match(source, /labels\?\.\[L1_IMAGE_LABEL\] !== l1\.id/);
-  // Аттестация — только по явному выбору (профиль или рецепт), неявный
-  // l1Default в сверку OCI-метки не попадает ни в одном раннере.
-  assert.equal(source.match(/assertL1Image\(recipe, l1Profile \?\? l1Recipe/g).length, 2);
-  assert.equal(/assertL1Image\([^)]*l1Default/.test(source), false);
+  assert.match(source, /imageL1Label\(recipe, execDocker\) !== l1\.id/);
+  // Явный выбор — fail-closed аттестация; неявный l1Default проходит
+  // мягкую сверку: метка совпадает — дефолт применяется, метки нет —
+  // legacy-маршрут без заявления среды, метка иная — отказ.
+  assert.equal(source.match(/resolveRunnerL1\(recipe, l1Profile \?\? l1Recipe, l1Default, dockerExec\)/g).length, 2);
+  assert.match(source, /assertL1Image\(recipe, l1Explicit, execDocker\)/);
+  assert.match(source, /tagged === l1Default\.id\) return l1Default;/);
+  assert.match(source, /tagged !== undefined\) throw new Error\(`l1_image_mismatch:\$\{l1Default\.id\}`\)/);
 });
 
 // Реальная совместимость политики l1Default: при неявном дефолте
@@ -439,7 +442,11 @@ test('runtime: OCI-метка обязательна лишь при явном 
     // отказ идёт из unpackExact и никогда не совпадает с l1_image_*.
     const handoff = { candidate_sha: SHA, worktree: dir, task_id: '1' };
     const recipe = { image: `sha256:${HEX}`, argv: ['pytest'], cwd: '.', timeoutMs: 1000 };
-    const notL1Image = error => !/l1_image_/.test(String(error));
+    // Отказ после снятия/прохождения аттестации обязан быть СЛЕДУЮЩИМ
+    // этапом (git archive распаковки), не любой ошибкой — это доказывает
+    // что legacy-маршрут реально доходит до исполнения, а не падает раньше.
+    const pastImageCheck = error => /git|ENOENT|spawn|archive/i.test(String(error))
+      && !/l1_image_/.test(String(error));
     const inspects = [];
     let labels = '{}';
     const execDocker = async (file, args) => {
@@ -451,26 +458,48 @@ test('runtime: OCI-метка обязательна лишь при явном 
       throw new Error(`unexpected docker call:${args.join(' ')}`);
     };
     const options = { execDocker };
-    for (const runner of [offlineDockerRunner(journal, options),
-      offlineProfileRunner(journal, options)]) {
+    const checkRunner = offlineDockerRunner(journal, options);
+    const profileRunner = offlineProfileRunner(journal, options);
+    const visual = offlineVisualRunner(journal, options);
+    const checkProfile = over => ({ check: recipe, checks: [recipe], ...over });
+    // 1. l1Default + образ БЕЗ метки: default не применяется, рецепт идёт
+    //    legacy-маршрутом дальше — отказ уже на этапе распаковки, inspect
+    //    при этом вызывается (default должен ПОДТВЕРДИТЬСЯ образом).
+    for (const runner of [checkRunner, profileRunner]) {
+      await assert.rejects(() => runner(handoff, checkProfile({ l1Default: 'python-node' })),
+        pastImageCheck);
+    }
+    await assert.rejects(() => visual(handoff,
+      { l1Default: 'python-node', visual: recipe }), pastImageCheck);
+    // 2. l1Default + метка другого профиля: образ аттестует не ту среду,
+    //    что заявляет дефолт → fail-closed, а не тихий запуск в чужой среде.
+    labels = '{"df.l1.profile":"node"}';
+    await assert.rejects(() => checkRunner(handoff, checkProfile({ l1Default: 'python-node' })),
+      /l1_image_mismatch:python-node/);
+    // 3. l1Default + метка совпадает: default подтверждён образом и
+    //    применяется — исполнение продолжается до следующего этапа.
+    labels = '{"df.l1.profile":"python-node"}';
+    for (const runner of [checkRunner, visual]) {
       await assert.rejects(() => runner(handoff,
-        { l1Default: 'python-node', check: recipe, checks: [recipe] }), notL1Image);
-      await assert.rejects(() => runner(handoff,
-        { l1Profile: 'python-node', check: recipe, checks: [recipe] }),
+        runner === visual ? { l1Default: 'python-node', visual: recipe }
+          : checkProfile({ l1Default: 'python-node' })), pastImageCheck);
+    }
+    // 4. Явный l1Profile — контракт жёсткий: образ без метки отклоняется
+    //    fail-closed на всех раннерах, образ с меткой проходит.
+    labels = '{}';
+    for (const runner of [checkRunner, profileRunner]) {
+      await assert.rejects(() => runner(handoff, checkProfile({ l1Profile: 'python-node' })),
         /l1_image_mismatch:python-node/);
     }
-    const visual = offlineVisualRunner(journal, options);
-    await assert.rejects(() => visual(handoff,
-      { l1Default: 'python-node', visual: recipe }), notL1Image);
     await assert.rejects(() => visual(handoff,
       { l1Profile: 'python-node', visual: recipe }), /l1_image_mismatch:python-node/);
-    // Явный выбор + метка на образе — аттестация проходит, отказ дальше.
     labels = '{"df.l1.profile":"python-node"}';
     await assert.rejects(() => visual(handoff,
-      { l1Profile: 'python-node', visual: recipe }), notL1Image);
-    // Ни один вызов при неявном дефолте не дошёл до image inspect:
-    // inspect в логе — только от явных случаев.
-    assert.equal(inspects.length, 4);
+      { l1Profile: 'python-node', visual: recipe }), pastImageCheck);
+    // image inspect вызывался в каждом кейсе с dockerfile-профилем —
+    // и явном, и неявном: проверка образа не ослаблена, а различает
+    // подтверждённый дефолт и legacy-образ.
+    assert.equal(inspects.length, 10);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

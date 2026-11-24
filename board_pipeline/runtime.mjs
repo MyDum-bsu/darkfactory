@@ -116,12 +116,8 @@ async function cleanupContainer(name) {
 // встроенной его Dockerfile: ЯВНЫЙ выбор среды (profile.l1Profile или
 // recipe.l1Profile) обязан реально соответствовать закреплённому
 // recipe.image, иначе Node-only образ молча выполнил бы проверки под
-// python-node. Неявный дефолт репозитория (l1Default) проверку не
-// запускает: старые политики без явного l1Profile сохраняют прежний
-// pinned образ без метки и продолжают работать — defaultEnv дефолта
-// при этом подмешивается как раньше.
-async function assertL1Image(recipe, l1, execDocker = exec) {
-  if (l1?.dockerfile === undefined) return;
+// python-node.
+async function imageL1Label(recipe, execDocker) {
   let labels;
   try {
     labels = JSON.parse((await execDocker('docker',
@@ -130,9 +126,34 @@ async function assertL1Image(recipe, l1, execDocker = exec) {
   } catch (error) {
     throw new Error(`l1_image_uninspectable:${String(error?.stderr ?? error?.message ?? error)}`);
   }
-  if (labels?.[L1_IMAGE_LABEL] !== l1.id) {
+  return labels?.[L1_IMAGE_LABEL];
+}
+
+async function assertL1Image(recipe, l1, execDocker = exec) {
+  if (l1?.dockerfile === undefined) return;
+  if (await imageL1Label(recipe, execDocker) !== l1.id) {
     throw new Error(`l1_image_mismatch:${l1.id}`);
   }
+}
+
+// Эффективный L1 для исполнения рецепта: ЯВНЫЙ выбор аттестуется
+// fail-closed (образ обязан носить метку профиля). Неявный l1Default
+// только ПОДТВЕРЖДАЕТСЯ образом: метка совпадает — defaultEnv дефолта
+// применяется; метки нет — legacy-маршрут, рецепт исполняется как есть
+// без заявления python-среды (обратная совместимость со старыми
+// pinned-образами); метка иная — образ аттестует другую среду, чем
+// заявленный дефолт → fail-closed.
+async function resolveRunnerL1(recipe, l1Explicit, l1Default, execDocker) {
+  if (l1Explicit !== undefined) {
+    await assertL1Image(recipe, l1Explicit, execDocker);
+    return l1Explicit;
+  }
+  if (l1Default === undefined) return undefined;
+  if (l1Default.dockerfile === undefined) return l1Default;
+  const tagged = await imageL1Label(recipe, execDocker).catch(() => undefined);
+  if (tagged === l1Default.id) return l1Default;
+  if (tagged !== undefined) throw new Error(`l1_image_mismatch:${l1Default.id}`);
+  return undefined;
 }
 
 export function offlineDockerRunner(journal, { beforeEffect, execDocker } = {}) {
@@ -156,19 +177,17 @@ export function offlineDockerRunner(journal, { beforeEffect, execDocker } = {}) 
     // и не участвует в mismatch-сверке.
     const l1Default = profile.l1Default === undefined ? undefined
       : resolveL1Profile({ l1Profile: profile.l1Default });
-    // defaultEnv выбранного профиля подмешивается только в ключи, не
-    // заданные в recipe.env.
-    const l1 = l1Profile ?? l1Recipe ?? l1Default;
-    const effective = l1 === undefined ? recipe
-      : { ...recipe, env: { ...l1.defaultEnv, ...recipe.env } };
     if (!SHA.test(handoff.candidate_sha)) throw new Error('Local runner requires a full SHA');
     const security = JSON.parse((await dockerExec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
       timeout: 12_000,
     })).stdout);
     if (!security.includes('name=rootless')) throw new Error('The test runner requires rootless Docker');
-    // Аттестация образа — только при явном выборе: l1Default неявен,
-    // его образ без OCI-метки не отклоняется (обратная совместимость).
-    await assertL1Image(recipe, l1Profile ?? l1Recipe, dockerExec);
+    const l1 = await resolveRunnerL1(recipe, l1Profile ?? l1Recipe, l1Default, dockerExec);
+    // defaultEnv подмешивается только когда профиль действительно
+    // применяется: legacy-образ без метки не получает env дефолта, иначе
+    // план заявлял бы python-среду на Node-only образе.
+    const effective = l1 === undefined ? recipe
+      : { ...recipe, env: { ...l1.defaultEnv, ...recipe.env } };
 
     const scratch = await mkdtemp(join(tmpdir(), 'board-check-'));
     const name = `board-check-${randomUUID()}`;
@@ -274,10 +293,10 @@ export function offlineVisualRunner(journal, { beforeEffect, execDocker } = {}) 
     if (!security.includes('name=rootless')) throw new Error('The visual runner requires rootless Docker');
     // Тот же инвариант образа, что у проверочного раннера: visual-гейт под
     // ЯВНО выбранным профилем с доверенным Dockerfile обязан идти в
-    // аттестованном образе. Неявный l1Default отдельный образ гейта не
-    // аттестует — как и у проверочного раннера, дефолт репозитория не
-    // отклоняет прежний pinned образ без метки.
-    await assertL1Image(recipe, l1Profile ?? l1Recipe, dockerExec);
+    // аттестованном образе. Неявный l1Default применяется только когда
+    // образ сам подтверждает тот же профиль меткой; образ без метки —
+    // legacy, метка иная — среда иная, чем заявленный дефолт → отказ.
+    await resolveRunnerL1(recipe, l1Profile ?? l1Recipe, l1Default, dockerExec);
 
     const scratch = await mkdtemp(join(tmpdir(), 'board-visual-'));
     const name = `board-visual-${randomUUID()}`;
