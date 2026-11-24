@@ -45,7 +45,10 @@ node ops/factory-enqueue.mjs \
 `reviewPrompt`, `reviewGate`, `routes.json`, исходные пути review-скиллов).
 Вход внутри worktree (включая через симлинк-предок `wt/link/...` или alias
 worktree) отклоняется до чтения файла и хэширования — дайджест непригодной
-политики не попадает на Board.
+политики не попадает на Board. Цепочки симлинков обходятся по хопам
+(`alias1 -> alias2 -> wt/link -> наружу` — отказ по промежуточному хопу),
+а `realpath` берётся от сырого пути: `..` раскрывается ФС после симлинков,
+и `op/link/../x` при `link -> wt/deep` отклоняется как вход внутрь дерева.
 
 ## Запуск контроллера — `ops/factory-run.mjs`
 
@@ -69,7 +72,7 @@ node ops/factory-run.mjs \
   `acp-zcode-start`, `glm` / `glm-*`.
 - Проверка применяется к CLI-спеке, `policy.bb`, **каждому**
   `profiles.*.review` (не только выбранному `route.checkProfile`),
-  `policy.arbiter` **и каждому
+  `policy.arbiter`, `route.critic` **и каждому
   кандидату `policy.routing.allowlist.{worker,critic,arbiter}`** —
   активный роутинг закрепляет кандидата скоркардом, поэтому запрет
   действует до запуска. Плюс `opencodeGoPolicyViolation` и

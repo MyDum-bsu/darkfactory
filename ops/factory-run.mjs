@@ -63,6 +63,7 @@ export function assertModelMatrix({ cli, policy }) {
     ['cli', { provider: cli.provider, model: cli.model }],
     ['policy.bb', policy?.bb],
     ['arbiter', policy?.arbiter],
+    ['route.critic', policy?.route?.critic],
   ];
   // Все profiles.*.review, а не только выбранный route.checkProfile:
   // инвариант матрицы действует на каждое поле модели политики.
@@ -104,17 +105,26 @@ async function canonicalOutside(path, treeAliases, mustBe) {
     inside(t, p) || inside(p, t) || inside(dirname(p), t) || inside(t, dirname(p)));
   const literal = resolve(path);
   if (overlap(literal)) fail('path_inside_worktree');
-  for (let probe = dirname(literal), prev; probe !== prev; prev = probe, probe = dirname(probe)) {
-    const st = await lstat(probe).catch(() => null);
-    if (st?.isSymbolicLink()) {
-      // Промежуточный хоп и полная цель — в обе стороны: внешний alias
-      // может указывать на симлинк внутри worktree или на каталог,
-      // содержащий дерево (alias -> wt/link -> наружу, ld -> родитель wt).
-      const hop = resolve(dirname(probe), await readlink(probe).catch(() => probe));
-      const target = await realpath(probe).catch(() => probe);
-      if (treeAliases.some(t =>
-        inside(t, hop) || inside(hop, t) || inside(t, target) || inside(target, t))) {
-        fail('path_inside_worktree');
+  // Цепочки симлинк-предков — только в сторону worktree: контроллер
+  // сверяет сам путь и его родителя, а не произвольного общего предка,
+  // но симлинк, разрешающийся внутрь дерева (непосредственно или
+  // промежуточным хопом alias -> wt/link -> наружу), — отказ до
+  // Git-конфига и запуска.
+  const seen = new Set();
+  const queue = [dirname(literal)];
+  while (queue.length) {
+    for (let probe = queue.pop(), prev; probe !== prev;
+      prev = probe, probe = dirname(probe)) {
+      if (seen.has(probe)) break;
+      seen.add(probe);
+      const st = await lstat(probe).catch(() => null);
+      if (st?.isSymbolicLink()) {
+        const hop = resolve(dirname(probe), await readlink(probe).catch(() => probe));
+        const target = await realpath(probe).catch(() => probe);
+        if (treeAliases.some(t => inside(t, hop) || inside(t, target))) {
+          fail('path_inside_worktree');
+        }
+        queue.push(hop);
       }
     }
   }
@@ -122,7 +132,10 @@ async function canonicalOutside(path, treeAliases, mustBe) {
   if (st.isSymbolicLink()) fail('path_symlink_refused');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
-  const real = await realpath(literal);
+  // realpath по сырому пути: resolve() сворачивает '..' лексически, а ФС
+  // раскрывает симлинк-предков до '..' — op/link/../x при link -> wt/deep
+  // фактически разрешается в wt/x.
+  const real = await realpath(path);
   if (overlap(real)) fail('path_inside_worktree');
   return real;
 }

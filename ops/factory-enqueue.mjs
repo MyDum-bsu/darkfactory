@@ -54,22 +54,33 @@ async function canonicalInput(path, { worktrees = [], mustBe } = {}) {
   const inside = p => worktrees.some(w => within(w, p));
   const literal = resolve(path);
   if (inside(literal)) fail('path_inside_worktree');
-  for (let probe = dirname(literal), prev; probe !== prev; prev = probe, probe = dirname(probe)) {
-    const st = await lstat(probe).catch(() => null);
-    if (st?.isSymbolicLink()) {
-      // Важен промежуточный хоп: внешний alias может указывать на симлинк
-      // внутри worktree (alias -> wt/link -> наружу) — полный realpath
-      // остаётся внешним, но вход проходит через дерево воркера.
-      const hop = resolve(dirname(probe), await readlink(probe).catch(() => probe));
-      const real = await realpath(probe).catch(() => probe);
-      if (inside(hop) || inside(real)) fail('path_inside_worktree');
+  // Полный обход цепочки симлинков: каждый симлинк-предок каждого звена
+  // расширяется до readlink-цели, и каждый буквальный хоп сверяется с
+  // worktree — alias1 -> alias2 -> wt/link -> наружу отклоняется, хотя
+  // realpath конечной цели внешний.
+  const seen = new Set();
+  const queue = [dirname(literal)];
+  while (queue.length) {
+    for (let probe = queue.pop(), prev; probe !== prev;
+      prev = probe, probe = dirname(probe)) {
+      if (seen.has(probe)) break;
+      seen.add(probe);
+      const st = await lstat(probe).catch(() => null);
+      if (st?.isSymbolicLink()) {
+        const hop = resolve(dirname(probe), await readlink(probe).catch(() => probe));
+        if (inside(hop)) fail('path_inside_worktree');
+        queue.push(hop);
+      }
     }
   }
   const st = await lstat(literal).catch(() => fail('path_missing'));
   if (st.isSymbolicLink()) fail('path_symlink_refused');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
-  const real = await realpath(literal);
+  // realpath по сырому пути: resolve() сворачивает '..' лексически, а ФС
+  // раскрывает симлинк-предков до '..' — op/link/../x при link -> wt/deep
+  // фактически разрешается в wt/x.
+  const real = await realpath(path);
   if (inside(real)) fail('path_inside_worktree');
   return real;
 }

@@ -201,6 +201,15 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
       'policy-digest': undefined, 'spec-digest': undefined,
       brief: join(extAlias, 'brief.md'), policy: policyFile }),
       /path_inside_worktree/);
+    // Цепочка через дополнительный внешний симлинк:
+    // chain -> ext-alias -> wt/link -> наружу — промежуточный wt/link
+    // отклоняется при обходе цепочки.
+    const chain = join(dir, 'chain');
+    await symlink(extAlias, chain);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, 'spec-digest': undefined,
+      brief: join(chain, 'brief.md'), policy: policyFile }),
+      /path_inside_worktree/);
     // Исходный путь review skill через симлинк внутри worktree — отказ.
     const skill = join(wt, 'skill.md');
     await writeFile(join(dir, 'skill-real.md'), 's');
@@ -344,6 +353,13 @@ test('run: запрещённая модель в CLI, критике, арби�
     const f4 = await withPolicy(dir, otherProfile);
     await assert.rejects(() => buildRunPlan(runValues(f4, 's')),
       /disallowed:profiles\.other/);
+    // route.critic — то же поле модели маршрута, тот же запрет.
+    const badRoute = { ...policySpec(wt),
+      route: { ...policySpec(wt).route,
+        critic: { provider: 'openai', model: 'gpt-6.1-terra' } } };
+    const f5 = await withPolicy(dir, badRoute);
+    await assert.rejects(() => buildRunPlan(runValues(f5, 's')),
+      /disallowed:route\.critic/);
     const badArbiter = { ...policySpec(wt), arbiter: { provider: 'pi', model: 'acp-zcode-start/x' } };
     const f2 = await withPolicy(dir, badArbiter);
     await assert.rejects(() => buildRunPlan(runValues(f2, 's')), /zcode.*:arbiter/);
@@ -510,6 +526,36 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const fMem = await withPolicy(dir, memParent);
     await assert.rejects(() => buildRunPlan(runValues(fMem, state)),
       /path_inside_worktree/);
+    // Симлинк перед '..': resolve() сворачивает link/.. лексически в
+    // operator/ledger.jsonl, а ФС сначала раскрывает link -> wt/deep —
+    // фактическая цель wt/ledger.jsonl внутри worktree, отказ до запуска.
+    const operator = join(dir, 'operator');
+    await mkdir(operator);
+    await writeFile(join(operator, 'ledger.jsonl'), '');
+    await mkdir(join(wt, 'deep'));
+    await symlink(join(wt, 'deep'), join(operator, 'link'));
+    await writeFile(join(wt, 'ledger.jsonl'), '');
+    const dotdot = { ...policySpec(wt),
+      decisionLedger: `${operator}/link/../ledger.jsonl` };
+    const fDot = await withPolicy(dir, dotdot);
+    await assert.rejects(() => buildRunPlan(runValues(fDot, state)),
+      /path_inside_worktree/);
+    // Alias общего корня (root-alias -> <root>, wt в <root>/worktrees/wt):
+    // ни сам путь, ни его родитель не пересекаются с деревом — контроллер
+    // не сравнивает произвольного общего предка, путь принимается.
+    const root2 = join(dir, 'root');
+    await mkdir(join(root2, 'worktrees'), { recursive: true });
+    const wt2 = join(root2, 'worktrees', 'wt');
+    await mkdir(wt2);
+    await mkdir(join(root2, 'ops'));
+    const rootAlias = join(dir, 'root-alias');
+    await symlink(root2, rootAlias);
+    const aliasLedger = join(rootAlias, 'ops', 'ledger.jsonl');
+    await writeFile(join(root2, 'ops', 'ledger.jsonl'), '');
+    const aliasOk = { ...policySpec(wt2), decisionLedger: aliasLedger };
+    const fAlias = await withPolicy(dir, aliasOk);
+    const aliasPlan = await buildRunPlan(runValues(fAlias, state));
+    assert.equal(aliasPlan.ledger, aliasLedger);
     // Полный канон: строковый ledger, объектный memory — проходят; env-fallback тоже.
     const okPolicy = { ...policySpec(wt), decisionLedger: ledger,
       projectMemory: { storeDir: memory } };
