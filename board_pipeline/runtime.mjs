@@ -150,7 +150,10 @@ async function resolveRunnerL1(recipe, l1Explicit, l1Default, execDocker) {
   }
   if (l1Default === undefined) return undefined;
   if (l1Default.dockerfile === undefined) return l1Default;
-  const tagged = await imageL1Label(recipe, execDocker).catch(() => undefined);
+  // Inspect lỗi — fail-closed l1_image_uninspectable: chỉ inspect
+  // THÀNH CÔNG xác nhận thiếu nhãn mới được phép vào legacy-маршрут,
+  // kẻo docker hồi phục lúc run sẽ chạy trên image chưa kiểm chứng.
+  const tagged = await imageL1Label(recipe, execDocker);
   if (tagged === l1Default.id) return l1Default;
   if (tagged !== undefined) throw new Error(`l1_image_mismatch:${l1Default.id}`);
   return undefined;

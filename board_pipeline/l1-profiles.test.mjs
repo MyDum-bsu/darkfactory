@@ -496,6 +496,19 @@ test('runtime: OCI-метка обязательна лишь при явном 
     labels = '{"df.l1.profile":"python-node"}';
     await assert.rejects(() => visual(handoff,
       { l1Profile: 'python-node', visual: recipe }), pastImageCheck);
+    // 5. Inspect LỖI (sự cố docker/timeout/JSON hỏng) — fail-closed
+    //    l1_image_uninspectable cho cả l1Default: legacy-маршрут chỉ
+    //    được phép sau inspect THÀNH CÔNG xác nhận thiếu nhãn.
+    const execDockerDown = async (file, args) => {
+      if (args[0] === 'info') return { stdout: '["name=rootless"]' };
+      throw new Error('daemon gone');
+    };
+    await assert.rejects(() => offlineDockerRunner(journal,
+      { execDocker: execDockerDown })(handoff, checkProfile({ l1Default: 'python-node' })),
+      /l1_image_uninspectable/);
+    await assert.rejects(() => offlineVisualRunner(journal,
+      { execDocker: execDockerDown })(handoff,
+      { l1Default: 'python-node', visual: recipe }), /l1_image_uninspectable/);
     // image inspect вызывался в каждом кейсе с dockerfile-профилем —
     // и явном, и неявном: проверка образа не ослаблена, а различает
     // подтверждённый дефолт и legacy-образ.
