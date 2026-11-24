@@ -344,6 +344,28 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile,
       'memory-dir': hoMemory }), /path_inside_worktree/);
+    // Пути хранилищ без границы worktree (нет ни --worktree, ни
+    // policy.route.worktree) не подтверждают разделение хранилища и
+    // рабочего дерева — контроллер отклонил бы такой запуск: отказ
+    // worktree_required до вызова vb, и для CLI-флагов, и для путей,
+    // закреплённых в политике.
+    const noWtReview = { route: { checkProfile: 'p' },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } } };
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, ...noWtReview,
+      handoffDir: hoInbox }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile,
+      'memory-dir': store }), /worktree_required/);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile,
+      'ledger-path': storeLedger }), /worktree_required/);
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, ...noWtReview,
+      decisionLedger: storeLedger, handoffDir: hoInbox }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }), /worktree_required/);
     // Канонические хранилища вне дерева в политике проходят, когда
     // handoffDir — отдельный каталог, не пересекающийся с ними. Соседние
     // каталоги памяти/квитанций и сдачи под общим родителем — допустимая

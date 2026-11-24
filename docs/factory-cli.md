@@ -35,7 +35,10 @@ node ops/factory-enqueue.mjs \
 Флаги хранилищ (`--memory-dir`, `--ledger-path`) требуют именно `--policy`
 (а не только `--policy-digest`): без файла политики значение `handoffDir`
 неизвестно, и двустороннюю границу хранилища с каталогом сдачи
-подтвердить нельзя — отказ `policy_required` до вызова `vb`.
+подтвердить нельзя — отказ `policy_required` до вызова `vb`. При задании
+любого пути хранилища обязательна и граница `worktree` (`--worktree` или
+`policy.route.worktree`): без неё разделение хранилища и рабочего дерева
+не подтверждается — отказ `worktree_required` до вызова `vb`.
 Контрактные метки (`spec_digest`, `policy_digest`, `repo_id`,
 `profile_id`, `finish`) резервированы: `--label` их не переопределяет.
 

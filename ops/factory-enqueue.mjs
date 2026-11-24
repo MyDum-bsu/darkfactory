@@ -218,6 +218,14 @@ export async function buildEnqueuePlan(values) {
     // карточка с незапускаемой закреплённой политикой на Board не
     // создаётся.
     const outside = handoff === undefined ? [] : [handoff];
+    // Заданные пути хранилищ без границы worktree не подтверждают
+    // двустороннее разделение хранилища и рабочего дерева: контроллер
+    // отклонил бы такой запуск — отказ до вызова vb.
+    if (worktrees.length === 0 &&
+        (policyJson.decisionLedger !== undefined ||
+         policyJson.projectMemory !== undefined)) {
+      fail('worktree_required');
+    }
     const policyLedger = policyStoragePath(policyJson.decisionLedger, ['path']);
     if (policyLedger !== undefined) {
       await canonicalInput(policyLedger,
@@ -277,6 +285,10 @@ export async function buildEnqueuePlan(values) {
       // подтвердить нельзя — в Board не уходит метка с непроверенным
       // путём, отказ до вызова vb.
       if (values.policy === undefined) fail('policy_required');
+      // Без границы worktree (--worktree или policy.route.worktree)
+      // двустороннюю границу хранилища против рабочего дерева подтвердить
+      // нельзя — контроллер отклонил бы запуск, отказ до вызова vb.
+      if (worktrees.length === 0) fail('worktree_required');
       // Та же двусторонняя storage-граница действует и против handoffDir:
       // журнал/память — операторские пути вне рабочего каталога сдачи.
       extra[key] = await canonicalInput(values[flag],
