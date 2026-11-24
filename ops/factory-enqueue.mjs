@@ -24,6 +24,7 @@ import { dirname, isAbsolute, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
+import { resolveL1Profile } from '../board_pipeline/l1-profiles.mjs';
 
 const execFileAsync = promisify(execFile);
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -33,7 +34,7 @@ const FINISH = new Set(['verified', 'deployed']);
 // не переопределяет (иначе в Board уйдёт путь без проверки).
 const RESERVED_LABELS = new Set(
   ['spec_digest', 'policy_digest', 'repo_id', 'profile_id', 'finish',
-    'memory_dir', 'ledger_path', 'worktree', 'ticket']);
+    'memory_dir', 'ledger_path', 'worktree', 'ticket', 'l1_profile']);
 
 function fail(code) { throw new Error(code); }
 
@@ -319,8 +320,32 @@ export async function buildEnqueuePlan(values) {
   }
   if (worktrees.length) extra.worktree = worktrees[0];
 
+  // L1-профиль проверок: явный --l1-profile и закреплённый
+  // profiles.<profile>.l1Profile политики — оба строго из реестра; при
+  // расхождении — отказ до вызова vb. Без явного выбора действует
+  // дефолт репозитория (python-node для optimization/autoresearcher).
+  const policyProfileL1 = policyJson?.profiles?.[values.profile]?.l1Profile;
+  if (policyProfileL1 !== undefined) resolveL1Profile({ l1Profile: policyProfileL1 });
+  if (values['l1-profile'] !== undefined) {
+    resolveL1Profile({ l1Profile: values['l1-profile'] });
+  }
+  if (values['l1-profile'] !== undefined && policyProfileL1 !== undefined &&
+      values['l1-profile'] !== policyProfileL1) {
+    fail('l1_profile_mismatch');
+  }
+  const l1Profile = resolveL1Profile({
+    l1Profile: values['l1-profile'] ?? policyProfileL1,
+    repoId: values['repo-id'] }).id;
+
   const labels = { spec_digest: specDigest, policy_digest: policyDigest,
     repo_id: values['repo-id'], profile_id: values.profile, finish: values.finish, ...extra };
+  // Метка ставится при явном выборе (CLI или политика) либо при
+  // недефолтном результате — авто-выбор python-node для репозитория
+  // тоже фиксируется на карточке.
+  if (values['l1-profile'] !== undefined || policyProfileL1 !== undefined ||
+      l1Profile !== 'node') {
+    labels.l1_profile = l1Profile;
+  }
   for (const item of values.label ?? []) {
     const i = item.indexOf('=');
     // Метка обязана быть в синтаксисе k=v: без разделителя значение не
@@ -359,7 +384,7 @@ export async function buildEnqueuePlan(values) {
     }
   }
   return { tool, argv, labels,
-    meta: { boardUrl: url, channel: values.channel, finish: values.finish } };
+    meta: { boardUrl: url, channel: values.channel, finish: values.finish, l1Profile } };
 }
 
 export async function runEnqueue(argv, deps = {}) {
@@ -372,6 +397,7 @@ export async function runEnqueue(argv, deps = {}) {
     label: { type: 'string', multiple: true }, ticket: { type: 'string' },
     worktree: { type: 'string' }, 'memory-dir': { type: 'string' },
     'ledger-path': { type: 'string' }, vb: { type: 'string' },
+    'l1-profile': { type: 'string' },
     'dry-run': { type: 'boolean' }, json: { type: 'boolean' } } });
   const plan = await buildEnqueuePlan(values);
   if (values['dry-run']) {

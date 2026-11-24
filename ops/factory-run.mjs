@@ -23,6 +23,7 @@ import { parseArgs, promisify } from 'node:util';
 import { createPilotSwitch } from '../board_pipeline/pilot-gate.mjs';
 import { opencodeGoPolicyViolation, retiredProviderViolation }
   from '../board_pipeline/worker-selector.mjs';
+import { isValidL1Profile, resolveL1Profile } from '../board_pipeline/l1-profiles.mjs';
 
 const execFileAsync = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -212,6 +213,18 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   }
   assertModelMatrix({ cli: values, policy });
 
+  // l1Profile — инвариант всех профилей политики (как матрица моделей):
+  // неизвестное имя в любом profiles.* отклоняется fail-closed до
+  // Git-конфига и запуска контроллера.
+  for (const profile of Object.values(policy?.profiles ?? {})) {
+    if (profile?.l1Profile !== undefined && !isValidL1Profile(profile.l1Profile)) {
+      fail(`unknown_l1_profile:${String(profile.l1Profile)}`);
+    }
+  }
+  if (values['l1-profile'] !== undefined && !isValidL1Profile(values['l1-profile'])) {
+    fail(`unknown_l1_profile:${String(values['l1-profile'])}`);
+  }
+
   // Guard привязан к worktree контроллера: политика обязана закрепить
   // route.worktree, --worktree может лишь подтвердить тот же путь.
   const policyTree = policy?.route?.worktree;
@@ -273,6 +286,15 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // обязательная локальная проверка отклонит уже при выполнении
   // воркером.
   const runProfile = policy?.profiles?.[policy?.route?.checkProfile];
+  // Явный --l1-profile и закреплённый l1Profile выбранного профиля при
+  // расхождении — отказ; эффективный профиль иначе — дефолт repoId.
+  if (values['l1-profile'] !== undefined && runProfile?.l1Profile !== undefined &&
+      values['l1-profile'] !== runProfile.l1Profile) {
+    fail('l1_profile_mismatch');
+  }
+  const l1Profile = resolveL1Profile({
+    l1Profile: values['l1-profile'] ?? runProfile?.l1Profile,
+    repoId: policy?.route?.repoId }).id;
   const runRecipes = [...(runProfile?.checks ?? []),
     ...(runProfile?.visual === undefined ? [] : [runProfile.visual])];
   // Канонические источники маунтов сохраняются для границы против
@@ -537,7 +559,7 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   }
   return { node: process.execPath, argv, env: envOverrides,
     worktree: worktreeReal, spec: { provider: values.provider, model: values.model },
-    policy: policyPathReal, state, ledger, memory, handoff };
+    l1Profile, policy: policyPathReal, state, ledger, memory, handoff };
 }
 
 // Git не наследует перенаправления окружения: унаследованный GIT_DIR
@@ -596,6 +618,7 @@ export async function runFactory(argv, deps = {}) {
     switch: { type: 'string' }, 'interval-ms': { type: 'string' },
     'allow-live-pilot': { type: 'boolean' },
     'recheck-rejected-handoff': { type: 'boolean' },
+    'l1-profile': { type: 'string' },
     'dry-run': { type: 'boolean' }, json: { type: 'boolean' } } });
   const plan = await buildRunPlan(values, { env: deps.env ?? process.env });
   if (values['dry-run']) {

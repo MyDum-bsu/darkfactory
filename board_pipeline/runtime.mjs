@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFi
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join, posix } from 'node:path';
 import { promisify } from 'node:util';
+import { resolveL1Profile } from './l1-profiles.mjs';
 
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
@@ -49,7 +50,8 @@ function checkCommand(recipe) {
 }
 
 const HOST_SYSTEM_DIRS = new Set(['/usr', '/etc/fonts', '/etc/texmf', '/var/lib/texmf', '/opt/google/chrome']);
-const SANDBOX_ENV = new Set(['PYTHONPATH', 'PYTHONDONTWRITEBYTECODE', 'MO_TRACKER_DATA', 'MO_TRACKER_DB']);
+export const SANDBOX_ENV = new Set(['PYTHONPATH', 'PYTHONDONTWRITEBYTECODE',
+  'RUFF_CACHE_DIR', 'PYTEST_ADDOPTS', 'MO_TRACKER_DATA', 'MO_TRACKER_DB']);
 
 async function sandboxExtras(recipe, source) {
   const args = [];
@@ -112,6 +114,11 @@ export function offlineDockerRunner(journal, { beforeEffect } = {}) {
   return async (handoff, profile) => {
     const recipe = checkCommand(profile.check ?? {});
     const { image, argv, cwd, timeoutMs } = recipe;
+    // Явный l1Profile профиля/рецепта — fail-closed до любого вызова docker;
+    // его defaultEnv подмешивается только в ключи, не заданные в recipe.env.
+    const l1 = profile.l1Profile ?? recipe.l1Profile;
+    const effective = l1 === undefined ? recipe
+      : { ...recipe, env: { ...resolveL1Profile({ l1Profile: l1 }).defaultEnv, ...recipe.env } };
     if (!SHA.test(handoff.candidate_sha)) throw new Error('Local runner requires a full SHA');
     const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
       timeout: 12_000,
@@ -127,7 +134,7 @@ export function offlineDockerRunner(journal, { beforeEffect } = {}) {
       // The scratch parent stays private; only the mounted checkout is traversable to the mapped UID.
       await chmod(source, 0o755);
       await unpackExact(handoff.worktree, handoff.candidate_sha, archive, source);
-      const extras = await sandboxExtras(recipe, source);
+      const extras = await sandboxExtras(effective, source);
       const args = ['run', '--rm', '--name', name, '--pull=never', '--network=none', '--read-only',
         '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
         '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777', '-e', 'HOME=/tmp',
@@ -288,7 +295,8 @@ export function offlineProfileRunner(journal, options) {
     if (!Array.isArray(profile.checks) || !profile.checks.length) throw new Error('An approved check list is required');
     const evidence = [];
     for (const recipe of profile.checks) {
-      const result = await check(handoff, { check: recipe });
+      const result = await check(handoff,
+        { check: recipe, l1Profile: profile.l1Profile ?? recipe.l1Profile });
       evidence.push(result.evidence);
       if (!result.ok) return { sha: result.sha, ok: false, evidence };
     }

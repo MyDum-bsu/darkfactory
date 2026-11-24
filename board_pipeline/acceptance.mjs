@@ -10,6 +10,7 @@ import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter, NEON_I
 import { l2RunnableSpec, runnerReviewSpec } from './review-runner.mjs';
 import { assertTriadIndependent, opencodeGoPolicyViolation,
   retiredProviderViolation, workerFamily } from './worker-selector.mjs';
+import { isValidL1Profile } from './l1-profiles.mjs';
 
 const HANDOFF_KEYS = [
   'task_id',
@@ -116,6 +117,11 @@ function validatePolicy(policy, checkProfile, { allowNeon = false, pinned = fals
   const profile = Object.hasOwn(profiles, checkProfile) ? profiles[checkProfile] : null;
   if (profile === null || typeof profile !== 'object') {
     throw new Denied(`unknown_profile:${checkProfile}`);
+  }
+  // Заданный l1Profile обязан быть именем из доверенного реестра —
+  // fail-closed до любой проверки ревью и любого эффекта.
+  if (profile.l1Profile !== undefined && !isValidL1Profile(profile.l1Profile)) {
+    throw new Denied(`unknown_l1_profile:${String(profile.l1Profile)}`);
   }
   const legacy = isLegacyPiReview(profile.review);
   const neon = allowNeon && isNeonReview(profile.review) && isReviewSkillList(profile.review.skills);

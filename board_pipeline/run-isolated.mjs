@@ -40,6 +40,7 @@ import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
 import * as workerSelector from './worker-selector.mjs';
 import { abEffectGuard, enrollAbPilot, guardAbBoard, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
 import { pilotWriterWorkspaceReady } from './bb-stage-adapter.mjs';
+import { isValidL1Profile } from './l1-profiles.mjs';
 
 const exec = promisify(execFile);
 const inside = (root, p) => {
@@ -242,6 +243,12 @@ async function execute() {
   };
   if (p.version !== route.policyVersion || !p.owner || !p.label?.key || !p.label?.value ||
       !p.profiles?.[route.checkProfile]?.branch) throw new Error('Incomplete enrolled policy');
+  // Явный l1Profile выбранного профиля — строго из реестра, fail-closed
+  // на старте, до любой проверки и эффекта.
+  const l1Profile = p.profiles[route.checkProfile].l1Profile;
+  if (l1Profile !== undefined && !isValidL1Profile(l1Profile)) {
+    throw new Error(`unknown_l1_profile:${String(l1Profile)}`);
+  }
   if (!Number.isSafeInteger(p.waitMs) || p.waitMs < 1) throw new Error('Configure the pilot wait time');
   delete process.env.BOARD_TOKEN;
   process.env.BOARD_URL = p.boardUrl;
