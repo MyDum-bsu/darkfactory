@@ -414,8 +414,10 @@ async function execute() {
         projectMemory: await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`),
         lessons: lessonRules.length ? lessonRules : undefined });
       await writeFile(initial, prompt, { mode: 0o600, flag: 'wx' });
+      const ticket = typeof p.route?.ticket === 'string' && p.route.ticket.trim()
+        ? ` · ${p.route.ticket.trim()}` : '';
       const argv = ['thread', 'spawn', '--project', p.bb.project, '--environment', tree,
-        '--provider', execSpec.provider, '--model', execSpec.model, '--title', `Пилот #${attempt.task_id}`,
+        '--provider', execSpec.provider, '--model', execSpec.model, '--title', `DF #${attempt.task_id}${ticket}`,
         '--prompt-file', initial,
         '--parent-notifications', 'off', '--permission-mode', permissionMode, '--json'];
       if (ab) argv.push('--parent-thread', ab.parent);
