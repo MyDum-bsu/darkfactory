@@ -1271,3 +1271,34 @@ test('reconcileSpawn после потери ответа резервного �
   assert.deepEqual(x.effects.attempts[0].executor, RESERVE);
   assert.deepEqual(x.effects.attempts[0].triad, record.triad);
 });
+
+// Board #1670: находки критика с произвольными ключами/значениями проецируются
+// на whitelist validateAttempt до передачи в verification.prior_findings —
+// раунд 2+ не падает с invalid_prior_findings на грязной находке раунда 1.
+test('prior_findings are projected onto the acceptance whitelist before verify', async t => {
+  const x = await lab(t);
+  await x.tick();
+  const messy = {
+    file: 'a.js', line: 12, expected: 'e1', actual: 'x'.repeat(2500),
+    severity: 'P1', title: 'stray critic key', violates_dod: true,
+    harm: ['arrays', 'dropped'], input: { nested: 'object' }, freq: 3,
+  };
+  const bad = {
+    [BAD1]: { outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+      feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings: [messy] } },
+  };
+  const seen = [];
+  x.cfg.verify = async (attempt, submission) => {
+    seen.push(attempt.prior_findings);
+    const scripted = bad[submission.candidate_sha];
+    if (scripted) return scripted;
+    await x.cfg.board.complete(attempt.task_id, attempt.epoch, { sha: submission.candidate_sha });
+    return { outcome: 'verified', receipt: { settle: 'completed' } };
+  };
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.deepEqual(seen[1], [{ file: 'a.js', line: 12, expected: 'e1',
+    actual: 'x'.repeat(2000), freq: 3, severity: 'P1', dod_violation: true }]);
+});

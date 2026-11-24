@@ -191,3 +191,19 @@ test('red run: TAP not ok от TypeError в setup — non-target crash, не ц�
   assert.ok(!isNonTargetFailure(tapAssert, 1));
   assert.ok(isTargetFailure(tapAssert, 1));
 });
+
+test('verifyTestFirst: red diff над путём с пробелом парсится по \0', async t => {
+  const { dir, baseSha } = await repo(t);
+  await mkdir(join(dir, 'tests'));
+  const spaced = 'tests/my case.test.mjs';
+  await writeFile(join(dir, spaced), 'assert.equal(f(), 2)\n');
+  const redSha = commit(dir, 'red test with space in path');
+  await writeFile(join(dir, 'prod.mjs'), 'export const f = () => 2;\n');
+  const candidateSha = commit(dir, 'impl');
+  const runTest = async ({ sha }) => sha === redSha
+    ? { exitCode: 1, output: 'assert failed: expected 2 got 1' }
+    : { exitCode: 0, output: 'ok' };
+  const result = await verifyTestFirst({ worktree: dir, baseSha, redSha, candidateSha, runTest });
+  assert.equal(result.verdict, 'PASS');
+  assert.deepEqual(result.changedTestFiles, [spaced]);
+});

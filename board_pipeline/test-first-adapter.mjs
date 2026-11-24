@@ -83,8 +83,8 @@ export async function verifyTestFirst({ worktree, baseSha, redSha, candidateSha,
   // --no-renames: прод-файл, «переименованный» в тестовый путь, обязан
   // видеться как удаление прод-пути — иначе tests-only проверка слепа к
   // источнику rename.
-  const changedFiles = String(await run('diff', '--no-renames', '--name-only', `${baseSha}..${redSha}`))
-    .split('\n').map(line => line.trim()).filter(Boolean);
+  const changedFiles = String(await run('diff', '-z', '--no-renames', '--name-only', `${baseSha}..${redSha}`))
+    .split('\0').filter(name => name.length > 0);
   const testDiff = sha256(Buffer.from(String(diffText)));
   if (!changedFiles.length) {
     const red = { exitCode: 1, output: 'empty red diff' };

@@ -14,6 +14,29 @@ const shaRE = /^[a-f0-9]{40}$/;
 // разрешённый профиль, identity репозитория и валидные хэши спеки/политики.
 const CONTRACT_LABELS = ['profile_id', 'repo_id', 'spec_digest', 'policy_digest'];
 
+// Проекция находки критика на whitelist validateAttempt (#1670): критик волен
+// вернуть любые ключи/значения — в verification.prior_findings уходят только
+// примитивные поля приёмки, violates_dod переносится в dod_violation, строки
+// обрезаются до 2000 символов.
+const PRIOR_FINDING_KEYS = ['file', 'line', 'input', 'expected', 'actual', 'freq',
+  'frequency', 'harm', 'severity', 'dod_violation'];
+
+function projectPriorFinding(f) {
+  const out = {};
+  if (f !== null && typeof f === 'object' && !Array.isArray(f)) {
+    for (const k of PRIOR_FINDING_KEYS) {
+      const v = f[k];
+      if (v === undefined) continue;
+      if (v === null || typeof v === 'number' || typeof v === 'boolean') out[k] = v;
+      else if (typeof v === 'string') out[k] = v.slice(0, 2000);
+    }
+    if (out.dod_violation === undefined && typeof f.violates_dod === 'boolean') {
+      out.dod_violation = f.violates_dod;
+    }
+  }
+  return out;
+}
+
 function isAllowlist(a) {
   if (!a || typeof a !== 'object' || Array.isArray(a)) return false;
   if (typeof a.owner !== 'string' || !a.owner) return false;
@@ -522,7 +545,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   // Блокирующие находки прошлого раунда; excerpt-only возражение (валидный
   // REVIEW_BLOCKED без structured findings) не пропадает из скоупа — оно
   // синтезируется в находку для критика.
-  const priorBlocking = partitionFindingsBySeverity(lastL2?.findings).blocking;
+  const priorBlocking = partitionFindingsBySeverity(lastL2?.findings).blocking
+    .slice(0, 256).map(projectPriorFinding);
   const excerptFinding = !priorBlocking.length && typeof lastL2?.excerpt === 'string' &&
     lastL2.excerpt.trim()
     ? [{ file: 'review.excerpt', expected: lastL2.excerpt.slice(0, 2000),
