@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -110,6 +110,8 @@ test('catalog validation fail-closed: неизвестное семейство,
       catalog => { catalog.models[0].until = '2026-02-30'; },
       catalog => { catalog.models[0].until = '2026-02-30T00:00:00Z'; },
       catalog => { catalog.models[0].until = '11/27/2026'; },
+      catalog => { catalog.models[0].id = 12345; },
+      catalog => { catalog.models[0].id = true; },
     ]) {
       const paths = await fixture(dir, mutate);
       await assert.rejects(loadModelRegistry({ ...paths, now: NOW }), /model_catalog_invalid/);
@@ -281,6 +283,9 @@ test('registrySnapshot: компактный срез моделей, contextual
     assert.ok(Array.isArray(snapshot.roles.coder_default));
     assert.equal(snapshot.triad.coder.family, 'cognition');
     assert.equal(snapshot.triad.reviewer.family, 'google');
+    assert.equal(snapshot.roles.coder_default[0].id, snapshot.triad.coder.id);
+    assert.equal(snapshot.roles.reviewer[0].id, snapshot.triad.reviewer.id);
+    assert.equal(snapshot.roles.arbiter[0].id, snapshot.triad.arbiter.id);
     assert.equal(snapshot.roles.arbiter.some(entry => entry.family === snapshot.triad.reviewer.family), false);
 
     const conflict = await loadFixture(dir, null, policy => {
@@ -373,5 +378,131 @@ test('CLI check: 0 на валидном конфиге, 1 на битом ил�
     assert.equal(bad.code, 1);
     assert.match(bad.stderr, /no eligible reviewer/);
     assert.ok(paths.catalogPath.endsWith('models-catalog.yaml'));
+  });
+});
+
+
+test('P1: не-строковый id отклоняется строгой схемой', async () => {
+  await tmp(async dir => {
+    for (const badId of [12345, true]) {
+      const paths = await fixture(dir, catalog => { catalog.models[0].id = badId; });
+      await assert.rejects(loadModelRegistry({ ...paths, now: NOW }), /model_catalog_invalid/);
+    }
+  });
+});
+
+test('P1: failed set на пустом configDir не создаёт файлы', async () => {
+  await tmp(async dir => {
+    const configDir = join(dir, 'config');
+    const result = await runCli(['set', 'nonexistent', 'active', '--config-dir', configDir]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /unknown model id/);
+    assert.deepEqual(await readdir(configDir), []);
+  });
+});
+
+test('P1: половинчатый configDir fail-closed и не восстанавливается молча', async () => {
+  await tmp(async dir => {
+    const configDir = join(dir, 'config');
+    await mkdir(configDir, { recursive: true });
+    const paths = await fixture(configDir);
+    const before = await readFile(paths.catalogPath, 'utf8');
+    await rm(paths.policyPath);
+    const result = await runCli(['set', 'gemini-4-neon', 'active', '--config-dir', configDir]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /model config incomplete/);
+    assert.equal(await readFile(paths.catalogPath, 'utf8'), before);
+    assert.deepEqual(await readdir(configDir), ['models-catalog.yaml']);
+  });
+});
+
+test('P1: validation failure в staging не изменяет существующий живой конфиг', async () => {
+  await tmp(async dir => {
+    const paths = await fixture(dir, catalog => {
+      for (let i = 0; catalog.models.length < 256; i += 1) {
+        catalog.models.push({
+          id: `extra-${i}`, provider: 'pi', model: `vendor/extra-${i}`, family: 'deepseek',
+          status: 'active', cost_tier: 'subscription', capabilities: ['code'],
+          quota_source: 'manual', notes: 'bulk fixture',
+        });
+      }
+    });
+    const before = await readFile(paths.catalogPath, 'utf8');
+    const result = await runCli(['add', '--id', 'overflow-model', '--provider', 'pi',
+      '--model', 'vendor/overflow', '--family', 'deepseek', '--config-dir', dir]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /model_catalog_invalid/);
+    assert.equal(await readFile(paths.catalogPath, 'utf8'), before);
+    assert.equal((await readdir(dir)).filter(name => name.includes('.tmp-')).length, 0);
+  });
+
+  await tmp(async dir => {
+    const paths = await fixture(dir, catalog => {
+      const targetSize = 256 * 1024 - 100;
+      let low = 0;
+      let high = 300000;
+      let best = 0;
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        catalog.models[0].notes = 'x'.repeat(mid);
+        const size = Buffer.byteLength(stringify(catalog), 'utf8');
+        if (size <= targetSize) {
+          best = mid;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+      catalog.models[0].notes = 'x'.repeat(best);
+    });
+    const before = await readFile(paths.catalogPath, 'utf8');
+    assert.ok(Buffer.byteLength(before) < 256 * 1024, `fixture size ${Buffer.byteLength(before)}`);
+    const result = await runCli(['add', '--id', 'huge-model', '--provider', 'pi',
+      '--model', 'vendor/huge', '--family', 'deepseek', '--config-dir', dir]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /model_registry_file_invalid|model_catalog_invalid/);
+    assert.equal(await readFile(paths.catalogPath, 'utf8'), before);
+    assert.equal((await readdir(dir)).filter(name => name.includes('.tmp-')).length, 0);
+  });
+
+  await tmp(async dir => {
+    const paths = await fixture(dir);
+    const before = await readFile(paths.catalogPath, 'utf8');
+    const result = await runCli(['add', '--id', 'bad-family', '--provider', 'pi',
+      '--model', 'vendor/bad', '--family', 'martian', '--config-dir', dir]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /unknown family/);
+    assert.equal(await readFile(paths.catalogPath, 'utf8'), before);
+    assert.equal((await readdir(dir)).filter(name => name.includes('.tmp-')).length, 0);
+  });
+});
+
+test('P2: неизвестный CLI flag отклоняется ненулевым exit без записи конфига', async () => {
+  await tmp(async dir => {
+    const configDir = join(dir, 'config');
+    const result = await runCli(['set', 'gemini-4-neon', 'standby', '--untill', '2026-12-01',
+      '--config-dir', configDir]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /unknown option --untill/);
+    assert.equal((await readdir(dir)).includes('config'), false);
+  });
+});
+
+test('P2: symlink родительского config dir допустим, symlink файла отклоняется', async () => {
+  await tmp(async dir => {
+    const real = join(dir, 'real-config');
+    await mkdir(real, { recursive: true });
+    const paths = await fixture(real);
+    const linked = join(dir, 'linked-config');
+    await symlink(real, linked, 'dir');
+    const registry = await loadModelRegistry({ configDir: linked, now: NOW });
+    assert.equal(registry.catalog.models.length, 9);
+
+    const target = join(dir, 'catalog-target.yaml');
+    await writeFile(target, await readFile(paths.catalogPath, 'utf8'));
+    await rm(paths.catalogPath);
+    await symlink(target, paths.catalogPath);
+    await assert.rejects(loadModelRegistry({ configDir: linked, now: NOW }),
+      /model_registry_file_invalid/);
   });
 });

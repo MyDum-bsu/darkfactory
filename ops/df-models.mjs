@@ -34,9 +34,22 @@ const USAGE = `usage:
   node ops/df-models.mjs add --id ID --provider P --model M --family F [--status active] [--cost subscription] [--until DATE] [--capabilities a,b] [--config-dir DIR]
   node ops/df-models.mjs check [--config-dir DIR]`;
 
-function parseCliArgs(args) {
+const COMMAND_OPTIONS = {
+  list: new Set(['json', 'config-dir']),
+  effective: new Set(['json', 'config-dir', 'mode']),
+  set: new Set(['until', 'config-dir']),
+  mode: new Set(['config-dir']),
+  add: new Set(['id', 'provider', 'model', 'family', 'status', 'cost', 'until',
+    'capabilities', 'config-dir', 'quota-source', 'notes']),
+  check: new Set(['config-dir']),
+  help: new Set(),
+  '--help': new Set(),
+};
+
+function parseCliArgs(args, command) {
   const positional = [];
   const options = {};
+  const allowed = COMMAND_OPTIONS[command] ?? new Set();
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (!arg.startsWith('--')) {
@@ -45,6 +58,7 @@ function parseCliArgs(args) {
     }
     const key = arg.slice(2);
     if (!key) throw new Error('empty option');
+    if (!allowed.has(key)) throw new Error(`unknown option --${key} for command ${command ?? 'help'}`);
     if (key === 'json') {
       options[key] = true;
       continue;
@@ -66,25 +80,67 @@ async function exists(path) {
   }
 }
 
-export async function atomicWriteFile(path, content) {
+async function stageConfigFile(path, content) {
   const full = resolve(path);
   const tmp = `${full}.tmp-${process.pid}-${randomUUID()}`;
-  try {
-    await writeFile(tmp, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    await rename(tmp, full);
-  } catch (error) {
-    await unlink(tmp).catch(() => {});
-    throw error;
-  }
+  await writeFile(tmp, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  return tmp;
+}
+
+async function cleanupFiles(paths) {
+  await Promise.all(paths.map(path => unlink(path).catch(() => {})));
 }
 
 async function ensureConfigFiles(configDir) {
   await mkdir(configDir, { recursive: true, mode: 0o700 });
   const catalogPath = join(configDir, 'models-catalog.yaml');
   const policyPath = join(configDir, 'routing-policy.yaml');
-  if (!await exists(catalogPath)) await atomicWriteFile(catalogPath, await readFile(EXAMPLE_CATALOG_PATH, 'utf8'));
-  if (!await exists(policyPath)) await atomicWriteFile(policyPath, await readFile(EXAMPLE_POLICY_PATH, 'utf8'));
-  return { catalogPath, policyPath };
+  const [hasCatalog, hasPolicy] = await Promise.all([exists(catalogPath), exists(policyPath)]);
+  if (hasCatalog !== hasPolicy) {
+    throw new Error('model config incomplete: models-catalog.yaml and routing-policy.yaml must exist as a pair');
+  }
+  return { catalogPath, policyPath, exists: hasCatalog };
+}
+
+async function readMutableConfig(configDir) {
+  const paths = await ensureConfigFiles(configDir);
+  if (!paths.exists) {
+    return { ...paths,
+      catalog: parse(await readFile(EXAMPLE_CATALOG_PATH, 'utf8')),
+      policy: parse(await readFile(EXAMPLE_POLICY_PATH, 'utf8')) };
+  }
+  await loadModelRegistry({ catalogPath: paths.catalogPath, policyPath: paths.policyPath, now: new Date() });
+  return { ...paths,
+    catalog: parse(await readFile(paths.catalogPath, 'utf8')),
+    policy: parse(await readFile(paths.policyPath, 'utf8')) };
+}
+
+async function writeConfigMutation(configDir, mutate, primary) {
+  const config = await readMutableConfig(configDir);
+  mutate(config);
+  const catalogText = `${stringify(config.catalog)}\n`;
+  const policyText = `${stringify(config.policy)}\n`;
+  const staged = [];
+  try {
+    staged.push(await stageConfigFile(config.catalogPath, catalogText));
+    staged.push(await stageConfigFile(config.policyPath, policyText));
+    await loadModelRegistry({ catalogPath: staged[0], policyPath: staged[1], now: new Date() });
+  } catch (error) {
+    await cleanupFiles(staged);
+    throw error;
+  }
+
+  const [catalogTmp, policyTmp] = staged;
+  if (!config.exists) {
+    await rename(policyTmp, config.policyPath);
+    await rename(catalogTmp, config.catalogPath);
+  } else if (primary === 'catalog') {
+    await rename(catalogTmp, config.catalogPath);
+    await unlink(policyTmp).catch(() => {});
+  } else {
+    await rename(policyTmp, config.policyPath);
+    await unlink(catalogTmp).catch(() => {});
+  }
 }
 
 function configDirFrom(options) {
@@ -155,14 +211,11 @@ async function effectiveRouting(options) {
 }
 
 async function writeCatalog(configDir, mutate) {
-  const { catalogPath, policyPath } = await ensureConfigFiles(configDir);
-  // Сначала fail-closed проверяем текущую пару файлов: поверх битого конфига
-  // атомарное обновление не выполняется.
-  await loadModelRegistry({ catalogPath, policyPath, now: new Date() });
-  const catalog = parse(await readFile(catalogPath, 'utf8'));
-  mutate(catalog);
-  await atomicWriteFile(catalogPath, `${stringify(catalog)}\n`);
-  await loadModelRegistry({ catalogPath, policyPath, now: new Date() });
+  await writeConfigMutation(configDir, config => mutate(config.catalog), 'catalog');
+}
+
+async function writePolicy(configDir, mutate) {
+  await writeConfigMutation(configDir, config => mutate(config.policy), 'policy');
 }
 
 async function setStatus(positional, options) {
@@ -186,12 +239,9 @@ async function setMode(positional, options) {
   const [mode] = positional;
   if (!ROUTING_MODES.includes(mode)) throw new Error('mode must be economy, balanced or sprint');
   const configDir = configDirFrom(options);
-  const { catalogPath, policyPath } = await ensureConfigFiles(configDir);
-  await loadModelRegistry({ catalogPath, policyPath, now: new Date() });
-  const policy = parse(await readFile(policyPath, 'utf8'));
-  policy.mode = mode;
-  await atomicWriteFile(policyPath, `${stringify(policy)}\n`);
-  await loadModelRegistry({ catalogPath, policyPath, now: new Date() });
+  await writePolicy(configDir, policy => {
+    policy.mode = mode;
+  });
   console.log(JSON.stringify({ ok: true, mode }));
   return 0;
 }
@@ -263,7 +313,7 @@ async function checkConfig(options) {
 
 export async function main(argv = process.argv.slice(2)) {
   const [command, ...rest] = argv;
-  const { positional, options } = parseCliArgs(rest);
+  const { positional, options } = parseCliArgs(rest, command);
   switch (command) {
     case 'list': return await listModels(options);
     case 'effective': return await effectiveRouting(options);

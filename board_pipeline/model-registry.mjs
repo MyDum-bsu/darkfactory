@@ -5,7 +5,7 @@
 
 import { lstat, readFile, realpath, access } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
 
@@ -66,15 +66,17 @@ function parseYaml(bytes, path) {
 async function readYamlFile(path) {
   const full = resolve(path);
   let info;
+  let canonical;
   try {
     info = await lstat(full);
+    canonical = join(await realpath(dirname(full)), basename(full));
   } catch (cause) {
     throw new Error(`model_registry_file_missing: ${path}`, { cause });
   }
-  if (!info.isFile() || info.size === 0 || info.size > YAML_LIMIT || await realpath(full) !== full) {
+  if (!info.isFile() || info.size === 0 || info.size > YAML_LIMIT) {
     throw new Error(`model_registry_file_invalid: ${path}`);
   }
-  return parseYaml(await readFile(full), path);
+  return parseYaml(await readFile(canonical), path);
 }
 
 function validDateOnly(value) {
@@ -128,7 +130,7 @@ function validateCatalog(raw) {
     const where = `models[${index}]`;
     if (!exactKeys(entry, ['id', 'provider', 'model', 'family', 'status', 'cost_tier',
         'capabilities', 'quota_source', 'notes'], ['until']) ||
-        !ID.test(entry.id ?? '') || seen.has(entry.id) ||
+        typeof entry.id !== 'string' || !ID.test(entry.id) || seen.has(entry.id) ||
         !nonEmptyString(entry.provider) || !nonEmptyString(entry.model) ||
         !FAMILY_SET.has(entry.family) || !STATUS_SET.has(entry.status) ||
         !COST_SET.has(entry.cost_tier) || !uniqueStrings(entry.capabilities) ||
@@ -462,16 +464,12 @@ export function registrySnapshot(registry, { mode, now = new Date(), quotas } = 
   const activeMode = mode ?? registry.policy.mode;
   const triad = resolveTriad(registry, { mode: activeMode, now, quotas });
   const independent = role => resolveRoleChain(registry, role, { mode: activeMode, now, quotas });
-  const excludedForReviewer = triad.coder ? [triad.coder.family] : [];
-  const excludedForArbiter = [triad.coder?.family, triad.reviewer?.family].filter(Boolean);
   const contextual = {
     lead: independent('lead'),
-    coder_default: independent('coder_default'),
+    coder_default: triad.coder?.chain ?? [],
     coder_heavy: independent('coder_heavy'),
-    reviewer: resolveRoleChain(registry, 'reviewer', {
-      mode: activeMode, now, quotas, excludeFamilies: excludedForReviewer }),
-    arbiter: resolveRoleChain(registry, 'arbiter', {
-      mode: activeMode, now, quotas, excludeFamilies: excludedForArbiter }),
+    reviewer: triad.reviewer?.chain ?? [],
+    arbiter: triad.arbiter?.chain ?? [],
     ux_critic: independent('ux_critic'),
   };
   const roles = Object.fromEntries(REGISTRY_ROLES.map(role => [role, compactChain(contextual[role])]));
