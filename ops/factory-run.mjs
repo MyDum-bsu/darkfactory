@@ -118,9 +118,12 @@ async function canonicalOutside(path, treeAliases, mustBe, { parent = true } = {
 
 // Вложенный операторский файл политики (brief, reviewPrompt, reviewGate,
 // reviewSkillFiles — как в readOperatorInputs контроллера): строго
-// канонический файл строго вне worktree. Без файла — пропуск.
+// канонический файл строго вне worktree. Без файла (undefined) — пропуск;
+// явный null или нестроковое значение — не «отсутствует»: контроллер
+// вызвал бы realpath(null) уже после записи Git-конфига, поэтому такой
+// вход отклоняется здесь, при построении плана.
 async function nestedPolicyFile(path, treeAliases) {
-  if (path === undefined || path === null) return;
+  if (path === undefined) return;
   if (typeof path !== 'string' || !isAbsolute(path)) fail('path_not_absolute');
   const real = await realpath(path).catch(() => fail('path_missing'));
   if (real !== path) fail('non_canonical_or_symlink_path');

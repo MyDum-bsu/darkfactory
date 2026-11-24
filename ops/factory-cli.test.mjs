@@ -7,6 +7,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile }
   from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -695,6 +696,15 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const fBriefChain = await withPolicy(dir, briefChain);
     await assert.rejects(() => runPlan(runValues(fBriefChain, state)),
       /non_canonical_or_symlink_path/);
+    // Явный brief: null — не «отсутствует»: контроллер вызвал бы
+    // realpath(null) после записи Git-конфига; отказ ещё в плане.
+    const fBriefNull = await withPolicy(dir, { ...policySpec(wt), brief: null });
+    await assert.rejects(() => runPlan(runValues(fBriefNull, state)),
+      /path_not_absolute/);
+    // То же для reviewGate: null отклоняется до проверки routes.json.
+    const fGateNull = await withPolicy(dir, { ...policySpec(wt), reviewGate: null });
+    await assert.rejects(() => runPlan(runValues(fGateNull, state)),
+      /path_not_absolute/);
     // --policy внутри собственного route.worktree — операторский файл в
     // дереве воркера: отказ до Git-конфига и запуска (dry-run тоже).
     await mkdir(join(wt, 'policies'));
@@ -988,7 +998,8 @@ test('run: нестроковое значение приоритетного п
 
 test('run-isolated: заголовок DF #, без Пилот #', async () => {
   const source = await readFile(
-    join(new URL('.', import.meta.url).pathname, '..', 'board_pipeline', 'run-isolated.mjs'),
+    join(fileURLToPath(new URL('.', import.meta.url)),
+      '..', 'board_pipeline', 'run-isolated.mjs'),
     'utf8');
   assert.match(source, /'--title', `DF #\$\{attempt\.task_id\}`,/);
   assert.doesNotMatch(source, /route\?\.ticket/);
