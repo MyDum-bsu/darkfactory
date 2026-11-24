@@ -924,17 +924,23 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
 
       // Раунд 2+: инкрементальный diff предыдущий кандидат → текущий.
       // Именно он отделяет новые регрессии от уже проверенных изменений —
-      // без него критик не может выполнить diff-scoped пересмотр.
+      // без него diff-scoped пересмотр невозможен: отказ до запуска критика,
+      // без вердикта (слепой base-diff не различает новые регрессии).
       const roundFile = join(scratch, 'round.diff');
       const reviewRound = Number.isSafeInteger(binding.review_round) ? binding.review_round : 1;
-      if (reviewRound > 1 && SHA.test(binding.prior_sha ?? '') &&
-          binding.prior_sha !== binding.candidate_sha) {
+      if (reviewRound > 1) {
+        if (!SHA.test(binding.prior_sha ?? '') ||
+            binding.prior_sha === binding.candidate_sha) {
+          throw new ReviewDenied('review_round_diff_missing');
+        }
         try {
           const { stdout: patch } = await exec('git',
             ['-C', binding.worktree, 'diff', `${binding.prior_sha}..${binding.candidate_sha}`],
             { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
-          if (patch.trim()) await writeFile(roundFile, patch, { mode: 0o600 });
-        } catch { /* инкрементальный diff необязателен */ }
+          await writeFile(roundFile, patch, { mode: 0o600 });
+        } catch (cause) {
+          throw new ReviewDenied(`review_round_diff_failed:${messageOf(cause)}`);
+        }
       }
 
       // Контрольные значения ДО запуска: дерево, байты снимка и worktree.

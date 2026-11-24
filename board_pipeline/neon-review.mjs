@@ -117,20 +117,23 @@ async function prepareSnapshot(binding, scratch, sandbox, beforeEffect, signal) 
   if (run.code !== 0) throw new ReviewDenied(run.code === 3 ? 'review_snapshot_unsafe_link' : 'review_neon_snapshot_failed');
   const files = JSON.parse(run.stdout);
   const names = ['candidate', 'diff.patch', 'files.json'];
-  // Раунд 2+: инкрементальный diff предыдущий кандидат → текущий — доказательство
-  // того, какие изменения новые в этом раунде.
-  if (Number.isSafeInteger(binding.review_round) && binding.review_round > 1 &&
-      SHA.test(binding.prior_sha ?? '') && binding.prior_sha !== binding.candidate_sha) {
+  // Раунд 2+: инкрементальный diff предыдущий кандидат → текущий — обязательное
+  // доказательство того, какие изменения новые в этом раунде. Без него
+  // diff-scoped вердикт невозможен: стоп до запуска критика, без вердикта.
+  if (Number.isSafeInteger(binding.review_round) && binding.review_round > 1) {
+    if (!SHA.test(binding.prior_sha ?? '') || binding.prior_sha === binding.candidate_sha) {
+      throw new ReviewDenied('review_round_diff_missing');
+    }
     try {
       const { stdout: round } = await exec('git', ['--no-pager', '-C', binding.worktree, 'diff',
         '--no-textconv', '--no-ext-diff', '--no-color', '--binary',
         binding.prior_sha, binding.candidate_sha, '--'],
         { timeout: 30_000, maxBuffer: PATCH_LIMIT, encoding: 'buffer' });
-      if (round.length) {
-        await writeFile(join(staged, 'round.patch'), round, { mode: 0o400 });
-        names.push('round.patch');
-      }
-    } catch { /* инкрементальный diff необязателен */ }
+      await writeFile(join(staged, 'round.patch'), round, { mode: 0o400 });
+      names.push('round.patch');
+    } catch (cause) {
+      throw new ReviewDenied(`review_round_diff_failed:${messageOf(cause)}`);
+    }
   }
   await writeFile(join(staged, 'diff.patch'), diff, { mode: 0o400 });
   await writeFile(join(staged, 'files.json'), JSON.stringify(files), { mode: 0o400 });

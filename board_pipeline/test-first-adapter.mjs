@@ -33,12 +33,16 @@ export function isNonTargetFailure(output, exitCode) {
 }
 
 // Позитивное доказательство целевого падения: вывод красного прогона обязан
-// нести маркер именно тестового failure (assert/expected/fail-строки
-// распространённых раннеров). Пустой вывод или неразмеченная ошибка запуска
-// при допустимом коде — не доказательство, что тест дошёл до утверждения.
-const TARGET_FAILURE = /(?:assert|expect|fail(?:ed|ure|ing)?|not ok|✗|✘|panic:|FAIL\b)/i;
+// нести маркер именно тестового failure. Голое слово failure/failed вне
+// тестового контекста (setup failure, deploy failed) не считается: маркеры
+// — assert/expect-строки, TAP not ok, счётчики вида "N failed/failing",
+// заголовки Failures: и FAIL-строки раннеров (регистрозависимо).
+const TARGET_FAILURE = /assert|expect|not ok\b|✗|✘|panic:|\d+\s+(?:tests?\s+)?(?:failed|failing|failures?)|tests?\s+failed|Failures?:/i;
+const TAP_FAIL = /\bFAIL(?:ED|URES?)?\b/;
 export function isTargetFailure(output, exitCode) {
-  return !isNonTargetFailure(output, exitCode) && TARGET_FAILURE.test(String(output ?? ''));
+  if (isNonTargetFailure(output, exitCode)) return false;
+  const text = String(output ?? '');
+  return TARGET_FAILURE.test(text) || TAP_FAIL.test(text);
 }
 
 function defaultGit(worktree) {

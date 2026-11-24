@@ -295,7 +295,7 @@ function validateAttempt(attempt) {
         !attempt.prior_findings.every(f => f !== null && typeof f === 'object' &&
           !Array.isArray(f) &&
           Object.entries(f).every(([k, v]) =>
-            ['file', 'line', 'input', 'expected', 'actual', 'freq', 'harm', 'severity'].includes(k) &&
+            ['file', 'line', 'input', 'expected', 'actual', 'freq', 'frequency', 'harm', 'severity'].includes(k) &&
             (v === undefined || v === null || typeof v === 'number' ||
               (typeof v === 'string' && v.length <= 2000)))))) {
     throw new Denied('invalid_prior_findings');
@@ -1394,6 +1394,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         spec_digest: attempt.spec_digest,
         policy_digest: attempt.policy_digest,
       };
+      // Закреплённая категория сверяется с живой меткой карточки: auto-approve
+      // по allowlist не может завершить кандидата, если категория вышла из
+      // списка или сменилась до seal.
+      if (attempt.category !== undefined) expectedLabels.category = attempt.category;
       for (const [field, expected] of Object.entries(expectedLabels)) {
         // GUARD:NoStaleCommit — seal обязан видеть живые метки равными контракту.
         if (!ports.__unsafeSkipSealCheck && labels[field] !== expected) {

@@ -219,6 +219,19 @@ export async function loadRoleRegistry(trustedCheckout) {
     }
     role.skills = Object.freeze(pinned);
     Object.freeze(role);
+
+    // Все .md-файлы каталога скиллов станции подчиняются per-file правилам и
+    // входят в digest реестра — не только перечисленные в role.skills. Неучтённый
+    // файл (симлинк, переполнение, пустой) — fail-closed, а не тихий пропуск.
+    if (skillsInfo !== null) {
+      const listed = new Set(pinned.map(s => s.id));
+      for (const entry of (await readdir(skillsDir)).sort()) {
+        if (!entry.endsWith('.md') || listed.has(entry.slice(0, -3))) continue;
+        const rel = `stations/${name}/skills/${entry}`;
+        const { bytes } = await catalogFile(root, rel);
+        fileDigests.push({ path: rel, digest: sha256(bytes) });
+      }
+    }
   }
 
   // Скиллы из skillPicker обязаны разрешаться в закреплённые sharedSkills.
