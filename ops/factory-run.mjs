@@ -466,8 +466,16 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     policy: policyPathReal, state, ledger, memory, handoff };
 }
 
+// Git не наследует перенаправления окружения: унаследованный GIT_DIR
+// выбрал бы конфиг другого репозитория, а GIT_WORK_TREE — чужой toplevel,
+// и guard писал бы core.fileMode не туда. Все переменные GIT_* снимаются:
+// rev-parse и config действуют строго на репозиторий `-C worktree`.
+const cleanGitEnv = env => Object.fromEntries(
+  Object.entries(env).filter(([key]) => !key.startsWith('GIT_')));
+
 async function defaultGit(args) {
-  return (await execFileAsync('git', args, { timeout: 30_000 })).stdout.trim();
+  return (await execFileAsync('git', args,
+    { timeout: 30_000, env: cleanGitEnv(process.env) })).stdout.trim();
 }
 
 // NTFS guard: worktree обязан быть точным корнем git worktree — та же

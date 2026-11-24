@@ -13,8 +13,8 @@ import { promisify } from 'node:util';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildEnqueuePlan, runEnqueue } from './factory-enqueue.mjs';
-import { buildRunPlan, forbiddenModelViolation, modelViolation, runFactory }
-  from './factory-run.mjs';
+import { buildRunPlan, ensureFilemodeGuard, forbiddenModelViolation,
+  modelViolation, runFactory } from './factory-run.mjs';
 
 const execFileAsync = promisify(execFile);
 const HEX = 'a'.repeat(64);
@@ -240,6 +240,32 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
       'memory-dir': store, 'ledger-path': storeLedger });
     assert.equal(storePlan.labels.memory_dir, store);
     assert.equal(storePlan.labels.ledger_path, storeLedger);
+    // Та же граница хранилищ действует на пути, закреплённые в самой
+    // политике (decisionLedger/projectMemory): контроллер отклонил бы
+    // запуск с path_inside_worktree — карточка с незапускаемой
+    // политикой не создаётся и без CLI-флага.
+    const wtLedger = join(wt, 'ledger.jsonl');
+    await writeFile(wtLedger, '');
+    for (const embedded of [
+      { decisionLedger: wtLedger },
+      { decisionLedger: { path: wtLedger } },
+      { projectMemory: { storeDir: wt } },
+      { projectMemory: { storeDir: dir } },
+    ]) {
+      await writeFile(policyFile, JSON.stringify({
+        brief, reviewPrompt, reviewGate: gate, route: { worktree: wt },
+        ...embedded }));
+      await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+        'policy-digest': undefined, policy: policyFile }),
+        /path_inside_worktree/);
+    }
+    // Канонические хранилища вне дерева в политике проходят.
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, route: { worktree: wt },
+      decisionLedger: storeLedger, projectMemory: { storeDir: store } }));
+    const embeddedPlan = await buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile });
+    assert.match(embeddedPlan.labels.policy_digest, /^[0-9a-f]{64}$/);
     const innerPolicy = join(wt, 'policy.json');
     await writeFile(innerPolicy, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate,
@@ -615,6 +641,42 @@ test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
       '--policy', subPolicy, '--state', state], { env: {}, run: async () => ({ code: 0 }) }),
       /worktree_not_git/);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run: NTFS guard не наследует GIT_DIR/GIT_WORK_TREE окружения', async t => {
+  if (!(await probeGit())) return t.skip('git binary unavailable');
+  const dir = await tempdir();
+  const savedGitDir = process.env.GIT_DIR;
+  const savedGitTree = process.env.GIT_WORK_TREE;
+  try {
+    const wt = join(dir, 'wt');
+    const other = join(dir, 'other');
+    await mkdir(wt);
+    await mkdir(other);
+    const gitA = await initGitRepo(wt);
+    const gitB = await initGitRepo(other);
+    // Унаследованное перенаправление: --show-toplevel читался бы из
+    // GIT_WORK_TREE (= wt, проверка проходит), а config --local писал бы
+    // в конфиг GIT_DIR (= other). Guard снимает GIT_*: rev-parse и запись
+    // действуют строго на репозиторий -C worktree.
+    process.env.GIT_DIR = join(other, '.git');
+    process.env.GIT_WORK_TREE = wt;
+    await ensureFilemodeGuard(wt);
+    delete process.env.GIT_DIR;
+    delete process.env.GIT_WORK_TREE;
+    assert.equal((await gitA(['config', '--local', '--get', 'core.fileMode']))
+      .stdout.trim(), 'false');
+    // Конфиг другого репозитория не тронут: init выставил fileMode=true,
+    // перезапись через перенаправленный GIT_DIR не произошла.
+    assert.equal((await gitB(['config', '--local', '--get', 'core.fileMode']))
+      .stdout.trim(), 'true');
+  } finally {
+    if (savedGitDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = savedGitDir;
+    if (savedGitTree === undefined) delete process.env.GIT_WORK_TREE;
+    else process.env.GIT_WORK_TREE = savedGitTree;
     await rm(dir, { recursive: true, force: true });
   }
 });

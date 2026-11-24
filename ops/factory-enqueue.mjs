@@ -73,6 +73,26 @@ async function canonicalInput(path, { worktrees = [], mustBe, storage = false } 
 const sha256File = async path =>
   createHash('sha256').update(await readFile(path)).digest('hex');
 
+// Путь хранилища из политики (та же форма, что у контроллера:
+// resolveLedgerPath принимает строку или { path }, resolveMemoryStoreDir —
+// строку или { storeDir|dir|path }). Явный null/''/нестроковое значение —
+// заданный, но непригодный вход: отказ до вызова vb, а не молчаливый
+// пропуск (factory-run с такой политикой тоже отказал бы).
+const policyStoragePath = (cfg, keys) => {
+  if (cfg === undefined) return undefined;
+  if (cfg === null) fail('path_not_absolute');
+  if (typeof cfg === 'string') return cfg;
+  if (typeof cfg !== 'object' || Array.isArray(cfg)) fail('policy_invalid');
+  let found;
+  for (const k of keys) {
+    const v = cfg[k];
+    if (v === undefined) continue;
+    if (v === null || v === '') fail('path_not_absolute');
+    if (found === undefined) found = v;
+  }
+  return found;
+};
+
 // Тот же отпечаток, что контроллер запишет в route.policyDigest и приёмка
 // сверит с меткой карточки на seal (readOperatorInputs, run-isolated.mjs).
 // Каждый вложенный вход проходит ту же проверку, что и --brief/--policy:
@@ -157,6 +177,19 @@ export async function buildEnqueuePlan(values) {
       worktrees.push(wtReal);
       // И сам файл политики обязан лежать вне дерева воркера.
       policyFile = await canonicalInput(values.policy, { worktrees, mustBe: 'file' });
+    }
+    // Пути хранилищ из политики — та же граница, что и у флагов
+    // --ledger-path/--memory-dir: журнал и память внутри worktree (или
+    // содержащие его) контроллер отклонил бы при запуске; карточка с
+    // незапускаемой закреплённой политикой на Board не создаётся.
+    const policyLedger = policyStoragePath(policyJson.decisionLedger, ['path']);
+    if (policyLedger !== undefined) {
+      await canonicalInput(policyLedger, { worktrees, mustBe: 'file', storage: true });
+    }
+    const policyMemory = policyStoragePath(policyJson.projectMemory,
+      ['storeDir', 'dir', 'path']);
+    if (policyMemory !== undefined) {
+      await canonicalInput(policyMemory, { worktrees, mustBe: 'dir', storage: true });
     }
   }
   let specDigest = values['spec-digest'];
