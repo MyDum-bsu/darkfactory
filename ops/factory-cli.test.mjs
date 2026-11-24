@@ -764,6 +764,15 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const fHbInner = await withPolicy(dir, hbInner);
     await assert.rejects(() => runPlan(runValues(fHbInner, state)),
       /path_inside_worktree|path_missing/);
+    // Операторский файл внутри inbox сдачи — рабочий путь воркера у
+    // контроллера: отклоняется при построении плана (до Git-конфига),
+    // как и в dry-run.
+    const briefInInbox = join(inbox, 'brief.md');
+    await writeFile(briefInInbox, 'brief');
+    const hbBrief = { ...policySpec(wt), handoffDir: inbox, brief: briefInInbox };
+    const fHbBrief = await withPolicy(dir, hbBrief);
+    await assert.rejects(() => runPlan(runValues(fHbBrief, state)),
+      /path_inside_worktree/);
     // Путь контроллера не переопределяется флагами.
     await assert.rejects(() => runFactory(['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', ok, '--state', state, '--run-isolated', join(dir, 'evil.mjs')], {}),
@@ -1028,6 +1037,14 @@ test('run: нестроковое значение приоритетного п
     const fEmpty = await withPolicy(dir, { ...policySpec(wt),
       decisionLedger: '' });
     await assert.rejects(() => runPlan(runValues(fEmpty, state)), /path_not_absolute/);
+    // Явный null в CLI-override — не «отсутствует»: ?? подставил бы
+    // policy/env, а в env-переопределение плана попал бы null. Отказ
+    // при построении плана.
+    const fOk = await withPolicy(dir, policySpec(wt));
+    await assert.rejects(() => runPlan(runValues(fOk, state,
+      { 'ledger-path': null })), /path_not_absolute/);
+    await assert.rejects(() => runPlan(runValues(fOk, state,
+      { 'memory-dir': null })), /path_not_absolute/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -131,6 +131,7 @@ async function nestedPolicyFile(path, treeAliases) {
   if (st.isSymbolicLink()) fail('non_canonical_or_symlink_path');
   if (!st.isFile()) fail('path_not_file');
   if (treeAliases.some(t => inside(t, real))) fail('path_inside_worktree');
+  return real;
 }
 
 const PASSTHROUGH_BOOL = ['stop-on-idle', 'daemon', 'allow-live-pilot',
@@ -167,7 +168,10 @@ function effectivePath({ explicit, policyValue, env, name }) {
   const policyRaw = policyValue ?? env;
   // Явная пустая строка в CLI или политике — не «не задано» (только
   // пустой/отсутствующий env означает отсутствие пути): отклоняется.
-  if (explicit === '' || policyValue === '') fail('path_not_absolute');
+  if (explicit === '' || explicit === null ||
+      policyValue === '' || policyValue === null) {
+    fail('path_not_absolute');
+  }
   if (explicit !== undefined && policyValue !== undefined && explicit !== policyValue) {
     fail(`${name}_mismatch`);
   }
@@ -228,15 +232,18 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // Вложенные операторские входы политики — та же каноничность, что и у
   // --policy: исходная строка brief/reviewPrompt/reviewGate/skillFiles
   // обязана совпадать с realpath и лежать вне worktree.
+  const operatorFiles = [policyPathReal];
   for (const p of [policy.brief, policy.reviewPrompt, policy.reviewGate,
     ...Object.values(policy.reviewSkillFiles ?? {})]) {
-    await nestedPolicyFile(p, treeAliases);
+    const real = await nestedPolicyFile(p, treeAliases);
+    if (real !== undefined) operatorFiles.push(real);
   }
   // routes.json — закрепляемый вход ревью рядом с reviewGate (как в
   // factory-enqueue): симлинк на внешнюю цель контроллер разрешил бы
   // молча — отказ здесь.
   if (policy.reviewGate !== undefined && policy.reviewGate !== null) {
-    await nestedPolicyFile(join(dirname(policy.reviewGate), 'routes.json'), treeAliases);
+    operatorFiles.push(await nestedPolicyFile(
+      join(dirname(policy.reviewGate), 'routes.json'), treeAliases));
   }
   // Эффективный kill-switch демона (--switch > pilot.killSwitch): как у
   // createPilotSwitch — абсолютный путь вне дерева воркера; родительский
@@ -309,6 +316,10 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   if (policy.handoffDir !== undefined) {
     handoff = await canonicalOutside(policy.handoffDir, treeAliases, 'dir', { parent: false });
     if (inside(state, handoff) || inside(handoff, state)) fail('path_inside_worktree');
+    // Inbox сдачи — рабочий путь воркера: операторский файл внутри него
+    // контроллер отклонил бы («Operator files must be outside worker
+    // paths») уже после записи Git-конфига; отказ здесь, до эффекта.
+    if (operatorFiles.some(f => inside(handoff, f))) fail('path_inside_worktree');
   }
   // Каталоги стоп-файлов — та же двусторонняя permitDirectory-граница
   // против state и handoffDir (inbox сдачи контроллера), когда он задан.
