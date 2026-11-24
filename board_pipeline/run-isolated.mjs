@@ -24,6 +24,7 @@ import { tamperGate } from './tamper-gate.mjs';
 import { reconcileFeedbackFromBb, reconcileSpawnFromBb } from './bb-reconcile.mjs';
 import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.mjs';
 import { DEFAULT_INTERVAL_MS, RotatingJournal, runDaemon, TERMINAL_PHASES } from './daemon.mjs';
+import { createEventBus, DEFAULT_SOCKET_PATH } from './event-bus.mjs';
 import { localReleasePort } from './local-release.mjs';
 import { ReleaseDenied } from './release-contract.mjs';
 import { arbiterIntakePrompt, decisionsPromptBlock, projectMemoryPromptBlock,
@@ -175,7 +176,7 @@ async function execute() {
     state: { type: 'string' }, 'recheck-rejected-handoff': { type: 'boolean' },
     'stop-on-idle': { type: 'boolean' }, 'allow-live-pilot': { type: 'boolean' },
     daemon: { type: 'boolean' }, 'interval-ms': { type: 'string' }, switch: { type: 'string' },
-    'l1-profile': { type: 'string' } } });
+    'l1-profile': { type: 'string' }, 'event-socket': { type: 'string' } } });
   if (!values.execute || !values.policy || !values.state) throw new Error('Use --execute --policy FILE --state DIR');
   const policyFile = await realpath(values.policy);
   const policyBytes = await readFile(policyFile);
@@ -202,6 +203,17 @@ async function execute() {
   if (inside(root, inbox) || inside(inbox, root) || inside(tree, inbox)) throw new Error('Handoff inbox must be separate');
   const st = await lstat(root);
   if (!st.isDirectory() || st.uid !== process.getuid() || st.mode & 0o077) throw new Error('State must be private');
+  // Fail-open Pub/Sub событий попытки (V2-3): события фаз/стадий/демона
+  // пишутся в <state>/events.ndjson и best-effort push'ятся в Unix socket
+  // Control Room. Приоритет пути сокета: --event-socket >
+  // DF_CONTROL_ROOM_SOCKET > дефолт XDG; 'off'/'none' отключает push.
+  // Недоступный сокет не влияет на контроллер (ограниченная очередь,
+  // drop-on-overflow, журнал — источник истины).
+  const eventSocket = values['event-socket'] ?? process.env.DF_CONTROL_ROOM_SOCKET;
+  const eventBus = createEventBus({ stateDir: root,
+    socketPath: eventSocket === undefined ? DEFAULT_SOCKET_PATH
+      : ['off', 'none', ''].includes(eventSocket) ? null : eventSocket,
+    project: p.bb.project, channel: p.channel ?? p.label?.value ?? null });
   const ab = await enrollAbPilot(p.abPilot, { policy: p, tree, root, inbox, daemon: values.daemon,
     allowLive: values['allow-live-pilot'], parent: process.env.BB_THREAD_ID });
   // Общий Foreman-плейбук без флага abPilot: канонические catalog, playbook,
@@ -994,7 +1006,7 @@ async function execute() {
   let recheck = values['recheck-rejected-handoff'];
   const tick = guardedEffect(assertOpen, advanceWithProjection);
   const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
-    release: releasePort, recheckRejectedHandoff: recheck,
+    release: releasePort, recheckRejectedHandoff: recheck, eventBus,
     workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter,
       ...(ab ? { selectWorker: () => [{ provider: p.bb.provider, model: p.bb.model }] } : {}), arbitrate,
       // VS-4.2 (#1263): триада резолвится один раз — при запуске попытки —
@@ -1066,7 +1078,7 @@ async function execute() {
       const journal = new RotatingJournal({ directory: root });
       await runDaemon({
         intervalMs, journal, diskPath: tree, assertOpen: daemonOpen,
-        tick: runTick,
+        tick: runTick, eventBus,
         onTick: async result => {
           observeTick(result);
           if (result.phase === 'release_ready' && !releasePort) return 'stop';
@@ -1112,6 +1124,9 @@ async function execute() {
       // Закрытая карточка с историей REWORK — источник уроков (#1263).
       if (['done', 'hold'].includes(lastResult?.phase)) await distillClosedAttempt();
       await finishTelemetry();
+      // Дочищаем очередь записи журнала событий и закрываем сокет Control
+      // Room: недописанный хвост не теряется при выходе процесса.
+      await eventBus.close();
     }
     finally { await release(); }
   }

@@ -136,16 +136,33 @@ function attemptOf(record, route) {
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
 export async function advance({ route, state, board, bb, submissions, verify, authorize,
-  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger }) {
+  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger, eventBus }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const hazards = mutants ?? {};
   const binding = createHash('sha256').update(JSON.stringify(route)).digest('hex');
   let record = await state.load();
   if (record && record.binding !== binding) throw new Error('The enrolled route changed');
+  let lastEmittedPhase = record?.phase;
+  // Fail-open события фаз для Control Room (V2-3): bus необязателен, его
+  // отсутствие и любая ошибка доставки не влияют на WAL и тик.
+  const emitPhase = () => {
+    if (!record?.phase || record.phase === lastEmittedPhase) return;
+    const phase = record.phase;
+    lastEmittedPhase = phase;
+    const attempt = attemptOf(record, route);
+    const kind = phase === 'awaiting_answer' ? 'question_blocked'
+      : phase === 'done' ? 'completed'
+      : TERMINAL.has(phase) ? phase
+      : 'phase';
+    eventBus?.emit({ kind, phase, task_id: attempt.task_id, attempt_id: attempt.attempt_id,
+      epoch: attempt.epoch, reason: record.reason ?? null, role: 'controller',
+      detail: { threadId: record.threadId ?? null, sha: record.sha ?? null } });
+  };
   const save = async patch => {
     record = patch === null ? null : { ...record, ...patch };
     await state.save(record);
+    emitPhase();
   };
   const visible = () => ({ phase: record.phase, attemptId: record.attemptId,
     epoch: record.epoch, threadId: record.threadId, reason: record.reason, sha: record.sha,
@@ -709,6 +726,9 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       .catch(() => null);
     if (!sent?.confirmed) return reconcileInFlight();
     await save({ phase: 'working', receipt: { kind: 'feedback', feedbackId } });
+    eventBus?.emit({ kind: 'rework', phase: 'working', task_id: attempt.task_id,
+      attempt_id: attempt.attempt_id, epoch: attempt.epoch, reason: feedbackReason,
+      round: roundsHistory?.filter(r => r.gate === 'l2').length ?? null });
   } else if (result.outcome === 'verified' && result.receipt?.settle === 'completed' && route.finish === 'verified') {
     const settled = await board.lookup(attempt.task_id);
     if (settled.state !== 'completed' || settled.result?.sha !== submission.candidate_sha) {

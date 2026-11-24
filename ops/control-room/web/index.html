@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Darkfactory Control Room</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header id="statusbar">
+  <span class="brand">DF Control Room</span>
+  <span class="chip" id="chip-slots" title="Активные слоты">слоты …</span>
+  <span class="chip" id="chip-killswitch">kill-switch …</span>
+  <span class="chip" id="chip-disk">disk …</span>
+  <span class="chip" id="chip-ram">RAM …</span>
+  <span class="chip" id="chip-cloud">cloud …</span>
+  <span class="chip" id="chip-net">net …</span>
+  <button class="chip clickable" id="chip-drift" type="button">drift …</button>
+  <label class="toggle"><input type="checkbox" id="toggle-clean" checked>
+    <span>Только чистые активные сессии</span></label>
+  <span class="spacer"></span>
+  <span class="chip dim" id="chip-ts">—</span>
+</header>
+
+<div id="drift-panel" class="hidden"></div>
+<div id="state-banner" class="hidden"></div>
+
+<main id="board">
+  <section class="col" id="col-running">
+    <h2>RUNNING NOW <span class="count" id="count-running">0</span></h2>
+    <div class="cards" id="running"></div>
+  </section>
+  <section class="col" id="col-queued">
+    <h2>QUEUED / WAITING <span class="count" id="count-queued">0</span></h2>
+    <div class="cards" id="queued"></div>
+  </section>
+  <section class="col" id="col-owner">
+    <h2>NEEDS OWNER <span class="count" id="count-owner">0</span></h2>
+    <div class="cards" id="needs-owner"></div>
+    <h2 class="mt">RECENTLY COMPLETED <span class="count" id="count-done">0</span></h2>
+    <div class="cards" id="done"></div>
+    <button id="toggle-done" class="link hidden" type="button"></button>
+  </section>
+</main>
+
+<footer>
+  <div id="projects"></div>
+</footer>
+
+<aside id="inspect" class="hidden">
+  <div class="inspect-head">
+    <span id="inspect-title">inspect</span>
+    <button id="inspect-close" type="button">×</button>
+  </div>
+  <pre id="inspect-body"></pre>
+</aside>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -64,7 +64,8 @@ export class RotatingJournal {
 //   onTick      — политика после тика: вернуть 'stop' для остановки демона.
 // Пустой тик не вызывает ничего, кроме журнала: ноль LLM на холостом ходу.
 export async function runDaemon({ tick, intervalMs = DEFAULT_INTERVAL_MS, assertOpen,
-  diskPath, checkDisk, journal, signal, installSignalHandlers = true, sleep = delay, onTick }) {
+  diskPath, checkDisk, journal, signal, installSignalHandlers = true, sleep = delay, onTick,
+  eventBus }) {
   if (typeof tick !== 'function') throw new Error('tick is required');
   if (!Number.isSafeInteger(intervalMs) || intervalMs < MIN_INTERVAL_MS) {
     throw new Error(`interval must be an integer >= ${MIN_INTERVAL_MS} ms`);
@@ -103,9 +104,13 @@ export async function runDaemon({ tick, intervalMs = DEFAULT_INTERVAL_MS, assert
   };
 
   const report = event => journal?.append(event).catch(() => {});
+  // Fail-open события демона для Control Room (V2-3): bus необязателен и
+  // никогда не влияет на цикл.
+  const emit = (kind, detail) => eventBus?.emit({ kind, role: 'daemon', detail });
   let ticks = 0;
   let stopped = 'signal';
   await report({ event: 'daemon_start', intervalMs });
+  emit('daemon.started', { intervalMs });
   try {
     for (;;) {
       if (stopping) break;
@@ -115,6 +120,7 @@ export async function runDaemon({ tick, intervalMs = DEFAULT_INTERVAL_MS, assert
       if (disk) {
         try { await disk(); } catch (error) {
           await report({ event: 'disk_budget_blocked', message: error.message });
+          emit('daemon.disk_blocked', { message: error.message });
           if (stopping) break;
           await wait(intervalMs);
           continue;
@@ -135,15 +141,18 @@ export async function runDaemon({ tick, intervalMs = DEFAULT_INTERVAL_MS, assert
       const action = await onTick?.(result);
       await report({ event: 'tick', ticks, phase: result?.phase,
         ...(result?.reason !== undefined ? { reason: result.reason } : {}) });
+      emit('daemon.tick', { ticks, phase: result?.phase ?? null, reason: result?.reason ?? null });
       if (action === 'stop') { stopped = 'terminal'; break; }
       if (stopping) break;
       // Сигнал во время ожидания будит цикл сразу, активный тик не прерывается:
       // слот завершает тик и остаётся в согласованной фазе WAL.
       await wait(intervalMs);
     }
+    if (stopped === 'kill_switch') emit('daemon.kill_switch', { ticks });
   } finally {
     for (const sig of installed) process.removeListener(sig, requestStop);
     signal?.removeEventListener('abort', requestStop);
+    emit('daemon.stopped', { reason: stopped, ticks });
     await journal?.append({ event: 'daemon_stop', reason: stopped, ticks }).catch(() => {});
   }
   return { ticks, stopped };

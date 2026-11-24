@@ -104,7 +104,7 @@ function inspectReceipt(request, receipt) {
 
 // Beta: the caller owns the existing Trust Kernel and read-only observation
 // ports. The outcome is workflow evidence; only native acceptance may settle.
-export async function runPlaybook({ registry, playbook, attempt }, { assertKernel, observeStage }) {
+export async function runPlaybook({ registry, playbook, attempt }, { assertKernel, observeStage, eventBus }) {
   if (!isRoleRegistry(registry) || typeof playbook !== 'string' || !Object.hasOwn(registry.playbooks, playbook) ||
       typeof assertKernel !== 'function' || typeof observeStage !== 'function') throw new Error('playbook_not_enrolled');
   const binding = boundSubject(attempt);
@@ -132,7 +132,16 @@ export async function runPlaybook({ registry, playbook, attempt }, { assertKerne
   while (next !== 'ready' && next !== 'hold') {
     await guard(assertKernel, binding, models);
     const request = Object.freeze({ ...plan[next], inputArtifactDigest: history.at(-1)?.digest ?? null });
+    // Fail-open телеметрия стадий для Control Room (V2-3): bus необязателен.
+    eventBus?.emit({ kind: 'stage.started', phase: 'stages', task_id: binding.task_id,
+      attempt_id: binding.attempt_id, epoch: binding.epoch, role: request.role,
+      mode: request.mode, model: request.model?.model ?? null,
+      detail: { stage: next, skills_digest: request.skills_digest } });
     const observation = inspectReceipt(request, await observeStage(request));
+    eventBus?.emit({ kind: 'stage.completed', phase: 'stages', task_id: binding.task_id,
+      attempt_id: binding.attempt_id, epoch: binding.epoch, role: request.role,
+      mode: request.mode, model: request.model?.model ?? null,
+      detail: { stage: next, verdict: observation.verdict, skills_digest: request.skills_digest } });
     await guard(assertKernel, binding, models);
     history.push({ stage: next, role: request.role, skills_digest: request.skills_digest, ...observation });
     if (observation.verdict === 'BLOCKED') return { status: 'hold', history };

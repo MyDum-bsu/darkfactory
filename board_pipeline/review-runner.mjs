@@ -15,6 +15,7 @@ import { unpackExact } from './runtime.mjs';
 import { withModelProxy } from './model-proxy.mjs';
 import { applySeverityGating, buildReviewInstruction } from './review-policy.mjs';
 import { sumUsages } from './telemetry.mjs';
+import { createStreamLoopGuard } from './loop-detector.mjs';
 
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
@@ -1060,6 +1061,17 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       await writeFile(join(journal, name), transcript, { flag: 'wx', mode: 0o600 });
 
       const parsed = parseReviewTranscript(transcript);
+      // Observe-метрика зацикливания критика (V2-3): детектор не меняет
+      // вердикт — сработка видна в журнале для калибровки abort-режима.
+      try {
+        const guard = createStreamLoopGuard({ mode: 'observe' });
+        guard.push('content', parsed.finalText ?? '');
+        const loopMetric = guard.finish();
+        if (loopMetric.looped) {
+          console.log(JSON.stringify({ loop_guard: 'l2_critic', task_id: binding.task_id,
+            content: loopMetric.content }));
+        }
+      } catch { /* метрика не влияет на приёмку */ }
       for (const key of ['provider', 'model', 'reasoningLevel']) {
         if (parsed.actual[key] !== critic[key]) {
           throw new ReviewDenied(`review_${key}_mismatch`);

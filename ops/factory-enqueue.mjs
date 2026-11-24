@@ -25,6 +25,7 @@ import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
 import { resolveL1Profile } from '../board_pipeline/l1-profiles.mjs';
+import { assertNoBranchDrift } from '../board_pipeline/branch-drift.mjs';
 
 const execFileAsync = promisify(execFile);
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -150,8 +151,38 @@ async function pinnedPolicyDigest(file, policy, { worktrees = [], separate = [] 
   return computed;
 }
 
+// Механический Branch Drift Preflight (V2-3): до постановки проверяем, что
+// в репозитории worktree нет невлитых веток, пересекающихся с --touch
+// путями задачи, и грязных bb/thr_* worktree. Проверка активируется, когда
+// worktrees[0] — git-репозиторий, либо явным --check-drift (на не-git
+// входе — fail-closed drift_check_unavailable). Дрейф без --allow-drift
+// блокирует постановку до вызова vb.
+async function branchDriftPreflight({ worktrees, values, deps }) {
+  const repoDir = worktrees[0];
+  const explicit = values['check-drift'] === true;
+  if (repoDir === undefined && !explicit) return null;
+  const execGit = deps.execGit ?? (async (args, cwd) =>
+    (await execFileAsync('git', args, { cwd, timeout: 20_000 })).stdout);
+  const isGit = repoDir !== undefined &&
+    await Promise.resolve(execGit(['rev-parse', '--is-inside-work-tree'], repoDir))
+      .then(out => out.trim() === 'true').catch(() => false);
+  if (!isGit && !(deps.checkBranchDrift && repoDir !== undefined)) {
+    if (explicit) fail('drift_check_unavailable');
+    return null;
+  }
+  const check = deps.checkBranchDrift ?? assertNoBranchDrift;
+  const report = await check({
+    repoDir,
+    baseRef: values['drift-base'] ?? 'HEAD',
+    touchPaths: values.touch ?? [],
+    allowDrift: values['allow-drift'] === true,
+    execGit,
+  });
+  return report;
+}
+
 // Собирает проверенный план вызова `vb tasks create`. Ничего не исполняет.
-export async function buildEnqueuePlan(values) {
+export async function buildEnqueuePlan(values, deps = {}) {
   const url = values['board-url'];
   try {
     const parsed = new URL(url ?? '');
@@ -258,6 +289,11 @@ export async function buildEnqueuePlan(values) {
       fail('handoff_required');
     }
   }
+  // Branch Drift Preflight до любого эффекта: дрейф без --allow-drift
+  // блокирует постановку (branch_drift_detected в error.drift — отчёт).
+  const drift = await branchDriftPreflight({ worktrees, values, deps });
+  const driftAllowed = drift?.driftDetected === true;
+
   let specDigest = values['spec-digest'];
   if (values.brief !== undefined) {
     const briefReal = await canonicalInput(values.brief, { worktrees, mustBe: 'file' });
@@ -404,7 +440,10 @@ export async function buildEnqueuePlan(values) {
     }
   }
   return { tool, argv, labels,
-    meta: { boardUrl: url, channel: values.channel, finish: values.finish, l1Profile } };
+    meta: { boardUrl: url, channel: values.channel, finish: values.finish, l1Profile,
+      ...(driftAllowed ? { branchDrift: { ...drift, allowedByFlag: true } }
+        : drift ? { branchDrift: { driftDetected: false, summary: drift.summary } }
+        : {}) } };
 }
 
 export async function runEnqueue(argv, deps = {}) {
@@ -418,8 +457,10 @@ export async function runEnqueue(argv, deps = {}) {
     worktree: { type: 'string' }, 'memory-dir': { type: 'string' },
     'ledger-path': { type: 'string' }, vb: { type: 'string' },
     'l1-profile': { type: 'string' },
+    touch: { type: 'string', multiple: true }, 'drift-base': { type: 'string' },
+    'allow-drift': { type: 'boolean' }, 'check-drift': { type: 'boolean' },
     'dry-run': { type: 'boolean' }, json: { type: 'boolean' } } });
-  const plan = await buildEnqueuePlan(values);
+  const plan = await buildEnqueuePlan(values, deps);
   if (values['dry-run']) {
     return { dryRun: true, plan };
   }

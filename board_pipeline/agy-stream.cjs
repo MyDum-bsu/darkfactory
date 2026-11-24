@@ -6,6 +6,7 @@ const { lstat, readFile, writeFile } = require('node:fs/promises');
 const { join } = require('node:path');
 const { isDeepStrictEqual, promisify } = require('node:util');
 const { checkSnapshotTool, isSnapshotTool } = require('./agy-tools.cjs');
+const { createStreamLoopGuard } = require('./loop-detector.cjs');
 const MODEL = 'gemini-4-neon';
 const EFFORT = 'medium';
 const LIMIT = 2 * 1024 * 1024;
@@ -55,8 +56,16 @@ function trackSnapshotReads(cwd, enabled) {
   };
 }
 
-function monitorAgy(cwd, { snapshotTools = false } = {}) {
+function monitorAgy(cwd, { snapshotTools = false, loopMode } = {}) {
   const reader = trackSnapshotReads(cwd, snapshotTools);
+  // Микро-уровень защиты от зацикливания модели (V2-3, MIT-порт
+  // loop-gate): rolling 32-словные n-граммы по content-каналу стрима.
+  // DF_LOOP_GATE_MODE: observe (дефолт, метрика loopGuard без прерывания),
+  // abort (немедленный 'loop_detected'), off. Невалидное значение —
+  // fail-open в observe, стрим не ломается о мисконфиг.
+  const mode = loopMode ?? (['observe', 'abort', 'off'].includes(process.env.DF_LOOP_GATE_MODE)
+    ? process.env.DF_LOOP_GATE_MODE : 'observe');
+  const loopGuard = createStreamLoopGuard({ mode });
   let conversation;
   let result;
   let usage = null;
@@ -98,6 +107,10 @@ function monitorAgy(cwd, { snapshotTools = false } = {}) {
             throw error('agy_stream_extra_turn');
           }
           if (step.step_type === 'agent_response' && step.state === 'DONE') answered = true;
+          if (step.step_type === 'agent_response' && typeof step.text_delta === 'string') {
+            const loop = loopGuard.push('content', step.text_delta);
+            if (loop.looped && loopGuard.mode === 'abort') throw error('loop_detected');
+          }
           break;
         }
         case 'result': {
@@ -121,7 +134,8 @@ function monitorAgy(cwd, { snapshotTools = false } = {}) {
     finish() {
       if (!result) throw error('agy_incomplete_turn');
       return { text: result, ...reader.finish(), actual: { provider: 'google', model: MODEL, reasoningLevel: EFFORT },
-        evidence: { model: 'agy_stream_init', effort: 'agy_cli_request' }, usage };
+        evidence: { model: 'agy_stream_init', effort: 'agy_cli_request' }, usage,
+        loopGuard: loopGuard.finish() };
     },
   };
 }
