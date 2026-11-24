@@ -209,9 +209,11 @@ test('enqueue: дефолт node, авто python-node, явный --l1-profile'
   for (const repo of ['optimization', 'autoresearcher']) {
     const plan = await buildEnqueuePlan({ ...baseValues(), 'repo-id': repo });
     assert.equal(plan.meta.l1Profile, 'python-node');
-    // Нестандартный авто-дефолт репозитория фиксируется на карточке:
-    // приёмка видит тот же явный выбор, что и постановка.
-    assert.equal(plan.labels.l1_profile, 'python-node');
+    // Авто-дефолт на карточку не пишется: записанная метка стала бы
+    // явным выбором контракта и ложно конфликтовала бы с явным
+    // l1Profile рецепта политики приёмки — контроллер выводит дефолт
+    // по repo_id сам.
+    assert.equal(plan.labels.l1_profile, undefined);
   }
   const explicit = await buildEnqueuePlan({ ...baseValues(),
     'l1-profile': 'python-node' });
@@ -266,6 +268,31 @@ test('enqueue: l1Profile политики валидируется и сверя
     await write(null);
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile }), /unknown_l1_profile:null/);
+    // Явный l1Profile рецепта выбранного профиля — контрактный источник
+    // (как в buildRunPlan): конфликт с --l1-profile отклоняется до vb,
+    // невалидное значение — fail-closed unknown_l1_profile.
+    const recipePolicy = l1 => writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate,
+      route: { checkProfile: 'prof' },
+      profiles: { prof: {
+        review: { provider: 'openai', model: 'gpt-6.2-sol',
+          reasoningLevel: 'medium' },
+        checks: [{ l1Profile: l1, argv: ['npm', 'test'], cwd: '.',
+          timeoutMs: 1000 }] } },
+    }));
+    await recipePolicy('python-node');
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile, 'l1-profile': 'node' }),
+      /l1_profile_mismatch/);
+    // Совпадающий явный выбор проходит и фиксируется на карточке.
+    const sameRecipe = await buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile,
+      'l1-profile': 'python-node' });
+    assert.equal(sameRecipe.labels.l1_profile, 'python-node');
+    await recipePolicy('bogus');
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }),
+      /unknown_l1_profile:bogus/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

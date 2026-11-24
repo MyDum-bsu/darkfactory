@@ -24,8 +24,7 @@ import { dirname, isAbsolute, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
-import { DEFAULT_L1_PROFILE, resolveL1Profile }
-  from '../board_pipeline/l1-profiles.mjs';
+import { resolveL1Profile } from '../board_pipeline/l1-profiles.mjs';
 
 const execFileAsync = promisify(execFile);
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -337,17 +336,33 @@ export async function buildEnqueuePlan(values) {
   const l1Profile = resolveL1Profile({
     l1Profile: values['l1-profile'] ?? policyProfileL1,
     repoId: values['repo-id'] }).id;
+  // Явный l1Profile рецептов проверок выбранного профиля — тот же
+  // контрактный источник, что в buildRunPlan: неизвестное имя и
+  // расхождение с --l1-profile или закреплённым l1Profile профиля
+  // отклоняются до вызова vb, а не при приёмке.
+  const selProfile = policyJson?.profiles?.[values.profile];
+  for (const recipe of [...(selProfile?.checks ?? []),
+    ...(selProfile?.visual === undefined ? [] : [selProfile.visual])]) {
+    if (recipe?.l1Profile !== undefined) {
+      resolveL1Profile({ l1Profile: recipe.l1Profile });
+      if ((values['l1-profile'] !== undefined &&
+            values['l1-profile'] !== recipe.l1Profile) ||
+          (policyProfileL1 !== undefined &&
+            policyProfileL1 !== recipe.l1Profile)) {
+        fail('l1_profile_mismatch');
+      }
+    }
+  }
 
   const labels = { spec_digest: specDigest, policy_digest: policyDigest,
     repo_id: values['repo-id'], profile_id: values.profile, finish: values.finish, ...extra };
-  // Метка ставится при явном выборе (CLI --l1-profile или
-  // profiles.<profile>.l1Profile политики) и при нестандартном
-  // эффективном профиле: авто-дефолт python-node репозитория
-  // (optimization/autoresearcher) фиксируется на карточке, чтобы
-  // приёмка видела тот же явный выбор, что и постановка. Совпадающий с
-  // repo_id дефолт 'node' не пишется — контроллер выводит его сам.
-  if (values['l1-profile'] !== undefined || policyProfileL1 !== undefined ||
-      l1Profile !== DEFAULT_L1_PROFILE) {
+  // Метка ставится только при ЯВНОМ выборе (CLI --l1-profile или
+  // profiles.<profile>.l1Profile политики): она — контрактный явный
+  // источник для контроллера. Авто-дефолт репозитория на карточку не
+  // пишется — контроллер выводит его по repo_id сам, а записанный
+  // дефолт стал бы явным выбором и ложно конфликтовал бы с явным
+  // l1Profile рецепта политики приёмки.
+  if (values['l1-profile'] !== undefined || policyProfileL1 !== undefined) {
     labels.l1_profile = l1Profile;
   }
   for (const item of values.label ?? []) {
