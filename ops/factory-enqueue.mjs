@@ -263,6 +263,11 @@ export async function buildEnqueuePlan(values) {
   const extra = {};
   for (const [flag, key] of [['memory-dir', 'memory_dir'], ['ledger-path', 'ledger_path']]) {
     if (values[flag] !== undefined) {
+      // Без --policy значение handoffDir неизвестно: по одному
+      // --policy-digest двустороннюю границу хранилища против inbox сдачи
+      // подтвердить нельзя — в Board не уходит метка с непроверенным
+      // путём, отказ до вызова vb.
+      if (values.policy === undefined) fail('policy_required');
       // Та же двусторонняя storage-граница действует и против handoffDir:
       // журнал/память — операторские пути вне рабочего каталога сдачи.
       extra[key] = await canonicalInput(values[flag],

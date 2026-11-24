@@ -309,6 +309,14 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     await writeFile(policyFile, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
       handoffDir: hoInbox }));
+    // Без файла политики (только --policy-digest) значение handoffDir
+    // неизвестно: границу хранилища против inbox сдачи подтвердить
+    // нельзя — CLI отклоняет такой вход до вызова vb, в Board не уходит
+    // метка с непроверенным путём.
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'ledger-path': storeLedger }), /policy_required/);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'memory-dir': store }), /policy_required/);
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile,
       'ledger-path': hoLedger }), /path_inside_worktree/);
