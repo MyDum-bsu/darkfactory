@@ -22,10 +22,17 @@
   <span class="chip dim" id="chip-ts">—</span>
 </header>
 
+<nav id="tabs" aria-label="Control Room sections">
+  <button type="button" class="tab active" data-tab="ops">Operations</button>
+  <button type="button" class="tab" data-tab="models">Models &amp; Routing</button>
+  <button type="button" class="tab" data-tab="finops">Resources &amp; FinOps</button>
+  <button type="button" class="tab" data-tab="workspace">Workspace Map</button>
+</nav>
+
 <div id="drift-panel" class="hidden"></div>
 <div id="state-banner" class="hidden"></div>
 
-<main id="board">
+<main id="board" class="tab-page">
   <section class="col" id="col-running">
     <h2>RUNNING NOW <span class="count" id="count-running">0</span></h2>
     <div class="cards" id="running"></div>
@@ -43,7 +50,30 @@
   </section>
 </main>
 
-<footer>
+<section id="models-page" class="tab-page hidden" aria-label="Models and routing">
+  <div id="models-summary" class="summary-grid"></div>
+  <h2>MODEL REGISTRY</h2>
+  <div id="models-table" class="table-wrap"></div>
+  <div class="hint">CLI: df-models set &lt;role&gt; &lt;model&gt; · df-models mode economy|balanced|sprint</div>
+</section>
+
+<section id="finops-page" class="tab-page hidden" aria-label="Resources and FinOps">
+  <div id="finops-summary" class="summary-grid"></div>
+  <div class="finops-grid">
+    <section><h2>GCP CREDITS</h2><div id="finops-credits"></div></section>
+    <section><h2>COMPUTE VMS</h2><div id="finops-vms"></div></section>
+    <section><h2>COMPUTE QUOTAS</h2><div id="finops-quotas"></div></section>
+    <section><h2>AI SUBSCRIPTIONS</h2><div id="finops-subscriptions"></div></section>
+  </div>
+  <section><h2>ALERTS</h2><div id="finops-alerts"></div></section>
+</section>
+
+<section id="workspace-page" class="tab-page hidden" aria-label="Workspace map">
+  <div id="workspace-links" class="workspace-grid"></div>
+  <section><h2>QUICK COMMANDS</h2><div id="workspace-commands" class="commands"></div></section>
+</section>
+
+<footer id="projects-footer">
   <div id="projects"></div>
 </footer>
 

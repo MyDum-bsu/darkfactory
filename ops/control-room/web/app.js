@@ -4,7 +4,7 @@
 'use strict';
 
 const $ = id => document.getElementById(id);
-const state = { snapshot: null, showAllDone: false, driftOpen: false, cleanOnly: true };
+const state = { snapshot: null, showAllDone: false, driftOpen: false, cleanOnly: true, tab: 'ops' };
 
 const el = (tag, cls, text) => {
   const node = document.createElement(tag);
@@ -14,6 +14,16 @@ const el = (tag, cls, text) => {
 };
 
 const fmtBytes = n => n == null ? '—' : `${(n / (1 << 30)).toFixed(1)}G`;
+const eur = n => n == null ? '—' : `€${Number(n).toFixed(2)}`;
+const safeHttpUrl = value => {
+  if (typeof value !== 'string' || !value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+  } catch {
+    return null;
+  }
+};
 const fmtMs = ms => {
   if (ms == null) return '—';
   const s = Math.max(0, Math.round(ms / 1000));
@@ -176,6 +186,209 @@ function renderProjects(snap) {
   }
 }
 
+function metric(label, value, cls) {
+  const node = el('div', `metric${cls ? ` ${cls}` : ''}`);
+  node.append(el('div', 'metric-label', label));
+  node.append(el('div', 'metric-value', value));
+  return node;
+}
+
+function tableInto(box, headers, rows) {
+  box.replaceChildren();
+  const table = el('table');
+  const head = el('thead');
+  const hr = el('tr');
+  for (const title of headers) hr.append(el('th', null, title));
+  head.append(hr);
+  table.append(head);
+  const body = el('tbody');
+  for (const row of rows) {
+    const tr = el('tr');
+    for (const cell of row) {
+      const spec = typeof cell === 'object' && cell !== null ? cell : { text: cell };
+      tr.append(el('td', spec.cls ?? null, String(spec.text ?? '—')));
+    }
+    body.append(tr);
+  }
+  table.append(body);
+  box.append(table);
+}
+
+function renderModels(snap) {
+  const summary = $('models-summary');
+  const tableBox = $('models-table');
+  summary.replaceChildren();
+  tableBox.replaceChildren();
+  const models = snap.models;
+  if (!models?.ok) {
+    summary.append(metric('Model registry', models?.error ?? 'нет данных', 'bad'));
+    return;
+  }
+  summary.append(metric('Active mode', models.mode ?? '—', 'ok'));
+  const roles = [['Coder', models.triad?.coder], ['Reviewer', models.triad?.reviewer],
+    ['Arbiter', models.triad?.arbiter], ['Lead', models.triad?.lead],
+    ['UX Critic', models.triad?.ux_critic]];
+  for (const [role, selected] of roles) {
+    summary.append(metric(role, selected
+      ? `${selected.id} · ${selected.family}` : '—', selected ? null : 'warn'));
+  }
+  const rows = (models.models ?? []).map(model => {
+    const status = model.effectiveStatus ?? model.status ?? '—';
+    const cls = status === 'promo_free' ? 'status-promo'
+      : status === 'active' ? 'status-active'
+      : status === 'quota_paused' ? 'status-paused'
+      : status === 'disabled' ? 'status-disabled' : 'status-standby';
+    return [model.id, model.provider, model.model, model.family,
+      { text: String(status).replaceAll('_', ' ').toUpperCase(), cls }, model.until ?? '—'];
+  });
+  tableInto(tableBox, ['id', 'provider', 'model', 'family', 'status', 'until'], rows);
+}
+
+function simpleCards(box, items, empty) {
+  box.replaceChildren();
+  if (!items.length) {
+    box.append(el('div', 'empty', empty));
+    return;
+  }
+  for (const item of items) box.append(item);
+}
+
+function quotaCard(quota) {
+  const node = el('div', 'resource-card');
+  const top = el('div', 'resource-top');
+  top.append(el('span', 'resource-title', quota.label ?? quota.id ?? 'quota'));
+  if (quota.status === 'underutilized') top.append(el('span', 'badge quota-idle', 'IDLE / UNDERUTILIZED'));
+  else top.append(el('span', 'badge shiva-clean', 'OK'));
+  node.append(top);
+  const pct = typeof quota.utilizationPct === 'number' ? quota.utilizationPct : null;
+  const bar = el('div', 'progress quota-bar');
+  if (pct != null) {
+    const fill = el('div');
+    fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    bar.append(fill);
+  }
+  node.append(bar);
+  node.append(el('div', 'meta',
+    `${pct == null ? 'usage unknown' : `${pct.toFixed(1)}%`} · total ${quota.totalUnits ?? '—'}${quota.unit ? ` ${quota.unit}` : ''}`));
+  if (quota.notes) node.append(el('div', 'last', quota.notes));
+  return node;
+}
+
+function renderFinops(snap) {
+  const summary = $('finops-summary');
+  summary.replaceChildren();
+  const finops = snap.finops;
+  for (const id of ['finops-credits', 'finops-vms', 'finops-quotas',
+    'finops-subscriptions', 'finops-alerts']) $(id).replaceChildren();
+  if (!finops?.ok) {
+    summary.append(metric('FinOps', finops?.error ?? 'нет данных', 'bad'));
+    return;
+  }
+  const totals = finops.totals ?? {};
+  summary.append(metric('Month spend', eur(totals.spentMonthCostEur), 'warn'));
+  summary.append(metric('Today', eur(totals.spentTodayCostEur)));
+  summary.append(metric('Monthly budget', eur(totals.monthlyBudgetEur)));
+  summary.append(metric('GCP credits', eur(totals.remainingCreditsEur), 'ok'));
+  summary.append(metric('Credit runway', finops.creditRunway?.days == null
+    ? '—' : `${finops.creditRunway.days} days`));
+  summary.append(metric('Worker hours', `${totals.runningHoursMonth ?? 0} h/mo`));
+
+  simpleCards($('finops-credits'), (finops.cloudCredits ?? []).map(credit => {
+    const node = el('div', 'resource-card');
+    node.append(el('div', 'resource-title', credit.label ?? credit.id ?? 'credit'));
+    node.append(el('div', 'meta',
+      `total ${eur(credit.totalEur)} · remaining ${eur(credit.remainingEur)}${credit.monthlyEur != null ? ` · monthly ${eur(credit.monthlyEur)}` : ''}`));
+    if (credit.expires) node.append(el('div', 'meta', `expires ${credit.expires}`));
+    if (credit.notes) node.append(el('div', 'last', credit.notes));
+    return node;
+  }), 'Нет cloud credits');
+
+  simpleCards($('finops-vms'), (finops.computeVms ?? []).map(vm => {
+    const node = el('div', 'resource-card');
+    const top = el('div', 'resource-top');
+    top.append(el('span', 'resource-title', vm.id ?? 'vm'));
+    top.append(el('span', 'badge', vm.state ?? 'unknown'));
+    node.append(top);
+    node.append(el('div', 'meta',
+      `${vm.machineType ?? '—'} · today ${eur(vm.costTodayEur)} · month ${eur(vm.costMonthEur)}`));
+    node.append(el('div', 'meta',
+      `hours ${(((vm.runningMinutesMonth ?? 0) / 60)).toFixed(1)} · wakes ${vm.wakesMonth ?? 0}${vm.pricing ? ` · ${vm.pricing}` : ''}`));
+    if (vm.notes) node.append(el('div', 'last', vm.notes));
+    return node;
+  }), 'Нет compute VM');
+
+  simpleCards($('finops-quotas'), (finops.computeQuotas ?? []).map(quotaCard), 'Нет compute quotas');
+
+  simpleCards($('finops-subscriptions'), (finops.aiSubscriptions ?? []).map(sub => {
+    const node = el('div', 'resource-card');
+    const top = el('div', 'resource-top');
+    top.append(el('span', 'resource-title', sub.label ?? sub.id ?? 'subscription'));
+    top.append(el('span', `badge ${sub.status === 'quota_paused' ? 'quota-idle' : 'shiva-clean'}`,
+      String(sub.status ?? 'active').replaceAll('_', ' ')));
+    node.append(top);
+    node.append(el('div', 'meta', `${sub.model ?? '—'}${sub.quota ? ` · quota ${sub.quota}` : ''}${sub.reset ? ` · reset ${sub.reset}` : ''}`));
+    if (sub.notes) node.append(el('div', 'last', sub.notes));
+    return node;
+  }), 'Нет AI subscriptions');
+
+  simpleCards($('finops-alerts'), (finops.alerts ?? []).map(alert =>
+    el('div', `alert ${alert.severity === 'bad' ? 'bad' : 'warn'}`,
+      `${alert.code}: ${alert.message}`)), 'Алертов нет');
+}
+
+function renderWorkspace(snap) {
+  const box = $('workspace-links');
+  const commands = $('workspace-commands');
+  box.replaceChildren();
+  commands.replaceChildren();
+  const finops = snap.finops;
+  if (!finops?.ok) {
+    box.append(el('div', 'empty', finops?.error ?? 'workspace map недоступна'));
+    return;
+  }
+  const groups = new Map();
+  for (const link of finops.workspaceLinks ?? []) {
+    const group = String(link.group ?? 'workspace');
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(link);
+  }
+  for (const [group, links] of groups) {
+    const section = el('section', 'workspace-group');
+    section.append(el('h2', null, group.replaceAll('_', ' ').toUpperCase()));
+    for (const link of links) {
+      const cardNode = el('div', 'resource-card workspace-card');
+      cardNode.append(el('div', 'resource-title', link.title ?? link.id ?? 'link'));
+      const url = safeHttpUrl(link.url);
+      if (url) {
+        const anchor = el('a', 'workspace-url', url);
+        anchor.href = url;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener noreferrer';
+        cardNode.append(anchor);
+      } else if (link.path) {
+        cardNode.append(el('div', 'cmd', link.path));
+      }
+      if (link.command) cardNode.append(el('div', 'cmd', link.command));
+      if (link.notes) cardNode.append(el('div', 'last', link.notes));
+      section.append(cardNode);
+    }
+    box.append(section);
+  }
+  for (const cmd of ['df-herd', 'df-models', 'vb', 'cloud-brain']) {
+    commands.append(el('span', 'cmd', cmd));
+  }
+}
+
+function setTab(tab) {
+  state.tab = tab;
+  for (const button of document.querySelectorAll('#tabs .tab')) {
+    button.classList.toggle('active', button.dataset.tab === tab);
+  }
+  const pages = { ops: 'board', models: 'models-page', finops: 'finops-page', workspace: 'workspace-page' };
+  for (const [name, id] of Object.entries(pages)) $(id).classList.toggle('hidden', name !== tab);
+  $('projects-footer').classList.toggle('hidden', tab !== 'ops');
+}
+
 async function openInspect(taskId) {
   const panel = $('inspect');
   panel.classList.remove('hidden');
@@ -200,6 +413,9 @@ function render(snap) {
   renderDriftPanel(snap);
   renderBoard(snap);
   renderProjects(snap);
+  renderModels(snap);
+  renderFinops(snap);
+  renderWorkspace(snap);
 }
 
 async function refresh() {
@@ -243,6 +459,9 @@ $('chip-drift').addEventListener('click', () => {
 });
 $('inspect-close').addEventListener('click', () => $('inspect').classList.add('hidden'));
 $('toggle-clean').addEventListener('change', ev => { state.cleanOnly = ev.target.checked; });
+for (const button of document.querySelectorAll('#tabs .tab')) {
+  button.addEventListener('click', () => setTab(button.dataset.tab));
+}
 
 document.addEventListener('keydown', ev => {
   if (ev.key === 'Escape') $('inspect').classList.add('hidden');

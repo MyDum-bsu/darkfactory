@@ -33,6 +33,7 @@ import { inspectWorktreesAndBranches } from '../../board_pipeline/branch-drift.m
 import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
   SECURITY_HEADERS } from './origin-guard.mjs';
 import { createNetHealthMonitor } from './net-health.mjs';
+import { createFinopsProvider } from './finops.mjs';
 import { loadModelRegistry, registrySnapshot } from '../../board_pipeline/model-registry.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -321,6 +322,7 @@ export function createControlRoomAggregator({
   netHealth = null,
   telemetryProvider = async () => null,
   modelsProvider = createModelsProvider(),
+  finopsProvider = createFinopsProvider(),
   inspectProvider = async () => ({ text: '', artifacts: [] }),
   webDir = WEB_DIR,
   now = () => Date.now(),
@@ -456,6 +458,10 @@ export function createControlRoomAggregator({
       ? await Promise.resolve().then(() => modelsProvider())
         .catch(error => ({ ok: false, error: sanitizeTerminalText(error.message) }))
       : null;
+    const finops = finopsProvider
+      ? await Promise.resolve().then(() => finopsProvider())
+        .catch(error => ({ ok: false, error: sanitizeTerminalText(error.message) }))
+      : null;
     const sessions = sessionHygiene(threads, tasks, attempts);
     const shiva = shivaCounter(threads, tasks);
     const reconciled = reconcileNeeded;
@@ -472,6 +478,7 @@ export function createControlRoomAggregator({
       netHealth: net,
       telemetry,
       models,
+      finops,
       eventsTail: ring.slice(-50),
       attemptsTracked: attempts.size,
     };
@@ -602,6 +609,7 @@ export function createControlRoomAggregator({
 //   [--board-url URL] [--board-channels a,b] [--board-token TOK]
 //   [--drift-repo DIR ...] [--net-probe name=url ...]
 //   [--models-catalog PATH] [--routing-policy PATH]
+//   [--resources-budget PATH] [--worker-usage PATH]
 async function loadBoardToken(flagValue) {
   if (typeof flagValue === 'string' && flagValue) return flagValue;
   const envToken = process.env.BOARD_TOKEN;
@@ -637,18 +645,23 @@ async function cli(argv) {
     'net-probe': { type: 'string', multiple: true },
     'cloud-state': { type: 'string' },
     'models-catalog': { type: 'string' },
-    'routing-policy': { type: 'string' } } });
+    'routing-policy': { type: 'string' },
+    'resources-budget': { type: 'string' },
+    'worker-usage': { type: 'string' } } });
   const port = values.port !== undefined ? Number(values.port)
     : Number(process.env.DF_CONTROL_ROOM_PORT ?? DEFAULT_PORT);
   const socketPath = values.socket !== undefined ? values.socket
     : join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'),
         'darkfactory', 'control-room.sock');
+  const cloudStatePath = values['cloud-state'] ??
+    join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'),
+      'darkfactory', 'cloud-worker-state.json');
   const netHealth = createNetHealthMonitor({
     probes: (values['net-probe'] ?? []).map(spec => {
       const i = spec.indexOf('=');
       return { name: spec.slice(0, i), url: spec.slice(i + 1) };
     }),
-    cloudStatePath: values['cloud-state'] ?? null });
+    cloudStatePath });
   const boardUrl = values['board-url'] ?? process.env.BOARD_URL ??
     `http://127.0.0.1:44100${BOARD_API_PATH}`;
   const channels = (values['board-channels'] ?? 'darkfactory')
@@ -668,7 +681,11 @@ async function cli(argv) {
     branchDriftProvider: driftProvider,
     modelsProvider: createModelsProvider({
       catalogPath: values['models-catalog'],
-      policyPath: values['routing-policy'] }) });
+      policyPath: values['routing-policy'] }),
+    finopsProvider: createFinopsProvider({
+      budgetPath: values['resources-budget'],
+      workerUsagePath: values['worker-usage'],
+      workerStatePath: cloudStatePath }) });
   const { port: actual } = await aggregator.start();
   console.log(JSON.stringify({ control_room: 'listening', host: '127.0.0.1', port: actual,
     socket: socketPath, boardApi: observeBoard.boardUrl, boardChannels: channels,

@@ -17,6 +17,7 @@ import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
 import { createNetHealthMonitor } from './net-health.mjs';
 import { createControlRoomAggregator, createBoardObserver,
   createBranchDriftProvider, createModelsProvider, RING_LIMIT } from './aggregator.mjs';
+import { createFinopsProvider } from './finops.mjs';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -636,4 +637,92 @@ test('aggregator: повреждённый models config fail-open, сервер
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+
+// --- DF-V2-COCKPIT: finops + terminal tabs -------------------------------------
+
+test('aggregator: snapshot включает read-only finops snapshot', async () => {
+  const budgetPath = join(MODULE_DIR, '..', 'local', 'resources-budget.example.yaml');
+  await withServer({ finopsProvider: createFinopsProvider({ budgetPath,
+      now: new Date('2026-11-24T12:00:00Z') }) },
+    async (server, base) => {
+      const res = await httpGet(`${base}/api/snapshot`);
+      assert.equal(res.status, 200);
+      const snap = JSON.parse(res.body);
+      assert.equal(snap.finops.ok, true);
+      assert.equal(snap.finops.computeQuotas.some(q => q.id === 'colab_pro_plus'), true);
+      assert.equal(snap.finops.workspaceLinks.length >= 5, true);
+      assert.equal(JSON.stringify(snap.finops).includes('javascript:'), false);
+      const post = await httpRequest(`${base}/api/snapshot`, {}, 'POST');
+      assert.equal(post.status, 405);
+    });
+});
+
+test('df-herd --once рендерит все 4 вкладки и санитизирует ANSI/OSC/bidi', async () => {
+  const evil = 'evil\x1b[2J\x1b]52;c;aGVsbG8=\x07\u202e';
+  const modelsProvider = async () => ({ ok: true, mode: 'balanced',
+    triad: {
+      coder: { id: `coder-${evil}`, family: 'cognition', alternatives: [] },
+      reviewer: { id: 'reviewer', family: 'google', alternatives: [] },
+      arbiter: { id: 'arbiter', family: 'deepseek', alternatives: [] },
+      lead: { id: 'lead', family: 'cognition', alternatives: [] },
+      ux_critic: { id: 'ux', family: 'google', alternatives: [] } },
+    models: [{ id: `model-${evil}`, provider: 'acp', model: 'm', family: 'cognition',
+      status: 'promo_free', effectiveStatus: 'promo_free', until: '2026-12-08' }] });
+  const finopsProvider = async () => ({ ok: true,
+    cloudCredits: [{ id: `credit-${evil}`, totalEur: 10, remainingEur: 9 }],
+    computeVms: [{ id: `vm-${evil}`, machineType: 'spot', state: 'stopped',
+      costTodayEur: 0, costMonthEur: 0, runningMinutesMonth: 0 }],
+    computeQuotas: [{ id: 'colab_pro_plus', totalUnits: 1006.02, usedUnits: 0,
+      utilizationPct: 0, status: 'underutilized', unit: 'CU' }],
+    aiSubscriptions: [{ id: `sub-${evil}`, model: 'm', status: 'active' }],
+    workspaceLinks: [{ id: `link-${evil}`, group: 'control_room', title: `Control ${evil}`,
+      url: 'http://127.0.0.1:44110/', command: `df-herd-${evil}` }],
+    totals: { spentMonthCostEur: 0, spentTodayCostEur: 0, monthlyBudgetEur: 1,
+      remainingCreditsEur: 9, runningHoursMonth: 0 },
+    estimatedMonthCostEur: 0,
+    creditRunway: { days: 99, remainingCreditsEur: 9, dailyBurnEur: 0.01 },
+    alerts: [{ severity: 'warn', code: `alert-${evil}`, message: `message-${evil}` }] });
+  const server = createControlRoomAggregator({ port: 0,
+    boardTasksProvider: async () => [{ task_id: 'T1', state: 'claimed', title: `title-${evil}` }],
+    modelsProvider, finopsProvider });
+  await server.start();
+  try {
+    for (const [tab, marker] of [['ops', 'RUNNING NOW'], ['models', 'MODEL REGISTRY'],
+      ['finops', 'Compute quotas'], ['workspace', 'WORKSPACE MAP']]) {
+      const { stdout } = await execFileAsync('node', [
+        join(MODULE_DIR, 'df-herd.mjs'), '--once', '--tab', tab,
+        '--url', `http://127.0.0.1:${server.port}`], { timeout: 15_000 });
+      assert.ok(stdout.includes(marker), `${tab}: missing ${marker}`);
+      assert.equal(stdout.includes('\x1b]52'), false, `${tab}: OSC 52`);
+      assert.equal(stdout.includes('\x1b[2J'), false, `${tab}: clear-screen injection`);
+      assert.equal(stdout.includes('\u202e'), false, `${tab}: bidi override`);
+    }
+  } finally {
+    await server.stop();
+  }
+});
+
+test('df-herd: https: схема принимается парсером и не отклоняется как unsupported', async () => {
+  const src = await readFile(join(MODULE_DIR, 'df-herd.mjs'), 'utf8');
+  assert.equal(src.includes("from 'node:https'"), true);
+  assert.equal(src.includes("parsed.protocol === 'https:'"), true);
+  const { stderr } = await execFileAsync('node', [
+    join(MODULE_DIR, 'df-herd.mjs'), '--once', '--url', 'https://127.0.0.1:1'],
+    { timeout: 15_000 }).catch(error => ({ stderr: error.stderr ?? String(error) }));
+  assert.equal(stderr.includes('unsupported URL scheme'), false);
+});
+
+test('web app: 4 вкладки, safe URL validation и mobile CSS присутствуют', async () => {
+  const app = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
+  const html = await readFile(join(MODULE_DIR, 'web', 'index.html'), 'utf8');
+  const css = await readFile(join(MODULE_DIR, 'web', 'styles.css'), 'utf8');
+  for (const label of ['Operations', 'Models &amp; Routing', 'Resources &amp; FinOps', 'Workspace Map']) {
+    assert.ok(html.includes(label), label);
+  }
+  assert.equal(app.includes('new URL(value)'), true);
+  assert.equal(app.includes("url.protocol === 'https:' || url.protocol === 'http:'"), true);
+  assert.equal(app.includes('javascript:'), false);
+  assert.equal(css.includes('@media (max-width: 720px)'), true);
 });

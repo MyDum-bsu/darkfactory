@@ -1,15 +1,15 @@
-// df-herd — терминальный read-only пульт фабрики (V2-3): zero-dep Node ESM
-// TUI поверх aggregator.mjs (HTTP + SSE), работает по SSH/mosh. Ноль
-// мутаций Board, ноль PTY-записи в треды; весь недоверенный текст через
+// df-herd — терминальный read-only пульт фабрики: zero-dep Node ESM.
+// 4 вкладки: Ops / Models / FinOps / Workspace. HTTP и HTTPS/Tailscale URL
+// читаются прямыми node:http(s)-запросами; env proxy не используется.
+// Ноль мутаций Board, ноль PTY-записи в треды; весь недоверенный текст через
 // sanitizeTerminalText.
 //
-//   node df-herd.mjs [--url http://127.0.0.1:44110] [--once] [--project IDX]
-// --once — один отрендеренный кадр и выход (smoke-тесты, SSH).
-// Клавиши: j/k/↑/↓ — выбор, Enter — инспекция (plain-text логи/квитанции),
-// 0-5 — фильтр проекта, d — детали Branch Drift, r — reconcile/refresh,
-// ? — help, q — quit.
+//   node df-herd.mjs [--url http://127.0.0.1:44110] [--once] [--tab ops]
+// Клавиши: 1/2/3/4 или Tab — вкладки, j/k/↑/↓ — выбор в Ops,
+// Enter — инспекция, d — drift, r — refresh, ? — help, q — quit.
 
-import { get } from 'node:http';
+import { get as httpGet } from 'node:http';
+import { get as httpsGet } from 'node:https';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { sanitizeTerminalText } from './origin-guard.mjs';
@@ -23,9 +23,15 @@ const clean = s => sanitizeTerminalText(String(s ?? ''));
 const trunc = (s, w) => { s = clean(s); return s.length > w ? s.slice(0, w - 1) + '…' : s; };
 const fmtBytes = n => n == null ? '—' : `${(n / (1 << 30)).toFixed(1)}G`;
 const fmtMs = ms => ms == null ? '—' : `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`;
+const eur = n => n == null ? '—' : `€${Number(n).toFixed(2)}`;
+const pad = (s, w) => { const v = visibleLen(s); return s + ' '.repeat(Math.max(0, w - v)); };
 
-const fetchJson = (url, timeoutMs = 6000) => new Promise((resolve, reject) => {
-  const req = get(url, res => {
+export const fetchJson = (url, timeoutMs = 6000) => new Promise((resolve, reject) => {
+  let parsed;
+  try { parsed = new URL(url); } catch (error) { reject(error); return; }
+  const get = parsed.protocol === 'https:' ? httpsGet : parsed.protocol === 'http:' ? httpGet : null;
+  if (!get) { reject(new Error(`unsupported URL scheme: ${parsed.protocol}`)); return; }
+  const req = get(parsed, res => {
     if (res.statusCode !== 200) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; }
     let body = '';
     res.on('data', c => { body += c; });
@@ -35,7 +41,18 @@ const fetchJson = (url, timeoutMs = 6000) => new Promise((resolve, reject) => {
   req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
 });
 
-// --- рендер -------------------------------------------------------------------
+// --- общие элементы -------------------------------------------------------------
+
+const TABS = [
+  ['ops', 'Ops'], ['models', 'Models'], ['finops', 'FinOps'], ['workspace', 'Workspace']];
+
+function tabLine(snap, active, width) {
+  const parts = TABS.map(([id, label], i) =>
+    id === active ? `${C.invert}[${i + 1}:${label}]${C.reset}` : ` ${i + 1}:${label} `);
+  const mode = snap.models?.ok ? `mode:${clean(snap.models.mode ?? '—')}` : 'mode:—';
+  const cloud = `cloud-bb-worker:${clean(snap.netHealth?.cloudWorker?.status ?? 'unknown')}`;
+  return fitAnsi(`${parts.join(' ')}  ${C.accent}${mode}${C.reset}  ${cloud}`, width);
+}
 
 function statusLine(snap, width) {
   const host = snap.netHealth?.host ?? {};
@@ -52,10 +69,40 @@ function statusLine(snap, width) {
     `RAM:${fmtBytes(host.mem?.freeBytes)}`,
     `cloud:${clean(cloud)}`,
     driftText,
-    `shiva:${snap.shiva?.dirty === 0 ? 'clean' : `dirty(${snap.shiva?.dirty})`}`,
+    `shiva:${snap.shiva?.dirty === 0 ? 'clean' : `dirty(${snap.shiva?.dirty ?? '—'})`}`,
   ];
-  return trunc(parts.join('  '), width);
+  if (snap.lastError) parts.push(`${C.bad}${clean(snap.lastError)}${C.reset}`);
+  return fitAnsi(parts.join('  '), width);
 }
+
+const visibleLen = s => s.replace(/\x1b\[[0-9;]*m/g, '').length;
+
+function fitAnsi(s, w) {
+  // Обрезка доверенной строки с уже вставленными CSI-color кодами. Динамические
+  // поля до этого проходят clean()/trunc(); функция нужна только для layout.
+  let out = '';
+  let visible = 0;
+  let cut = false;
+  for (let i = 0; i < s.length;) {
+    if (s[i] === '\x1b') {
+      const sequence = s.slice(i, i + 5).match(/^\x1b\[(?:0|1|2|7|31|32|33|36)m/)?.[0];
+      if (sequence) { out += sequence; i += sequence.length; continue; }
+      i++; // неизвестный escape никогда не уходит в терминал
+      continue;
+    }
+    if (visible >= w) { cut = true; break; }
+    const safe = clean(s[i]);
+    out += safe;
+    if (safe) visible++;
+    i++;
+  }
+  if (!cut && visible >= w && s.length > out.length) cut = true;
+  return cut ? out + '…' : out;
+}
+
+const money = n => n == null ? '—' : eur(n);
+
+// --- OPS ------------------------------------------------------------------------
 
 function cardLine(cardData, width, selected) {
   const base = `#${cardData.task_id} ${trunc(cardData.title, Math.max(10, width - 46))}`;
@@ -69,7 +116,7 @@ function cardLine(cardData, width, selected) {
   return `${selected ? C.invert : ''}${trunc(line, width)}${selected ? C.reset : ''}`;
 }
 
-function render(snap, { width = 100, selected = 0, projectFilter = null, driftOpen = false } = {}) {
+function renderOps(snap, { width = 100, selected = 0, projectFilter = null, driftOpen = false } = {}) {
   const colW = [Math.floor(width * 0.42), Math.floor(width * 0.28), width - Math.floor(width * 0.42) - Math.floor(width * 0.28)];
   const filter = cardData => projectFilter === null ||
     (cardData.labels?.project ?? cardData.labels?.repo_id ?? 'default') === projectFilter;
@@ -78,14 +125,14 @@ function render(snap, { width = 100, selected = 0, projectFilter = null, driftOp
     ['QUEUED / WAITING', (snap.queued ?? []).filter(filter), 'queued'],
     ['NEEDS OWNER', (snap.needsOwner ?? []).filter(filter), 'owner'],
   ];
-  const lines = [statusLine(snap, width), ''];
+  const lines = [];
   const maxRows = Math.max(...cols.map(([, items]) => items.length), 1) + 2;
   const selectable = [];
   for (let row = 0; row < maxRows; row++) {
     const cells = [];
     for (let c = 0; c < 3; c++) {
       const [title, items, kind] = cols[c];
-      if (row === 0) cells.push(trunc(`${C.bold}${title} (${items.length})${C.reset}`, colW[c]));
+      if (row === 0) cells.push(trunc(`${C.bold}${title} (${items.length})${C.reset}`, colW[c] + 20));
       else if (row === 1) cells.push(trunc('─'.repeat(Math.min(colW[c], 40)), colW[c]));
       else {
         const item = items[row - 2];
@@ -94,21 +141,18 @@ function render(snap, { width = 100, selected = 0, projectFilter = null, driftOp
           selectable.push({ ...item, kind });
           cells.push(cardLine(item, colW[c], idx === selected));
         } else if (row === 2) {
-          cells.push(trunc(`${C.dim}—${C.reset}`, colW[c]));
+          cells.push(trunc(`${C.dim}—${C.reset}`, colW[c] + 10));
         } else cells.push('');
       }
     }
-    lines.push(cells.map((cell, i) => {
-      const pad = Math.max(0, colW[i] - visibleLen(cell));
-      return cell + ' '.repeat(pad);
-    }).join(' │ '));
+    lines.push(cells.map((cell, i) => pad(cell, colW[i])).join(' │ '));
   }
   const done = (snap.recentlyCompleted ?? []).filter(filter);
-  lines.push('', trunc(`${C.bold}RECENTLY COMPLETED (${done.length})${C.reset}`, width));
+  lines.push('', trunc(`${C.bold}RECENTLY COMPLETED (${done.length})${C.reset}`, width + 20));
   for (const item of done.slice(0, 8)) lines.push(trunc(`  #${item.task_id} ${item.title}`, width));
   if (done.length > 8) lines.push(trunc(`  … ещё ${done.length - 8}`, width));
   if (driftOpen && snap.branchDrift?.driftDetected === true) {
-    lines.push('', trunc(`${C.warn}BRANCH DRIFT${C.reset}`, width));
+    lines.push('', trunc(`${C.warn}BRANCH DRIFT${C.reset}`, width + 10));
     for (const b of snap.branchDrift.unmergedBranches ?? []) {
       lines.push(trunc(`  unmerged ${b.branch} (${b.fileCount}f)`, width));
     }
@@ -116,11 +160,141 @@ function render(snap, { width = 100, selected = 0, projectFilter = null, driftOp
       lines.push(trunc(`  dirty ${w.path} (${w.dirtyCount}f)`, width));
     }
   }
-  lines.push('', trunc(`${C.dim}j/k:выбор Enter:инспекция 0-5:проект d:drift r:refresh ?:help q:quit${C.reset}`, width));
-  return { text: lines.join('\n'), selectable };
+  lines.push('', trunc(`${C.dim}1-4/Tab:вкладки j/k:выбор Enter:инспекция d:drift r:refresh ?:help q:quit${C.reset}`, width + 20));
+  return { lines, selectable };
 }
 
-const visibleLen = s => s.replace(/\x1b\[[0-9;]*m/g, '').length;
+// --- MODELS ---------------------------------------------------------------------
+
+function statusPaint(status) {
+  const s = clean(status ?? '—');
+  const label = s.replaceAll('_', ' ').toUpperCase();
+  if (s === 'promo_free') return `${C.ok}${label}${C.reset}`;
+  if (s === 'active') return `${C.accent}${label}${C.reset}`;
+  if (s === 'standby') return `${C.dim}${label}${C.reset}`;
+  if (s === 'quota_paused') return `${C.warn}${label}${C.reset}`;
+  if (s === 'disabled') return `${C.bad}${label}${C.reset}`;
+  return label;
+}
+
+function modelRow(model, width) {
+  const cols = [
+    pad(trunc(model.id, 22), 22),
+    pad(trunc(model.provider, 18), 18),
+    pad(trunc(model.model, 28), 28),
+    pad(trunc(model.family, 10), 10),
+    pad(statusPaint(model.effectiveStatus ?? model.status), 12),
+    trunc(model.until ?? '—', 10),
+  ];
+  return fitAnsi(cols.join(' '), width);
+}
+
+function renderModels(snap, { width = 100 } = {}) {
+  const models = snap.models;
+  if (!models?.ok) return { lines: [`${C.bad}models: ${clean(models?.error ?? 'нет данных')}${C.reset}`], selectable: [] };
+  const lines = [];
+  const triad = models.triad ?? {};
+  const roles = [['Coder', triad.coder], ['Reviewer', triad.reviewer], ['Arbiter', triad.arbiter],
+    ['Lead', triad.lead], ['UX Critic', triad.ux_critic]];
+  lines.push(fitAnsi(`${C.bold}ACTIVE ROUTING — mode:${clean(models.mode)}${C.reset}`, width));
+  for (const [role, selected] of roles) {
+    const value = selected
+      ? `${role}: ${selected.id} [${selected.family}] alt:${(selected.alternatives ?? []).slice(0, 2).join(',') || '—'}`
+      : `${role}: —`;
+    lines.push(trunc(`  ${value}`, width));
+  }
+  lines.push('', trunc(`${C.bold}MODEL REGISTRY${C.reset}`, width + 20));
+  lines.push(fitAnsi(`${C.dim}${pad('id', 22)} ${pad('provider', 18)} ${pad('model', 28)} ${pad('family', 10)} ${pad('status', 12)} until${C.reset}`, width));
+  for (const model of models.models ?? []) lines.push(modelRow(model, width));
+  lines.push('', fitAnsi(`${C.dim}CLI: df-models set <role> <model> · df-models mode economy|balanced|sprint${C.reset}`, width));
+  return { lines, selectable: [] };
+}
+
+// --- FINOPS ---------------------------------------------------------------------
+
+function progressBar(pct, width = 18) {
+  if (pct == null) return '—';
+  const n = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
+  return `[${'█'.repeat(n)}${'░'.repeat(width - n)}] ${pct.toFixed(1)}%`;
+}
+
+function renderFinops(snap, { width = 100 } = {}) {
+  const finops = snap.finops;
+  if (!finops?.ok) return { lines: [`${C.bad}finops: ${clean(finops?.error ?? 'нет данных')}${C.reset}`], selectable: [] };
+  const lines = [];
+  const totals = finops.totals ?? {};
+  lines.push(trunc(`${C.bold}MONEY / CREDITS${C.reset}  month spend ${money(totals.spentMonthCostEur)}  today ${money(totals.spentTodayCostEur)}  budget ${money(totals.monthlyBudgetEur)}  credits ${money(totals.remainingCreditsEur)}  runway ${finops.creditRunway?.days ?? '—'}d`, width + 30), '');
+  lines.push(trunc(`${C.bold}GCP credits${C.reset}`, width + 10));
+  for (const credit of finops.cloudCredits ?? []) {
+    lines.push(trunc(`  ${credit.id}: total ${money(credit.totalEur)} remaining ${money(credit.remainingEur)}${credit.monthlyEur != null ? ` monthly ${money(credit.monthlyEur)}` : ''}${credit.expires ? ` expires ${credit.expires}` : ''}`, width));
+  }
+  lines.push('', trunc(`${C.bold}Compute VMs${C.reset}`, width + 10));
+  for (const vm of finops.computeVms ?? []) {
+    lines.push(trunc(`  ${vm.id}: ${vm.machineType ?? '—'} ${vm.state ?? '—'}  today ${money(vm.costTodayEur)} month ${money(vm.costMonthEur)} hours ${((vm.runningMinutesMonth ?? 0) / 60).toFixed(1)}  ${vm.pricing ?? ''}`, width));
+  }
+  lines.push('', trunc(`${C.bold}Compute quotas${C.reset}`, width + 10));
+  for (const quota of finops.computeQuotas ?? []) {
+    const token = quota.status === 'underutilized' ? 'IDLE / UNDERUTILIZED' : 'OK';
+    const plain = trunc(`  ${quota.id}: ${progressBar(quota.utilizationPct)} of ${quota.totalUnits ?? '—'}${quota.unit ? ` ${quota.unit}` : ''}  ${token}`, width);
+    const color = quota.status === 'underutilized' ? C.warn : C.ok;
+    lines.push(plain.replace(token, `${color}${token}${C.reset}`));
+  }
+  lines.push('', trunc(`${C.bold}AI subscriptions${C.reset}`, width + 10));
+  for (const sub of finops.aiSubscriptions ?? []) {
+    lines.push(trunc(`  ${sub.id}: ${sub.model ?? sub.label ?? '—'}  ${String(sub.status ?? '—').replaceAll('_', ' ').toUpperCase()}${sub.quota ? ` quota:${sub.quota}` : ''}${sub.reset ? ` reset:${sub.reset}` : ''}`, width));
+  }
+  if (finops.alerts?.length) {
+    lines.push('', trunc(`${C.warn}ALERTS${C.reset}`, width + 10));
+    for (const alert of finops.alerts) {
+      const color = alert.severity === 'bad' ? C.bad : C.warn;
+      lines.push(trunc(`  ${alert.code} ${alert.message}`, width).replace(clean(alert.code), `${color}${clean(alert.code)}${C.reset}`));
+    }
+  }
+  return { lines, selectable: [] };
+}
+
+// --- WORKSPACE ------------------------------------------------------------------
+
+function renderWorkspace(snap, { width = 100 } = {}) {
+  const finops = snap.finops;
+  if (!finops?.ok) return { lines: [`${C.bad}workspace: ${clean(finops?.error ?? 'нет данных')}${C.reset}`], selectable: [] };
+  const lines = [trunc(`${C.bold}WORKSPACE MAP${C.reset}`, width + 20), ''];
+  const groups = new Map();
+  for (const link of finops.workspaceLinks ?? []) {
+    const group = clean(link.group ?? 'workspace');
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(link);
+  }
+  for (const [group, links] of groups) {
+    lines.push(trunc(`${C.accent}${group.replaceAll('_', ' ').toUpperCase()}${C.reset}`, width + 20));
+    for (const link of links) {
+      const target = link.url ?? link.path ?? '—';
+      const cmd = link.command ? `  cmd:${link.command}` : '';
+      lines.push(trunc(`  ${link.title}: ${target}${cmd}`, width));
+      if (link.notes) lines.push(trunc(`    ${C.dim}${link.notes}${C.reset}`, width + 10));
+    }
+    lines.push('');
+  }
+  lines.push(trunc(`${C.bold}QUICK COMMANDS${C.reset}`, width + 20));
+  for (const cmd of ['df-herd', 'df-models', 'vb', 'cloud-brain']) {
+    lines.push(trunc(`  ${cmd}`, width));
+  }
+  return { lines, selectable: [] };
+}
+
+// --- dispatcher ------------------------------------------------------------------
+
+function render(snap, { width = 100, selected = 0, projectFilter = null, driftOpen = false, tab = 'ops' } = {}) {
+  const active = TABS.some(([id]) => id === tab) ? tab : 'ops';
+  const body = active === 'models' ? renderModels(snap, { width })
+    : active === 'finops' ? renderFinops(snap, { width })
+    : active === 'workspace' ? renderWorkspace(snap, { width })
+    : renderOps(snap, { width, selected, projectFilter, driftOpen });
+  return {
+    text: [tabLine(snap, active, width), statusLine(snap, width), '', ...body.lines].join('\n'),
+    selectable: body.selectable ?? [],
+  };
+}
 
 function projectList(snap) {
   const set = new Set();
@@ -131,34 +305,33 @@ function projectList(snap) {
   return [...set];
 }
 
-// --- main ----------------------------------------------------------------------
+// --- main ------------------------------------------------------------------------
 
 async function main(argv) {
   const { values } = parseArgs({ args: argv, options: {
-    url: { type: 'string' }, once: { type: 'boolean' },
+    url: { type: 'string' }, once: { type: 'boolean' }, tab: { type: 'string' },
     width: { type: 'string' }, project: { type: 'string' } } });
   const base = (values.url ?? process.env.DF_CONTROL_ROOM_URL ?? 'http://127.0.0.1:44110')
     .replace(/\/$/, '');
   const width = Number(values.width ?? process.stdout.columns ?? 100);
+  const initialTab = TABS.some(([id]) => id === values.tab) ? values.tab : 'ops';
 
   if (values.once) {
     const snap = await fetchJson(`${base}/api/snapshot`);
-    const { text } = render(snap, { width });
+    const { text } = render(snap, { width, tab: initialTab });
     process.stdout.write(`${text}\n`);
     return;
   }
 
-  // Live-режим: опрос + клавиатурная навигация. Недоверенные строки уже
-  // проходят sanitizeTerminalText внутри рендера.
   const state = { snap: null, selected: 0, driftOpen: false,
-    projectFilter: values.project ?? null, inspect: null };
+    projectFilter: values.project ?? null, inspect: null, tab: initialTab };
   const redraw = () => {
     if (state.inspect) {
       process.stdout.write(`${C.clear}${C.hide}${state.inspect}\n`);
       return;
     }
     const body = state.snap
-      ? render(state.snap, { width, selected: state.selected,
+      ? render(state.snap, { width, selected: state.selected, tab: state.tab,
         projectFilter: state.projectFilter, driftOpen: state.driftOpen })
       : { text: 'connecting…', selectable: [] };
     state.selectable = body.selectable;
@@ -175,32 +348,43 @@ async function main(argv) {
     redraw();
   };
 
-  const projects = () => projectList(state.snap ?? {});
   const keymap = async key => {
     if (state.inspect !== null) {
       if (key === 'q' || key === '\x1b') { state.inspect = null; redraw(); }
       return;
     }
     if (key === 'q' || key === '\x03') { cleanup(); return; }
-    if (key === 'j' || key === '\x1b[B') {
+    if (key === '\t') {
+      const index = TABS.findIndex(([id]) => id === state.tab);
+      state.tab = TABS[(index + 1) % TABS.length][0];
+      state.selected = 0;
+    } else if (/^[1-4]$/.test(key)) {
+      state.tab = TABS[Number(key) - 1][0];
+      state.selected = 0;
+    } else if (state.tab === 'ops' && (key === 'j' || key === '\x1b[B')) {
       state.selected = Math.min(state.selected + 1, Math.max(0, (state.selectable?.length ?? 1) - 1));
-    } else if (key === 'k' || key === '\x1b[A') {
+    } else if (state.tab === 'ops' && (key === 'k' || key === '\x1b[A')) {
       state.selected = Math.max(0, state.selected - 1);
-    } else if (key === 'd') {
+    } else if (state.tab === 'ops' && key === 'd') {
       state.driftOpen = !state.driftOpen;
     } else if (key === 'r') {
       await refresh(); return;
     } else if (key === '?') {
-      state.inspect = 'df-herd: j/k — навигация, Enter — инспекция, 0-5 — фильтр проекта, d — drift, r — refresh, q — выход.';
-    } else if (/^[0-5]$/.test(key)) {
-      const list = projects();
-      state.projectFilter = key === '0' ? null : list[Number(key) - 1] ?? state.projectFilter;
-    } else if (key === '\r' || key === '\n') {
+      state.inspect = 'df-herd: 1 Ops, 2 Models, 3 FinOps, 4 Workspace, Tab — следующая вкладка. В Ops: j/k — навигация, Enter — инспекция, d — drift, r — refresh, q — выход.';
+    } else if (state.tab === 'ops' && key === '0') {
+      state.projectFilter = null;
+    } else if (state.tab === 'ops' && (key === '[' || key === ']')) {
+      const list = projectList(state.snap ?? {});
+      if (list.length) {
+        const index = list.indexOf(state.projectFilter);
+        const delta = key === ']' ? 1 : -1;
+        state.projectFilter = list[(index + delta + list.length + 1) % (list.length + 1)] ?? null;
+      }
+    } else if (state.tab === 'ops' && (key === '\r' || key === '\n')) {
       const item = state.selectable?.[state.selected];
       if (item) {
         try {
           const data = await fetchJson(`${base}/api/inspect/${encodeURIComponent(item.task_id)}`);
-          // Весь недоверенный текст — через clean(): title/artifacts/text.
           state.inspect = clean(`#${item.task_id} ${item.title}\n\n` +
             `${data.text || '(пусто)'}` +
             (data.artifacts?.length

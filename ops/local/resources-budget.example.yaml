@@ -1,0 +1,107 @@
+# Декларативный реестр ресурсов, квот, бюджета и рабочего пространства.
+# Пользовательская копия: $XDG_CONFIG_HOME/darkfactory/resources-budget.yaml
+# Значения ниже — проверяемый пример; живые данные не попадают в Git.
+version: 1
+currency: EUR
+usd_to_eur: 0.92
+monthly_budget_eur: 25
+underutilized_below_pct: 5
+
+cloud_credits:
+  - id: gcp_welcome
+    provider: gcp
+    label: GCP welcome credit
+    total_eur: 269.43
+    remaining_eur: 269.10
+    expires: "2027-08-01"
+    notes: Стартовый облачный кредит; тратить в первую очередь на эфемерные VM.
+  - id: gcp_ultra_monthly
+    provider: gcp
+    label: Google AI Ultra cloud credit
+    monthly_eur: 35.93
+    remaining_eur: 35.93
+    notes: Ежемесячный кредит Google AI Ultra.
+
+compute_vms:
+  - id: cloud-brain
+    machine_type: e2-micro
+    hourly_cost_usd: 0
+    pricing: Always Free
+    state: running
+    notes: Постоянный control-plane, не тарифицируется в рамках free tier.
+  - id: cloud-bb-worker
+    machine_type: e2-standard-8 Spot
+    hourly_cost_usd: 0.07
+    pricing: только когда RUNNING
+    state: stopped
+    metered: true
+    usage_key: cloud-bb-worker
+    notes: Эфемерный worker; живой статус и минуты читаются из cloud-worker-state/usage journal.
+
+compute_quotas:
+  - id: colab_pro_plus
+    label: Colab Pro+ compute units
+    unit: CU
+    total_units: 1006.02
+    used_units: 0
+    utilization_pct: 0
+    status: underutilized
+    notes: Крупный оплаченный/предоставленный запас CU простаивает — кандидат на осознанное использование.
+  - id: gdrive_storage
+    label: Google Drive storage
+    unit: TiB
+    total_tib: 20
+    used_gib: 0
+    track_utilization: false
+    notes: Хранилище бэкапов и артефактов; заполнение контролируется отдельно.
+
+ai_subscriptions:
+  - id: google_ai_ultra
+    label: Google AI Ultra
+    model: Antigravity / Gemini 4 Neon
+    status: active
+    notes: Ревьюер и UX-critic с vision.
+  - id: devin_pro
+    label: Devin Pro
+    model: SWE-2.1
+    status: promo_free
+    quota: daily/weekly
+    reset: "2026-12-08"
+    notes: Промо FREE до указанной даты.
+  - id: opencode_go
+    label: OpenCode Go
+    model: DeepSeek v4.1 Flash
+    status: active
+    notes: Быстрый независимый исполнитель/арбитр.
+  - id: chatgpt_sub
+    label: ChatGPT subscription
+    model: GPT-6.2-Sol
+    status: quota_paused
+    reset: "2026-11-27"
+    notes: Возвращается в ротацию после reset.
+
+workspace_links:
+  control_room:
+    title: Control Room
+    url: http://127.0.0.1:44110/
+    command: node ops/control-room/df-herd.mjs
+    notes: Read-only пульт операций, моделей, FinOps и workspace.
+  board_ui:
+    title: Board UI
+    url: http://127.0.0.1:44100/
+    notes: Очередь задач и зависимостей.
+  github_repos:
+    darkfactory:
+      title: Darkfactory repository
+      url: https://github.com/darkfactory/darkfactory
+      path: ~/projects/darkfactory
+      notes: Основной репозиторий фабрики.
+  local_hub:
+    title: Local hub
+    path: ~/projects
+    command: df-herd
+    notes: Локальная точка запуска worktree и пультов.
+  backups:
+    title: Backups
+    path: ~/backups/darkfactory
+    notes: Внешние снапшоты конфигурации и журналов; не хранятся в Git.
