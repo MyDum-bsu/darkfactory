@@ -4,6 +4,7 @@ import { isAbsolute, join, relative } from 'node:path';
 import { createPilotSwitch } from './pilot-gate.mjs';
 import { loadRoleRegistry } from './role-registry.mjs';
 import { createBbStageObserver } from './bb-stage-adapter.mjs';
+import { createStageSandboxTransport } from './stage-sandbox-transport.mjs';
 import { runPlaybook } from './playbook-router.mjs';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -114,7 +115,18 @@ export function pilotArtifacts({ candidate, diff, localEvidence, brief, review }
   };
 }
 
-export async function runPilotForeman(ab, { attempt, handoff, project, journal, readArtifact, assertCurrent, inspect, readState }) {
+// Доказательный diff base→candidate для общего (не ab) foreman-пути: без
+// ограничения CASES-скопом, та же форма {files, diffDigest}, что inspectPilotDiff.
+export async function foremanDiff({ git, base, candidate }) {
+  const changes = (await git('diff', '--no-renames', '--name-status', '-z', base, candidate)).split('\0');
+  if (changes.pop() !== '' || changes.length % 2) throw new Error('foreman_diff_unconfirmed');
+  const files = changes.filter((_, i) => i % 2 === 1).sort();
+  const diff = await git('diff', '--no-ext-diff', '--no-textconv', base, candidate, '--', ...files);
+  return { files, diffDigest: sha(diff) };
+}
+
+export async function runPilotForeman(ab, { attempt, handoff, project, journal, readArtifact,
+  assertCurrent, inspect, readState, observeStage, transport, signals }) {
   const pin = { playbook: ab.playbook, registry_digest: ab.registry.digest };
   const subject = { ...handoff, ...pin, attempt_id: attempt.attempt_id, epoch: attempt.epoch, triad: attempt.triad };
   const guard = async binding => {
@@ -130,11 +142,14 @@ export async function runPilotForeman(ab, { attempt, handoff, project, journal, 
   };
   const remaining = Math.floor((ab.deadline - Date.now()) / 1000);
   if (remaining < 5) throw new Error('ab_pilot_dispatch_deadline');
-  const observeStage = await createBbStageObserver({ project, workspace: ab.workspace, parentThread: ab.parent,
+  // VS-5.2: stage-станции идут через аттестованный read-only транспорт
+  // (переданный либо созданный на worktree субъекта) — не host bb thread spawn.
+  observeStage ??= await createBbStageObserver({ project, workspace: ab.workspace, parentThread: ab.parent,
     journal, deadline: ab.deadline, maxSeconds: Math.min(remaining, 120) }, {
-    // This installed, same-host BB launcher has no attested read-only seat.
-    // A policy file or empty directory cannot mint the assertReadOnly capability.
     assertCurrent: guard, readArtifact,
+    sandboxTransport: transport ?? createStageSandboxTransport({ worktree: handoff.worktree, journal,
+      deadlineMs: ab.deadline, signal: signals?.signal }),
+    phaseBudget: signals?.phaseBudget, signals,
     record: row => appendFile(join(journal, 'ab-stage-threads.jsonl'), `${JSON.stringify(row)}\n`, { mode: 0o600 }),
     recordWitness: row => appendFile(join(journal, 'ab-stage-receipts.jsonl'), `${JSON.stringify(row)}\n`, { mode: 0o600 }),
   });

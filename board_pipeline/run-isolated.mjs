@@ -38,8 +38,11 @@ import { aggregateScorecard } from './model-scorecard.mjs';
 import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
   loadLessons, validateDistilledLessons } from './rework-distiller.mjs';
 import * as workerSelector from './worker-selector.mjs';
-import { abEffectGuard, enrollAbPilot, guardAbBoard, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
-import { pilotWriterWorkspaceReady } from './bb-stage-adapter.mjs';
+import { abEffectGuard, enrollAbPilot, foremanDiff, guardAbBoard, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
+import { writerWorkspaceReady } from './bb-stage-adapter.mjs';
+import { createStageSandboxTransport } from './stage-sandbox-transport.mjs';
+import { createAttemptSignals } from './signals.mjs';
+import { loadRoleRegistry } from './role-registry.mjs';
 import { effectiveL1ProfileId, resolveL1Profile } from './l1-profiles.mjs';
 
 const exec = promisify(execFile);
@@ -200,6 +203,22 @@ async function execute() {
   if (!st.isDirectory() || st.uid !== process.getuid() || st.mode & 0o077) throw new Error('State must be private');
   const ab = await enrollAbPilot(p.abPilot, { policy: p, tree, root, inbox, daemon: values.daemon,
     allowLive: values['allow-live-pilot'], parent: process.env.BB_THREAD_ID });
+  // Общий Foreman-плейбук без флага abPilot: канонические catalog, playbook,
+  // registryDigest, опциональные phaseBudgets/deadlineMs. Стадии идут через
+  // аттестованный read-only транспорт stage-sandbox-transport.mjs.
+  let foreman = null;
+  if (p.foreman !== undefined) {
+    const cfg = p.foreman;
+    if (cfg === null || typeof cfg !== 'object' || !isAbsolute(cfg.catalog ?? '') ||
+        await realpath(cfg.catalog) !== cfg.catalog ||
+        !/^[a-f0-9]{64}$/.test(cfg.registryDigest ?? '') || typeof cfg.playbook !== 'string' ||
+        (cfg.deadlineMs !== undefined && (!Number.isSafeInteger(cfg.deadlineMs) || cfg.deadlineMs < 5000)) ||
+        (cfg.phaseBudgets !== undefined && (cfg.phaseBudgets === null || typeof cfg.phaseBudgets !== 'object' ||
+          Object.values(cfg.phaseBudgets).some(ms => !Number.isSafeInteger(ms) || ms < 1)))) {
+      throw new Error('foreman_policy_invalid');
+    }
+    foreman = cfg;
+  }
   const switchOpen = activation && await createPilotSwitch(activation.killSwitch, {
     permitDirectory: dir => [tree, inbox, root].every(path => !inside(path, dir) && !inside(dir, path)),
   });
@@ -560,9 +579,23 @@ async function execute() {
     const { stdout } = await exec('bb', ['thread', 'show', threadId, '--json'], { timeout: 9000 });
     const snapshot = JSON.parse(stdout);
     const thread = snapshot.thread;
-    if (ab) {
-      if (!pilotWriterWorkspaceReady(snapshot, { threadId, parentThread: ab.parent, project: p.bb.project, workspace: tree })) return;
-    } else if (snapshot.environment?.path !== tree || thread?.id !== threadId) throw new Error('BB workspace changed');
+    // B2: grace-ожидание 'starting -> ready' в общем пути для всех режимов —
+    // 'starting' без environment.path ждёт следующего тика, а не падает.
+    let ready;
+    try {
+      ready = writerWorkspaceReady(snapshot, { threadId, parentThread: ab?.parent,
+        project: p.bb.project, workspace: tree });
+    } catch (cause) {
+      // Диагностический снимок реального drift до выброса ошибки — приватный
+      // каталог root, mode 0600, fail-open (сбой записи не маскирует drift).
+      try {
+        await writeFile(join(root, `workspace-drift-${threadId}-${randomUUID()}.json`),
+          JSON.stringify({ threadId, error: String(cause?.message ?? cause), snapshot }),
+          { flag: 'wx', mode: 0o600 });
+      } catch { /* диагностика не влияет на исход */ }
+      throw cause;
+    }
+    if (!ready) return;
     if (!['idle', 'failed', 'interrupted'].includes(thread.status) || thread.activeBackgroundAgentCount !== 0 ||
         thread.queuedMessageCount !== 0) return;
     const log = await exec('bb', ['thread', 'log', thread.id, '--after-seq', String(after), '--all', '--json'],
@@ -643,6 +676,18 @@ async function execute() {
     if (attemptCritic === null) throw new Error('route_critic_not_runnable');
     if (attemptArbiter === null) throw new Error('route_arbiter_not_runnable');
     const neon = isNeonReview(attemptCritic);
+    // VS-5.2: единый сигнал попытки для Stage/Foreman — kill-switch, живая
+    // lease (verifyHeld/epoch), фазовые бюджеты и общий deadline. Dispose
+    // обязателен в finally — висячих таймеров не остаётся.
+    const attemptSignals = createAttemptSignals({
+      deadline: ab ? ab.deadline
+        : (foreman?.deadlineMs === undefined ? undefined : Date.now() + foreman.deadlineMs),
+      phaseBudgets: foreman?.phaseBudgets,
+      assertOpen: ab?.assertOpen ?? assertOpen ?? undefined,
+      lease: { verifyHeld: (id, ep) => port.verifyHeld(id, ep),
+        taskId: attempt.task_id, epoch: attempt.epoch },
+      disk: { path: tree },
+    });
     let lost = false;
     let renewal = Promise.resolve();
     // Те же живые гейты повтора применяются и на границе запуска читателя:
@@ -738,8 +783,9 @@ async function execute() {
       let diff, localEvidence;
       const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', inspect),
-        local: telemetry.port('l1_local', ab ? async (binding, trusted) => {
-          diff = await inspectPilotDiff(ab, { git: rawGit, base: route.base, candidate: binding.candidate_sha });
+        local: telemetry.port('l1_local', (ab || foreman) ? async (binding, trusted) => {
+          diff = ab ? await inspectPilotDiff(ab, { git: rawGit, base: route.base, candidate: binding.candidate_sha })
+            : await foremanDiff({ git: rawGit, base: route.base, candidate: binding.candidate_sha });
           localEvidence = await runLocal(binding, trusted);
           return localEvidence;
         } : runLocal),
@@ -752,11 +798,27 @@ async function execute() {
           if (lost) throw new Error('Lease lost');
           await assertPinned();
           await beforeEffect?.();
-          if (ab?.arm === 'foreman') {
+          if (ab?.arm === 'foreman' || foreman) {
             const readArtifact = pilotArtifacts({ candidate: handoff.candidate_sha, diff, localEvidence,
               brief: pinned.inputs.get(brief), review: reviewSpec });
-            await telemetry.phase('ab_foreman', () => runPilotForeman(ab, { attempt, handoff, project: p.bb.project,
-              journal: root, readArtifact, assertCurrent: beforeEffect, inspect, readState: state.load }));
+            // Общий (без abPilot) foreman-контур: живая загрузка реестра и
+            // сверка digest на каждом входе — тот же fail-closed, что у ab.
+            const seat = ab?.arm === 'foreman' ? ab : await (async () => {
+              const registry = await loadRoleRegistry(foreman.catalog);
+              if (registry.digest !== foreman.registryDigest ||
+                  !Object.hasOwn(registry.playbooks, foreman.playbook)) {
+                throw new Error('foreman_registry_unconfirmed');
+              }
+              const workspace = join(root, 'foreman-stage');
+              await mkdir(workspace, { recursive: true, mode: 0o700 });
+              return { arm: 'foreman', registry, playbook: foreman.playbook, workspace,
+                parent: process.env.BB_THREAD_ID,
+                deadline: foreman.deadlineMs === undefined ? Number.MAX_SAFE_INTEGER
+                  : Date.now() + foreman.deadlineMs };
+            })();
+            await telemetry.phase('ab_foreman', () => runPilotForeman(seat, { attempt, handoff,
+              project: p.bb.project, journal: root, readArtifact, assertCurrent: beforeEffect, inspect,
+              readState: state.load, signals: attemptSignals }));
             await beforeEffect();
           }
           // Один повтор того же критика/субъекта только по доказанному
@@ -809,6 +871,7 @@ async function execute() {
       return result;
     } finally {
       clearInterval(timer);
+      attemptSignals.dispose();
       await renewal;
     }
   };

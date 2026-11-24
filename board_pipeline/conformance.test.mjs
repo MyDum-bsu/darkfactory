@@ -33,6 +33,7 @@ import { createTelemetryRecorder } from './telemetry.mjs';
 import { loadRoleRegistry } from './role-registry.mjs';
 import { runPlaybook } from './playbook-router.mjs';
 import { PLAYBOOK_TRIAD, stageObservation } from './playbook-test-fixture.mjs';
+import { createBbStageObserver } from './bb-stage-adapter.mjs';
 import * as ws from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -440,6 +441,82 @@ test('VS-5 beta: green role DAG does not override the independent L2 verdict', {
   assert.equal(x.effects.feedbackCalls, 1);
   assert.equal(x.effects.completeCalls, 0);
 });
+
+test('V2-1: Foreman RO stage transport → L2 → native complete на одном candidate_sha, fail-closed без аттестации',
+  { timeout: 60_000 }, async t => {
+    const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+    const sandboxObserver = async (x, transport) => {
+      const stageDir = join(x.root, `ro-stage-${transport.kind ?? 'x'}`);
+      const journal = join(x.root, `ro-journal-${transport.kind ?? 'x'}`);
+      await mkdir(stageDir, { mode: 0o700 });
+      await mkdir(journal, { mode: 0o700 });
+      return createBbStageObserver({ project: 'proj_stage', workspace: stageDir, journal,
+        deadline: Date.now() + 120_000 }, {
+        assertCurrent: async () => {},
+        readArtifact: req => { const o = stageObservation(req); return { artifact: o.artifact, material: 'facts' }; },
+        record: async () => {},
+        recordWitness: async row => transport.witnesses.push(row),
+        sandboxTransport: transport,
+        execBb: async () => { transport.orphans++; throw new Error('host bb spawn запрещён в RO-пути'); },
+      });
+    };
+    const roTransport = x => ({
+      kind: 'attested', witnesses: [], orphans: 0,
+      async assertReadOnly() { return true; },
+      async observe(req) {
+        assert.equal(req.binding.candidate_sha, x.candidate);
+        assert.equal(req.binding.worktree, x.tree);
+        assert.match(req.prompt, /Изолированный этап измерения/);
+        const transcript = `stage-transcript:${req.challenge}`;
+        return { verdict: 'PASS', transcript_file: null, witness: {
+          mode: 'read-only', transport: 'docker-ro-v1', snapshotDigest: 'c'.repeat(64),
+          worktreeFingerprint: { head: x.candidate }, challenge: req.challenge, verdict: 'PASS',
+          artifactDigest: req.artifactDigest,
+          transcript_sha256: createHash('sha256').update(transcript).digest('hex'),
+          checkpoint: 'feed80ab',
+          actual: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' } } };
+      },
+    });
+    // Зелёный проход: role DAG через аттестованный RO-транспорт с witness,
+    // затем независимый L2 и нативное закрытие на том же candidate_sha.
+    const x = await lab(t);
+    const transport = roTransport(x);
+    const observer = await sandboxObserver(x, transport);
+    await enrollBetaPlaybook(x, registry, 'writer-course', { observeStage: observer });
+    assert.equal((await x.tick()).phase, 'working');
+    x.submit(x.candidate, 10);
+    const final = await x.tick();
+    assert.equal(final.phase, 'done', final.reason);
+    const { state, result } = await x.port.lookup(x.taskId);
+    assert.equal(state, 'completed');
+    assert.equal(result.sha, x.candidate);
+    assert.equal(x.effects.completeCalls, 1);
+    assert.equal(x.effects.reviewCalls, 1);
+    assert.equal(transport.orphans, 0, 'ноль осиротевших host-процессов');
+    assert.equal(transport.witnesses.length, 4);
+    for (const w of transport.witnesses) {
+      assert.equal(w.mode, 'read-only');
+      assert.equal(w.transport, 'docker-ro-v1');
+      assert.match(w.challenge, /^[a-f0-9]{64}$/);
+      assert.match(w.transcript_sha256, /^[a-f0-9]{64}$/);
+      assert.equal(w.threadId, 'sandbox:docker-ro-v1');
+    }
+    // Неаттестованный транспорт — fail-closed: ни стадий, ни L2, ни complete.
+    const y = await lab(t);
+    const denied = { kind: 'denied', witnesses: [], orphans: 0,
+      async assertReadOnly() { return false; },
+      async observe() { assert.fail('неаттестованный транспорт не вызывается'); } };
+    const deniedObserver = await sandboxObserver(y, denied);
+    await enrollBetaPlaybook(y, registry, 'writer-course', { observeStage: deniedObserver });
+    assert.equal((await y.tick()).phase, 'working');
+    y.submit(y.candidate, 10);
+    const held = await y.tick();
+    assert.equal(held.phase, 'hold');
+    assert.match(held.reason, /stage_read_only_transport_not_enrolled/);
+    assert.equal(y.effects.reviewCalls, 0);
+    assert.equal(y.effects.completeCalls, 0);
+    assert.equal(denied.orphans, 0);
+  });
 
 // ---------------------------------------------------------------------------
 // Трасса 1A: потерянный ack после реального эффекта spawn — однозначное

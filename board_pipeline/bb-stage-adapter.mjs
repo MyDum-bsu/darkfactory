@@ -7,6 +7,7 @@ import { artifactVerdict } from './stage-verifier.mjs';
 import { canonicalDigest } from './subject.mjs';
 import { opencodeGoPolicyViolation, retiredProviderViolation } from './worker-selector.mjs';
 import { syncDir } from './slot.mjs';
+import { assertStageReadOnly, createStageSandboxTransport } from './stage-sandbox-transport.mjs';
 
 const exec = promisify(execFile);
 const BB_ID = /^thr_[a-z0-9]+$/;
@@ -47,6 +48,22 @@ export function pilotWriterWorkspaceReady(snapshot, { threadId, parentThread, pr
   }
   if (environment?.path === workspace) return true;
   // No handoff, verify or side effects while BB is still allocating the env.
+  if (thread.status === 'starting' && (environment?.path == null)) return false;
+  throw new Error('BB workspace changed');
+}
+
+// Общий grace-ожидание ready для ЛЮБОГО режима (B2): parentThread опционален
+// — вне пилота родитель не закреплён и не проверяется; переданный —
+// обязателен. 'starting' без environment.path — wait-only тик (false), а не
+// падение 'BB workspace changed'; подтверждённый drift — writer_identity_drift.
+export function writerWorkspaceReady(snapshot, { threadId, parentThread, project, workspace }) {
+  const { thread, environment } = snapshot ?? {};
+  if (thread?.id !== threadId ||
+      (project !== undefined && thread?.projectId !== undefined && thread.projectId !== project) ||
+      (parentThread !== undefined && thread.parentThreadId !== parentThread)) {
+    throw new Error('writer_identity_drift');
+  }
+  if (environment?.path === workspace) return true;
   if (thread.status === 'starting' && (environment?.path == null)) return false;
   throw new Error('BB workspace changed');
 }
@@ -94,8 +111,18 @@ export function verifyBbStageTurn({ snapshot, events, threadId, parentThread, pr
 }
 
 export async function createBbStageObserver({ project, workspace, parentThread, journal, deadline, maxSeconds = 120 },
-  { assertCurrent, assertReadOnly, readArtifact, record, recordWitness, execBb = invokeBb }) {
-  if (!/^proj_[a-z0-9]+$/.test(project ?? '') || !BB_ID.test(parentThread ?? '') ||
+  { assertCurrent, assertReadOnly, readArtifact, record, recordWitness, execBb = invokeBb,
+    sandboxTransport, sandboxOptions, phaseBudget, signals }) {
+  // Аттестованный read-only транспорт: явный sandboxTransport либо
+  // sandboxOptions { mode:'read-only', worktree } — создаётся здесь и живёт
+  // столько же, сколько наблюдатель. Без него остаётся host-путь bb spawn.
+  if (sandboxTransport === undefined && sandboxOptions?.mode === 'read-only' &&
+      isAbsolute(sandboxOptions.worktree ?? '')) {
+    sandboxTransport = createStageSandboxTransport({ ...sandboxOptions, journal,
+      deadlineMs: deadline, signal: signals?.signal });
+  }
+  if (!/^proj_[a-z0-9]+$/.test(project ?? '') ||
+      (sandboxTransport === undefined && !BB_ID.test(parentThread ?? '')) ||
       !isAbsolute(workspace ?? '') || !isAbsolute(journal ?? '') ||
       !Number.isSafeInteger(deadline) || !Number.isSafeInteger(maxSeconds) || maxSeconds < 5 || maxSeconds > 180 ||
       typeof assertCurrent !== 'function' || typeof readArtifact !== 'function' ||
@@ -108,7 +135,10 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
   const run = async (argv, timeout = 8000) => JSON.parse((await execBb(argv, { timeout, maxBuffer: 4 * 1024 * 1024 })).stdout);
   return async request => {
     await assertCurrent(request.binding);
-    const [provider, model] = stageActor(request.model);
+    // Host-путь проверяет спек модели до readArtifact; sandbox-путь
+    // аттестует модель самим транспортом (stageTransportKind), включая
+    // acp-antigravity-acp/gemini-4-neon.
+    if (sandboxTransport === undefined) stageActor(request.model);
     // The verified tool evidence is supplied by the host, never by the model.
     const { artifact, material } = await readArtifact(request);
     if (typeof material !== 'string' || !material.trim()) throw new Error('stage_material_unconfirmed');
@@ -129,13 +159,48 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     ].join('\n\n');
     if (Buffer.byteLength(text) > 48 * 1024) throw new Error('stage_prompt_too_large');
     const checkTransport = async () => {
-      if (typeof assertReadOnly !== 'function' || await assertReadOnly({ workspace, project, provider, model }) !== true) {
-        throw new Error('stage_read_only_transport_not_enrolled');
+      if (sandboxTransport !== undefined) {
+        if (await assertStageReadOnly(sandboxTransport, request.model) !== true) {
+          throw new Error('stage_read_only_transport_not_enrolled');
+        }
+      } else {
+        const [provider, model] = stageActor(request.model);
+        if (typeof assertReadOnly !== 'function' ||
+            await assertReadOnly({ workspace, project, provider, model }) !== true) {
+          throw new Error('stage_read_only_transport_not_enrolled');
+        }
       }
       if (deadline - Date.now() < 5000) throw new Error('stage_dispatch_deadline');
     };
     await checkTransport();
     const prompt = await durableIntent(journal, key, text);
+    // Аттестованный read-only путь: наблюдение идёт через sandbox-транспорт
+    // (Landlock/Docker) с криптографическим stage_witness, без host bb spawn.
+    if (sandboxTransport !== undefined) {
+      await assertCurrent(request.binding);
+      const budgetMs = phaseBudget ? phaseBudget.remaining('stages') : maxSeconds * 1000;
+      if (budgetMs < 1000) throw new Error('phase_deadline_exceeded:stages');
+      signals?.phase?.('stages');
+      try {
+        const observed = await sandboxTransport.observe({ binding: request.binding,
+          model: request.model, prompt: text, challenge, artifactDigest,
+          timeoutMs: Math.min(maxSeconds * 1000, budgetMs, Math.max(0, deadline - Date.now())) });
+        await assertCurrent(request.binding);
+        if (observed.verdict !== 'BLOCKED' && observed.verdict !== expectedVerdict) {
+          throw new Error('stage_artifact_disputed');
+        }
+        await recordWitness({ threadId: `sandbox:${observed.witness.transport}`,
+          stage: request.stage, artifactDigest, ...observed.witness });
+        return { binding: request.binding, registryDigest: request.registryDigest, playbook: request.playbook,
+          stage: request.stage, verifier: request.verifier, model: request.model,
+          inputArtifactDigest: request.inputArtifactDigest, verdict: observed.verdict, artifact, artifactDigest,
+          witness: observed.witness };
+      } finally {
+        signals?.leavePhase?.();
+      }
+    }
+    // Host-путь требует закреплённого parent-треда и bb-спеки модели.
+    const [provider, model] = stageActor(request.model);
     const argv = ['thread', 'spawn', '--project', project, '--environment', workspace, '--parent-thread', parentThread,
       '--parent-notifications', 'off', '--provider', provider, '--model', model, '--permission-mode', 'accept-edits',
       '--title', 'VS-5.2 stage', '--prompt-file', prompt, '--json'];
@@ -153,10 +218,14 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     catch (cause) {
       // Stop is cleanup of an already-launched, specifically identified child,
       // not progression of the attempt; it remains needed after gate loss.
-      const current = await run(['thread', 'show', spawned.id, '--json']);
-      if (current.thread?.parentThreadId === parentThread && current.thread?.projectId === project &&
-          current.environment?.path === workspace && current.thread?.id === spawned.id) {
-        await execBb(['thread', 'stop', spawned.id], { timeout: 12_000 });
+      // Сбой промежуточного thread show не отменяет остановку: spawned.id —
+      // наш подтверждённый дочерний тред, осиротевших процессов быть не должно.
+      let current = null;
+      try { current = await run(['thread', 'show', spawned.id, '--json']); } catch { /* show недоступен */ }
+      if (current === null ||
+          (current.thread?.parentThreadId === parentThread && current.thread?.projectId === project &&
+          current.environment?.path === workspace && current.thread?.id === spawned.id)) {
+        await execBb(['thread', 'stop', spawned.id], { timeout: 12_000 }).catch(() => {});
       }
       throw new Error('stage_wait_unconfirmed', { cause });
     }

@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createBbStageObserver, matchesNativeStageWitness, pilotWriterWorkspaceReady, verifyBbStageTurn } from './bb-stage-adapter.mjs';
+import { createBbStageObserver, matchesNativeStageWitness, pilotWriterWorkspaceReady,
+  verifyBbStageTurn, writerWorkspaceReady } from './bb-stage-adapter.mjs';
+import { createAttemptSignals } from './signals.mjs';
 import { abEffectGuard, enrollAbPilot, guardAbBoard, inspectPilotDiff, pilotArtifacts, CASES } from './ab-pilot.mjs';
 import { resolveArbitration } from './worker-selector.mjs';
 
@@ -180,4 +182,132 @@ test('retired or non-DeepSeek model cannot launch and out-of-scope pilot cannot 
     /ab_pilot_diff_out_of_scope/);
   await assert.rejects(inspectPilotDiff({ case: 'policy' }, { git: () => `M\0${CASES.policy.files[0]}\0A\0${CASES.policy.files[1]}\0`,
     base: 'x', candidate: 'y' }), /ab_pilot_diff_out_of_scope/);
+});
+
+test('writerWorkspaceReady: общий путь без parentThread — тот же grace starting->ready', () => {
+  const desired = trace('/isolated');
+  const args = { threadId, project, workspace: '/isolated' };
+  const starting = { thread: { ...desired.snapshot.thread, status: 'starting' }, environment: null };
+  assert.equal(writerWorkspaceReady(starting, args), false);
+  assert.equal(writerWorkspaceReady(desired.snapshot, args), true);
+  assert.throws(() => writerWorkspaceReady({ ...starting, environment: { path: '/other' } }, args),
+    /BB workspace changed/);
+  assert.throws(() => writerWorkspaceReady({ ...starting, thread: { ...starting.thread, id: 'thr_other' } }, args),
+    /writer_identity_drift/);
+  assert.throws(() => writerWorkspaceReady(
+    { ...starting, thread: { ...starting.thread, parentThreadId: 'thr_other' } },
+    { ...args, parentThread }), /writer_identity_drift/);
+});
+
+test('observer идёт через аттестованный sandbox-транспорт и пишет stage_witness, bb spawn не вызывается', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'df-stage-sandbox-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'observer'), journal = join(root, 'journal');
+  await mkdir(workspace, { mode: 0o700 });
+  await mkdir(journal, { mode: 0o700 });
+  const witnesses = [];
+  const observed = [];
+  const artifact = Buffer.from(JSON.stringify({ type: 'inventory', inventory: 'a'.repeat(64), items: 1, unresolved: 0 }));
+  const transport = {
+    async assertReadOnly(model) { assert.equal(model.model, 'gpt-6.2-sol'); return true; },
+    async observe(req) {
+      observed.push(req);
+      assert.equal(req.artifactDigest.length, 64);
+      assert.match(req.prompt, new RegExp(`Challenge: ${req.challenge}`));
+      return { verdict: 'PASS', transcript_file: null, witness: {
+        mode: 'read-only', transport: 'docker-ro-v1', snapshotDigest: 'c'.repeat(64),
+        worktreeFingerprint: { head: 'a'.repeat(40) }, challenge: req.challenge, verdict: 'PASS',
+        artifactDigest: req.artifactDigest, transcript_sha256: 'e'.repeat(64), checkpoint: 'feed80ab',
+        actual: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' } } };
+    },
+  };
+  const tracked = [];
+  const observer = await createBbStageObserver({ workspace, project, journal,
+    parentThread: undefined, deadline: Date.now() + 60_000 }, {
+    assertCurrent() {}, readArtifact: () => ({ artifact, material: 'Measured facts' }),
+    record: row => tracked.push(row), recordWitness: row => witnesses.push(row),
+    execBb: async () => assert.fail('host bb spawn запрещён в sandbox-пути'),
+    sandboxTransport: transport,
+  });
+  const req = { stage: 'intake', role: 'materials-reader', verifier: 'inventory', playbook: 'policy',
+    registryDigest: 'a'.repeat(64), inputArtifactDigest: null,
+    model: { provider: 'openai', model: 'gpt-6.2-sol', reasoning: null },
+    binding: { task_id: '1', candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) },
+    skills: [{ text: 'Embedded fixture skill' }] };
+  const got = await observer(req);
+  assert.equal(got.verdict, 'PASS');
+  assert.equal(got.witness.transport, 'docker-ro-v1');
+  assert.equal(witnesses[0].mode, 'read-only');
+  assert.equal(witnesses[0].threadId, 'sandbox:docker-ro-v1');
+  assert.equal(witnesses[0].challenge, observed[0].challenge);
+});
+
+test('без аттестованного assertReadOnly остаётся fail-closed stage_read_only_transport_not_enrolled', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'df-stage-deny-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'observer'), journal = join(root, 'journal');
+  await mkdir(workspace, { mode: 0o700 });
+  await mkdir(journal, { mode: 0o700 });
+  const unexpected = () => assert.fail('не должно быть дочернего вызова');
+  const observer = await createBbStageObserver({ workspace, project, journal,
+    deadline: Date.now() + 60_000 }, {
+    assertCurrent() {}, readArtifact: () => ({ artifact: Buffer.from(JSON.stringify(
+      { type: 'inventory', inventory: 'a'.repeat(64), items: 1, unresolved: 0 })), material: 'm' }),
+    record: unexpected, recordWitness: unexpected, execBb: unexpected,
+    sandboxTransport: { assertReadOnly: async () => false, observe: unexpected },
+  });
+  const req = { stage: 'intake', role: 'r', verifier: 'inventory', registryDigest: 'a'.repeat(64),
+    model: { provider: 'openai', model: 'gpt-6.2-sol', reasoning: null },
+    binding: { task_id: '1', candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) },
+    skills: [{ text: 's' }] };
+  await assert.rejects(observer(req), /stage_read_only_transport_not_enrolled/);
+});
+
+test('phase-aware deadline: исчерпанный бюджет stages отклоняет наблюдение до транспорта', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'df-stage-phase-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'observer'), journal = join(root, 'journal');
+  await mkdir(workspace, { mode: 0o700 });
+  await mkdir(journal, { mode: 0o700 });
+  const artifact = Buffer.from(JSON.stringify({ type: 'inventory', inventory: 'a'.repeat(64), items: 1, unresolved: 0 }));
+  const unexpected = () => assert.fail('transport не должен вызываться');
+  const observer = await createBbStageObserver({ workspace, project, journal,
+    deadline: Date.now() + 60_000 }, {
+    assertCurrent() {}, readArtifact: () => ({ artifact, material: 'm' }),
+    record: unexpected, recordWitness: unexpected, execBb: unexpected,
+    sandboxTransport: { assertReadOnly: async () => true, observe: unexpected },
+    phaseBudget: { remaining: () => 0 },
+  });
+  const req = { stage: 'intake', role: 'r', verifier: 'inventory', registryDigest: 'a'.repeat(64),
+    model: { provider: 'openai', model: 'gpt-6.2-sol', reasoning: null },
+    binding: { task_id: '1', candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) },
+    skills: [{ text: 's' }] };
+  await assert.rejects(observer(req), /phase_deadline_exceeded:stages/);
+});
+
+test('cleanup при abort/timeout: thread stop идёт даже при сбое промежуточного thread show', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'df-stage-stop-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'observer'), journal = join(root, 'journal');
+  await mkdir(workspace, { mode: 0o700 });
+  await mkdir(journal, { mode: 0o700 });
+  let stopped = 0;
+  const artifact = Buffer.from(JSON.stringify({ type: 'inventory', inventory: 'a'.repeat(64), items: 1, unresolved: 0 }));
+  const execBb = async argv => {
+    if (argv[1] === 'spawn') return { stdout: JSON.stringify({ id: threadId }) };
+    if (argv[1] === 'wait') throw new Error('lost transport');
+    if (argv[1] === 'show') throw new Error('show unavailable');
+    if (argv[1] === 'stop') { stopped++; return { stdout: '{}' }; }
+    return { stdout: '{}' };
+  };
+  const observer = await createBbStageObserver({ workspace, project, journal, parentThread,
+    deadline: Date.now() + 60_000 }, {
+    assertCurrent() {}, assertReadOnly: () => true,
+    readArtifact: () => ({ artifact, material: 'm' }), record: () => {}, recordWitness: () => {}, execBb });
+  const req = { stage: 'intake', role: 'r', verifier: 'inventory', registryDigest: 'a'.repeat(64),
+    model: { provider, model, reasoning: null },
+    binding: { task_id: '1', candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) },
+    skills: [{ text: 's' }] };
+  await assert.rejects(observer(req), /stage_wait_unconfirmed/);
+  assert.equal(stopped, 1, 'подтверждённый дочерний тред обязан быть остановлен');
 });
