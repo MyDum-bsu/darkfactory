@@ -190,6 +190,17 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     }));
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: innerPolicy }), /path_inside_worktree/);
+    // Внешний alias, нацеленный на исходящий симлинк внутри worktree
+    // (alias -> wt/link -> наружу): конечный realpath внешний, но вход
+    // проходит через дерево воркера — отказ по промежуточному хопу.
+    const outLink = join(wt, 'link');
+    await symlink(dir, outLink);
+    const extAlias = join(dir, 'ext-alias');
+    await symlink(outLink, extAlias);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, 'spec-digest': undefined,
+      brief: join(extAlias, 'brief.md'), policy: policyFile }),
+      /path_inside_worktree/);
     // Исходный путь review skill через симлинк внутри worktree — отказ.
     const skill = join(wt, 'skill.md');
     await writeFile(join(dir, 'skill-real.md'), 's');
@@ -240,6 +251,15 @@ test('enqueue: policy.policyDigest закреплён и сверяется с -
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': HEX2, policy: policyFile }), /policy_digest_mismatch/);
     await write('zz');
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }), /policy_digest_invalid/);
+    // null — вычисленный отпечаток (семантика ?? контроллера); не-строка
+    // с coercible-значением — отказ, а не молчаливая подстановка.
+    await write(null);
+    const fallback = await buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile });
+    assert.match(fallback.labels.policy_digest, /^[0-9a-f]{64}$/);
+    await write([HEX]);
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile }), /policy_digest_invalid/);
   } finally {
@@ -316,7 +336,14 @@ test('run: запрещённая модель в CLI, критике, арби�
     const badCritic = policySpec(wt);
     badCritic.profiles.default.review = { provider: 'openai', model: 'gpt-6.1-terra' };
     const f1 = await withPolicy(dir, badCritic);
-    await assert.rejects(() => buildRunPlan(runValues(f1, 's')), /disallowed:critic/);
+    await assert.rejects(() => buildRunPlan(runValues(f1, 's')), /disallowed:profiles\.default/);
+    // Запрещённый спек в невыбранном профиле — тот же запрет матрицы.
+    const otherProfile = policySpec(wt);
+    otherProfile.profiles.other = { branch: 'b2',
+      review: { provider: 'openai', model: 'gpt-6.1-terra' } };
+    const f4 = await withPolicy(dir, otherProfile);
+    await assert.rejects(() => buildRunPlan(runValues(f4, 's')),
+      /disallowed:profiles\.other/);
     const badArbiter = { ...policySpec(wt), arbiter: { provider: 'pi', model: 'acp-zcode-start/x' } };
     const f2 = await withPolicy(dir, badArbiter);
     await assert.rejects(() => buildRunPlan(runValues(f2, 's')), /zcode.*:arbiter/);
@@ -475,7 +502,11 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const fSib = await withPolicy(dir, sibPolicy);
     await assert.rejects(() => buildRunPlan(runValues(fSib, state)),
       /path_inside_worktree/);
-    const memParent = { ...policySpec(wt), projectMemory: { storeDir: dir } };
+    // Соседний <tmp>/memory рядом с <tmp>/wt: dirname хранилища содержит
+    // worktree — контроллер отклонил бы на assertStoreOutside.
+    const siblingMemory = join(dir, 'memory');
+    await mkdir(siblingMemory);
+    const memParent = { ...policySpec(wt), projectMemory: { storeDir: siblingMemory } };
     const fMem = await withPolicy(dir, memParent);
     await assert.rejects(() => buildRunPlan(runValues(fMem, state)),
       /path_inside_worktree/);

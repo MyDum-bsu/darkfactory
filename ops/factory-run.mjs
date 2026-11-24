@@ -16,8 +16,8 @@
 //     [--interval-ms N] [--allow-live-pilot] [--recheck-rejected-handoff] \
 //     [--dry-run] [--json]
 import { execFile, spawn } from 'node:child_process';
-import { lstat, realpath, readFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { lstat, realpath, readFile, readlink } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { opencodeGoPolicyViolation, retiredProviderViolation }
@@ -62,9 +62,13 @@ export function assertModelMatrix({ cli, policy }) {
   const specs = [
     ['cli', { provider: cli.provider, model: cli.model }],
     ['policy.bb', policy?.bb],
-    ['critic', policy?.profiles?.[policy?.route?.checkProfile]?.review],
     ['arbiter', policy?.arbiter],
   ];
+  // Все profiles.*.review, а не только выбранный route.checkProfile:
+  // инвариант матрицы действует на каждое поле модели политики.
+  for (const [name, profile] of Object.entries(policy?.profiles ?? {})) {
+    specs.push([`profiles.${name}`, profile?.review]);
+  }
   for (const role of ['worker', 'critic', 'arbiter']) {
     for (const entry of policy?.routing?.allowlist?.[role] ?? []) {
       specs.push([`routing.allowlist.${role}`, entry]);
@@ -77,28 +81,41 @@ export function assertModelMatrix({ cli, policy }) {
   }
 }
 
-const inside = (root, p) => p === root || p.startsWith(`${root}/`);
+// Семантика inside() контроллера (relative, а не префикс): корректна и
+// для корня ФС — '/' содержит любой абсолютный путь, префиксная сверка
+// '//' это пропускала бы.
+const inside = (root, p) => {
+  const rel = relative(root, p);
+  return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
+};
 
 // Та же двусторонняя граница, что у контроллера (decision-ledger.mjs,
 // project-memory.mjs): путь абсолютный (resolveLedgerPath отклоняет
 // относительный), не симлинк и не пересекается с worktree ни в одну
 // сторону — ни буквально, ни после realpath, против всех алиасов дерева.
 // Симлинк-предок внутри worktree (wt/link -> наружу) отсекается
-// буквальной сверкой до записи Git-конфига и запуска. Для файла ledger
-// (parent: true) проверяется и родительский каталог: dirname, содержащий
-// worktree, ставит журнал рядом с деревом воркера — контроллер отклонил
-// бы его на assertLedgerOutside.
-async function canonicalOutside(path, treeAliases, mustBe, { parent = false } = {}) {
+// буквальной сверкой до записи Git-конфига и запуска. Родительский
+// каталог тоже не пересекается с деревом (assertLedgerOutside/
+// assertStoreOutside проверяют dirTarget/targetDir): dirname, содержащий
+// worktree, ставит хранилище рядом с деревом воркера.
+async function canonicalOutside(path, treeAliases, mustBe) {
   if (!isAbsolute(path ?? '')) fail('path_not_absolute');
-  const overlap = p => treeAliases.some(t => inside(t, p) || inside(p, t));
-  const parentHoldsTree = p => treeAliases.some(t => inside(dirname(p), t));
+  const overlap = p => treeAliases.some(t =>
+    inside(t, p) || inside(p, t) || inside(dirname(p), t) || inside(t, dirname(p)));
   const literal = resolve(path);
-  if (overlap(literal) || (parent && parentHoldsTree(literal))) fail('path_inside_worktree');
+  if (overlap(literal)) fail('path_inside_worktree');
   for (let probe = dirname(literal), prev; probe !== prev; prev = probe, probe = dirname(probe)) {
     const st = await lstat(probe).catch(() => null);
     if (st?.isSymbolicLink()) {
+      // Промежуточный хоп и полная цель — в обе стороны: внешний alias
+      // может указывать на симлинк внутри worktree или на каталог,
+      // содержащий дерево (alias -> wt/link -> наружу, ld -> родитель wt).
+      const hop = resolve(dirname(probe), await readlink(probe).catch(() => probe));
       const target = await realpath(probe).catch(() => probe);
-      if (treeAliases.some(t => inside(t, target))) fail('path_inside_worktree');
+      if (treeAliases.some(t =>
+        inside(t, hop) || inside(hop, t) || inside(t, target) || inside(target, t))) {
+        fail('path_inside_worktree');
+      }
     }
   }
   const st = await lstat(literal).catch(() => fail('path_missing'));
@@ -106,7 +123,7 @@ async function canonicalOutside(path, treeAliases, mustBe, { parent = false } = 
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   const real = await realpath(literal);
-  if (overlap(real) || (parent && parentHoldsTree(real))) fail('path_inside_worktree');
+  if (overlap(real)) fail('path_inside_worktree');
   return real;
 }
 
@@ -171,9 +188,7 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // CLI — пересечение по любому из них отклоняется.
   const treeAliases = [...new Set([worktreeReal, resolve(policyTree),
     ...(values.worktree === undefined ? [] : [resolve(values.worktree)])])];
-  if (ledger !== null) {
-    await canonicalOutside(ledger, treeAliases, 'file', { parent: true });
-  }
+  if (ledger !== null) await canonicalOutside(ledger, treeAliases, 'file');
   if (memory !== null) await canonicalOutside(memory, treeAliases, 'dir');
 
   // CLI-override без конфликта с политикой передаётся контроллеру через

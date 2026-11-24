@@ -67,8 +67,9 @@ node ops/factory-run.mjs \
 - Жёстко запрещены в любом сегменте `provider/model` (регистр не важен,
   включая вложенные `pi/a/b/...`): `gpt-6.1-terra`, `zcode` /
   `acp-zcode-start`, `glm` / `glm-*`.
-- Проверка применяется к CLI-спеке, `policy.bb`, критику профиля
-  (`profiles[route.checkProfile].review`), `policy.arbiter` **и каждому
+- Проверка применяется к CLI-спеке, `policy.bb`, **каждому**
+  `profiles.*.review` (не только выбранному `route.checkProfile`),
+  `policy.arbiter` **и каждому
   кандидату `policy.routing.allowlist.{worker,critic,arbiter}`** —
   активный роутинг закрепляет кандидата скоркардом, поэтому запрет
   действует до запуска. Плюс `opencodeGoPolicyViolation` и
@@ -97,8 +98,8 @@ rev-parse --show-toplevel` обязан строго равняться кано
 через соответствующий env. Каждый путь — абсолютный, каноничный (не
 симлинк) и не пересекается с worktree **ни в одну сторону** — как
 буквально, так и после `realpath`, против всех алиасов дерева:
-хранилище внутри worktree, worktree внутри хранилища и — для файла
-ledger — родительский каталог, содержащий worktree, отклоняются так же,
+хранилище внутри worktree, worktree внутри хранилища и родительский
+каталог, содержащий worktree (или сам лежащий в дереве), отклоняются так же,
 как их отклоняют `assertLedgerOutside`/`assertStoreOutside` контроллера.
 Симлинк-предок `wt/link -> наружу` или alias worktree отсекается до
 запуска.

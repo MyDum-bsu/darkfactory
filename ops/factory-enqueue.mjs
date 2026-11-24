@@ -19,8 +19,8 @@
 // policy_digest не сойдётся с отпечатком и seal вернёт policy_digest_drift.
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstat, readFile, realpath } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { lstat, readFile, readlink, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
@@ -42,15 +42,27 @@ function fail(code) { throw new Error(code); }
 // списка. Симлинк-предок, разрешающийся внутрь worktree (alias -> wt при
 // пути alias/link/...), тоже отсекается: исходный путь контроллера проходил
 // бы через дерево воркера даже при внешнем realpath.
+// Семантика inside() контроллера (relative, а не префикс): корректна и
+// для корня ФС — '/' содержит любой абсолютный путь.
+const within = (root, p) => {
+  const rel = relative(root, p);
+  return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
+};
+
 async function canonicalInput(path, { worktrees = [], mustBe } = {}) {
   if (typeof path !== 'string' || !path) fail('path_required');
-  const inside = p => worktrees.some(w => p === w || p.startsWith(`${w}/`));
+  const inside = p => worktrees.some(w => within(w, p));
   const literal = resolve(path);
   if (inside(literal)) fail('path_inside_worktree');
   for (let probe = dirname(literal), prev; probe !== prev; prev = probe, probe = dirname(probe)) {
     const st = await lstat(probe).catch(() => null);
-    if (st?.isSymbolicLink() && inside(await realpath(probe).catch(() => probe))) {
-      fail('path_inside_worktree');
+    if (st?.isSymbolicLink()) {
+      // Важен промежуточный хоп: внешний alias может указывать на симлинк
+      // внутри worktree (alias -> wt/link -> наружу) — полный realpath
+      // остаётся внешним, но вход проходит через дерево воркера.
+      const hop = resolve(dirname(probe), await readlink(probe).catch(() => probe));
+      const real = await realpath(probe).catch(() => probe);
+      if (inside(hop) || inside(real)) fail('path_inside_worktree');
     }
   }
   const st = await lstat(literal).catch(() => fail('path_missing'));
@@ -86,11 +98,15 @@ async function pinnedPolicyDigest(file, policy, { worktrees = [] } = {}) {
     gate, await check(join(dirname(gate), 'routes.json')), ...skillFiles];
   const hashes = await Promise.all(files.map(sha256File));
   const computed = createHash('sha256').update(JSON.stringify(hashes)).digest('hex');
-  // Как у контроллера (p.policyDigest ?? route.policyDigest): закреплённый
-  // в политике дайджест первичен, но границы входов выше проверены всё
-  // равно — закрепление дайджеста проверку путей не отменяет.
-  if (policy?.policyDigest !== undefined) {
-    if (!HEX64.test(policy.policyDigest)) fail('policy_digest_invalid');
+  // Семантика контроллера (p.policyDigest ?? route.policyDigest): null —
+  // вычисленный отпечаток; ненулевое закреплённое значение обязано быть
+  // строкой из 64 hex (массив/число проходили бы test за счёт приведения).
+  // Границы входов выше проверены всё равно — закрепление дайджеста
+  // проверку путей не отменяет.
+  if (policy?.policyDigest != null) {
+    if (typeof policy.policyDigest !== 'string' || !HEX64.test(policy.policyDigest)) {
+      fail('policy_digest_invalid');
+    }
     return policy.policyDigest;
   }
   return computed;
