@@ -292,7 +292,20 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           }
         }
         if (pinned?.outcome === 'rejected') {
-          await save({ phase: 'hold', reason: pinned.reason ?? 'route_rejected' });
+          // Карточка уже захвачена (claim выполнен до пина): отказ триады без
+          // блока оставил бы бесхозный claim до истечения аренды — штатно
+          // блокируем с причиной для владельца (#1666 r3).
+          const reason = pinned.reason ?? 'route_rejected';
+          const blockText = board.blockText?.(record.epoch, reason) ?? reason;
+          await save({ phase: 'blocking',
+            intent: { kind: 'block', attemptId: record.attemptId, epoch: record.epoch,
+              reason, blockText: blockText.slice(0, 1000) } });
+          try {
+            await board.block(record.taskId, record.epoch, blockText);
+            await save({ phase: 'hold', reason, receipt: { kind: 'block' } });
+          } catch {
+            return reconcileInFlight();
+          }
           return visible();
         }
         const attemptCritic = pinned?.critic ?? selCritic;

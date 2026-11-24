@@ -1104,6 +1104,11 @@ test('rejected pinTriad — явный hold без spawn', async t => {
   assert.equal(out.phase, 'hold');
   assert.equal(out.reason, 'route_base_triad_violation:x');
   assert.equal(x.effects.spawn, 0);
+  // Отказ после claim: карточка заблокирована с причиной, а не оставлена
+  // захваченной до истечения аренды (#1666 r3).
+  const card = await x.inspect();
+  assert.equal(card.state, 'blocked');
+  assert.match(card.blocked?.reason ?? '', /route_base_triad_violation/);
 });
 
 test('исключение pinTriad — fail-closed hold, дефолтный воркер не запускается', async t => {
