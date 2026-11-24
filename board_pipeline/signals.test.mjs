@@ -59,7 +59,10 @@ test('phaseDeadline: фазовые бюджеты writer/l1_l3/stages/l2_critic
 });
 
 test('phase(): автоматический abort по истечении бюджета фазы с причиной фазы', async () => {
-  const signals = createAttemptSignals({ phaseBudgets: { stages: 25 } });
+  // Фиксированный now: точное значение остатка детерминировано — реальная
+  // граница миллисекунд между enter() и remaining() иначе даёт флаки 25/24.
+  let now = 1_000_000;
+  const signals = createAttemptSignals({ phaseBudgets: { stages: 25 }, now: () => now });
   assert.equal(signals.phase('stages'), 25);
   await delay(60);
   assert.equal(signals.signal.aborted, true);
