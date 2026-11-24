@@ -3,12 +3,25 @@ import test from 'node:test';
 import { advance } from './controller.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
+import { memoryBoardSdk } from './board-test-fixture.mjs';
 import * as ws from './worker-selector.mjs';
 
 const workerSelector = (over = {}) => ({ ...ws, ...over });
 
+// Детерминированный check-контейнер (rootless Docker, --network=none) не
+// содержит приватного host-SDK: там тесты идут на in-memory Board той же
+// формы. На хосте с установленным SDK — как и раньше через loadSdk.
+function sdk() {
+  try {
+    return loadSdk();
+  } catch (error) {
+    if (error?.code !== 'MODULE_NOT_FOUND' && error?.code !== 'ERR_MODULE_NOT_FOUND') throw error;
+    return memoryBoardSdk();
+  }
+}
+
 async function lab(t, finish = 'verified') {
-  const { board, local } = loadSdk();
+  const { board, local } = sdk();
   const backend = local({ memory: true });
   t.after(() => backend.close());
   const handle = board({ backend });
@@ -50,7 +63,7 @@ async function lab(t, finish = 'verified') {
 
 // Очередный (queue-driven) слот: маршрут без taskId, допуск по allowlist, две связанные карточки.
 async function queueLab(t, { finish = 'verified', owner = 'board:client', labels = CONTRACT, extra } = {}) {
-  const { board, local } = loadSdk();
+  const { board, local } = sdk();
   const backend = local({ memory: true });
   t.after(() => backend.close());
   const handle = board({ backend });
