@@ -73,6 +73,14 @@ test('enqueue: отказы до эффекта', async () => {
     /spec_digest_invalid/);
   await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), 'policy-digest': '0'.repeat(63) }),
     /policy_digest_invalid/);
+  // repo_id — формат нативной очереди.
+  await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), 'repo-id': 'repo name' }),
+    /repo_id_invalid/);
+  // Проверенные пути не переопределяются произвольной меткой.
+  for (const key of ['ledger_path', 'memory_dir', 'worktree', 'ticket', 'spec_digest']) {
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      label: [`${key}=spoofed`] }), /label_invalid/);
+  }
 });
 
 test('enqueue: brief/policy файлы, симлинк и путь внутри worktree отклоняются', async () => {
@@ -121,15 +129,34 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     await writeFile(reviewPrompt, 'r');
     await writeFile(gate, 'g');
     await writeFile(routes, '{}');
+    // Критик закреплён явно (legacy Pi/Sol): дайджест не зависит от
+    // DF_AGY_KEYRING_ITEM окружения оператора (Neon-выбор требует keyring).
     await writeFile(policyFile, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate,
-      route: { checkProfile: 'p' }, profiles: { p: {} },
+      route: { checkProfile: 'p' },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } },
     }));
     const plan = await buildEnqueuePlan({ ...baseValues(), 'policy-digest': undefined,
       policy: policyFile });
     const expected = sha256Text(JSON.stringify(await Promise.all(
       [policyFile, brief, reviewPrompt, gate, routes].map(sha256File))));
     assert.equal(plan.labels.policy_digest, expected);
+
+    // Вложенный вход политики внутри worktree — отказ до чтения и карточки.
+    const wt = join(dir, 'wt');
+    await mkdir(wt);
+    const innerBrief = join(wt, 'brief.md');
+    await writeFile(innerBrief, 'x');
+    await writeFile(policyFile, JSON.stringify({
+      brief: innerBrief, reviewPrompt, reviewGate: gate,
+      route: { checkProfile: 'p' },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } },
+    }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile, worktree: wt }),
+      /path_inside_worktree/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -346,6 +373,19 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await writeFile(envLedger, '');
     await assert.rejects(() => buildRunPlan(runValues(ok, state),
       { env: { DF_DECISION_LEDGER_PATH: envLedger } }), /path_inside_worktree/);
+    // Относительный путь — отказ (resolveLedgerPath контроллера требует absolute).
+    const relPolicy = { ...policySpec(wt), decisionLedger: 'rel-ledger.jsonl' };
+    const f4 = await withPolicy(dir, relPolicy);
+    await assert.rejects(() => buildRunPlan(runValues(f4, state)), /path_not_absolute/);
+    // Симлинк-предок внутри worktree: буквальный путь отклоняется до realpath.
+    const linkDir = join(wt, 'ld');
+    await symlink(dir, linkDir);
+    await assert.rejects(() => buildRunPlan(runValues(ok, state,
+      { 'ledger-path': join(linkDir, 'ledger.jsonl') })), /path_inside_worktree/);
+    // Путь контроллера не переопределяется флагами.
+    await assert.rejects(() => runFactory(['--provider', 'acp-devin', '--model', 'swe-2-high',
+      '--policy', ok, '--state', state, '--run-isolated', '/tmp/evil.mjs'], {}),
+      /Unknown option|run-isolated/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

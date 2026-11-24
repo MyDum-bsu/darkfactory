@@ -17,7 +17,7 @@
 //     [--dry-run] [--json]
 import { execFile, spawn } from 'node:child_process';
 import { lstat, realpath, readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { opencodeGoPolicyViolation, retiredProviderViolation }
@@ -77,12 +77,21 @@ export function assertModelMatrix({ cli, policy }) {
   }
 }
 
+// Та же граница, что у контроллера: путь абсолютный (resolveLedgerPath
+// отклоняет относительный), не симлинк и вне worktree как буквально, так и
+// после realpath — симлинк-предок внутри worktree (wt/link -> наружу)
+// отсекается буквальной сверкой до записи Git-конфига и запуска.
 async function canonicalOutside(path, worktreeReal, mustBe) {
-  const st = await lstat(path).catch(() => fail('path_missing'));
+  if (!isAbsolute(path ?? '')) fail('path_not_absolute');
+  const literal = resolve(path);
+  if (worktreeReal && (literal === worktreeReal || literal.startsWith(`${worktreeReal}/`))) {
+    fail('path_inside_worktree');
+  }
+  const st = await lstat(literal).catch(() => fail('path_missing'));
   if (st.isSymbolicLink()) fail('path_symlink_refused');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
-  const real = await realpath(path);
+  const real = await realpath(literal);
   if (worktreeReal && (real === worktreeReal || real.startsWith(`${worktreeReal}/`))) {
     fail('path_inside_worktree');
   }
@@ -149,18 +158,21 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
 
   // CLI-override без конфликта с политикой передаётся контроллеру через
   // тот же env-канал (DF_DECISION_LEDGER_PATH / DF_PROJECT_MEMORY_DIR):
-  // проверенный путь и есть используемый путь.
-  const childEnv = { ...env };
-  if (values['ledger-path'] !== undefined) childEnv[LEDGER_PATH_ENV] = values['ledger-path'];
-  if (values['memory-dir'] !== undefined) childEnv[MEMORY_DIR_ENV] = values['memory-dir'];
+  // проверенный путь и есть используемый путь. В план попадают только
+  // переопределения — унаследованное окружение (токены, ключи) не печатается.
+  const envOverrides = {};
+  if (values['ledger-path'] !== undefined) envOverrides[LEDGER_PATH_ENV] = values['ledger-path'];
+  if (values['memory-dir'] !== undefined) envOverrides[MEMORY_DIR_ENV] = values['memory-dir'];
 
-  const runIsolated = values['run-isolated'] ?? join(HERE, '..', 'board_pipeline', 'run-isolated.mjs');
+  // Делегирование строго принятому контроллеру: ни путь, ни бинарник
+  // не переопределяются флагами.
+  const runIsolated = join(HERE, '..', 'board_pipeline', 'run-isolated.mjs');
   const argv = [runIsolated, '--execute', '--policy', policyPathReal, '--state', values.state];
   for (const flag of PASSTHROUGH_BOOL) if (values[flag]) argv.push(`--${flag}`);
   for (const flag of PASSTHROUGH_VALUE) {
     if (values[flag] !== undefined) argv.push(`--${flag}`, values[flag]);
   }
-  return { node: values.node ?? process.execPath, argv, env: childEnv,
+  return { node: process.execPath, argv, env: envOverrides,
     worktree: worktreeReal, spec: { provider: values.provider, model: values.model },
     policy: policyPathReal, state: values.state, ledger, memory };
 }
@@ -195,8 +207,7 @@ export async function runFactory(argv, deps = {}) {
     provider: { type: 'string' }, model: { type: 'string' },
     policy: { type: 'string' }, state: { type: 'string' },
     worktree: { type: 'string' }, 'memory-dir': { type: 'string' },
-    'ledger-path': { type: 'string' }, 'run-isolated': { type: 'string' },
-    node: { type: 'string' },
+    'ledger-path': { type: 'string' },
     'stop-on-idle': { type: 'boolean' }, daemon: { type: 'boolean' },
     switch: { type: 'string' }, 'interval-ms': { type: 'string' },
     'allow-live-pilot': { type: 'boolean' },
@@ -213,7 +224,8 @@ export async function runFactory(argv, deps = {}) {
   }
   await ensureFilemodeGuard(plan.worktree, { git: deps.git ?? defaultGit });
   const run = deps.run ?? defaultRun;
-  const result = await run(plan.node, plan.argv, plan.env);
+  const result = await run(plan.node, plan.argv,
+    { ...(deps.env ?? process.env), ...plan.env });
   return { dryRun: false, plan, result };
 }
 

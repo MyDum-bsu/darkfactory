@@ -27,9 +27,13 @@ import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
 
 const execFileAsync = promisify(execFile);
 const HEX64 = /^[0-9a-f]{64}$/;
+const REPO_LABEL = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 const FINISH = new Set(['verified', 'deployed']);
+// Контрактные метки и ключи проверенных CLI-путей: произвольный --label их
+// не переопределяет (иначе в Board уйдёт путь без проверки).
 const RESERVED_LABELS = new Set(
-  ['spec_digest', 'policy_digest', 'repo_id', 'profile_id', 'finish']);
+  ['spec_digest', 'policy_digest', 'repo_id', 'profile_id', 'finish',
+    'memory_dir', 'ledger_path', 'worktree', 'ticket']);
 
 function fail(code) { throw new Error(code); }
 
@@ -62,14 +66,18 @@ const sha256File = async path =>
 
 // Тот же отпечаток, что контроллер запишет в route.policyDigest и приёмка
 // сверит с меткой карточки на seal (readOperatorInputs, run-isolated.mjs).
-async function pinnedPolicyDigest(policyFile) {
+// Каждый вложенный вход проходит ту же проверку, что и --brief/--policy:
+// не симлинк и строго вне worktree — контроллер отклонил бы такую политику
+// ('Operator files must be outside worker paths'), карточка не создаётся.
+async function pinnedPolicyDigest(policyFile, { worktreeReal } = {}) {
   const file = await realpath(policyFile);
   const policy = JSON.parse(await readFile(file, 'utf8'));
   const reviewSetup = await operatorReviewSetup(policy);
-  const files = [file, await realpath(policy.brief), await realpath(policy.reviewPrompt),
-    await realpath(policy.reviewGate),
-    await realpath(join(dirname(await realpath(policy.reviewGate)), 'routes.json')),
-    ...reviewSetup.skillPaths];
+  const check = p => canonicalInput(p, { worktreeReal, mustBe: 'file' });
+  const gate = await check(policy.reviewGate);
+  const files = [file, await check(policy.brief), await check(policy.reviewPrompt),
+    gate, await check(join(dirname(gate), 'routes.json')),
+    ...await Promise.all(reviewSetup.skillPaths.map(check))];
   const hashes = await Promise.all(files.map(sha256File));
   return createHash('sha256').update(JSON.stringify(hashes)).digest('hex');
 }
@@ -84,10 +92,12 @@ export async function buildEnqueuePlan(values) {
     if (error.code === 'ERR_INVALID_URL' || url === undefined) fail('board_url_invalid');
     throw error;
   }
-  for (const [flag, v] of [['channel', values.channel], ['repo_id', values['repo-id']],
-    ['profile_id', values.profile]]) {
+  for (const [flag, v] of [['channel', values.channel], ['profile_id', values.profile]]) {
     if (typeof v !== 'string' || !v.trim()) fail(`${flag}_required`);
   }
+  // Формат нативной очереди (native-board.mjs): вне формата карточка не
+  // допускается к захвату — отказ до её создания.
+  if (!REPO_LABEL.test(values['repo-id'] ?? '')) fail('repo_id_invalid');
   const title = values.title ?? values.text;
   if (typeof title !== 'string' || !title.trim()) fail('title_or_text_required');
   if (!FINISH.has(values.finish)) fail('finish_invalid');
@@ -102,7 +112,7 @@ export async function buildEnqueuePlan(values) {
   let policyDigest = values['policy-digest'];
   if (values.policy !== undefined) {
     policyDigest = await pinnedPolicyDigest(
-      await canonicalInput(values.policy, { worktreeReal, mustBe: 'file' }));
+      await canonicalInput(values.policy, { worktreeReal, mustBe: 'file' }), { worktreeReal });
   }
   if (!HEX64.test(specDigest ?? '')) fail('spec_digest_invalid');
   if (!HEX64.test(policyDigest ?? '')) fail('policy_digest_invalid');
