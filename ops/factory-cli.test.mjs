@@ -281,6 +281,29 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     const embeddedPlan = await buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile });
     assert.match(embeddedPlan.labels.policy_digest, /^[0-9a-f]{64}$/);
+    // --brief внутри отдельного handoffDir — отказ до хэширования и vb:
+    // рабочий каталог сдачи не должен давать дайджест спеки.
+    const handoff = join(dir, 'handoff');
+    await mkdir(handoff);
+    const hoBrief = join(handoff, 'brief.md');
+    await writeFile(hoBrief, 'x');
+    const hoSkill = join(handoff, 'logika.md');
+    await writeFile(hoSkill, 'x');
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
+      handoffDir: handoff }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, 'spec-digest': undefined,
+      brief: hoBrief, policy: policyFile }), /path_inside_worktree/);
+    // Невыбранная критиком привязка reviewSkillFiles внутри handoffDir —
+    // та же граница операторских файлов (Pi/Sol навыков не выбирает);
+    // состав дайджеста при этом не меняется.
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
+      handoffDir: handoff, reviewSkillFiles: { logika: hoSkill } }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }),
+      /path_inside_worktree/);
     const innerPolicy = join(wt, 'policy.json');
     await writeFile(innerPolicy, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate,

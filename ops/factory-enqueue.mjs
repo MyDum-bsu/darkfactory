@@ -116,6 +116,13 @@ async function pinnedPolicyDigest(file, policy, { worktrees = [], separate = [] 
     if (real !== reviewSetup.skillPaths[i]) fail('review_skill_path_mismatch');
     return real;
   }));
+  // Все привязки reviewSkillFiles — операторские файлы контроллера
+  // (factory-run проверяет каждое значение, не только выбранные критиком
+  // reviewSetup.skills): невыбранная привязка внутри worktree/handoffDir
+  // — отказ до создания карточки, но в состав дайджеста она не входит.
+  for (const p of Object.values(policy.reviewSkillFiles ?? {})) {
+    if (p !== undefined) await check(p);
+  }
   const files = [file, await check(policy.brief), await check(policy.reviewPrompt),
     gate, await check(join(dirname(gate), 'routes.json')), ...skillFiles];
   const hashes = await Promise.all(files.map(sha256File));
@@ -220,8 +227,14 @@ export async function buildEnqueuePlan(values) {
   }
   let specDigest = values['spec-digest'];
   if (values.brief !== undefined) {
-    specDigest = await sha256File(
-      await canonicalInput(values.brief, { worktrees, mustBe: 'file' }));
+    const briefReal = await canonicalInput(values.brief, { worktrees, mustBe: 'file' });
+    // --brief — тоже операторский файл: внутри handoffDir (inbox сдачи —
+    // рабочего каталога воркера) контроллер отклонил бы запуск, поэтому
+    // дайджест спеки из него в Board не уходит.
+    if (handoff !== undefined && within(handoff, briefReal)) {
+      fail('path_inside_worktree');
+    }
+    specDigest = await sha256File(briefReal);
   }
   let policyDigest = values['policy-digest'];
   if (values.policy !== undefined) {
