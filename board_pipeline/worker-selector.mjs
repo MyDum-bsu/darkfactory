@@ -22,7 +22,7 @@ import {
 // согласованных резерва независимых семейств. Резерв, нарушающий
 // кросс-семейственную триаду конкретного маршрута, пропускается — маршрут
 // продолжается по следующему кандидату.
-export const PRIMARY_WORKER = Object.freeze({ provider: 'acp-devin', model: 'swe-2-high' });
+export const PRIMARY_WORKER = Object.freeze({ provider: 'acp-devin', model: 'swe-2-1-medium' });
 export const NARROW_RESERVE_PI = Object.freeze({
   provider: 'pi',
   model: 'opencode-go/deepseek-v4.1-flash',
@@ -106,7 +106,7 @@ export function retiredProviderViolation(spec) {
   return scan(spec) ? 'zcode_provider_retired' : null;
 }
 
-// Упорядоченный план исполнителей маршрута: первичный acp-devin/swe-2-high,
+// Упорядоченный план исполнителей маршрута: первичный acp-devin/swe-2-1-medium,
 // затем согласованные резервы независимых семейств. Фактическая пригодность
 // резерва решается попыткой: нарушитель триады пропускается, подтверждённый
 // отказ допускает переход только при доказанной чистоте worktree.

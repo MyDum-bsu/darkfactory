@@ -50,6 +50,7 @@ function spawnLog(results) {
 }
 
 test('selectWorker: acp-devin первым, затем pi/deepseek и antigravity/gemini', () => {
+  assert.deepEqual(PRIMARY_WORKER, { provider: 'acp-devin', model: 'swe-2-1-medium' });
   // Routing Policy v2: резервы ZCode в плане нет; два согласованных резерва
   // независимых семейств идут сразу за первичным.
   assert.deepEqual(selectWorker({ route: {} }),

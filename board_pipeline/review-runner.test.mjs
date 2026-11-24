@@ -26,6 +26,10 @@ test('family: строгая таблица provider/model без подстро
   assert.equal(executorFamily('acp-zcode-start'), null);
   assert.equal(executorFamily('acp-antigravity-acp'), null);
   assert.equal(executorFamily({ provider: 'acp-devin', model: 'swe-2-high' }), 'cognition');
+  for (const model of ['swe-2-1', 'swe-2-1-low', 'swe-2-1-medium',
+    'swe-2-1-high', 'swe-2-1-xhigh', 'swe-2-1-max']) {
+    assert.equal(executorFamily({ provider: 'acp-devin', model }), 'cognition');
+  }
   assert.equal(executorFamily({ provider: 'acp-zcode-start',
     model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }), 'glm');
   assert.equal(executorFamily('opencode-go/deepseek-v4'), 'deepseek');
@@ -43,6 +47,7 @@ test('family: строгая таблица provider/model без подстро
   assert.equal(executorFamily('deepseek-reasoner'), null);
   assert.equal(executorFamily('gemini-4-neon'), null);
   assert.equal(executorFamily('codex-exec'), null);
+  assert.equal(executorFamily({ provider: 'acp-devin', model: 'swe-2-1-fake' }), null);
   assert.equal(executorFamily('mystery-model'), null);
   assert.equal(executorFamily(null), null);
 });
@@ -62,6 +67,11 @@ test('family: противоречивая пара provider/model и подст
 });
 
 test('family: кросс-семейственный инвариант', () => {
+  const neon = { provider: 'google', model: 'gemini-4-neon' };
+  for (const model of ['swe-2-1-medium', 'swe-2-1-high', 'swe-2-1-max']) {
+    assert.deepEqual(assertCrossFamily({ provider: 'acp-devin', model }, neon),
+      { executor: 'cognition', critic: 'google' });
+  }
   for (const executor of ['acp-devin/swe-2-high',
       'acp-zcode-start/builtin:zai-start-plan\\GLM-5.3-Flash',
       'opencode-go/deepseek-v4', 'acp-antigravity-acp/gemini-4-neon']) {

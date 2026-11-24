@@ -53,13 +53,18 @@ const inside = (root, p) => {
   return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
 // Routing Policy v2: зависимость от acp-zcode-start снята. Допущены
-// acp-devin/swe-2-high и acp-antigravity-acp/gemini-4-neon; харнесс pi —
-// только с моделями opencode-go/deepseek-* (см. opencodeGoPolicyViolation).
+// acp-devin/swe-2-1-* (плюс legacy swe-2-high) и
+// acp-antigravity-acp/gemini-4-neon; харнесс pi — только с моделями
+// opencode-go/deepseek-* (см. opencodeGoPolicyViolation).
 const approved = [
   { provider: 'acp-devin', model: 'swe-2-high' },
+  { provider: 'acp-devin', model: 'swe-2-1-medium' },
+  { provider: 'acp-devin', model: 'swe-2-1-high' },
+  { provider: 'acp-devin', model: 'swe-2-1-xhigh' },
+  { provider: 'acp-devin', model: 'swe-2-1-max' },
   { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' },
 ];
-const isApprovedWorker = bb =>
+export const isApprovedWorker = bb =>
   approved.some(e => e.provider === bb?.provider && e.model === bb?.model) ||
   (bb?.provider === 'pi' && typeof bb.model === 'string' &&
     /^opencode-go\//i.test(bb.model) &&

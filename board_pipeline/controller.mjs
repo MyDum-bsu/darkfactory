@@ -379,7 +379,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         // ответе reconcileSpawn восстанавливает попытку уже с триадой —
         // worker пишется по факту после выбора исполнителя.
         await save({ triad: { worker: attemptPlan[0], critic: attemptCritic, arbiter: attemptArbiter } });
-        // Приоритет acp-devin/swe-2-high; резерв только при подтверждённом
+        // Приоритет acp-devin/swe-2-1-medium; резерв только при подтверждённом
         // отказе, неизвестный исход — карантин без второго писателя.
         const selection = await workerSelector.attemptSpawnWithFallback({
           route, attempt: attemptOf(record, route),

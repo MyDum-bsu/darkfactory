@@ -3,7 +3,7 @@
   "workerPresets": {
     "implementation": {
       "provider": "acp-devin",
-      "model": "swe-2-high"
+      "model": "swe-2-1-medium"
     },
     "reviewer": {
       "provider": "pi",
