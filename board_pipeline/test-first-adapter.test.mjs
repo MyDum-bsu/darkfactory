@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { artifactVerdict } from './stage-verifier.mjs';
-import { isNonTargetFailure, isTestFilePath, verifyTestFirst } from './test-first-adapter.mjs';
+import { isNonTargetFailure, isTargetFailure, isTestFilePath, verifyTestFirst } from './test-first-adapter.mjs';
 
 function git(cwd, ...args) {
   return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -44,6 +44,13 @@ test('isTestFilePath / isNonTargetFailure', () => {
   assert.ok(isNonTargetFailure('', 130));
   assert.ok(!isNonTargetFailure('assert failed: expected 2 got 1', 1));
   assert.ok(!isNonTargetFailure('2 failures', 2));
+  // Позитивное доказательство: код 1 без маркера тестового падения — non-target.
+  assert.ok(!isTargetFailure('', 1));
+  assert.ok(!isTargetFailure('config error: no such file', 1));
+  assert.ok(isTargetFailure('assert failed: expected 2 got 1', 1));
+  assert.ok(isTargetFailure('1 failed, 3 passed', 1));
+  assert.ok(isTargetFailure('FAIL tests/f.test.mjs', 1));
+  assert.ok(!isTargetFailure('1 failed', 139));
 });
 
 test('verifyTestFirst: red→green pass with valid artifact', async t => {

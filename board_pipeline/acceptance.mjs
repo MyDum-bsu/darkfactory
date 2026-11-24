@@ -9,7 +9,7 @@ import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
 import { evaluateAutoApprove, isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter,
-  loadApprovalPolicy, NEON_ISOLATION, partitionFindingsBySeverity } from './review-policy.mjs';
+  NEON_ISOLATION, parseApprovalPolicy, partitionFindingsBySeverity } from './review-policy.mjs';
 import { l2RunnableSpec, runnerReviewSpec } from './review-runner.mjs';
 import { assertTriadIndependent, opencodeGoPolicyViolation,
   retiredProviderViolation, workerFamily } from './worker-selector.mjs';
@@ -54,7 +54,9 @@ const ATTEMPT_OPTIONAL = [
   'attempted_workers',
   'review_round',
   'prior_findings',
+  'prior_sha',
   'category',
+  'labels',
 ];
 const CONTRACT_REQUIRED = ['repo_id', 'spec_digest', 'policy_digest'];
 const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
@@ -301,6 +303,21 @@ function validateAttempt(attempt) {
   if (attempt.category !== undefined &&
       (typeof attempt.category !== 'string' || !/^[a-z][a-z0-9-]{0,47}$/.test(attempt.category))) {
     throw new Denied('invalid_category');
+  }
+  // Предыдущий проверенный кандидат для инкрементального diff раунда 2+ —
+  // доверенное значение из истории попытки, не из сдачи.
+  if (attempt.prior_sha !== undefined && !SHA_RE.test(attempt.prior_sha)) {
+    throw new Denied('invalid_prior_sha');
+  }
+  // Контрактные метки карточки для skillPicker формана: плоский словарь
+  // boolean/id-строк, ключи — декларируемые предикаты пикера.
+  if (attempt.labels !== undefined &&
+      (attempt.labels === null || typeof attempt.labels !== 'object' ||
+        Array.isArray(attempt.labels) || Object.keys(attempt.labels).length > 16 ||
+        !Object.entries(attempt.labels).every(([k, v]) =>
+          /^[a-z][a-z0-9_]{0,47}$/.test(k) &&
+          (typeof v === 'boolean' || (typeof v === 'string' && /^[a-z][a-z0-9-]{0,47}$/.test(v)))))) {
+    throw new Denied('invalid_labels');
   }
   validateContract(attempt);
 }
@@ -704,11 +721,20 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   // ослабляет гейты выше; любой отказ политики возвращает обычный путь L2.
   let autoApprove = null;
   if (typeof binding.category === 'string' && binding.category) {
+    // Правила auto-approve — операторские, не кандидатские: политика читается
+    // из байтов закреплённого base_sha. Кандидат может менять
+    // .darkfactory/approval-policy.yaml в своём дереве — это не влияет на
+    // решение о его допуске (и без того отклоняется denyPathPatterns).
     let loaded = null;
     try {
-      loaded = await loadApprovalPolicy(binding.worktree);
+      const policyBlob = await execGit('git', ['-C', binding.worktree, 'show',
+        `${binding.base_sha}:.darkfactory/approval-policy.yaml`],
+        { timeout: 30_000, maxBuffer: 64 * 1024, encoding: 'buffer' });
+      loaded = parseApprovalPolicy(policyBlob.stdout);
     } catch (e) {
-      if (e?.code !== 'ENOENT') {
+      // Отсутствие политики в базе — auto-approve не настроен, обычный путь L2;
+      // битая доверенная политика — операционный hold, а не молчаливый пропуск.
+      if (e?.code === undefined || e.code === 0) {
         await step('review', false, messageOf(e));
         return { status: 'hold', reason: 'approval_policy_invalid' };
       }
@@ -1130,7 +1156,9 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     executor: attempt.executor ?? profile.executor,
     review_round: attempt.review_round ?? 1,
     prior_findings: attempt.prior_findings ?? [],
+    prior_sha: attempt.prior_sha,
     category: attempt.category,
+    labels: attempt.labels,
   };
   // Ключ запуска включает контракт и требование L3: новый манифест или смена
   // has_ui при том же SHA не переиспользуют терминальный вердикт старого запуска.

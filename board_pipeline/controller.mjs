@@ -73,6 +73,15 @@ function contractOf(labels) {
     // Категория рутинной работы для policy-driven auto-approve (#1745):
     // контрактная метка карточки, не слово воркера.
     category: typeof labels?.category === 'string' ? labels.category : undefined,
+    // Декларируемые предикаты skillPicker из меток карточки: boolean-метки
+    // нормализуются 'true'/'false' → boolean, domain — id-строкой.
+    labels: Object.fromEntries([
+      ...['requires_lean', 'requires_colab', 'touches_migrations', 'pr_ci_red', 'test_first']
+        .map(key => [key, labels?.[key] === 'true' ? true : labels?.[key] === 'false' ? false : undefined]),
+      ['has_ui', labels?.has_ui === 'true' ? true : labels?.has_ui === 'false' ? false : undefined],
+      ['domain', typeof labels?.domain === 'string' && /^[a-z][a-z0-9-]{0,47}$/.test(labels.domain)
+        ? labels.domain : undefined],
+    ].filter(([, value]) => value !== undefined)),
   };
 }
 
@@ -94,6 +103,7 @@ function attemptOf(record, route) {
     if (record.contract.l1_profile !== undefined) attempt.l1_profile = record.contract.l1_profile;
     if (record.contract.has_ui !== undefined) attempt.has_ui = record.contract.has_ui;
     if (record.contract.category !== undefined) attempt.category = record.contract.category;
+    if (record.contract.labels !== undefined) attempt.labels = record.contract.labels;
   }
   return attempt;
 }
@@ -508,11 +518,22 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   // верификация проверяет закрытие P0/P1 и отсутствие новых регрессий,
   // а не полный аудит заново.
   const priorL2 = (record.roundsHistory ?? []).filter(r => r?.gate === 'l2');
+  const lastL2 = priorL2.at(-1);
+  // Блокирующие находки прошлого раунда; excerpt-only возражение (валидный
+  // REVIEW_BLOCKED без structured findings) не пропадает из скоупа — оно
+  // синтезируется в находку для критика.
+  const priorBlocking = partitionFindingsBySeverity(lastL2?.findings).blocking;
+  const excerptFinding = !priorBlocking.length && typeof lastL2?.excerpt === 'string' &&
+    lastL2.excerpt.trim()
+    ? [{ file: 'review.excerpt', expected: lastL2.excerpt.slice(0, 2000),
+        actual: 'blocking objection without structured findings' }]
+    : [];
   const verification = { ...attempt,
     review_round: priorL2.length + 1,
-    prior_findings: priorL2.length
-      ? partitionFindingsBySeverity(priorL2.at(-1).findings).blocking
-      : [],
+    prior_findings: priorBlocking.length ? priorBlocking : excerptFinding,
+    // Предыдущий проверенный SHA: раннеры строят инкрементальный diff
+    // prior→current, отделяя новые регрессии от уже проверенных изменений.
+    ...(shaRE.test(lastL2?.sha ?? '') ? { prior_sha: lastL2.sha } : {}),
     ...(prepared ? { release_target: { finish: 'deployed', target_id: prepared.target,
       release_channel: 'isolated-static', previous_live_digest: prepared.previous.digest } } : {}) };
   const result = await verify(verification, { ...submission, task_id: taskId });

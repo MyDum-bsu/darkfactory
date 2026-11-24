@@ -922,6 +922,21 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         if (patch.trim()) await writeFile(diffFile, patch, { mode: 0o600 });
       } catch { /* без diff ревью всё равно идёт по снимку */ }
 
+      // Раунд 2+: инкрементальный diff предыдущий кандидат → текущий.
+      // Именно он отделяет новые регрессии от уже проверенных изменений —
+      // без него критик не может выполнить diff-scoped пересмотр.
+      const roundFile = join(scratch, 'round.diff');
+      const reviewRound = Number.isSafeInteger(binding.review_round) ? binding.review_round : 1;
+      if (reviewRound > 1 && SHA.test(binding.prior_sha ?? '') &&
+          binding.prior_sha !== binding.candidate_sha) {
+        try {
+          const { stdout: patch } = await exec('git',
+            ['-C', binding.worktree, 'diff', `${binding.prior_sha}..${binding.candidate_sha}`],
+            { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+          if (patch.trim()) await writeFile(roundFile, patch, { mode: 0o600 });
+        } catch { /* инкрементальный diff необязателен */ }
+      }
+
       // Контрольные значения ДО запуска: дерево, байты снимка и worktree.
       const treeSha = await git(binding.worktree, 'rev-parse', `${binding.candidate_sha}^{tree}`);
       const before = await snapshotDigest(source);
@@ -949,6 +964,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       if (await lstat(diffFile).catch(() => null)) {
         mounts.push({ src: diffFile, dst: '/review/diff.patch' });
       }
+      if (await lstat(roundFile).catch(() => null)) {
+        mounts.push({ src: roundFile, dst: '/review/round.diff' });
+      }
       for (const component of PI_MOUNT_DIRS) {
         const src = join(piRoot, component);
         const info = await lstat(src).catch(() => null);
@@ -959,8 +977,11 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         PI_ALLOW_CONNECT: allow.join(',') };
 
       const hasDiff = mounts.some((m) => m.dst === '/review/diff.patch');
+      const hasRound = mounts.some((m) => m.dst === '/review/round.diff');
       const diffLine = hasDiff
-        ? 'and the exact diff base→candidate is mounted read-only at /review/diff.patch'
+        ? 'and the exact diff base→candidate is mounted read-only at /review/diff.patch' +
+          (hasRound ? ', and the incremental previous-candidate→current diff is at /review/round.diff — ' +
+            'only changes inside it are new this round' : '')
         : 'and the base→candidate diff is not available (review the tree as a whole)';
       const subjectLine = binding.subject_digest
         ? `The required subject_digest for this candidate is "${binding.subject_digest}". ` +
@@ -968,7 +989,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           'copy it verbatim, do NOT compute or invent a digest yourself.'
         : '';
       const instruction = buildReviewInstruction({ binding, diffLine, subjectLine,
-        prompt, round: binding.review_round ?? 1,
+        prompt, round: reviewRound,
         priorBlockingFindings: binding.prior_findings ?? [] });
 
       // Каталоги pi — симлинки на read-only монтирования кода; конфиги

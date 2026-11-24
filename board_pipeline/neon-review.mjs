@@ -74,8 +74,10 @@ function neonBody({ task_id, candidate_sha, subject_digest, review_round, prior_
     ...((Number.isSafeInteger(review_round) && review_round > 1) ? [
       `Diff-scoped re-review round ${review_round}: verify ONLY that each blocking (P0/P1)`,
       'finding from the previous round is resolved in the current diff and that the diff',
-      'introduces no NEW P0/P1 regressions. Do NOT re-audit from scratch and never issue',
-      'REWORK for P2/nit alone. Blocking findings from the previous round:',
+      'introduces no NEW P0/P1 regressions. The incremental previous-candidate→current',
+      'diff is in round.patch when present — only changes inside it are new this round.',
+      'Do NOT re-audit from scratch and never issue REWORK for P2/nit alone.',
+      'Blocking findings from the previous round:',
       ...(Array.isArray(prior_findings) && prior_findings.length
         ? prior_findings.map((f, i) =>
             `${i + 1}. ${f?.file ?? '?'}${f?.line != null ? `:${f.line}` : ''}` +
@@ -114,6 +116,22 @@ async function prepareSnapshot(binding, scratch, sandbox, beforeEffect, signal) 
     beforeEffect, signal });
   if (run.code !== 0) throw new ReviewDenied(run.code === 3 ? 'review_snapshot_unsafe_link' : 'review_neon_snapshot_failed');
   const files = JSON.parse(run.stdout);
+  const names = ['candidate', 'diff.patch', 'files.json'];
+  // Раунд 2+: инкрементальный diff предыдущий кандидат → текущий — доказательство
+  // того, какие изменения новые в этом раунде.
+  if (Number.isSafeInteger(binding.review_round) && binding.review_round > 1 &&
+      SHA.test(binding.prior_sha ?? '') && binding.prior_sha !== binding.candidate_sha) {
+    try {
+      const { stdout: round } = await exec('git', ['--no-pager', '-C', binding.worktree, 'diff',
+        '--no-textconv', '--no-ext-diff', '--no-color', '--binary',
+        binding.prior_sha, binding.candidate_sha, '--'],
+        { timeout: 30_000, maxBuffer: PATCH_LIMIT, encoding: 'buffer' });
+      if (round.length) {
+        await writeFile(join(staged, 'round.patch'), round, { mode: 0o400 });
+        names.push('round.patch');
+      }
+    } catch { /* инкрементальный diff необязателен */ }
+  }
   await writeFile(join(staged, 'diff.patch'), diff, { mode: 0o400 });
   await writeFile(join(staged, 'files.json'), JSON.stringify(files), { mode: 0o400 });
   await mkdir(view, { mode: 0o500 });
@@ -126,7 +144,7 @@ async function prepareSnapshot(binding, scratch, sandbox, beforeEffect, signal) 
       // The host can populate the directory; Agy's Landlock rule stays read-only.
       await chmod(view, 0o700);
       try {
-        for (const name of ['candidate', 'diff.patch', 'files.json']) {
+        for (const name of names) {
           await rename(join(staged, name), join(view, name));
         }
         published = true;

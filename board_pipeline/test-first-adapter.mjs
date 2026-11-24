@@ -32,6 +32,15 @@ export function isNonTargetFailure(output, exitCode) {
     NON_TARGET.test(String(output ?? ''));
 }
 
+// Позитивное доказательство целевого падения: вывод красного прогона обязан
+// нести маркер именно тестового failure (assert/expected/fail-строки
+// распространённых раннеров). Пустой вывод или неразмеченная ошибка запуска
+// при допустимом коде — не доказательство, что тест дошёл до утверждения.
+const TARGET_FAILURE = /(?:assert|expect|fail(?:ed|ure|ing)?|not ok|✗|✘|panic:|FAIL\b)/i;
+export function isTargetFailure(output, exitCode) {
+  return !isNonTargetFailure(output, exitCode) && TARGET_FAILURE.test(String(output ?? ''));
+}
+
 function defaultGit(worktree) {
   return (...args) => execFileSync('git', ['-C', worktree, ...args],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }).trim();
@@ -65,7 +74,10 @@ export async function verifyTestFirst({ worktree, baseSha, redSha, candidateSha,
     throw new Error('test_first_ancestry_invalid');
   }
   const diffText = await run('diff', `${baseSha}..${redSha}`);
-  const changedFiles = String(await run('diff', '--name-only', `${baseSha}..${redSha}`))
+  // --no-renames: прод-файл, «переименованный» в тестовый путь, обязан
+  // видеться как удаление прод-пути — иначе tests-only проверка слепа к
+  // источнику rename.
+  const changedFiles = String(await run('diff', '--no-renames', '--name-only', `${baseSha}..${redSha}`))
     .split('\n').map(line => line.trim()).filter(Boolean);
   const testDiff = sha256(Buffer.from(String(diffText)));
   if (!changedFiles.length) {
@@ -85,7 +97,7 @@ export async function verifyTestFirst({ worktree, baseSha, redSha, candidateSha,
     return { verdict: 'REWORK', reason: 'test_first_red_passed', changedTestFiles: changedFiles,
       ...artifact({ redSha, testDiff, redExitCode: 0, failureReasonDigest, touchesProdCode: false }) };
   }
-  if (!Number.isSafeInteger(red?.exitCode) || isNonTargetFailure(red.output, red.exitCode)) {
+  if (!isTargetFailure(red?.output, red?.exitCode)) {
     return { verdict: 'REWORK', reason: 'test_first_non_target_failure', changedTestFiles: changedFiles,
       ...artifact({ redSha, testDiff, redExitCode: Number.isSafeInteger(red?.exitCode) ? red.exitCode : 127,
         failureReasonDigest, touchesProdCode: false }) };

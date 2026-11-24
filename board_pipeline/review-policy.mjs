@@ -220,14 +220,10 @@ const policyRecord = v => v !== null && typeof v === 'object' && !Array.isArray(
 const policyList = (v, check, required = true) => Array.isArray(v) && v.length <= 64 &&
   (v.length > 0 || !required) && new Set(v).size === v.length && v.every(check);
 
-export async function loadApprovalPolicy(trustedCheckout) {
-  const dir = await realpath(trustedCheckout);
-  const path = join(dir, '.darkfactory', 'approval-policy.yaml');
-  const info = await lstat(path);
-  if (!info.isFile() || info.size > 64 * 1024 || await realpath(path) !== path) {
-    throw new Error('approval_policy_invalid');
-  }
-  const bytes = await readFile(path);
+// Парсинг уже полученных доверенных байтов политики: тот же строгий контракт,
+// что у файлового загрузчика, — без доступа к ФС. Источник байтов (закреплённый
+// base_sha, доверенный checkout) выбирает вызывающий.
+export function parseApprovalPolicy(bytes) {
   let manifest;
   try {
     const yaml = parseDocument(new TextDecoder('utf-8', { fatal: true }).decode(bytes),
@@ -261,6 +257,16 @@ export async function loadApprovalPolicy(trustedCheckout) {
     denyPathPatterns: Object.freeze([...auto.denyPathPatterns]),
   }) });
   return Object.freeze({ policy, digest: createHash('sha256').update(bytes).digest('hex') });
+}
+
+export async function loadApprovalPolicy(trustedCheckout) {
+  const dir = await realpath(trustedCheckout);
+  const path = join(dir, '.darkfactory', 'approval-policy.yaml');
+  const info = await lstat(path);
+  if (!info.isFile() || info.size > 64 * 1024 || await realpath(path) !== path) {
+    throw new Error('approval_policy_invalid');
+  }
+  return parseApprovalPolicy(await readFile(path));
 }
 
 // Мини-матчер path-паттернов: '**/' — ноль и более каталогов, '**' — любые
