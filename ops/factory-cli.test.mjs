@@ -218,6 +218,28 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile, 'memory-dir': wt }),
       /path_inside_worktree/);
+    // Обратное направление той же границы (canonicalOutside в factory-run):
+    // каталог Project Memory, содержащий worktree, и родительский каталог
+    // файла журнала, содержащий worktree, — отказ до вызова vb.
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile, 'memory-dir': dir }),
+      /path_inside_worktree/);
+    const ledger = join(dir, 'ledger.jsonl');
+    await writeFile(ledger, '');
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile, 'ledger-path': ledger }),
+      /path_inside_worktree/);
+    // Хранилища в отдельном каталоге вне дерева проходят ту же проверку
+    // (родительский каталог хранилища тоже не содержит worktree).
+    const store = join(dir, 'sub', 'store');
+    await mkdir(store, { recursive: true });
+    const storeLedger = join(store, 'ledger.jsonl');
+    await writeFile(storeLedger, '');
+    const storePlan = await buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile,
+      'memory-dir': store, 'ledger-path': storeLedger });
+    assert.equal(storePlan.labels.memory_dir, store);
+    assert.equal(storePlan.labels.ledger_path, storeLedger);
     const innerPolicy = join(wt, 'policy.json');
     await writeFile(innerPolicy, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate,

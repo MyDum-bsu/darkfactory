@@ -49,7 +49,7 @@ const within = (root, p) => {
   return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
 
-async function canonicalInput(path, { worktrees = [], mustBe } = {}) {
+async function canonicalInput(path, { worktrees = [], mustBe, storage = false } = {}) {
   if (typeof path !== 'string' || !path) fail('path_required');
   if (!isAbsolute(path)) fail('path_not_absolute');
   const real = await realpath(path).catch(() => fail('path_missing'));
@@ -58,7 +58,15 @@ async function canonicalInput(path, { worktrees = [], mustBe } = {}) {
   if (st.isSymbolicLink()) fail('non_canonical_or_symlink_path');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
-  if (worktrees.some(w => within(w, real))) fail('path_inside_worktree');
+  // Пути хранилищ (--memory-dir, --ledger-path) — та же двусторонняя
+  // граница, что у factory-run/контроллера (canonicalOutside): хранилище
+  // (для файла журнала — его родительский каталог) не содержит worktree
+  // и не содержится в нём, иначе в Board ушла бы карточка с путями,
+  // которые контроллер отклонит при запуске.
+  if (worktrees.some(w => within(w, real) ||
+      (storage && (within(real, w) || within(dirname(real), w))))) {
+    fail('path_inside_worktree');
+  }
   return real;
 }
 
@@ -171,7 +179,8 @@ export async function buildEnqueuePlan(values) {
   for (const [flag, key] of [['memory-dir', 'memory_dir'], ['ledger-path', 'ledger_path']]) {
     if (values[flag] !== undefined) {
       extra[key] = await canonicalInput(values[flag],
-        { worktrees, mustBe: flag === 'memory-dir' ? 'dir' : 'file' });
+        { worktrees, mustBe: flag === 'memory-dir' ? 'dir' : 'file',
+          storage: true });
     }
   }
   if (values.ticket !== undefined) {
