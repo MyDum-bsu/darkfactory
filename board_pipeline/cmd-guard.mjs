@@ -21,7 +21,13 @@ const FORK_BOMB = /([^\s()]+)\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;?\s*\1/;
 const SQL_DESTRUCTIVE = /\b(drop\s+(table|database|schema)|truncate\s+(table\s+)?[\w`"'])/i;
 const SHELL_WRAPPERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ash', 'ksh']);
 // Флаги оболочек, принимающие ОТДЕЛЬНЫЙ аргумент до -c (bash -o pipefail -c).
-const SHELL_ARG_FLAGS = new Set(['-o', '-O', '--init-file', '--rcfile']);
+// Bash понимает '+' так же, как '-': +o/+O тоже берут аргумент.
+const SHELL_ARG_FLAGS = new Set(['-o', '-O', '+o', '+O', '--init-file', '--rcfile']);
+
+// Опция оболочки — токен с '-' или с '+' (bash +e, +x, +o pipefail);
+// '--' — конец опций, '-' — stdin/операнд.
+const isShellOption = tok => typeof tok === 'string' && tok.length > 1 &&
+  (tok.startsWith('+') || (tok.startsWith('-') && tok !== '--'));
 // Ведущие ключевые слова shell пропускаются: if/for/while — не команды.
 const SHELL_KEYWORDS = new Set(['if', 'then', 'elif', 'else', 'fi', 'do',
   'done', 'while', 'until', 'for', 'in', 'case', 'esac', 'time', '!',
@@ -323,12 +329,12 @@ function unwrap(argv, depth, state, visit) {
       if (w.startsWith('-') && w.includes('c') && !w.startsWith('--')) {
         // -c / -lc / -ec / -xc: командная строка — ПЕРВЫЙ non-option
         // операнд после флагов и '--' (bash -c -- 'cmd', bash -c -e 'cmd',
-        // bash -c -o pipefail 'cmd').
+        // bash -c +o pipefail 'cmd').
         let j = i + 1;
         while (j < args.length) {
           const v = args[j];
           if (v === '--') { j++; continue; }
-          if (v.startsWith('-') && v !== '-') {
+          if (isShellOption(v)) {
             const takesArg = SHELL_ARG_FLAGS.has(v.split('=')[0]) && !v.includes('=');
             j += takesArg ? 2 : 1;
             continue;
@@ -339,7 +345,7 @@ function unwrap(argv, depth, state, visit) {
         return tag(args.slice(0, 0));
       }
       if (w === '--') return unwrap(args.slice(i + 1), depth + 1, state, visit);
-      if (w.startsWith('-')) { i++; continue; }
+      if (isShellOption(w)) { i++; continue; }
       break;
     }
     return tag(args.slice(i));
