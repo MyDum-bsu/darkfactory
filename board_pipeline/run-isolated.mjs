@@ -40,7 +40,7 @@ import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
 import * as workerSelector from './worker-selector.mjs';
 import { abEffectGuard, enrollAbPilot, guardAbBoard, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
 import { pilotWriterWorkspaceReady } from './bb-stage-adapter.mjs';
-import { isValidL1Profile, resolveL1Profile } from './l1-profiles.mjs';
+import { effectiveL1ProfileId } from './l1-profiles.mjs';
 
 const exec = promisify(execFile);
 const inside = (root, p) => {
@@ -59,23 +59,6 @@ const isApprovedWorker = bb =>
   (bb?.provider === 'pi' && typeof bb.model === 'string' &&
     /^opencode-go\//i.test(bb.model) &&
     workerSelector.workerFamily(bb) === 'deepseek');
-
-// Эффективный L1-профиль попытки: явный --l1-profile > l1Profile
-// выбранного профиля политики > дефолт repoId. Любое заданное
-// неизвестное имя и два явных различных источника — fail-closed отказ
-// до любой проверки и эффекта.
-export function effectiveL1ProfileId({ cliProfile, profileL1, repoId } = {}) {
-  if (profileL1 !== undefined && !isValidL1Profile(profileL1)) {
-    throw new Error(`unknown_l1_profile:${String(profileL1)}`);
-  }
-  if (cliProfile !== undefined && !isValidL1Profile(cliProfile)) {
-    throw new Error(`unknown_l1_profile:${String(cliProfile)}`);
-  }
-  if (cliProfile !== undefined && profileL1 !== undefined && cliProfile !== profileL1) {
-    throw new Error('l1_profile_mismatch');
-  }
-  return resolveL1Profile({ l1Profile: cliProfile ?? profileL1, repoId }).id;
-}
 
 async function readOperatorInputs(paths) {
   const inputs = new Map(await Promise.all(paths.map(async path => [path, await readFile(path)])));
