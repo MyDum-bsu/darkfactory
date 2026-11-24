@@ -175,7 +175,44 @@ async function initGitRepo(dir) {
   return args => execFileAsync('git', ['-C', dir, ...args]);
 }
 
-test('run: валидный dry-run и NTFS core.fileMode=false guard', async () => {
+test('run: валидный dry-run печатает план без вызова контроллера', async () => {
+  const dir = await tempdir();
+  try {
+    const wt = join(dir, 'wt');
+    await mkdir(wt);
+    const state = join(dir, 'state');
+    await mkdir(state);
+    const policy = await withPolicy(dir, policySpec(wt));
+    const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
+      '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50'];
+    // git-вызов dry-run — только read-only rev-parse; мокаем.
+    const gitCalls = [];
+    const git = async a => { gitCalls.push(a); return 'true'; };
+    const dry = await runFactory([...args, '--dry-run'], { git });
+    assert.equal(dry.dryRun, true);
+    assert.deepEqual(dry.plan.argv.slice(1),
+      ['--execute', '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50']);
+    assert.deepEqual(gitCalls, [['-C', wt, 'rev-parse', '--is-inside-work-tree']]);
+    // Не-git worktree в dry-run — отказ.
+    gitCalls.length = 0;
+    const notGit = async () => 'false\n';
+    await assert.rejects(() => runFactory([...args, '--dry-run'], { git: notGit }),
+      /worktree_not_git/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+let gitAvailable;
+async function probeGit() {
+  if (gitAvailable === undefined) {
+    gitAvailable = await execFileAsync('git', ['--version']).then(() => true, () => false);
+  }
+  return gitAvailable;
+}
+
+test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
+  if (!(await probeGit())) return t.skip('git binary unavailable');
   const dir = await tempdir();
   try {
     const wt = join(dir, 'wt');
@@ -185,13 +222,7 @@ test('run: валидный dry-run и NTFS core.fileMode=false guard', async ()
     await mkdir(state);
     const policy = await withPolicy(dir, policySpec(wt));
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
-      '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50'];
-
-    const dry = await runFactory([...args, '--dry-run']);
-    assert.equal(dry.dryRun, true);
-    assert.deepEqual(dry.plan.argv.slice(1),
-      ['--execute', '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50']);
-
+      '--policy', policy, '--state', state];
     const calls = [];
     const result = await runFactory(args, { run: async (cmd, argv) => {
       calls.push(argv); return { status: 0 };
@@ -210,7 +241,6 @@ test('run: memory/ledger вне worktree, симлинк отклоняется'
   try {
     const wt = join(dir, 'wt');
     await mkdir(wt);
-    await initGitRepo(wt);
     const ledger = join(dir, 'ledger.jsonl');
     await writeFile(ledger, '');
     const memory = join(dir, 'memory');
