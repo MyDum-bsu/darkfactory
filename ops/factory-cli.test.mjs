@@ -366,6 +366,16 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
       decisionLedger: storeLedger, handoffDir: hoInbox }));
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile }), /worktree_required/);
+    // Настройки без пути (decisionLedger.maxChars, projectMemory без
+    // storeDir/dir/path/trustedReceiptDir) путём хранилища не являются:
+    // без границы worktree постановка всё равно строится.
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, ...noWtReview,
+      decisionLedger: { maxChars: 2000 },
+      projectMemory: { maxItems: 50 } }));
+    const noPathPlan = await buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile });
+    assert.match(noPathPlan.labels.policy_digest, /^[0-9a-f]{64}$/);
     // Канонические хранилища вне дерева в политике проходят, когда
     // handoffDir — отдельный каталог, не пересекающийся с ними. Соседние
     // каталоги памяти/квитанций и сдачи под общим родителем — допустимая

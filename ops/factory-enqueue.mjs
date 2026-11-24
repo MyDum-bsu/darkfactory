@@ -218,21 +218,24 @@ export async function buildEnqueuePlan(values) {
     // карточка с незапускаемой закреплённой политикой на Board не
     // создаётся.
     const outside = handoff === undefined ? [] : [handoff];
+    const policyLedger = policyStoragePath(policyJson.decisionLedger, ['path']);
+    const policyMemory = policyStoragePath(policyJson.projectMemory,
+      ['storeDir', 'dir', 'path']);
+    const policyReceipts = policyJson?.projectMemory?.trustedReceiptDir;
     // Заданные пути хранилищ без границы worktree не подтверждают
     // двустороннее разделение хранилища и рабочего дерева: контроллер
-    // отклонил бы такой запуск — отказ до вызова vb.
+    // отклонил бы такой запуск — отказ до вызова vb. Объект настроек без
+    // пути (decisionLedger.maxChars и т.п.) путём хранилища не является
+    // и требования не вызывает.
     if (worktrees.length === 0 &&
-        (policyJson.decisionLedger !== undefined ||
-         policyJson.projectMemory !== undefined)) {
+        (policyLedger !== undefined || policyMemory !== undefined ||
+         policyReceipts !== undefined)) {
       fail('worktree_required');
     }
-    const policyLedger = policyStoragePath(policyJson.decisionLedger, ['path']);
     if (policyLedger !== undefined) {
       await canonicalInput(policyLedger,
         { worktrees, mustBe: 'file', storage: true, outside });
     }
-    const policyMemory = policyStoragePath(policyJson.projectMemory,
-      ['storeDir', 'dir', 'path']);
     if (policyMemory !== undefined) {
       await canonicalInput(policyMemory,
         { worktrees, mustBe: 'dir', storage: true, outside });
@@ -240,8 +243,8 @@ export async function buildEnqueuePlan(values) {
     // projectMemory.trustedReceiptDir — то же семейство хранилищ, что и
     // storeDir (проверка factory-run/контроллера): та же двусторонняя
     // storage-граница вне worktree и handoffDir.
-    if (policyJson?.projectMemory?.trustedReceiptDir !== undefined) {
-      await canonicalInput(policyJson.projectMemory.trustedReceiptDir,
+    if (policyReceipts !== undefined) {
+      await canonicalInput(policyReceipts,
         { worktrees, mustBe: 'dir', storage: true, outside });
     }
     // Заданные пути хранилищ без policy.handoffDir не подтверждают
@@ -250,7 +253,7 @@ export async function buildEnqueuePlan(values) {
     // Board ушла бы карточка с незапускаемой политикой.
     if (handoff === undefined &&
         (policyLedger !== undefined || policyMemory !== undefined ||
-         policyJson?.projectMemory?.trustedReceiptDir !== undefined)) {
+         policyReceipts !== undefined)) {
       fail('handoff_required');
     }
   }
