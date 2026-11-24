@@ -7,6 +7,10 @@ FROM node:22.23.2-bookworm-slim AS node_base
 
 FROM python:3.12-slim-bookworm
 
+# Аттестация образа для L1-раннера: закреплённый recipe.image проверяется
+# по этой метке — чужой Node-only образ не запустится как python-node.
+LABEL df.l1.profile="python-node"
+
 # Бинарники и модули Node 22 из pinned-базы: node, npm и npx в /usr/local.
 COPY --from=node_base /usr/local/bin/node /usr/local/bin/node
 COPY --from=node_base /usr/local/lib/node_modules /usr/local/lib/node_modules

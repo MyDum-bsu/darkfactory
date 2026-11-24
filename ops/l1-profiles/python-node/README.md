@@ -12,6 +12,10 @@ docker image inspect --format '{{.Id}}' df-l1-python-node
 # => sha256:<64 hex> — pinned-идентификатор для policy.json
 ```
 
+Образ аттестует себя OCI-меткой `df.l1.profile=python-node`: раннер
+сверяет закреплённый `recipe.image` по `docker image inspect` — чужой
+образ не запускается под этим профилем.
+
 ## Использование в policy.json
 
 ```json

@@ -339,6 +339,91 @@ test('acceptHeld: l1_profile попытки сверяется с профиле
   }
 });
 
+test('acceptHeld: незакреплённая попытка — L1 в ключе запуска, повтор без выбора совместим', async () => {
+  const journal = await tempdir();
+  try {
+    // Попытка без spec_digest (фиксированный маршрут): ключ контракта
+    // отсутствует, но явный l1Profile профиля — часть ключа запуска.
+    const first = heldPorts();
+    const run1 = await acceptHeld({
+      attempt: heldAttempt({}),
+      submission: heldSubmission(),
+      policy: heldPolicy({ l1Profile: 'node' }),
+      journal,
+      ports: first.ports,
+    });
+    assert.equal(run1.outcome, 'verified');
+    assert.equal(first.seen.localProfile.l1Profile, 'node');
+    // Вердикт под node не подтверждает запуск под python-node: смена
+    // явного выбора — новый запуск, а не repeated от прежнего исхода.
+    const second = heldPorts();
+    const run2 = await acceptHeld({
+      attempt: heldAttempt({}),
+      submission: heldSubmission(),
+      policy: heldPolicy({ l1Profile: 'python-node' }),
+      journal,
+      ports: second.ports,
+    });
+    assert.equal(run2.outcome, 'verified');
+    assert.equal(run2.repeated, undefined);
+    assert.equal(second.seen.localProfile.l1Profile, 'python-node');
+    assert.equal(second.calls.local, 1);
+    // Тот же вход повторно — прежняя запись, исход repeated.
+    const run3 = await acceptHeld({
+      attempt: heldAttempt({}),
+      submission: heldSubmission(),
+      policy: heldPolicy({ l1Profile: 'python-node' }),
+      journal,
+      ports: second.ports,
+    });
+    assert.equal(run3.outcome, 'verified');
+    assert.equal(run3.repeated, true);
+    assert.equal(second.calls.local, 1);
+    // Попытка без явного L1-выбора сохраняет прежний ключ: терминальный
+    // исход базовой версии находится repeated, а не начинается заново.
+    const journal3 = await tempdir();
+    try {
+      const noL1 = heldPorts();
+      const base = await acceptHeld({
+        attempt: heldAttempt({}),
+        submission: heldSubmission(),
+        policy: heldPolicy({}),
+        journal: journal3,
+        ports: noL1.ports,
+      });
+      assert.equal(base.outcome, 'verified');
+      const again = await acceptHeld({
+        attempt: heldAttempt({}),
+        submission: heldSubmission(),
+        policy: heldPolicy({}),
+        journal: journal3,
+        ports: noL1.ports,
+      });
+      assert.equal(again.outcome, 'verified');
+      assert.equal(again.repeated, true);
+      assert.equal(noL1.calls.local, 1);
+    } finally {
+      await rm(journal3, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(journal, { recursive: true, force: true });
+  }
+});
+
+// Образ L1 аттестует себя OCI-меткой: раннер сверяет recipe.image с
+// эффективным профилем до docker run (источник — docker/vb в тесте не
+// вызываются, проверка идёт по коду и Dockerfile).
+test('runtime: закреплённый образ обязан аттестовать эффективный L1-профиль', async () => {
+  const source = await readFile(join(ROOT, 'board_pipeline', 'runtime.mjs'), 'utf8');
+  const dockerfile = await readFile(
+    join(ROOT, 'ops', 'l1-profiles', 'python-node', 'Dockerfile'), 'utf8');
+  assert.match(dockerfile, /LABEL df\.l1\.profile="python-node"/);
+  assert.match(source, /image', 'inspect', recipe\.image/);
+  assert.match(source, /labels\?\.\[L1_IMAGE_LABEL\] !== l1\.id/);
+  assert.match(source, /assertL1Image\(recipe, l1\)/);
+  assert.match(source, /assertL1Image\(recipe, l1Profile \?\? l1Recipe \?\? l1Default\)/);
+});
+
 test('accept/acceptHeld: visual.l1Profile=bogus отклоняется при has_ui=false до портов', async () => {
   const journal = await tempdir();
   try {

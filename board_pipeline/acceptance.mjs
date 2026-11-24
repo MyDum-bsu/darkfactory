@@ -1033,11 +1033,16 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   };
   // Ключ запуска включает контракт и требование L3: новый манифест или смена
   // has_ui при том же SHA не переиспользуют терминальный вердикт старого запуска.
+  // У незакреплённой попытки (без spec_digest) контрактного ключа нет — явный
+  // L1-выбор добавляется в хэш сам: вердикт под node не подтверждает запуск
+  // под python-node, а повтор без выбора сохраняет прежнее имя файла.
+  const unpinnedL1 = key === null ? contractL1Profile(attempt, profile) : null;
   const id = journalId(runId(`${attempt.task_id}.${attempt.attempt_id}.${attempt.epoch}`,
     submission.candidate_sha, policy.version) + (key ? `-s${key}` : '') +
     '-h' + createHash('sha256').update(JSON.stringify([
       attempt.task_id, attempt.attempt_id, attempt.epoch, submission.candidate_sha,
       policy.version, attempt.has_ui ?? null, key ?? null,
+      ...(unpinnedL1 === null ? [] : [unpinnedL1]),
     ])).digest('hex').slice(0, 16));
   const file = path.join(journal, `${id}.jsonl`);
 

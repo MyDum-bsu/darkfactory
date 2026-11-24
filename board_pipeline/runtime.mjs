@@ -9,6 +9,8 @@ import { resolveL1Profile } from './l1-profiles.mjs';
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
 const IMAGE = /^sha256:[a-f0-9]{64}$/;
+// OCI-метка, которой доверенный образ L1-профиля аттестует себя.
+const L1_IMAGE_LABEL = 'df.l1.profile';
 
 async function git(worktree, ...args) {
   return (await exec('git', ['-C', worktree, ...args], { timeout: 20_000 })).stdout.trimEnd();
@@ -110,6 +112,25 @@ async function cleanupContainer(name) {
   }
 }
 
+// Доверенный образ профиля аттестует себя OCI-меткой L1_IMAGE_LABEL,
+// встроенной его Dockerfile: эффективный выбор среды (явный или дефолт
+// репозитория) обязан реально соответствовать закреплённому recipe.image,
+// иначе Node-only образ молча выполнил бы проверки под python-node.
+async function assertL1Image(recipe, l1) {
+  if (l1?.dockerfile === undefined) return;
+  let labels;
+  try {
+    labels = JSON.parse((await exec('docker',
+      ['image', 'inspect', recipe.image, '--format', '{{json .Config.Labels}}'],
+      { timeout: 12_000 })).stdout);
+  } catch (error) {
+    throw new Error(`l1_image_uninspectable:${String(error?.stderr ?? error?.message ?? error)}`);
+  }
+  if (labels?.[L1_IMAGE_LABEL] !== l1.id) {
+    throw new Error(`l1_image_mismatch:${l1.id}`);
+  }
+}
+
 export function offlineDockerRunner(journal, { beforeEffect } = {}) {
   return async (handoff, profile) => {
     const recipe = checkCommand(profile.check ?? {});
@@ -140,6 +161,7 @@ export function offlineDockerRunner(journal, { beforeEffect } = {}) {
       timeout: 12_000,
     })).stdout);
     if (!security.includes('name=rootless')) throw new Error('The test runner requires rootless Docker');
+    await assertL1Image(recipe, l1);
 
     const scratch = await mkdtemp(join(tmpdir(), 'board-check-'));
     const name = `board-check-${randomUUID()}`;
@@ -235,14 +257,16 @@ export function offlineVisualRunner(journal, { beforeEffect } = {}) {
     if (l1Profile !== undefined && l1Recipe !== undefined && l1Profile.id !== l1Recipe.id) {
       throw new Error('l1_profile_mismatch');
     }
-    if (profile.l1Default !== undefined) {
-      resolveL1Profile({ l1Profile: profile.l1Default });
-    }
+    const l1Default = profile.l1Default === undefined ? undefined
+      : resolveL1Profile({ l1Profile: profile.l1Default });
     if (!SHA.test(binding.candidate_sha)) throw new Error('Visual runner requires a full SHA');
     const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
       timeout: 12_000,
     })).stdout);
     if (!security.includes('name=rootless')) throw new Error('The visual runner requires rootless Docker');
+    // Тот же инвариант образа, что у проверочного раннера: visual-гейт под
+    // профилем с доверенным Dockerfile обязан идти в аттестованном образе.
+    await assertL1Image(recipe, l1Profile ?? l1Recipe ?? l1Default);
 
     const scratch = await mkdtemp(join(tmpdir(), 'board-visual-'));
     const name = `board-visual-${randomUUID()}`;
