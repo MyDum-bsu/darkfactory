@@ -414,10 +414,12 @@ test('run: --worktree обязан совпадать с policy.route.worktree',
   try {
     const wt = join(dir, 'wt');
     const other = join(dir, 'other');
+    const state = join(dir, 'st-root', 'state');
     await mkdir(wt);
     await mkdir(other);
+    await mkdir(state, { recursive: true });
     const policy = await withPolicy(dir, policySpec(wt));
-    const plan = await buildRunPlan(runValues(policy, 's', { worktree: wt }));
+    const plan = await buildRunPlan(runValues(policy, state, { worktree: wt }));
     assert.equal(plan.worktree, wt);
     await assert.rejects(() => buildRunPlan(runValues(policy, 's', { worktree: other })),
       /worktree_mismatch/);
@@ -431,8 +433,8 @@ test('run: валидный dry-run печатает план без вызов�
   try {
     const wt = join(dir, 'wt');
     await mkdir(wt);
-    const state = join(dir, 'state');
-    await mkdir(state);
+    const state = join(dir, 'st-root', 'state');
+    await mkdir(state, { recursive: true });
     const policy = await withPolicy(dir, policySpec(wt));
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50'];
@@ -479,8 +481,8 @@ test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
     const wt = join(dir, 'wt');
     await mkdir(wt);
     const git = await initGitRepo(wt);
-    const state = join(dir, 'state');
-    await mkdir(state);
+    const state = join(dir, 'st-root', 'state');
+    await mkdir(state, { recursive: true });
     const policy = await withPolicy(dir, policySpec(wt));
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', policy, '--state', state];
@@ -523,7 +525,8 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await writeFile(insideLedger, '');
     const link = join(ops, 'link');
     await symlink(ledger, link);
-    const state = join(dir, 'st');
+    const state = join(dir, 'st-root', 'st');
+    await mkdir(state, { recursive: true });
 
     // Путь политики внутрь worktree — отказ даже при внешнем CLI-флаге.
     const badPolicy = { ...policySpec(wt), decisionLedger: insideLedger };
@@ -654,6 +657,25 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const fChain = await withPolicy(dir, chainPolicy);
     await assert.rejects(() => buildRunPlan(runValues(fChain, state)),
       /non_canonical_or_symlink_path/);
+    // --policy внутри собственного route.worktree — операторский файл в
+    // дереве воркера: отказ до Git-конфига и запуска (dry-run тоже).
+    await mkdir(join(wt, 'policies'));
+    const innerPolicy = join(wt, 'policies', 'policy.json');
+    await writeFile(innerPolicy, JSON.stringify(policySpec(wt)));
+    await assert.rejects(() => buildRunPlan(runValues(innerPolicy, state)),
+      /path_inside_worktree/);
+    // --state: относительный путь, симлинк-предок и каталог внутри
+    // worktree — отказ до эффекта; канонический каталог вне дерева проходит.
+    await assert.rejects(() => buildRunPlan(runValues(ok, 'relative-state')),
+      /path_not_absolute/);
+    const stateLink = join(dir, 'state-link');
+    await symlink(state, stateLink);
+    await assert.rejects(() => buildRunPlan(runValues(ok, stateLink)),
+      /non_canonical_or_symlink_path/);
+    const innerState = join(wt, 'state');
+    await mkdir(innerState);
+    await assert.rejects(() => buildRunPlan(runValues(ok, innerState)),
+      /path_inside_worktree/);
     // Путь контроллера не переопределяется флагами.
     await assert.rejects(() => runFactory(['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', ok, '--state', state, '--run-isolated', '/tmp/evil.mjs'], {}),

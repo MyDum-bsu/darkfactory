@@ -15,11 +15,19 @@ node ops/factory-enqueue.mjs \
   --board-url https://board.example --channel ops \
   --title "Карточка X" --repo-id darkfactory --profile p0 \
   --finish verified \
-  --brief spec/brief.md --policy policy/operator.json \
+  --brief /path/spec/brief.md --policy /path/policy/operator.json \
   --label domain=pipeline --ticket DF-OPS-2 \
   --worktree /path/wt --memory-dir /path/memory --ledger-path /path/ledger.jsonl \
   --dry-run
 ```
+
+Все файловые пути — строго канонические абсолютные: `realpath` обязан
+совпадать с исходной строкой пути. Симлинк-компонент на любом уровне,
+`..`, `.` и относительные пути отклоняются
+(`non_canonical_or_symlink_path` / `path_not_absolute`) — включая
+цепочки вида `D/alias/wt/out/file`, где `D/alias -> D/repo` и
+`D/repo/wt/out -> D/ops`: realpath конечной цели может быть внешним, но
+сам путь не канонический, и вход отклоняется до эффекта.
 
 Обязательные: `--board-url` (http/https), `--channel`, `--title` или
 `--text`, `--repo-id`, `--profile`, `--finish` (`verified`|`deployed`),
@@ -37,21 +45,15 @@ node ops/factory-enqueue.mjs \
 (`p.policyDigest ?? route.policyDigest`); переданный одновременно
 `--policy-digest` обязан совпадать, иначе отказ до вызова `vb`.
 
-**Проверки путей** до эффекта: `lstat` на конечном пути (симлинк — отказ),
-сверка буквального и resolved пути с `--worktree` **и** `route.worktree` из
+**Проверки путей** до эффекта: каноничность исходной строки (см. выше),
+`lstat` конечного пути (ожидаемый тип: файл или каталог, не симлинк),
+сверка канонического пути с `--worktree` **и** `route.worktree` из
 `--policy` — граница политики действует даже без флага `--worktree` и
 применяется ко **всем** входам: самому файлу `--policy`, `--brief`,
 `--memory-dir`, `--ledger-path` и вложенным входам политики (`brief`,
 `reviewPrompt`, `reviewGate`, `routes.json`, исходные пути review-скиллов).
-Вход внутри worktree (включая через симлинк-предок `wt/link/...` или alias
-worktree) отклоняется до чтения файла и хэширования — дайджест непригодной
-политики не попадает на Board. Цепочки симлинков обходятся по хопам
-(`alias1 -> alias2 -> wt/link -> наружу` — отказ по промежуточному хопу),
-а `realpath` берётся от сырого пути: `..` раскрывается ФС после симлинков,
-и `op/link/../x` при `link -> wt/deep` отклоняется как вход внутрь дерева.
-Проверяются фактические `dirname` и конечный компонент (не лексически
-свёрнутые): конечный симлинк внутри дерева отклоняется, даже если его
-цель снаружи.
+Вход внутри worktree отклоняется до чтения файла и хэширования —
+дайджест непригодной политики не попадает на Board.
 
 ## Запуск контроллера — `ops/factory-run.mjs`
 
@@ -60,10 +62,17 @@ worktree) отклоняется до чтения файла и хэширов�
 ```sh
 node ops/factory-run.mjs \
   --provider acp-devin --model swe-2-high \
-  --policy policy.json --state state-dir \
+  --policy /path/policy.json --state /path/state-dir \
   [--daemon] [--stop-on-idle] [--switch V] [--interval-ms N] \
   [--allow-live-pilot] [--recheck-rejected-handoff] [--dry-run]
 ```
+
+`--policy` и `--state` — строго канонические абсолютные пути
+(`realpath` совпадает с исходной строкой; относительные пути и пути
+через симлинк-компоненты отклоняются). `--state` — существующий каталог
+вне worktree; `--policy` не может лежать внутри собственного
+`route.worktree` — обе границы проверяются до записи Git-конфига и
+запуска контроллера, включая `--dry-run`.
 
 ### Матрица моделей (обязательна)
 
@@ -101,14 +110,12 @@ rev-parse --show-toplevel` обязан строго равняться кано
 (строка или `{path}`/`{storeDir|dir|path}`) > `DF_DECISION_LEDGER_PATH`/
 `DF_PROJECT_MEMORY_DIR`. CLI-флаг против закреплённого в политике пути —
 `*_mismatch`, отказ. CLI-override без конфликта передаётся контроллеру
-через соответствующий env. Каждый путь — абсолютный, каноничный (не
-симлинк) и не пересекается с worktree **ни в одну сторону** — как
-буквально, так и после `realpath`, против всех алиасов дерева:
-хранилище внутри worktree, worktree внутри хранилища и родительский
-каталог, содержащий worktree (или сам лежащий в дереве), отклоняются так же,
-как их отклоняют `assertLedgerOutside`/`assertStoreOutside` контроллера.
-Симлинк-предок `wt/link -> наружу` или alias worktree отсекается до
-запуска.
+через соответствующий env. Каждый путь — строго канонический абсолютный
+(`realpath` равен исходной строке: ни симлинк-компонентов, ни `..`/`.`)
+и не пересекается с worktree **ни в одну сторону** против всех алиасов
+дерева: хранилище внутри worktree, worktree внутри хранилища и
+родительский каталог, содержащий worktree, отклоняются так же, как их
+отклоняют `assertLedgerOutside`/`assertStoreOutside` контроллера.
 
 ### Делегирование
 

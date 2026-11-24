@@ -178,8 +178,14 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // CLI — пересечение по любому из них отклоняется.
   const treeAliases = [...new Set([worktreeReal, resolve(policyTree),
     ...(values.worktree === undefined ? [] : [resolve(values.worktree)])])];
+  // Сам файл политики — операторский вход: не может лежать внутри дерева
+  // воркера (контроллер отклонил бы его позже — отказ до Git-конфига).
+  if (treeAliases.some(t => inside(t, policyPathReal))) fail('path_inside_worktree');
   if (ledger !== null) await canonicalOutside(ledger, treeAliases, 'file');
   if (memory !== null) await canonicalOutside(memory, treeAliases, 'dir');
+  // --state — тоже операторский путь: контроллер делает лишь realpath без
+  // сверки со строкой; каноничность и граница worktree проверяются здесь.
+  const state = await canonicalOutside(values.state, treeAliases, 'dir');
 
   // CLI-override без конфликта с политикой передаётся контроллеру через
   // тот же env-канал (DF_DECISION_LEDGER_PATH / DF_PROJECT_MEMORY_DIR):
@@ -192,14 +198,14 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // Делегирование строго принятому контроллеру: ни путь, ни бинарник
   // не переопределяются флагами.
   const runIsolated = join(HERE, '..', 'board_pipeline', 'run-isolated.mjs');
-  const argv = [runIsolated, '--execute', '--policy', policyPathReal, '--state', values.state];
+  const argv = [runIsolated, '--execute', '--policy', policyPathReal, '--state', state];
   for (const flag of PASSTHROUGH_BOOL) if (values[flag]) argv.push(`--${flag}`);
   for (const flag of PASSTHROUGH_VALUE) {
     if (values[flag] !== undefined) argv.push(`--${flag}`, values[flag]);
   }
   return { node: process.execPath, argv, env: envOverrides,
     worktree: worktreeReal, spec: { provider: values.provider, model: values.model },
-    policy: policyPathReal, state: values.state, ledger, memory };
+    policy: policyPathReal, state, ledger, memory };
 }
 
 async function defaultGit(args) {
