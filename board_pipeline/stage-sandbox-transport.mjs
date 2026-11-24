@@ -167,16 +167,18 @@ export function stageVerdictLine(text, challenge) {
 // вызывается onAbort (остановка активного дочернего процесса/контейнера),
 // внутренний промис ДОЖИДАЕТСЯ (его finally — гарантированный cleanup),
 // затем выбрасывается причина аборта. Осиротевших процессов не остаётся.
-async function settleWithAbort(promise, signal, onAbort) {
-  if (signal === undefined) return await promise;
+export function settleWithAbort(promise, signal, onAbort) {
+  if (signal === undefined) return promise;
   const reason = () => signal.reason ?? new StageDenied('stage_aborted');
   // Остановка повторяется до завершения внутреннего промиса: в момент
   // отмены дочерний процесс может ещё не существовать (асинхронное окно
   // подготовки запуска) — одноразовое сканирование пропустило бы его, и
-  // модель стартовала бы уже после отмены.
-  const stopUntilSettled = async () => {
+  // модель стартовала бы уже после отмены. Мемоизируется: каждая ветка
+  // ниже дожидается той же остановки, а не запускает свою.
+  let stopping = null;
+  const stop = () => stopping ??= (async () => {
     let live = true;
-    const stopping = (async () => {
+    const loop = (async () => {
       while (live) {
         try { await onAbort?.(); } catch { /* best effort */ }
         await new Promise(resolve => setTimeout(resolve, 250));
@@ -184,23 +186,29 @@ async function settleWithAbort(promise, signal, onAbort) {
     })();
     await Promise.resolve(promise).catch(() => {});
     live = false;
-    await stopping;
-  };
+    await loop;
+  })();
   if (signal.aborted) {
-    await stopUntilSettled();
-    throw reason();
+    return stop().then(() => { throw reason(); });
   }
-  return await new Promise((resolve, reject) => {
-    const onSignal = () => stopUntilSettled()
-      .finally(() => reject(reason()));
+  return new Promise((resolve, reject) => {
+    const onSignal = () => stop().finally(() => reject(reason()));
     signal.addEventListener('abort', onSignal, { once: true });
     Promise.resolve(promise).then(
       value => {
         signal.removeEventListener('abort', onSignal);
-        if (signal.aborted) reject(reason());
+        // Отказ после отмены — только по завершении остановки: иначе
+        // параллельный cleanup (stopRun по id / rm по имени) переживал бы
+        // возврат вызову, и вызывающий удалял бы временные файлы стадии
+        // под ещё идущее удаление контейнера.
+        if (signal.aborted) stop().finally(() => reject(reason()));
         else resolve(value);
       },
-      cause => { signal.removeEventListener('abort', onSignal); reject(cause); });
+      cause => {
+        signal.removeEventListener('abort', onSignal);
+        if (signal.aborted) stop().finally(() => reject(cause));
+        else reject(cause);
+      });
   });
 }
 

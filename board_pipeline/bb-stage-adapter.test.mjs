@@ -433,10 +433,12 @@ test('stopLostSpawn: сверка challenge — чужой соседний тр
     if (argv[1] === 'log') return { stdout: JSON.stringify(
       argv[2] === 'thr_lostmine'
         ? [{ seq: 1, type: 'client/turn/requested', data: { input: [{ type: 'text', text: `… Challenge: ${nonce}` }] } }]
-        : [{ seq: 1, type: 'client/turn/requested', data: { input: [{ type: 'text', text: 'Чужая стадия. Challenge: ' + 'b'.repeat(64) }] } },
-           // Поздний tell цитирует наш challenge в соседнем треде — это
-           // уже не исходный запрос на запуск, подтверждением не считается.
-           { seq: 2, type: 'client/turn/requested', data: { input: [{ type: 'text', text: `Видел чужой маркер ${nonce}` }] } }]) };
+        : [{ seq: 1, type: 'client/turn/requested',
+             // Первый по seq запрос соседа — tell с цитатой нашего challenge:
+             // это не исходный spawn, подтверждением не считается.
+             data: { source: 'tell', input: [{ type: 'text', text: `Видел чужой маркер ${nonce}` }] } },
+           { seq: 2, type: 'client/turn/requested',
+             data: { source: 'tell', input: [{ type: 'text', text: 'Чужая стадия. Challenge: ' + 'b'.repeat(64) }] } }]) };
     if (argv[1] === 'stop') { stopped.push(argv[2]); return { stdout: '{}' }; }
     return { stdout: '{}' };
   };

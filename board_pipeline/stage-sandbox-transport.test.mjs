@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { assertStageReadOnly, createStageSandboxTransport, observeStageInSandbox,
-  probeStageSandboxCapability, stageDockerSandbox, stageTransportKind,
+  probeStageSandboxCapability, settleWithAbort, stageDockerSandbox, stageTransportKind,
   stageVerdictLine } from './stage-sandbox-transport.mjs';
 import { REVIEW_IMAGE, runInReadOnlySandbox } from './review-runner.mjs';
 
@@ -294,6 +294,19 @@ test('stageDockerSandbox пробрасывает signal в runInReadOnlySandbox
   assert.deepEqual(result, { code: 0, stdout: '' });
 });
 
+test('settleWithAbort: отказ внутреннего промиса после abort ждёт завершения onAbort', async () => {
+  const controller = new AbortController();
+  let stopped = false;
+  const inner = new Promise((_, reject) => setTimeout(() => reject(new Error('inner_failed')), 20));
+  const pending = settleWithAbort(inner, controller.signal, async () => {
+    await new Promise(resolve => setTimeout(resolve, 60));
+    stopped = true;
+  });
+  controller.abort();
+  await assert.rejects(pending);
+  assert.equal(stopped, true, 'отказ не должен обгонять конкурирующий cleanup onAbort');
+});
+
 test('abort во время docker run через stageDockerSandbox: отказ после удаления именно этого контейнера', async t => {
   const { enrolled } = await probeStageSandboxCapability('docker-ro-v1');
   if (!enrolled) return t.skip('rootless Docker недоступен на хосте');
@@ -311,9 +324,20 @@ test('abort во время docker run через stageDockerSandbox: отказ
   // Запуск идёт именно через обёртку stageDockerSandbox с реальным
   // runInReadOnlySandbox: abort должен добить контейнер ЭТОГО запуска.
   const started = Date.now();
-  const pending = stageDockerSandbox({ allow: ['api.openai.com:443'], snapshot: empty,
-    argv: ['/bin/sh', '-c', 'sleep 60'], timeoutMs: 60_000, signal: controller.signal }, {
-    withProxy: async (opts, cb) => cb(fakeSock) });
+  // Конкурирующий путь продакшена: внутренний вызов обёрнут в
+  // settleWithAbort с stopRun, удаляющим контейнер по id, — гонка с rm по
+  // имени внутри раннера проверяется на настоящем Docker.
+  const pending = settleWithAbort(
+    stageDockerSandbox({ allow: ['api.openai.com:443'], snapshot: empty,
+      argv: ['/bin/sh', '-c', 'sleep 60'], timeoutMs: 60_000, signal: controller.signal }, {
+      withProxy: async (opts, cb) => cb(fakeSock) }),
+    controller.signal,
+    async () => {
+      const fresh = (await containers()).filter(id => !before.has(id));
+      for (const id of fresh) {
+        await exec('docker', ['rm', '-f', id], { timeout: 15_000 }).catch(() => {});
+      }
+    });
   // Подтверждённый старт: ждём появления нового контейнера (diff со снимком
   // до запуска — параллельные чужие контейнеры не путаются).
   let ours = null;

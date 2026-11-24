@@ -644,11 +644,20 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
     // rm -f во время активного удаления получил бы «removal ... is already
     // in progress» и отказ вернулся бы до завершения cleanup.
     await stopping;
-    try {
-      await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
-    } catch (failure) {
-      if (!String(failure.stderr).includes('No such container')) {
-        throw new ReviewDenied('sandbox_cleanup_failed', { cause: failure });
+    // Параллельный stopRun мог начать удаление этого же контейнера по id
+    // раньше rm по имени: «removal already in progress» значит удаление ещё
+    // идёт — дожидаемся его завершения, отказ только после реального cleanup.
+    for (let poll = 0; ; poll++) {
+      try {
+        await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
+        break;
+      } catch (failure) {
+        const detail = String(failure.stderr);
+        if (detail.includes('No such container')) break;
+        if (!detail.includes('already in progress') || poll >= 12) {
+          throw new ReviewDenied('sandbox_cleanup_failed', { cause: failure });
+        }
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
     }
   }
