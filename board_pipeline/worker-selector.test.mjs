@@ -317,9 +317,13 @@ test('l2ReworkLimitExceeded: четвёртый L2-раунд достигает
   const mixed = [detRound('l1', 'a'), detRound('tamper', 'b'), ...l2(3), detRound('l3', 'c')];
   assert.equal(l2ReworkLimitExceeded({ roundsHistory: mixed }), false);
   assert.equal(l2ReworkLimitExceeded({ roundsHistory: [...mixed, l2Round({ signature: 's4' })] }), true);
-  // Настраиваемый лимит; невалидный — fail-closed на дефолт.
+  // Настраиваемый лимит только ужесточает: выше дефолтного потолка или
+  // невалидный — fail-closed на дефолт, четвёртый раунд всегда лимитный.
   assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(2), limit: 2 }), true);
   assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(1), limit: 2 }), false);
+  for (const loose of [5, 10, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(4), limit: loose }), true, `${loose}`);
+  }
   for (const bad of [0, -1, 1.5, '4', NaN]) {
     assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(4), limit: bad }), true, `${bad}`);
   }

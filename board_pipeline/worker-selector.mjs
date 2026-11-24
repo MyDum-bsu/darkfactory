@@ -395,11 +395,14 @@ function contradicting(prev, latest) {
 // контроллер останавливается без следующего круга и эскалирует карточку
 // владельцу ('l2_rework_limit_exceeded'). Считаются только раунды с
 // gate === 'l2' — детерминированные гейты лимит не расходуют. Лимит
-// настраивается маршрутом (route.maxL2ReworkRounds), по умолчанию 4.
+// настраивается маршрутом (route.maxL2ReworkRounds), по умолчанию 4;
+// маршрут может потолок только ужесточить — значение выше потолка и
+// невалидное одинаково откатываются к дефолту, четвёртый REWORK всегда
+// лимитный.
 export const DEFAULT_L2_REWORK_LIMIT = 4;
 export function l2ReworkLimitExceeded({ roundsHistory = [], limit = DEFAULT_L2_REWORK_LIMIT } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 1) limit = DEFAULT_L2_REWORK_LIMIT;
-  return roundsHistory.filter(r => r?.gate === 'l2').length >= limit;
+  return roundsHistory.filter(r => r?.gate === 'l2').length >= Math.min(limit, DEFAULT_L2_REWORK_LIMIT);
 }
 
 // Детектор отсутствия прогресса и содержательного спора. roundsHistory —

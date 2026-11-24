@@ -28,6 +28,11 @@ export async function operatorReviewSetup(policy, { env = process.env } = {}) {
   if (neon && (!isSolArbiter(arbiter) || policy.route.taskId !== undefined || policy.policyDigest !== undefined)) {
     throw new Error('Neon requires a subject-bound queue route, fingerprinted policy and Sol arbiter');
   }
+  // Незакреплённый список навыков Neon-критика: дефолт наследует все
+  // допустимые привязки оператора (reviewSkillFiles) и фиксируется в самом
+  // критике — пустой набор остаётся fail-closed 'Invalid review skill binding'.
+  const bound = Object.keys(policy.reviewSkillFiles ?? {}).filter(skill => isReviewSkillList([skill]));
+  if (critic.skills === undefined && neon && bound.length) critic.skills = bound;
   const skills = critic.skills;
   if ((neon || skills !== undefined) && !isReviewSkillList(skills)) throw new Error('Invalid review skill binding');
   const skillPaths = await Promise.all((skills ?? []).map(skill => {

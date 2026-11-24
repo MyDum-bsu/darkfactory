@@ -582,6 +582,28 @@ test('route.maxL2ReworkRounds настраивает потолок L2-раун�
   assert.equal(x.effects.feedback.length, 1);
 });
 
+// Лимит маршрута только ужесточает потолок: значение выше дефолтного не
+// ослабляет circuit breaker — четвёртый L2 REWORK всё равно лимитный.
+test('route.maxL2ReworkRounds выше дефолта не отменяет остановку на четвёртом REWORK', async t => {
+  const x = await lab(t);
+  x.cfg.route.maxL2ReworkRounds = 5;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => { throw new Error('no arbitration'); } });
+  await x.tick();
+  const rework = finding => ({ outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+    feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings: [finding] } });
+  x.cfg.verify = async (attempt, submission) =>
+    rework({ file: 'a.js', expected: 'e', actual: `x-${submission.candidate_sha.slice(0, 4)}` });
+  for (const sha of [BAD1, BAD2, BAD3]) {
+    x.submit(sha);
+    assert.equal((await x.tick()).phase, 'working');
+  }
+  x.submit('b' + '4'.repeat(39));
+  const stopped = await x.tick();
+  assert.equal(stopped.phase, 'hold');
+  assert.equal(stopped.reason, 'l2_rework_limit_exceeded');
+  assert.equal(x.effects.feedback.length, 3);
+});
+
 // Пункт 6: L1 починил тест A, упал тест B — разные сигнатуры, починка сходится.
 test('different failing checks in L1 converge instead of stalling', async t => {
   const x = await lab(t);

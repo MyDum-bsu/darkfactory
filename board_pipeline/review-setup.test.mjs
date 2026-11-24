@@ -34,12 +34,22 @@ test('дефолтный профиль: keyring зачислен — Neon mediu
   const skillPath = await skillFiles(t);
   const env = { DF_AGY_KEYRING_ITEM: KEYRING };
   assert.deepEqual(defaultReviewRoles(env), { critic: NEON_CRITIC, arbiter: SOL_ARBITER });
-  const policy = policyOf({ skills: ['logika'] }, { reviewSkillFiles: { logika: skillPath } });
-  const setup = await operatorReviewSetup(policy, { env });
+  // Профиль без review: дефолт выбирает Neon и наследует допустимую
+  // операторскую привязку навыка из reviewSkillFiles.
+  const setup = await operatorReviewSetup(
+    policyOf(undefined, { reviewSkillFiles: { logika: skillPath } }), { env });
   assert.equal(setup.neon, true);
   assert.deepEqual(setup.critic, { ...NEON_CRITIC, skills: ['logika'] });
   assert.deepEqual(setup.arbiter, SOL_ARBITER);
   assert.deepEqual(setup.skillPaths, [skillPath]);
+  // Явный список навыков в review сильнее дефолта.
+  const pinned = await operatorReviewSetup(policyOf({ skills: ['logika'] },
+    { reviewSkillFiles: { logika: skillPath } }), { env });
+  assert.equal(pinned.neon, true);
+  assert.deepEqual(pinned.skillPaths, [skillPath]);
+  // Без допустимых операторских привязок — прежний fail-closed.
+  await assert.rejects(operatorReviewSetup(policyOf(), { env }),
+    /Invalid review skill binding/);
 });
 
 // Без keyring тот же дефолтный профиль остаётся Pi/Sol L2 с Neon-арбитром
