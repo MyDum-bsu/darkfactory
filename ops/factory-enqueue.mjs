@@ -333,6 +333,10 @@ export async function buildEnqueuePlan(values) {
     // contractLabelsValid нативной очереди значение обязано быть
     // 64-hex дайджестом, иначе карточка отклоняется до вызова vb.
     if (key === 'fixtures_digest' && !HEX64.test(value)) fail('label_invalid');
+    // has_ui — булева метка контракта: contractOf читает строго 'true'/
+    // 'false' в нижнем регистре, любое другое значение ('TRUE', '1')
+    // молча меняло бы смысл карточки — отказ до вызова vb.
+    if (key === 'has_ui' && value !== 'true' && value !== 'false') fail('has_ui_invalid');
     labels[key] = value;
   }
 

@@ -113,6 +113,16 @@ test('enqueue: отказы до эффекта', async () => {
   const fdOk = await buildEnqueuePlan({ ...baseValues(),
     label: [`fixtures_digest=${'c'.repeat(64)}`] });
   assert.equal(fdOk.labels.fixtures_digest, 'c'.repeat(64));
+  // has_ui — булева метка контракта: только строгие 'true'/'false',
+  // иначе отказ до вызова vb.
+  for (const bad of ['TRUE', '1', 'yes', '']) {
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      label: [`has_ui=${bad}`] }), /has_ui_invalid/);
+  }
+  for (const ok of ['true', 'false']) {
+    const plan = await buildEnqueuePlan({ ...baseValues(), label: [`has_ui=${ok}`] });
+    assert.equal(plan.labels.has_ui, ok);
+  }
   // Метка без разделителя '=' — отказ до вызова vb: значение не
   // выводится из ключа (k=v, а не k=k).
   await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
