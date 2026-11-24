@@ -32,6 +32,10 @@ node ops/factory-enqueue.mjs \
 Обязательные: `--board-url` (http/https), `--channel`, `--title` или
 `--text`, `--repo-id`, `--profile`, `--finish` (`verified`|`deployed`),
 `--spec-digest` или `--brief`, `--policy-digest` или `--policy`.
+Флаги хранилищ (`--memory-dir`, `--ledger-path`) требуют именно `--policy`
+(а не только `--policy-digest`): без файла политики значение `handoffDir`
+неизвестно, и двустороннюю границу хранилища с каталогом сдачи
+подтвердить нельзя — отказ `policy_required` до вызова `vb`.
 Контрактные метки (`spec_digest`, `policy_digest`, `repo_id`,
 `profile_id`, `finish`) резервированы: `--label` их не переопределяет.
 
@@ -55,13 +59,20 @@ node ops/factory-enqueue.mjs \
 Вход внутри worktree отклоняется до чтения файла и хэширования —
 дайджест непригодной политики не попадает на Board.
 
-Для путей хранилищ (`--memory-dir`, `--ledger-path`) граница
-двусторонняя — та же, что у factory-run и контроллера: каталог
-Project Memory и родительский каталог файла Owner Decision Ledger не
-должны содержать worktree (в примере выше оба хранилища лежат в
-`/path/store`, а не непосредственно в `/path` рядом с `/path/wt`),
-равно как и worktree не должен содержать хранилище. Нарушение
-отклоняется `path_inside_worktree` до вызова `vb`.
+Для путей хранилищ (`--memory-dir`, `--ledger-path`, а также
+`decisionLedger`, `projectMemory` и `projectMemory.trustedReceiptDir`
+из политики) граница двусторонняя — та же, что у factory-run и
+контроллера: каталог Project Memory и родительский каталог файла
+Owner Decision Ledger не должны содержать worktree (в примере выше оба
+хранилища лежат в `/path/store`, а не непосредственно в `/path` рядом с
+`/path/wt`), равно как и worktree не должен содержать хранилище.
+Нарушение отклоняется `path_inside_worktree` до вызова `vb`. Та же
+двусторонняя граница действует и против `policy.handoffDir` — хранилища
+лежат вне рабочего каталога сдачи (для файла журнала проверяется и его
+родительский каталог; общий родитель каталогов памяти/квитанций и сдачи
+допустим). Политика без `handoffDir` не подтверждает эту границу и при
+заданных путях хранилищ отклоняется `handoff_required` — как её отклонил
+бы factory-run при запуске.
 
 ## Запуск контроллера — `ops/factory-run.mjs`
 

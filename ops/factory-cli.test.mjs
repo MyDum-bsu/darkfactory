@@ -230,11 +230,24 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
       'policy-digest': undefined, policy: policyFile, 'ledger-path': ledger }),
       /path_inside_worktree/);
     // Хранилища в отдельном каталоге вне дерева проходят ту же проверку
-    // (родительский каталог хранилища тоже не содержит worktree).
+    // (родительский каталог хранилища тоже не содержит worktree); флаги
+    // хранилищ требуют политику с handoffDir — без него границу с
+    // каталогом сдачи подтвердить нельзя (handoff_required).
     const store = join(dir, 'sub', 'store');
     await mkdir(store, { recursive: true });
     const storeLedger = join(store, 'ledger.jsonl');
     await writeFile(storeLedger, '');
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile,
+      'memory-dir': store, 'ledger-path': storeLedger }), /handoff_required/);
+    const cliInbox = join(dir, 'cli-inbox');
+    await mkdir(cliInbox);
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate,
+      route: { checkProfile: 'p', worktree: wt },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } },
+      handoffDir: cliInbox }));
     const storePlan = await buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile,
       'memory-dir': store, 'ledger-path': storeLedger });
@@ -273,6 +286,14 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
         'policy-digest': undefined, policy: policyFile }),
         /path_inside_worktree/);
     }
+    // Закреплённый путь хранилища при отсутствии policy.handoffDir —
+    // неподтверждённая граница с каталогом сдачи (factory-run отклонил
+    // бы ту же политику с handoff_required): отказ до вызова vb.
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
+      decisionLedger: storeLedger }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }), /handoff_required/);
     // Хранилища и handoffDir не пересекаются в обе стороны: журнал,
     // память и trustedReceiptDir внутри inbox сдачи (или inbox внутри
     // каталога хранилища / родителя файла журнала) контроллер отклонил

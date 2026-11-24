@@ -236,6 +236,15 @@ export async function buildEnqueuePlan(values) {
       await canonicalInput(policyJson.projectMemory.trustedReceiptDir,
         { worktrees, mustBe: 'dir', storage: true, outside });
     }
+    // Заданные пути хранилищ без policy.handoffDir не подтверждают
+    // границу с каталогом сдачи: factory-run отклоняет такую политику
+    // с handoff_required — тот же отказ здесь, до вызова vb, иначе в
+    // Board ушла бы карточка с незапускаемой политикой.
+    if (handoff === undefined &&
+        (policyLedger !== undefined || policyMemory !== undefined ||
+         policyJson?.projectMemory?.trustedReceiptDir !== undefined)) {
+      fail('handoff_required');
+    }
   }
   let specDigest = values['spec-digest'];
   if (values.brief !== undefined) {
@@ -274,6 +283,10 @@ export async function buildEnqueuePlan(values) {
         { worktrees, mustBe: flag === 'memory-dir' ? 'dir' : 'file',
           storage: true,
           outside: handoff === undefined ? [] : [handoff] });
+      // Политика без handoffDir — та же неподтверждённая граница
+      // (factory-run отклоняет её с handoff_required): отказ после
+      // проверки каноничности и worktree-границы, до вызова vb.
+      if (handoff === undefined) fail('handoff_required');
     }
   }
   if (values.ticket !== undefined) {
