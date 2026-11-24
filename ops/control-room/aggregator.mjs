@@ -478,9 +478,8 @@ export function createControlRoomAggregator({
 //   [--drift-repo DIR ...] [--net-probe name=url ...]
 async function loadBoardToken(flagValue) {
   if (typeof flagValue === 'string' && flagValue) return flagValue;
-  if (typeof process.env.BOARD_TOKEN === 'string' && process.env.BOARD_TOKEN) {
-    return process.env.BOARD_TOKEN;
-  }
+  const envToken = process.env.BOARD_TOKEN;
+  if (typeof envToken === 'string' && envToken) return envToken;
   // Токен из конфигурации: $XDG_CONFIG_HOME/darkfactory/board-token.
   const confDir = process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config');
   const token = await readFile(join(confDir, 'darkfactory', 'board-token'), 'utf8')
