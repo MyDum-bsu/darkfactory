@@ -125,9 +125,14 @@ export function offlineDockerRunner(journal, { beforeEffect } = {}) {
     if (l1Profile !== undefined && l1Recipe !== undefined && l1Profile.id !== l1Recipe.id) {
       throw new Error('l1_profile_mismatch');
     }
+    // Неявный дефолт контроллера (repoId попытки) — не явный выбор: он
+    // применяется только когда ни профиль, ни рецепт профиль не задали,
+    // и не участвует в mismatch-сверке.
+    const l1Default = profile.l1Default === undefined ? undefined
+      : resolveL1Profile({ l1Profile: profile.l1Default });
     // defaultEnv выбранного профиля подмешивается только в ключи, не
     // заданные в recipe.env.
-    const l1 = l1Profile ?? l1Recipe;
+    const l1 = l1Profile ?? l1Recipe ?? l1Default;
     const effective = l1 === undefined ? recipe
       : { ...recipe, env: { ...l1.defaultEnv, ...recipe.env } };
     if (!SHA.test(handoff.candidate_sha)) throw new Error('Local runner requires a full SHA');
@@ -310,7 +315,7 @@ export function offlineProfileRunner(journal, options) {
       // fail-closed валидация каждого — в раннере, ?? здесь скрыл бы
       // недопустимый рецепт за валидным профилем.
       const result = await check(handoff,
-        { check: recipe, l1Profile: profile.l1Profile });
+        { check: recipe, l1Profile: profile.l1Profile, l1Default: profile.l1Default });
       evidence.push(result.evidence);
       if (!result.ok) return { sha: result.sha, ok: false, evidence };
     }

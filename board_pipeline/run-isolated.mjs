@@ -246,9 +246,10 @@ async function execute() {
       !p.profiles?.[route.checkProfile]?.branch) throw new Error('Incomplete enrolled policy');
   // Явный l1Profile выбранного профиля и CLI --l1-profile — строго из
   // реестра, fail-closed на старте, до любой проверки и эффекта. Оба
-  // заданных различных значения — отказ; эффективный профиль иначе —
-  // дефолт repoId.
-  const effectiveL1Profile = effectiveL1ProfileId({
+  // заданных различных значения — отказ. Репозиторный дефолт резолвится
+  // на попытку в verify по подтверждённому attempt.repo_id (queue-маршрут
+  // без route.repoId обязан получить дефолт repo_id карточки).
+  effectiveL1ProfileId({
     cliProfile: values['l1-profile'],
     profileL1: p.profiles[route.checkProfile].l1Profile,
     repoId: route.repoId });
@@ -668,9 +669,20 @@ async function execute() {
     // Дайджест политики для seal — операторский (p.policyDigest) или отпечаток
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
     // сверяется с доверенным значением, а не сам с собой.
+    // Эффективный L1-профиль попытки: дефолт репозитория — по
+    // подтверждённому attempt.repo_id (иначе route.repoId). Явный выбор
+    // (CLI/политика) идёт в l1Profile и сверяется с рецептом; неявный
+    // дефолт — в l1Default и не считается конфликтующим явным выбором:
+    // явный l1Profile рецепта сохраняет прежнее поведение.
+    const explicitL1 = (values['l1-profile'] ?? profile.l1Profile) === undefined ? undefined
+      : effectiveL1ProfileId({ cliProfile: values['l1-profile'],
+        profileL1: profile.l1Profile, repoId: attempt.repo_id ?? route.repoId });
+    const attemptL1Default = effectiveL1ProfileId({ cliProfile: values['l1-profile'],
+      profileL1: profile.l1Profile, repoId: attempt.repo_id ?? route.repoId });
     const policy = { version: p.version,
       digest: p.policyDigest ?? route.policyDigest,
-      profiles: { [attempt.check_profile]: { ...profile, l1Profile: effectiveL1Profile, visual: profile.visual,
+      profiles: { [attempt.check_profile]: { ...profile, l1Profile: explicitL1,
+        l1Default: attemptL1Default, visual: profile.visual,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
       arbiter: attemptArbiter,

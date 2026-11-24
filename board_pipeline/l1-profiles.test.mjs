@@ -142,6 +142,22 @@ test('runtime: runner отклоняет неизвестный l1Profile до �
           check: { ...recipe, l1Profile: 'python-node' },
           checks: [{ ...recipe, l1Profile: 'python-node' }] }),
         /l1_profile_mismatch/);
+      // Неявный дефолт контроллера валидируется fail-closed, но не
+      // считается явным выбором: mismatch с ним не возникает, а явный
+      // l1Profile рецепта сохраняет прежнее поведение. Следующий рубеж
+      // после валидации — проверка формата SHA кандидата.
+      const badSha = { ...handoff, candidate_sha: 'x' };
+      await assert.rejects(() => runner(badSha,
+        { l1Default: 'bogus', check: recipe, checks: [recipe] }),
+        /unknown_l1_profile:bogus/);
+      await assert.rejects(() => runner(badSha,
+        { l1Default: 'node',
+          check: { ...recipe, l1Profile: 'python-node' },
+          checks: [{ ...recipe, l1Profile: 'python-node' }] }),
+        /full SHA/);
+      await assert.rejects(() => runner(badSha,
+        { l1Default: 'python-node', check: recipe, checks: [recipe] }),
+        /full SHA/);
     }
   } finally {
     await rm(journal, { recursive: true, force: true });
@@ -353,10 +369,12 @@ test('run-isolated: --l1-profile разобран, резолвлен и при�
   const source = await readFile(join(ROOT, 'board_pipeline', 'run-isolated.mjs'), 'utf8');
   // CLI-опция зарегистрирована в parseArgs контроллера.
   assert.match(source, /'l1-profile':\s*\{\s*type:\s*'string'\s*\}/);
-  // Эффективный профиль резолвится из CLI-флага, l1Profile выбранного
-  // профиля политики и дефолта repoId — единым fail-closed вызовом.
-  assert.match(source, /effectiveL1ProfileId\(\{[\s\S]*?cliProfile:\s*values\['l1-profile'\][\s\S]*?profileL1:[\s\S]*?repoId:\s*route\.repoId[\s\S]*?\}\)/);
-  // Эффективное значение (а не сырой профиль политики) подставляется в
-  // проверочный профиль приёмки — раннер применяет его defaultEnv.
-  assert.match(source, /l1Profile:\s*effectiveL1Profile/);
+  // Эффективный профиль резолвится на попытку по подтверждённому
+  // attempt.repo_id с откатом на route.repoId — queue-маршрут без
+  // repoId получает дефолт repo_id захваченной карточки.
+  assert.match(source, /effectiveL1ProfileId\(\{[\s\S]*?repoId:\s*attempt\.repo_id\s*\?\?\s*route\.repoId/);
+  // Явный выбор идёт в l1Profile (mismatch с рецептом), неявный дефолт —
+  // в l1Default: явный l1Profile рецепта не конфликтует с дефолтом.
+  assert.match(source, /l1Profile:\s*explicitL1/);
+  assert.match(source, /l1Default:\s*attemptL1Default/);
 });
