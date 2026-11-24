@@ -20,6 +20,7 @@ import { lstat, readdir, realpath, readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
+import { createPilotSwitch } from '../board_pipeline/pilot-gate.mjs';
 import { opencodeGoPolicyViolation, retiredProviderViolation }
   from '../board_pipeline/worker-selector.mjs';
 
@@ -399,6 +400,31 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     // ((await readdir(...)).length === 0 в enrollAbPilot): непустой
     // отклоняется здесь, до Git-конфига, а не после него.
     if ((await readdir(abWorkspace)).length !== 0) fail('path_not_empty');
+  }
+
+  // Стоп-файлы пилотов — единый createPilotSwitch контроллера (та же
+  // permitDirectory-граница [tree, inbox, root]): каталог стоп-файла
+  // каноничен, приватен и не пересекается с worktree, state и handoffDir.
+  const permitSwitchDir = dir => [worktreeReal, handoff, state]
+    .every(p => !inside(p, dir) && !inside(dir, p));
+  // abPilot.switch — как в enrollAbPilot: файл обязан уже существовать и
+  // быть открытым стоп-файлом ('run\n', 0600, nlink === 1) до записи
+  // Git-конфига — assertOpen() здесь безусловен.
+  if (policy?.abPilot?.switch !== undefined) {
+    const assertAbOpen = await createPilotSwitch(policy.abPilot.switch,
+      { permitDirectory: permitSwitchDir });
+    await assertAbOpen();
+  }
+  // pilot.killSwitch при действующем pilot-допуске (scope 'pilot' +
+  // pilot.enabled): в не-daemon режиме контроллер вызывает switchOpen()
+  // сразу (файл обязан быть открытым стоп-файлом); в daemon-режиме
+  // eager-проверка пропускается — стоп ловит первый тик демона, а
+  // симлинк/каталог уже отклонены проверкой пути выше.
+  if (policy?.scope === 'pilot' && policy?.pilot?.enabled === true &&
+      policy.pilot?.killSwitch !== undefined) {
+    const assertPilotOpen = await createPilotSwitch(policy.pilot.killSwitch,
+      { permitDirectory: permitSwitchDir });
+    if (!values.daemon) await assertPilotOpen();
   }
 
   // CLI-override без конфликта с политикой передаётся контроллеру через

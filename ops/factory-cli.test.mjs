@@ -921,8 +921,24 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     const fAbInTree = await withPolicy(dir, abInTree);
     await assert.rejects(() => runPlan(runValues(fAbInTree, state)),
       /path_inside_worktree/);
-    // Канонический путь вне worktree/state/handoff проходит.
-    const abOk = { ...policySpec(wt), abPilot: { switch: join(ops, 'ab-stop') } };
+    // abPilot.switch — действующий стоп-файл контроллера (assertOpen в
+    // enrollAbPilot безусловен): отсутствующий файл (ENOENT) отклоняется
+    // до Git-конфига, как и файл с содержимым не 'run\n'.
+    const abMissing = { ...policySpec(wt),
+      abPilot: { switch: join(ops, 'ab-missing') } };
+    const fAbMissing = await withPolicy(dir, abMissing);
+    await assert.rejects(() => runPlan(runValues(fAbMissing, state)),
+      /pilot_stopped|pilot_switch_invalid/);
+    const abStop = join(ops, 'ab-stop');
+    await writeFile(abStop, 'halt\n', { mode: 0o600 });
+    const abHalt = { ...policySpec(wt), abPilot: { switch: abStop } };
+    const fAbHalt = await withPolicy(dir, abHalt);
+    await assert.rejects(() => runPlan(runValues(fAbHalt, state)),
+      /pilot_stopped/);
+    // Канонический путь вне worktree/state/handoff с валидным открытым
+    // стоп-файлом ('run\n', 0600, nlink === 1) проходит.
+    await writeFile(abStop, 'run\n', { mode: 0o600 });
+    const abOk = { ...policySpec(wt), abPilot: { switch: abStop } };
     const fAbOk = await withPolicy(dir, abOk);
     await runPlan(runValues(fAbOk, state));
     // abPilot без switch: контроллер безусловно передаёт config.switch в
