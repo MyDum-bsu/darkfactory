@@ -191,6 +191,12 @@ export async function buildEnqueuePlan(values) {
     if (policyMemory !== undefined) {
       await canonicalInput(policyMemory, { worktrees, mustBe: 'dir', storage: true });
     }
+    // handoffDir — inbox сдачи контроллера: каталог внутри worktree он
+    // отклонил бы при запуске ('Handoff inbox must be separate');
+    // карточка с незапускаемой политикой на Board не создаётся.
+    if (policyJson.handoffDir !== undefined) {
+      await canonicalInput(policyJson.handoffDir, { worktrees, mustBe: 'dir' });
+    }
   }
   let specDigest = values['spec-digest'];
   if (values.brief !== undefined) {

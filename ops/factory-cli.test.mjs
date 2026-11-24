@@ -246,6 +246,8 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     // политикой не создаётся и без CLI-флага.
     const wtLedger = join(wt, 'ledger.jsonl');
     await writeFile(wtLedger, '');
+    const wtInbox = join(wt, 'inbox');
+    await mkdir(wtInbox);
     // Критик закреплён явно (legacy Sol): выбор ревью-профиля не зависит
     // от DF_AGY_KEYRING_ITEM окружения оператора.
     const pinnedReview = { route: { checkProfile: 'p', worktree: wt },
@@ -256,6 +258,7 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
       { decisionLedger: { path: wtLedger } },
       { projectMemory: { storeDir: wt } },
       { projectMemory: { storeDir: dir } },
+      { handoffDir: wtInbox },
     ]) {
       await writeFile(policyFile, JSON.stringify({
         brief, reviewPrompt, reviewGate: gate, ...pinnedReview, ...embedded }));
@@ -266,7 +269,8 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     // Канонические хранилища вне дерева в политике проходят.
     await writeFile(policyFile, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
-      decisionLedger: storeLedger, projectMemory: { storeDir: store } }));
+      decisionLedger: storeLedger, projectMemory: { storeDir: store },
+      handoffDir: store }));
     const embeddedPlan = await buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile });
     assert.match(embeddedPlan.labels.policy_digest, /^[0-9a-f]{64}$/);
@@ -596,7 +600,12 @@ test('run: валидный dry-run печатает план без вызов�
 });
 
 async function initGitRepo(dir) {
-  const git = args => execFileAsync('git', ['-C', dir, ...args]);
+  // Без GIT_*-перенаправлений окружения (наследуются, например, из
+  // Git-хука): init/config и проверочные вызовы действуют строго на
+  // временный репозиторий -C dir, а не на внешний GIT_DIR.
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+  const git = args => execFileAsync('git', ['-C', dir, ...args], { env });
   await git(['init']);
   await git(['config', 'user.email', 't@t']);
   await git(['config', 'user.name', 't']);
