@@ -62,7 +62,10 @@ function contractOf(labels) {
     fixtures_digest: typeof labels?.fixtures_digest === 'string' ? labels.fixtures_digest : null,
     // Явный L1-выбор оператора при постановке — контрактная метка:
     // контроллер обязан применить именно её, а не свой дефолт repo_id.
-    l1_profile: typeof labels?.l1_profile === 'string' ? labels.l1_profile : undefined,
+    // Значение передаётся без приведения: заданное нестроковое значение
+    // обязано быть отклонено fail-closed на приёмке, а не трактоваться
+    // как отсутствие метки.
+    l1_profile: labels?.l1_profile,
     // Метка has_ui карточки может только ВКЛЮЧИТЬ L3; 'false' не выключает
     // обязательный profile.has_ui — решение остаётся у оператора.
     has_ui: labels?.has_ui === 'true' ? true : undefined,

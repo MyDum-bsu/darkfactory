@@ -109,6 +109,26 @@ test('acceptance: неизвестный l1Profile отклоняется fail-c
     profiles: { p: { review } } }, 'p').l1Profile, undefined);
 });
 
+test('acceptance: l1_profile попытки — реестр fail-closed, stray запрещён', () => {
+  const contract = { repo_id: 'optimization', spec_digest: HEX,
+    policy_digest: 'c'.repeat(64) };
+  // Закреплённая метка карточки доезжает до приёмки как явный выбор.
+  assert.doesNotThrow(() => _internals.validateContract(
+    { ...contract, l1_profile: 'python-node' }));
+  assert.doesNotThrow(() => _internals.validateContract(contract));
+  // Заданное нестроковое или неизвестное значение — отказ, а не
+  // «отсутствие метки»: неверный вход не подменяется дефолтом.
+  for (const bad of ['bogus', '', null, 42, {}, ['node'], '__proto__', 'toString']) {
+    assert.throws(() => _internals.validateContract(
+      { ...contract, l1_profile: bad }),
+      err => err?.reason === `unknown_l1_profile:${String(bad)}`,
+      JSON.stringify(bad));
+  }
+  // Метка без остального контракта — неполный закреп, отклоняется.
+  assert.throws(() => _internals.validateContract({ l1_profile: 'node' }),
+    err => err?.reason === 'subject_contract_incomplete');
+});
+
 test('runtime: runner отклоняет неизвестный l1Profile до вызова docker', async () => {
   const journal = await tempdir();
   try {
@@ -189,7 +209,9 @@ test('enqueue: дефолт node, авто python-node, явный --l1-profile'
   for (const repo of ['optimization', 'autoresearcher']) {
     const plan = await buildEnqueuePlan({ ...baseValues(), 'repo-id': repo });
     assert.equal(plan.meta.l1Profile, 'python-node');
-    assert.equal(plan.labels.l1_profile, 'python-node');
+    // Авто-дефолт на карточку не пишется: записанная метка — контрактный
+    // явный выбор и ложно конфликтовала бы с явным l1Profile политики.
+    assert.equal(plan.labels.l1_profile, undefined);
   }
   const explicit = await buildEnqueuePlan({ ...baseValues(),
     'l1-profile': 'python-node' });

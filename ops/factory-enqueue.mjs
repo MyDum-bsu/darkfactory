@@ -339,11 +339,12 @@ export async function buildEnqueuePlan(values) {
 
   const labels = { spec_digest: specDigest, policy_digest: policyDigest,
     repo_id: values['repo-id'], profile_id: values.profile, finish: values.finish, ...extra };
-  // Метка ставится при явном выборе (CLI или политика) либо при
-  // недефолтном результате — авто-выбор python-node для репозитория
-  // тоже фиксируется на карточке.
-  if (values['l1-profile'] !== undefined || policyProfileL1 !== undefined ||
-      l1Profile !== 'node') {
+  // Метка ставится только при ЯВНОМ выборе (CLI --l1-profile или
+  // profiles.<profile>.l1Profile политики): она — контрактный явный
+  // источник для контроллера. Авто-дефолт репозитория на карточку не
+  // пишется — контроллер выводит его по repo_id сам, а записанный
+  // дефолт ложно конфликтовал бы с явным l1Profile политики приёмки.
+  if (values['l1-profile'] !== undefined || policyProfileL1 !== undefined) {
     labels.l1_profile = l1Profile;
   }
   for (const item of values.label ?? []) {

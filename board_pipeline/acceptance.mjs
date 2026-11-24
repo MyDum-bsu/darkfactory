@@ -41,6 +41,7 @@ const ATTEMPT_OPTIONAL = [
   'spec_digest',
   'policy_digest',
   'fixtures_digest',
+  'l1_profile',
   'release_target',
   'has_ui',
   'executor',
@@ -174,7 +175,7 @@ function strictKeys(record, allowed, optional = []) {
 function validateContract(attempt) {
   const pinned = CONTRACT_REQUIRED.some(key => attempt[key] !== undefined);
   if (!pinned) {
-    for (const key of ['tree_sha', 'fixtures_digest', 'release_target']) {
+    for (const key of ['tree_sha', 'fixtures_digest', 'l1_profile', 'release_target']) {
       if (attempt[key] !== undefined) throw new Denied('subject_contract_incomplete');
     }
     return;
@@ -195,6 +196,12 @@ function validateContract(attempt) {
     if (attempt.fixtures_digest !== null && !SHA256_RE.test(attempt.fixtures_digest)) {
       throw new Denied('invalid_fixtures_digest');
     }
+  }
+  // Закреплённый L1-выбор карточки — тот же fail-closed реестр, что и
+  // профиль: нестроковое или неизвестное значение метки отклоняется, а
+  // не трактуется как отсутствие выбора.
+  if (attempt.l1_profile !== undefined && !isValidL1Profile(attempt.l1_profile)) {
+    throw new Denied(`unknown_l1_profile:${String(attempt.l1_profile)}`);
   }
   const target = attempt.release_target;
   if (target !== undefined) {
@@ -1225,6 +1232,14 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       if (liveFixtures !== expectedFixtures) {
         await step('seal', false, 'fixtures_digest_drift');
         return { fail: 'fixtures_digest_drift' };
+      }
+      // l1_profile — та же контрактная метка: смена закреплённого выбора
+      // после проверок останавливает кандидата до complete, а не закрывает
+      // карточку со свидетельством под другим профилем.
+      const liveL1 = typeof labels.l1_profile === 'string' ? labels.l1_profile : null;
+      if (liveL1 !== (attempt.l1_profile ?? null)) {
+        await step('seal', false, 'l1_profile_drift');
+        return { fail: 'l1_profile_drift' };
       }
       if (policy.digest !== undefined && policy.digest !== attempt.policy_digest) {
         await step('seal', false, 'policy_digest_drift');
