@@ -144,8 +144,15 @@ const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 // Как и ?? -цепочка контроллера, берётся первое значение, отличное от
 // null/undefined: нестроковое значение приоритетного поля (false, число)
 // проверяется и отклоняется здесь, а не проскакивает к следующему ключу.
-const policyPath = (cfg, keys) =>
-  typeof cfg === 'string' ? cfg : keys.map(k => cfg?.[k]).find(v => v !== undefined && v !== null);
+const policyPath = (cfg, keys) => {
+  if (cfg === undefined || cfg === null) return undefined;
+  if (typeof cfg === 'string') return cfg;
+  // Скалярное значение или массив — не форма пути: контроллер отклонил
+  // бы её в ledgerPolicyConfig/memoryPolicyConfig после записи
+  // Git-конфига; L2 отклоняет такой вход при построении плана.
+  if (typeof cfg !== 'object' || Array.isArray(cfg)) fail('policy_invalid');
+  return keys.map(k => cfg[k]).find(v => v !== undefined && v !== null);
+};
 
 // Чистый старт: резолвит тот же путь, что реально использует контроллер
 // (explicit > policy > env). Расхождение CLI-флага с закреплённым в

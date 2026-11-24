@@ -991,6 +991,18 @@ test('run: нестроковое значение приоритетного п
     const fNum = await withPolicy(dir, { ...policySpec(wt),
       decisionLedger: { path: 42 } });
     await assert.rejects(() => runPlan(runValues(fNum, state)), /path_not_absolute/);
+    // Скалярное значение или массив на месте конфигурации пути — не
+    // «отсутствует»: контроллер отклонил бы её в
+    // ledgerPolicyConfig/memoryPolicyConfig после записи Git-конфига;
+    // отказ здесь, при построении плана.
+    for (const bad of [
+      { decisionLedger: 42 },
+      { projectMemory: false },
+      { decisionLedger: [join(ops, 'ledger.jsonl')] },
+    ]) {
+      const fBad = await withPolicy(dir, { ...policySpec(wt), ...bad });
+      await assert.rejects(() => runPlan(runValues(fBad, state)), /policy_invalid/);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
