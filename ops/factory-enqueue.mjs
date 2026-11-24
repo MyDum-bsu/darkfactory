@@ -286,8 +286,17 @@ export async function buildEnqueuePlan(values) {
   // --vb без флага — команда по умолчанию 'vb'; явный путь исполняемого
   // файла — тот же инвариант каноничности вне worktree, что и у прочих
   // операторских входов: проверка до вызова vb.
-  const tool = values.vb === undefined ? 'vb'
-    : await canonicalInput(values.vb, { worktrees, mustBe: 'file' });
+  let tool = 'vb';
+  if (values.vb !== undefined) {
+    tool = await canonicalInput(values.vb, { worktrees, mustBe: 'file' });
+    // --vb — тоже явно заданный операторский файл: исполняемый файл
+    // внутри handoffDir (рабочего каталога сдачи) контроллер не допустил
+    // бы — отказ до вызова vb, иначе постановка запускала бы файл из
+    // inbox воркера вместо доверенного vb.
+    if (handoff !== undefined && within(handoff, tool)) {
+      fail('path_inside_worktree');
+    }
+  }
   return { tool, argv, labels,
     meta: { boardUrl: url, channel: values.channel, finish: values.finish } };
 }

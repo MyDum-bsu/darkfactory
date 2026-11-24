@@ -304,6 +304,16 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile }),
       /path_inside_worktree/);
+    // Явный --vb внутри handoffDir — тот же операторский вход: файл из
+    // рабочего каталога сдачи не может исполняться вместо доверенного vb.
+    const hoVb = join(handoff, 'vb');
+    await writeFile(hoVb, 'x');
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
+      handoffDir: handoff }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile, vb: hoVb }),
+      /path_inside_worktree/);
     const innerPolicy = join(wt, 'policy.json');
     await writeFile(innerPolicy, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate,
