@@ -173,6 +173,11 @@ const round2Evasions = [
   ['bash +o pipefail -c \'rm -rf /\'', 'critical'],
   ['bash -c +e \'rm -rf /\'', 'critical'],
   ['bash -c +o pipefail \'rm -rf /\'', 'critical'],
+  // Round 4: '+c' исполняет строку так же, как '-c' (bash 5.2 и sh).
+  ['bash +c \'rm -rf /\'', 'critical'],
+  ['sh +c \'rm -rf /\'', 'critical'],
+  ['bash +xc \'rm -rf /\'', 'critical'],
+  ['bash +ec \'rm -rf /\'', 'critical'],
 ];
 for (const [cmd, severity] of round2Evasions) {
   test(`evasion (round 2): ${cmd}`, () => expectBlock(cmd, severity));
@@ -182,7 +187,8 @@ test('round 2: варианты обвёрток не ломают safe-кома
   for (const cmd of ['bash -c \'echo hi\'', 'env -S \'echo hi\'',
     'env -u FOO ls', 'time -p ls', 'su -s /bin/zsh -c \'echo hi\'',
     'bash -c -o pipefail \'echo hi\'', 'bash +e script.sh',
-    'bash +e -c \'echo hi\'', 'bash -c +e \'echo hi\'']) {
+    'bash +e -c \'echo hi\'', 'bash -c +e \'echo hi\'',
+    'bash +c \'echo hi\'', 'sh +c \'echo hi\'', 'bash +x script.sh']) {
     expectAllow(cmd);
   }
 });

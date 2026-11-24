@@ -326,8 +326,10 @@ function unwrap(argv, depth, state, visit) {
         i += w.includes('=') ? 1 : 2;
         continue;
       }
-      if (w.startsWith('-') && w.includes('c') && !w.startsWith('--')) {
-        // -c / -lc / -ec / -xc: командная строка — ПЕРВЫЙ non-option
+      if ((w.startsWith('-') || w.startsWith('+')) && w.includes('c') &&
+          !w.startsWith('--')) {
+        // -c / -lc / -ec / -xc и их '+' формы (+c, +xc, +ec — bash 5.2 и
+        // sh исполняют их так же): командная строка — ПЕРВЫЙ non-option
         // операнд после флагов и '--' (bash -c -- 'cmd', bash -c -e 'cmd',
         // bash -c +o pipefail 'cmd').
         let j = i + 1;
