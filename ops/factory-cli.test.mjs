@@ -621,6 +621,17 @@ test('run: валидный dry-run печатает план без вызов�
       ['--provider', 'acp-devin', '--model', 'swe-2-high',
         '--policy', policy, '--state', state, '--daemon', '--dry-run'],
       { git: git0, env: {} }), /daemon_switch_required/);
+    // Действующий pilot-допуск без pilot.killSwitch: --switch — только
+    // стоп-файл демона и обязательный путь не заменяет; контроллер
+    // отклонил бы pilot_switch_invalid после записи Git-конфига —
+    // отказ при построении плана, и в dry-run тоже.
+    const noKill = await withPolicy(dir,
+      { ...policySpec(wt), scope: 'pilot', pilot: { enabled: true } });
+    await assert.rejects(() => runFactory(
+      ['--provider', 'acp-devin', '--model', 'swe-2-high',
+        '--policy', noKill, '--state', state, '--daemon', '--switch', stop,
+        '--dry-run'],
+      { git: git0, env: {} }), /pilot_switch_invalid/);
     // git-вызов dry-run — только read-only rev-parse; мокаем.
     const gitCalls = [];
     const git = async a => { gitCalls.push(a); return a.includes('--show-toplevel') ? wt : 'true'; };

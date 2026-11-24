@@ -434,7 +434,15 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     await assertAbOpen();
   }
   // pilot.killSwitch при действующем pilot-допуске (scope 'pilot' +
-  // pilot.enabled): в не-daemon режиме контроллер вызывает switchOpen()
+  // pilot.enabled) обязателен: --switch задаёт только стоп-файл демона
+  // и обязательный путь не заменяет — контроллер отклонил бы его
+  // отсутствие (pilot_switch_invalid) уже после записи Git-конфига;
+  // отказ при построении плана, в том числе в dry-run.
+  if (policy?.scope === 'pilot' && policy?.pilot?.enabled === true &&
+      policy.pilot?.killSwitch === undefined) {
+    fail('pilot_switch_invalid');
+  }
+  // В не-daemon режиме контроллер вызывает switchOpen()
   // сразу (файл обязан быть открытым стоп-файлом); в daemon-режиме
   // eager-проверка пропускается — стоп ловит первый тик демона, а
   // симлинк/каталог уже отклонены проверкой пути выше.
