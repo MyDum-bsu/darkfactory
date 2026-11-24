@@ -16,7 +16,7 @@ import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
   escapeHtml, SECURITY_HEADERS } from './origin-guard.mjs';
 import { createNetHealthMonitor } from './net-health.mjs';
 import { createControlRoomAggregator, createBoardObserver,
-  createBranchDriftProvider, RING_LIMIT } from './aggregator.mjs';
+  createBranchDriftProvider, createModelsProvider, RING_LIMIT } from './aggregator.mjs';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -594,4 +594,46 @@ test('aggregator: columns pick the latest attempt per task_id', async () => {
   const snap = await server.snapshot();
   assert.equal(snap.running[0].phase, 'checking');
   assert.equal(snap.running[0].model, 'm2');
+});
+
+
+// --- DF-V2-MODEL-REG: read-only model registry exposure -------------------------
+
+test('aggregator: snapshot включает read-only models snapshot из явных YAML', async () => {
+  const catalogPath = join(MODULE_DIR, '..', 'local', 'models-catalog.example.yaml');
+  const policyPath = join(MODULE_DIR, '..', 'local', 'routing-policy.example.yaml');
+  await withServer({ modelsProvider: createModelsProvider({ catalogPath, policyPath }) },
+    async (server, base) => {
+      const res = await httpGet(`${base}/api/snapshot`);
+      assert.equal(res.status, 200);
+      const snap = JSON.parse(res.body);
+      assert.equal(snap.models.ok, true);
+      assert.equal(snap.models.models.length, 9);
+      assert.equal(snap.models.mode, 'balanced');
+      assert.equal(snap.models.triad.coder.family, 'cognition');
+      assert.equal(snap.models.triad.reviewer.family, 'google');
+      assert.notEqual(snap.models.triad.coder.family, snap.models.triad.reviewer.family);
+    });
+});
+
+test('aggregator: повреждённый models config fail-open, сервер и read-only API живы', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-models-'));
+  try {
+    const catalogPath = join(dir, 'models-catalog.yaml');
+    const policyPath = join(dir, 'routing-policy.yaml');
+    await writeFile(catalogPath, 'models: [broken\n');
+    await writeFile(policyPath, 'version: 1\n');
+    await withServer({ modelsProvider: createModelsProvider({ catalogPath, policyPath }) },
+      async (server, base) => {
+        const res = await httpGet(`${base}/api/snapshot`);
+        assert.equal(res.status, 200);
+        const snap = JSON.parse(res.body);
+        assert.equal(snap.models.ok, false);
+        assert.match(snap.models.error, /model_registry_yaml_invalid/);
+        const post = await httpRequest(`${base}/api/snapshot`, {}, 'POST');
+        assert.equal(post.status, 405);
+      });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

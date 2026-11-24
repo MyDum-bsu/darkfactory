@@ -33,6 +33,7 @@ import { inspectWorktreesAndBranches } from '../../board_pipeline/branch-drift.m
 import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
   SECURITY_HEADERS } from './origin-guard.mjs';
 import { createNetHealthMonitor } from './net-health.mjs';
+import { loadModelRegistry, registrySnapshot } from '../../board_pipeline/model-registry.mjs';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -292,6 +293,20 @@ async function readEventsTail(stateDirs, limit) {
   return events.slice(-limit);
 }
 
+// Read-only провайдер модельного реестра. Любая ошибка конфигурации —
+// fail-open для Control Room: snapshot живёт, но видит явный models.ok=false.
+export function createModelsProvider({ catalogPath, policyPath, configDir, now, quotas } = {}) {
+  return async () => {
+    try {
+      const at = typeof now === 'function' ? now() : now ?? new Date();
+      const registry = await loadModelRegistry({ catalogPath, policyPath, configDir, now: at });
+      return { ok: true, ...registrySnapshot(registry, { now: at, quotas }) };
+    } catch (error) {
+      return { ok: false, error: sanitizeTerminalText(error.message) };
+    }
+  };
+}
+
 // --- агрегатор -----------------------------------------------------------------
 
 export function createControlRoomAggregator({
@@ -305,6 +320,7 @@ export function createControlRoomAggregator({
   branchDriftProvider = null,
   netHealth = null,
   telemetryProvider = async () => null,
+  modelsProvider = createModelsProvider(),
   inspectProvider = async () => ({ text: '', artifacts: [] }),
   webDir = WEB_DIR,
   now = () => Date.now(),
@@ -436,6 +452,10 @@ export function createControlRoomAggregator({
     const drift = branchDriftProvider
       ? await branchDriftProvider().catch(() => ({ driftDetected: null, error: true }))
       : null;
+    const models = modelsProvider
+      ? await Promise.resolve().then(() => modelsProvider())
+        .catch(error => ({ ok: false, error: sanitizeTerminalText(error.message) }))
+      : null;
     const sessions = sessionHygiene(threads, tasks, attempts);
     const shiva = shivaCounter(threads, tasks);
     const reconciled = reconcileNeeded;
@@ -451,6 +471,7 @@ export function createControlRoomAggregator({
       branchDrift: drift,
       netHealth: net,
       telemetry,
+      models,
       eventsTail: ring.slice(-50),
       attemptsTracked: attempts.size,
     };
@@ -580,6 +601,7 @@ export function createControlRoomAggregator({
 // CLI: node aggregator.mjs [--port N] [--socket PATH] [--state-dir DIR]
 //   [--board-url URL] [--board-channels a,b] [--board-token TOK]
 //   [--drift-repo DIR ...] [--net-probe name=url ...]
+//   [--models-catalog PATH] [--routing-policy PATH]
 async function loadBoardToken(flagValue) {
   if (typeof flagValue === 'string' && flagValue) return flagValue;
   const envToken = process.env.BOARD_TOKEN;
@@ -613,7 +635,9 @@ async function cli(argv) {
     'drift-repo': { type: 'string', multiple: true },
     'drift-ttl': { type: 'string' },
     'net-probe': { type: 'string', multiple: true },
-    'cloud-state': { type: 'string' } } });
+    'cloud-state': { type: 'string' },
+    'models-catalog': { type: 'string' },
+    'routing-policy': { type: 'string' } } });
   const port = values.port !== undefined ? Number(values.port)
     : Number(process.env.DF_CONTROL_ROOM_PORT ?? DEFAULT_PORT);
   const socketPath = values.socket !== undefined ? values.socket
@@ -641,7 +665,10 @@ async function cli(argv) {
     netHealth,
     boardTasksProvider: observeBoard.fetchTasks,
     bbThreadsProvider: () => loadBbThreadsFromCli(),
-    branchDriftProvider: driftProvider });
+    branchDriftProvider: driftProvider,
+    modelsProvider: createModelsProvider({
+      catalogPath: values['models-catalog'],
+      policyPath: values['routing-policy'] }) });
   const { port: actual } = await aggregator.start();
   console.log(JSON.stringify({ control_room: 'listening', host: '127.0.0.1', port: actual,
     socket: socketPath, boardApi: observeBoard.boardUrl, boardChannels: channels,
