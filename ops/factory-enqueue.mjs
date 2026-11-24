@@ -5,16 +5,25 @@
 // Все проверки — до любого эффекта; --dry-run печатает план без вызова vb.
 //
 //   node ops/factory-enqueue.mjs \
-//     --board-url URL --channel CH --title T --repo-id R --profile P \
-//     --finish verified|deployed \
-//     (--spec-digest HEX64 | --brief FILE) (--policy-digest HEX64 | --policy FILE) \
+//     --board-url URL --channel CH (--title T | --text BODY) \
+//     --repo-id R --profile P --finish verified|deployed \
+//     (--spec-digest HEX64 | --brief FILE) \
+//     (--policy-digest HEX64 | --policy FILE) \
 //     [--label k=v ...] [--ticket ID] [--worktree DIR] [--memory-dir DIR] \
 //     [--ledger-path FILE] [--vb PATH] [--dry-run] [--json]
+//
+// --policy FILE: дайджест считается так же, как контроллер закрепляет
+// входы при приёмке — sha256 JSON-массива sha256-хэшей файлов маршрута
+// [policyFile, brief, reviewPrompt, reviewGate, routes.json, ...skillPaths]
+// (board_pipeline/run-isolated.mjs readOperatorInputs); иначе метка
+// policy_digest не сойдётся с отпечатком и seal вернёт policy_digest_drift.
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
+import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
 
 const execFileAsync = promisify(execFile);
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -24,23 +33,45 @@ const RESERVED_LABELS = new Set(
 
 function fail(code) { throw new Error(code); }
 
-// Канонический путь существующего файла/каталога: без симлинка на самом пути,
-// resolved — не внутри worktree (если worktree задан).
+// Канонический путь существующего входа: без симлинка ни на конечном пути,
+// ни среди предков (отсечение обхода вида wt/link -> внешний файл), и ни
+// буквальный, ни resolved путь не лежат внутри worktree (если задан).
 async function canonicalInput(path, { worktreeReal, mustBe } = {}) {
   if (typeof path !== 'string' || !path) fail('path_required');
-  const st = await lstat(path).catch(() => fail('path_missing'));
+  const literal = resolve(path);
+  if (worktreeReal && (literal === worktreeReal || literal.startsWith(`${worktreeReal}/`))) {
+    fail('path_inside_worktree');
+  }
+  // Симлинк-предок внутри worktree (wt/link -> наружу) отсекается проверкой
+  // буквального пути выше; предок снаружи, ведущий внутрь worktree, —
+  // сверкой realpath ниже. Проверка каждого предка отклоняла бы легальные
+  // входы под симлинкованными tmp/монтированиями.
+  const st = await lstat(literal).catch(() => fail('path_missing'));
   if (st.isSymbolicLink()) fail('path_symlink_refused');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
-  const real = await realpath(path);
+  const real = await realpath(literal);
   if (worktreeReal && (real === worktreeReal || real.startsWith(`${worktreeReal}/`))) {
     fail('path_inside_worktree');
   }
   return real;
 }
 
-async function digestOf(path) {
-  return createHash('sha256').update(await readFile(path)).digest('hex');
+const sha256File = async path =>
+  createHash('sha256').update(await readFile(path)).digest('hex');
+
+// Тот же отпечаток, что контроллер запишет в route.policyDigest и приёмка
+// сверит с меткой карточки на seal (readOperatorInputs, run-isolated.mjs).
+async function pinnedPolicyDigest(policyFile) {
+  const file = await realpath(policyFile);
+  const policy = JSON.parse(await readFile(file, 'utf8'));
+  const reviewSetup = await operatorReviewSetup(policy);
+  const files = [file, await realpath(policy.brief), await realpath(policy.reviewPrompt),
+    await realpath(policy.reviewGate),
+    await realpath(join(dirname(await realpath(policy.reviewGate)), 'routes.json')),
+    ...reviewSetup.skillPaths];
+  const hashes = await Promise.all(files.map(sha256File));
+  return createHash('sha256').update(JSON.stringify(hashes)).digest('hex');
 }
 
 // Собирает проверенный план вызова `vb tasks create`. Ничего не исполняет.
@@ -57,20 +88,21 @@ export async function buildEnqueuePlan(values) {
     ['profile_id', values.profile]]) {
     if (typeof v !== 'string' || !v.trim()) fail(`${flag}_required`);
   }
-  if (values.title === undefined && values.text === undefined) fail('title_or_text_required');
-  if (values.title !== undefined && !String(values.title).trim()) fail('title_required');
-  if (values.text !== undefined && !String(values.text).trim()) fail('text_required');
+  const title = values.title ?? values.text;
+  if (typeof title !== 'string' || !title.trim()) fail('title_or_text_required');
   if (!FINISH.has(values.finish)) fail('finish_invalid');
 
   const worktreeReal = values.worktree === undefined ? null
     : await canonicalInput(values.worktree, { mustBe: 'dir' });
   let specDigest = values['spec-digest'];
   if (values.brief !== undefined) {
-    specDigest = await digestOf(await canonicalInput(values.brief, { worktreeReal, mustBe: 'file' }));
+    specDigest = await sha256File(
+      await canonicalInput(values.brief, { worktreeReal, mustBe: 'file' }));
   }
   let policyDigest = values['policy-digest'];
   if (values.policy !== undefined) {
-    policyDigest = await digestOf(await canonicalInput(values.policy, { worktreeReal, mustBe: 'file' }));
+    policyDigest = await pinnedPolicyDigest(
+      await canonicalInput(values.policy, { worktreeReal, mustBe: 'file' }));
   }
   if (!HEX64.test(specDigest ?? '')) fail('spec_digest_invalid');
   if (!HEX64.test(policyDigest ?? '')) fail('policy_digest_invalid');
@@ -97,9 +129,8 @@ export async function buildEnqueuePlan(values) {
     labels[key] = item.slice(i + 1);
   }
 
-  const argv = ['tasks', 'create', '--board-url', url, '--channel', values.channel];
-  if (values.title !== undefined) argv.push('--title', values.title);
-  if (values.text !== undefined) argv.push('--text', values.text);
+  // Реальный синтаксис vb: `vb --url URL tasks create CHANNEL TITLE --label k=v --json`.
+  const argv = ['--url', url, 'tasks', 'create', values.channel, title];
   for (const [key, value] of Object.entries(labels)) argv.push('--label', `${key}=${value}`);
   argv.push('--json');
   return { tool: values.vb ?? 'vb', argv, labels,

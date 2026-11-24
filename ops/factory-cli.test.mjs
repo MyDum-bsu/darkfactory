@@ -2,6 +2,7 @@
 // Без внешних зависимостей и host-путей: все эффекты через внедряемые
 // runner'ы, временные каталоги удаляются в finally.
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +16,8 @@ import { buildRunPlan, forbiddenModelViolation, modelViolation, runFactory }
 const execFileAsync = promisify(execFile);
 const HEX = 'a'.repeat(64);
 const HEX2 = 'b'.repeat(64);
+const sha256Text = text => createHash('sha256').update(text).digest('hex');
+const sha256File = async path => createHash('sha256').update(await readFile(path)).digest('hex');
 
 async function tempdir() {
   return mkdtemp(join(tmpdir(), 'factory-cli-'));
@@ -28,8 +31,10 @@ const baseValues = () => ({
 test('enqueue: валидный план и dry-run', async () => {
   const plan = await buildEnqueuePlan(baseValues());
   assert.equal(plan.tool, 'vb');
-  assert.deepEqual(plan.argv.slice(0, 2), ['tasks', 'create']);
-  assert.ok(plan.argv.includes('--board-url'));
+  // Реальный синтаксис vb: vb --url URL tasks create CHANNEL TITLE --label k=v --json
+  assert.deepEqual(plan.argv.slice(0, 5),
+    ['--url', 'https://board.example', 'tasks', 'create', 'ops']);
+  assert.equal(plan.argv[5], 'T');
   const labels = plan.argv.filter((a, i) => plan.argv[i - 1] === '--label');
   assert.ok(labels.includes(`spec_digest=${HEX}`));
   assert.ok(labels.includes(`policy_digest=${HEX2}`));
@@ -50,7 +55,7 @@ test('enqueue: mocked runner получает собранные argv', async ()
     { exec: async (cmd, argv) => { calls.push([cmd, argv]); return '{"id":1}'; } });
   assert.equal(result.dryRun, false);
   assert.equal(calls.length, 1);
-  assert.ok(calls[0][1].includes('--text'));
+  assert.ok(calls[0][1].includes('body'));
 });
 
 test('enqueue: отказы до эффекта', async () => {
@@ -85,11 +90,46 @@ test('enqueue: brief/policy файлы, симлинк и путь внутри 
     await writeFile(inner, 'x');
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), 'spec-digest': undefined,
       brief: inner, worktree }), /path_inside_worktree/);
-    // Симлинк — отказ.
+    // Симлинк внутри worktree на внешний каталог: буквальный путь отклоняется
+    // до чтения файла и создания карточки.
+    const linkDir = join(worktree, 'link');
+    await symlink(dir, linkDir);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), 'spec-digest': undefined,
+      brief: join(linkDir, 'brief.md'), worktree }), /path_inside_worktree/);
+    // Симлинк на конечном пути — отказ.
     const link = join(dir, 'link.md');
     await symlink(brief, link);
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), 'spec-digest': undefined,
       brief: link, worktree }), /path_symlink_refused/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// --policy FILE: метка policy_digest — тот же отпечаток закреплённых входов,
+// что контроллер проверяет на seal (sha256 JSON-массива sha256 файлов).
+test('enqueue: --policy вычисляет закреплённый policy_digest контроллера', async () => {
+  const dir = await tempdir();
+  try {
+    const brief = join(dir, 'brief.md');
+    const reviewPrompt = join(dir, 'review.md');
+    const gate = join(dir, 'gate', 'board-review.mjs');
+    const routes = join(dir, 'gate', 'routes.json');
+    const policyFile = join(dir, 'policy.json');
+    await mkdir(join(dir, 'gate'));
+    await writeFile(brief, 'b');
+    await writeFile(reviewPrompt, 'r');
+    await writeFile(gate, 'g');
+    await writeFile(routes, '{}');
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate,
+      route: { checkProfile: 'p' }, profiles: { p: {} },
+    }));
+    const plan = await buildEnqueuePlan({ ...baseValues(), 'policy-digest': undefined,
+      policy: policyFile });
+    const expected = sha256Text(JSON.stringify(await Promise.all(
+      [policyFile, brief, reviewPrompt, gate, routes].map(sha256File))));
+    assert.equal(plan.labels.policy_digest, expected);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -104,7 +144,7 @@ const policySpec = worktree => ({
 });
 
 async function withPolicy(dir, policy) {
-  const file = join(dir, 'policy.json');
+  const file = join(dir, `policy-${Math.random().toString(36).slice(2)}.json`);
   await writeFile(file, JSON.stringify(policy));
   return file;
 }
@@ -143,7 +183,7 @@ test('run: отказ без явных --provider/--model и при несов�
   }
 });
 
-test('run: запрещённая модель в CLI, критике и арбитре отклоняется', async () => {
+test('run: запрещённая модель в CLI, критике, арбитре и allowlist отклоняется', async () => {
   const dir = await tempdir();
   try {
     const wt = join(dir, 'wt');
@@ -156,24 +196,37 @@ test('run: запрещённая модель в CLI, критике и арб�
     const f1 = await withPolicy(dir, badCritic);
     await assert.rejects(() => buildRunPlan(runValues(f1, 's')), /disallowed:critic/);
     const badArbiter = { ...policySpec(wt), arbiter: { provider: 'pi', model: 'acp-zcode-start/x' } };
-    const f2 = join(dir, 'p2.json');
-    await writeFile(f2, JSON.stringify(badArbiter));
+    const f2 = await withPolicy(dir, badArbiter);
     await assert.rejects(() => buildRunPlan(runValues(f2, 's')), /zcode.*:arbiter/);
+    // Кандидат в routing.allowlist.critic с активным роутингом — тот же запрет.
+    const routed = { ...policySpec(wt),
+      routing: { mode: 'active', allowlist: {
+        critic: [{ provider: 'openai', model: 'gpt-6.2-sol' },
+          { provider: 'openai', model: 'gpt-6.1-terra' }] } } };
+    const f3 = await withPolicy(dir, routed);
+    await assert.rejects(() => buildRunPlan(runValues(f3, 's')),
+      /disallowed:routing\.allowlist\.critic/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-async function initGitRepo(dir) {
-  const git = args => execFileAsync('git', ['-C', dir, ...args]);
-  await git(['init']);
-  await git(['config', 'user.email', 't@t']);
-  await git(['config', 'user.name', 't']);
-  await writeFile(join(dir, 'f.txt'), 'x');
-  await git(['add', 'f.txt']);
-  await git(['commit', '-m', 'init']);
-  return args => execFileAsync('git', ['-C', dir, ...args]);
-}
+test('run: --worktree обязан совпадать с policy.route.worktree', async () => {
+  const dir = await tempdir();
+  try {
+    const wt = join(dir, 'wt');
+    const other = join(dir, 'other');
+    await mkdir(wt);
+    await mkdir(other);
+    const policy = await withPolicy(dir, policySpec(wt));
+    const plan = await buildRunPlan(runValues(policy, 's', { worktree: wt }));
+    assert.equal(plan.worktree, wt);
+    await assert.rejects(() => buildRunPlan(runValues(policy, 's', { worktree: other })),
+      /worktree_mismatch/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test('run: валидный dry-run печатает план без вызова контроллера', async () => {
   const dir = await tempdir();
@@ -194,14 +247,24 @@ test('run: валидный dry-run печатает план без вызов�
       ['--execute', '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50']);
     assert.deepEqual(gitCalls, [['-C', wt, 'rev-parse', '--is-inside-work-tree']]);
     // Не-git worktree в dry-run — отказ.
-    gitCalls.length = 0;
-    const notGit = async () => 'false\n';
+    const notGit = async () => 'false';
     await assert.rejects(() => runFactory([...args, '--dry-run'], { git: notGit }),
       /worktree_not_git/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+async function initGitRepo(dir) {
+  const git = args => execFileAsync('git', ['-C', dir, ...args]);
+  await git(['init']);
+  await git(['config', 'user.email', 't@t']);
+  await git(['config', 'user.name', 't']);
+  await writeFile(join(dir, 'f.txt'), 'x');
+  await git(['add', 'f.txt']);
+  await git(['commit', '-m', 'init']);
+  return args => execFileAsync('git', ['-C', dir, ...args]);
+}
 
 let gitAvailable;
 async function probeGit() {
@@ -224,19 +287,19 @@ test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', policy, '--state', state];
     const calls = [];
-    const result = await runFactory(args, { run: async (cmd, argv) => {
-      calls.push(argv); return { status: 0 };
+    const result = await runFactory(args, { run: async (cmd, argv, env) => {
+      calls.push({ argv, env }); return { code: 0 };
     } });
     assert.equal(result.dryRun, false);
     assert.equal(calls.length, 1);
-    assert.ok(calls[0][0].endsWith('run-isolated.mjs'));
+    assert.ok(calls[0].argv[0].endsWith('run-isolated.mjs'));
     assert.equal((await git(['config', '--local', 'core.fileMode'])).stdout.trim(), 'false');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test('run: memory/ledger вне worktree, симлинк отклоняется', async () => {
+test('run: memory/ledger вне worktree, симлинк и mismatch отклоняются', async () => {
   const dir = await tempdir();
   try {
     const wt = join(dir, 'wt');
@@ -249,20 +312,40 @@ test('run: memory/ledger вне worktree, симлинк отклоняется'
     await writeFile(insideLedger, '');
     const link = join(dir, 'link');
     await symlink(ledger, link);
-    const badPolicy = { ...policySpec(wt), decisionLedger: insideLedger };
-    const f1 = join(dir, 'p1.json');
-    await writeFile(f1, JSON.stringify(badPolicy));
     const state = join(dir, 'st');
+
+    // Путь политики внутрь worktree — отказ даже при внешнем CLI-флаге.
+    const badPolicy = { ...policySpec(wt), decisionLedger: insideLedger };
+    const f1 = await withPolicy(dir, badPolicy);
     await assert.rejects(() => buildRunPlan(runValues(f1, state)),
       /path_inside_worktree/);
+    // CLI-флаг против закреплённого в политике пути — mismatch, не молчаливый override.
+    await assert.rejects(() => buildRunPlan(runValues(f1, state, { 'ledger-path': ledger })),
+      /decision_ledger_mismatch|path_inside_worktree/);
+    // Симлинк — отказ.
     const ok = await withPolicy(dir, policySpec(wt));
-    await assert.rejects(() => buildRunPlan(
-      runValues(ok, state, { 'ledger-path': link })), /path_symlink_refused/);
-    const okPolicy = { ...policySpec(wt), decisionLedger: ledger, projectMemory: memory };
-    const f2 = join(dir, 'p2.json');
-    await writeFile(f2, JSON.stringify(okPolicy));
-    const plan = await buildRunPlan(runValues(f2, state));
-    assert.ok(plan.argv.includes('--execute'));
+    await assert.rejects(() => buildRunPlan(runValues(ok, state, { 'ledger-path': link })),
+      /path_symlink_refused/);
+    // storeDir projectMemory внутри worktree — отказ.
+    const badMem = { ...policySpec(wt), projectMemory: { storeDir: join(wt, 'mem') } };
+    const f2 = await withPolicy(dir, badMem);
+    await assert.rejects(() => buildRunPlan(runValues(f2, state)), /path_missing|inside/);
+    // Полный канон: строковый ledger, объектный memory — проходят; env-fallback тоже.
+    const okPolicy = { ...policySpec(wt), decisionLedger: ledger,
+      projectMemory: { storeDir: memory } };
+    const f3 = await withPolicy(dir, okPolicy);
+    const plan = await buildRunPlan(runValues(f3, state));
+    assert.equal(plan.ledger, ledger);
+    assert.equal(plan.memory, memory);
+    assert.equal(plan.env.DF_DECISION_LEDGER_PATH, undefined);
+    // CLI-флаг при отсутствии пути в политике → передаётся контроллеру через env.
+    const plan2 = await buildRunPlan(runValues(ok, state, { 'ledger-path': ledger }));
+    assert.equal(plan2.env.DF_DECISION_LEDGER_PATH, ledger);
+    // env-fallback контроллера учитывается при проверке.
+    const envLedger = join(wt, 'env-ledger.jsonl');
+    await writeFile(envLedger, '');
+    await assert.rejects(() => buildRunPlan(runValues(ok, state),
+      { env: { DF_DECISION_LEDGER_PATH: envLedger } }), /path_inside_worktree/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

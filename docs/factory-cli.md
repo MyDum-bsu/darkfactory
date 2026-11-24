@@ -1,11 +1,13 @@
 # Фабрика: единый CLI Лида
 
-Два тонких входа для оператора-Лида. Оба — только встроенные модули Node,
-все проверки до любого эффекта, `--dry-run` печатает план без вызова.
+Два тонких входа для оператора-Лида. Оба — только встроенные модули Node
+и модули `board_pipeline/`, все проверки до любого эффекта, `--dry-run`
+печатает план без вызова.
 
 ## Постановка задачи — `ops/factory-enqueue.mjs`
 
-Безопасная постановка одной карточки на Board через `vb tasks create`.
+Безопасная постановка одной карточки на Board через
+`vb --url URL tasks create CHANNEL TITLE --label k=v --json`.
 Без обхода очереди, без claim/spawn — исполнение остаётся за контроллером.
 
 ```sh
@@ -22,12 +24,19 @@ node ops/factory-enqueue.mjs \
 Обязательные: `--board-url` (http/https), `--channel`, `--title` или
 `--text`, `--repo-id`, `--profile`, `--finish` (`verified`|`deployed`),
 `--spec-digest` или `--brief`, `--policy-digest` или `--policy`.
-Дайджесты файлов считаются sha256 самим CLI. Контрактные метки
-(`spec_digest`, `policy_digest`, `repo_id`, `profile_id`, `finish`)
-резервированы: `--label` их не переопределяет.
+Контрактные метки (`spec_digest`, `policy_digest`, `repo_id`,
+`profile_id`, `finish`) резервированы: `--label` их не переопределяет.
 
-Проверки путей до эффекта: `lstat`+`realpath`, симлинк — отказ, путь
-внутри `--worktree` — отказ.
+**Дайджесты.** `--brief` → `spec_digest` = sha256 файла. `--policy` →
+`policy_digest` считается ровно как закреплённый отпечаток контроллера
+(`readOperatorInputs`): sha256 JSON-массива sha256-хэшей файлов маршрута
+`[policyFile, brief, reviewPrompt, reviewGate, routes.json, ...skillPaths]`.
+Только так метка карточки сходится с отпечатком приёмки — иначе seal
+завершится `policy_digest_drift` после всех проверок.
+
+**Проверки путей** до эффекта: `lstat` на конечном пути (симлинк — отказ),
+сверка буквального и resolved пути с `--worktree` — вход внутри worktree
+(включая через симлинк-предок `wt/link/...`) отклоняется до чтения файла.
 
 ## Запуск контроллера — `ops/factory-run.mjs`
 
@@ -50,34 +59,41 @@ node ops/factory-run.mjs \
   включая вложенные `pi/a/b/...`): `gpt-6.1-terra`, `zcode` /
   `acp-zcode-start`, `glm` / `glm-*`.
 - Проверка применяется к CLI-спеке, `policy.bb`, критику профиля
-  (`profiles[route.checkProfile].review`) и `policy.arbiter`, плюс
-  `opencodeGoPolicyViolation` и `retiredProviderViolation` из
-  `board_pipeline/worker-selector.mjs`.
+  (`profiles[route.checkProfile].review`), `policy.arbiter` **и каждому
+  кандидату `policy.routing.allowlist.{worker,critic,arbiter}`** —
+  активный роутинг закрепляет кандидата скоркардом, поэтому запрет
+  действует до запуска. Плюс `opencodeGoPolicyViolation` и
+  `retiredProviderViolation` из `board_pipeline/worker-selector.mjs`.
 
 ### NTFS `core.fileMode false` guard
 
-Перед запуском worktree (`--worktree` или `policy.route.worktree`)
-проверяется как валидный git worktree (`git rev-parse
---is-inside-work-tree`), затем локально выставляется
-`git -C <worktree> config --local core.fileMode false` — checkout на
-не-POSIX ФС не должен ломать учёт executable-бита.
+Worktree берётся из `policy.route.worktree`; `--worktree` может только
+подтвердить тот же канонический путь — несовпадающий override отклоняется
+(`worktree_mismatch`), иначе guard менял бы конфиг чужого репозитория.
+До запуска проверяется `git rev-parse --is-inside-work-tree`, затем
+локально `git -C <worktree> config --local core.fileMode false`.
 
 ### Чистый старт с Project Memory и Owner Decision Ledger
 
-Пути берутся из `--memory-dir` / `--ledger-path` или из политики
-(`projectMemory`, `decisionLedger`; строка или `{ path }`). Каждый заданный
-путь проверяется каноничным (`lstat` без симлинка, `realpath`) и
-обязан лежать строго вне worktree.
+Проверяется тот путь, что реально использует контроллер:
+`--ledger-path`/`--memory-dir` > `policy.decisionLedger`/`policy.projectMemory`
+(строка или `{path}`/`{storeDir|dir|path}`) > `DF_DECISION_LEDGER_PATH`/
+`DF_PROJECT_MEMORY_DIR`. CLI-флаг против закреплённого в политике пути —
+`*_mismatch`, отказ. CLI-override без конфликта передаётся контроллеру
+через соответствующий env. Каждый путь — каноничный (не симлинк) и строго
+вне worktree.
 
 ### Делегирование
 
-После валидации вызывается ровно:
+После валидации запускается ровно:
 
 ```
 node board_pipeline/run-isolated.mjs --execute --policy <policy> --state <state> [passthrough]
 ```
 
-`--dry-run` печатает валидированный JSON-план без вызова контроллера.
+через `spawn` со `stdio:'inherit'` — вывод контроллера виден по мере
+работы, буферизованный `execFile` убивал бы долгий демон по maxBuffer.
+`--dry-run` печатает валидированный JSON-план без вызова.
 
 ## Правило «Шивы»
 
