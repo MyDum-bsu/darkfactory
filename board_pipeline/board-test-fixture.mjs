@@ -23,7 +23,6 @@ const CLAIM_LOST = () => {
 export function memoryBoard({ actor = 'board:client' } = {}) {
   const messages = new Map();
   let seq = 0;
-  let claimSeq = 0;
 
   const expired = task =>
     task.state === 'claimed' && task.claim !== null && Date.now() >= Date.parse(task.claim.until);
@@ -49,7 +48,6 @@ export function memoryBoard({ actor = 'board:client' } = {}) {
     return {
       epoch: heldEpoch,
       until: task.claimRec.until,
-      token,
       async renew(lease) {
         held();
         task.claimRec.until = new Date(Date.now() + lease * 1000).toISOString();
@@ -96,10 +94,7 @@ export function memoryBoard({ actor = 'board:client' } = {}) {
       if (!task) throw CLAIM_LOST();
       if (task.state !== 'ready' && !expired(task)) throw CLAIM_CONFLICT();
       task.epoch += 1;
-      // Как у настоящего бэкенда: без явного токена сервер его генерирует
-      // (формат тот, что проверяет adopt — 43 символа [a-zA-Z0-9_-]).
-      task.claimRec = { epoch: task.epoch,
-        token: token ?? `native-${++claimSeq}`.padEnd(43, 'x'),
+      task.claimRec = { epoch: task.epoch, token: token ?? null,
         until: new Date(Date.now() + lease * 1000).toISOString() };
       task.state = 'claimed';
       task.claim = { actor, until: task.claimRec.until };
@@ -154,12 +149,7 @@ export function memoryBoard({ actor = 'board:client' } = {}) {
     async label(id, change) {
       const message = messages.get(id);
       if (!message) throw new Error('No task root');
-      // Семантика бэкенда: set — слияние значений, unset — снятие меток;
-      // прочие ключи изменения применяются напрямую, как раньше.
-      message.labels ??= {};
-      const { set, unset, ...rest } = change ?? {};
-      Object.assign(message.labels, rest, set ?? {});
-      for (const key of unset ?? []) delete message.labels[key];
+      Object.assign(message.labels, change);
     },
   };
 }

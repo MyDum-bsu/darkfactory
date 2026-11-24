@@ -209,9 +209,9 @@ test('enqueue: дефолт node, авто python-node, явный --l1-profile'
   for (const repo of ['optimization', 'autoresearcher']) {
     const plan = await buildEnqueuePlan({ ...baseValues(), 'repo-id': repo });
     assert.equal(plan.meta.l1Profile, 'python-node');
-    // Авто-дефолт на карточку не пишется: записанная метка — контрактный
-    // явный выбор и ложно конфликтовала бы с явным l1Profile политики.
-    assert.equal(plan.labels.l1_profile, undefined);
+    // Нестандартный авто-дефолт репозитория фиксируется на карточке:
+    // приёмка видит тот же явный выбор, что и постановка.
+    assert.equal(plan.labels.l1_profile, 'python-node');
   }
   const explicit = await buildEnqueuePlan({ ...baseValues(),
     'l1-profile': 'python-node' });
@@ -364,6 +364,22 @@ test('run: l1Profile — дефолт, авто-репозиторий, mismatch
     const otherFile = join(dir, 'policy-other.json');
     await writeFile(otherFile, JSON.stringify(other));
     await assert.rejects(() => buildRunPlan(values(otherFile), { env: {} }),
+      /unknown_l1_profile:bogus/);
+    // Явный l1Profile рецепта проверок — контрактный источник: конфликт
+    // с --l1-profile отклоняется buildRunPlan (тот же отказ, что дал бы
+    // dry-run), невалидное значение — fail-closed unknown_l1_profile.
+    const recipePinned = JSON.parse(await readFile(fPlain, 'utf8'));
+    recipePinned.profiles.default.checks = [{ l1Profile: 'python-node',
+      argv: ['npm', 'test'], cwd: '.', timeoutMs: 1000 }];
+    const recipeFile = join(dir, 'policy-recipe.json');
+    await writeFile(recipeFile, JSON.stringify(recipePinned));
+    await assert.rejects(() => buildRunPlan(
+      values(recipeFile, { 'l1-profile': 'node' }), { env: {} }),
+      /l1_profile_mismatch/);
+    recipePinned.profiles.default.checks[0].l1Profile = 'bogus';
+    const recipeBadFile = join(dir, 'policy-recipe-bad.json');
+    await writeFile(recipeBadFile, JSON.stringify(recipePinned));
+    await assert.rejects(() => buildRunPlan(values(recipeBadFile), { env: {} }),
       /unknown_l1_profile:bogus/);
   } finally {
     await rm(dir, { recursive: true, force: true });

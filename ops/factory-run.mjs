@@ -220,6 +220,12 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     if (profile?.l1Profile !== undefined && !isValidL1Profile(profile.l1Profile)) {
       fail(`unknown_l1_profile:${String(profile.l1Profile)}`);
     }
+    for (const recipe of [...(profile?.checks ?? []),
+      ...(profile?.visual === undefined ? [] : [profile.visual])]) {
+      if (recipe?.l1Profile !== undefined && !isValidL1Profile(recipe.l1Profile)) {
+        fail(`unknown_l1_profile:${String(recipe.l1Profile)}`);
+      }
+    }
   }
   if (values['l1-profile'] !== undefined && !isValidL1Profile(values['l1-profile'])) {
     fail(`unknown_l1_profile:${String(values['l1-profile'])}`);
@@ -301,6 +307,19 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // worktree и handoffDir ниже (handoffDir вычисляется позже).
   const mountFroms = [];
   for (const recipe of runRecipes) {
+    // Явный l1Profile рецепта проверок — тот же контрактный источник:
+    // расхождение с --l1-profile или закреплённым l1Profile профиля —
+    // отказ до эффектов, как в контроллере (l1_profile_mismatch).
+    if (recipe?.l1Profile !== undefined) {
+      if (values['l1-profile'] !== undefined &&
+          values['l1-profile'] !== recipe.l1Profile) {
+        fail('l1_profile_mismatch');
+      }
+      if (runProfile?.l1Profile !== undefined &&
+          runProfile.l1Profile !== recipe.l1Profile) {
+        fail('l1_profile_mismatch');
+      }
+    }
     for (const mount of recipe?.mounts ?? []) {
       const from = mount?.from;
       const to = mount?.to;

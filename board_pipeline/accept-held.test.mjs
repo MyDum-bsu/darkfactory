@@ -9,20 +9,9 @@ import { acceptHeld } from './acceptance.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
 import { loadSdk } from './sdk.mjs';
-import { memoryBoardSdk } from './board-test-fixture.mjs';
 import { NEON_CRITIC, NEON_ISOLATION, SOL_ARBITER } from './review-policy.mjs';
 
-// Детерминированный check-контейнер (rootless Docker, --network=none) не
-// содержит приватного host-SDK: там тесты идут на in-memory Board той же
-// формы. На хосте с установленным SDK — как и раньше через loadSdk.
-function sdk() {
-  try {
-    return loadSdk();
-  } catch (error) {
-    if (error?.code !== 'MODULE_NOT_FOUND' && error?.code !== 'ERR_MODULE_NOT_FOUND') throw error;
-    return memoryBoardSdk();
-  }
-}
+const { board, local } = loadSdk();
 
 const BASE = '0'.repeat(40);
 const CAND = 'a'.repeat(40);
@@ -37,7 +26,6 @@ function tmpJournal() {
 
 // Изолированная доска: настоящий native claim/held, никакой заглушки статуса.
 async function isolated(t) {
-  const { board, local } = sdk();
   const backend = local({ memory: true });
   t.after(() => backend.close());
   const handle = board({ backend });
@@ -689,9 +677,6 @@ test('неполный контракт попытки отклоняется д
 
 test('tree_sha берётся из реального снимка: контракт без tree_sha проходит приёмку', async (t) => {
   const { execFileSync } = await import('node:child_process');
-  // В check-контейнере нет git-бинарника — сценарий реальной инспекции
-  // пропускается там, как git-тесты ops/factory-cli.test.mjs.
-  try { execFileSync('git', ['--version']); } catch { return t.skip('git binary unavailable'); }
   const { worktreeInspector } = await import('./runtime.mjs');
   const { mkdtemp } = await import('node:fs/promises');
   const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args],
