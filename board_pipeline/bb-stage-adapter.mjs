@@ -259,14 +259,16 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
         if (current?.thread?.parentThreadId !== parentThread || current?.thread?.projectId !== project ||
             !(current?.environment === null || current?.environment === undefined ||
               current?.environment?.path === workspace)) continue;
-        // Маркер доказывает запуск только в исходном запросе на старт треда:
-        // поздняя цитата challenge в другом событии соседнего треда — не
-        // подтверждение нашего spawn.
+        // Маркер доказывает запуск только в ПЕРВОМ запросе на старт треда
+        // (исходный spawn): поздний tell тоже создаёт client/turn/requested
+        // и может цитировать challenge — не подтверждение нашего запуска.
         let events = null;
         try { events = await run(['thread', 'log', item.id, '--all', '--json']); } catch { continue; }
         const entries = Array.isArray(events) ? events : (Array.isArray(events?.events) ? events.events : []);
-        if (!entries.some(entry => entry?.type === 'client/turn/requested' &&
-            JSON.stringify(entry).includes(challenge))) continue;
+        const first = entries.filter(entry => entry?.type === 'client/turn/requested')
+          .reduce((min, entry) => (min === null ||
+              (Number.isSafeInteger(entry.seq) && entry.seq < min.seq) ? entry : min), null);
+        if (!first || !JSON.stringify(first.data?.input ?? first.data ?? null).includes(challenge)) continue;
         await stopThread(item.id);
       }
     };

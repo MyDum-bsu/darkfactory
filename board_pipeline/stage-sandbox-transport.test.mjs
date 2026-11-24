@@ -294,23 +294,41 @@ test('stageDockerSandbox пробрасывает signal в runInReadOnlySandbox
   assert.deepEqual(result, { code: 0, stdout: '' });
 });
 
-test('abort во время docker run: отказ возвращается только после завершения удаления контейнера', async t => {
+test('abort во время docker run через stageDockerSandbox: отказ после удаления именно этого контейнера', async t => {
   const { enrolled } = await probeStageSandboxCapability('docker-ro-v1');
   if (!enrolled) return t.skip('rootless Docker недоступен на хосте');
   const image = await exec('docker', ['image', 'inspect', REVIEW_IMAGE], { timeout: 10_000 }).catch(() => null);
   if (!image) return t.skip('закреплённый образ ревью отсутствует локально');
   const empty = await mkdtemp(join(tmpdir(), 'df-stage-abort-'));
   t.after(() => rm(empty, { recursive: true, force: true }));
+  const fakeSock = join(empty, 'upstream.sock');
+  await writeFile(fakeSock, '');
+  const containers = async () => (await exec('docker',
+    ['ps', '-aq', '--filter', 'name=board-review-'], { timeout: 10_000 }))
+    .stdout.split('\n').map(line => line.trim()).filter(Boolean);
+  const before = new Set(await containers());
   const controller = new AbortController();
-  const pending = runInReadOnlySandbox({ snapshot: empty, timeoutMs: 60_000,
-    argv: ['node', '-e', 'setTimeout(()=>{},60000)'], signal: controller.signal });
-  // Даём контейнеру стартовать, затем абортируем — обработчик отмены
-  // начинает rm -f именованного контейнера.
-  await new Promise(resolve => setTimeout(resolve, 1500));
+  // Запуск идёт именно через обёртку stageDockerSandbox с реальным
+  // runInReadOnlySandbox: abort должен добить контейнер ЭТОГО запуска.
+  const started = Date.now();
+  const pending = stageDockerSandbox({ allow: ['api.openai.com:443'], snapshot: empty,
+    argv: ['/bin/sh', '-c', 'sleep 60'], timeoutMs: 60_000, signal: controller.signal }, {
+    withProxy: async (opts, cb) => cb(fakeSock) });
+  // Подтверждённый старт: ждём появления нового контейнера (diff со снимком
+  // до запуска — параллельные чужие контейнеры не путаются).
+  let ours = null;
+  for (let poll = 0; poll < 40 && ours === null; poll++) {
+    const fresh = (await containers()).filter(id => !before.has(id));
+    if (fresh.length) ours = fresh[0];
+    else await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  assert.ok(ours, 'контейнер этого запуска обязан появиться до abort');
   controller.abort(new Error('kill_switch'));
   await assert.rejects(pending, /kill_switch/);
-  // Отказ пришёл только после завершения cleanup: контейнера уже нет.
-  const { stdout } = await exec('docker', ['ps', '-aq', '--filter', 'name=board-review-'],
-    { timeout: 10_000 });
-  assert.equal(stdout.trim(), '', 'осиротевших board-review контейнеров не остаётся');
+  assert.ok(Date.now() - started < 30_000,
+    'отмена останавливает контейнер немедленно, не дожидаясь 60-секундного сна');
+  // К моменту отказа именно этот контейнер уже удалён — cleanup завершён.
+  const inspect = await exec('docker', ['inspect', ours], { timeout: 10_000 }).catch(e => e);
+  assert.ok(inspect instanceof Error && /No such (object|container)/i.test(String(inspect.stderr ?? inspect)),
+    'осиротевшего контейнера этого запуска не остаётся');
 });
