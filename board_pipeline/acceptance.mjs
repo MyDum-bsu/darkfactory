@@ -124,6 +124,20 @@ function validatePolicy(policy, checkProfile, { allowNeon = false, pinned = fals
   if (profile.l1Profile !== undefined && !isValidL1Profile(profile.l1Profile)) {
     throw new Denied(`unknown_l1_profile:${String(profile.l1Profile)}`);
   }
+  // Тот же реестр действует на l1Profile внутри каждого рецепта профиля:
+  // ручной submit/accept с невалидным recipe.l1Profile (включая visual при
+  // has_ui=false) отклоняется до любого эффекта, а явный рецепт,
+  // расходящийся с явным profile.l1Profile, — мисматч, а не приоритет.
+  for (const recipe of [...(Array.isArray(profile.checks) ? profile.checks : []),
+    profile.check, profile.visual]) {
+    if (recipe?.l1Profile === undefined) continue;
+    if (!isValidL1Profile(recipe.l1Profile)) {
+      throw new Denied(`unknown_l1_profile:${String(recipe.l1Profile)}`);
+    }
+    if (profile.l1Profile !== undefined && recipe.l1Profile !== profile.l1Profile) {
+      throw new Denied('l1_profile_mismatch');
+    }
+  }
   const legacy = isLegacyPiReview(profile.review);
   const neon = allowNeon && isNeonReview(profile.review) && isReviewSkillList(profile.review.skills);
   // Routed-допуск только при закреплённой триаде попытки: без пина
@@ -919,6 +933,25 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     profile = validatePolicy(policy, attempt.check_profile,
       { allowNeon: true, pinned: attempt.triad !== undefined });
     validateEnrolled(attempt, profile);
+    // Закреплённый l1_profile попытки сверяется с профилем и каждым рецептом
+    // до любого порта приёмки: прямой вызов acceptHeld применяет тот же
+    // инвариант, что контроллер при формировании попытки.
+    if (attempt.l1_profile !== undefined) {
+      if (profile.l1Profile !== undefined && attempt.l1_profile !== profile.l1Profile) {
+        throw new Denied('l1_profile_mismatch');
+      }
+      for (const recipe of [...(Array.isArray(profile.checks) ? profile.checks : []),
+        profile.check, profile.visual]) {
+        if (recipe?.l1Profile !== undefined && attempt.l1_profile !== recipe.l1Profile) {
+          throw new Denied('l1_profile_mismatch');
+        }
+      }
+      // Портам передаётся эффективный профиль: закреплённый выбор попытки
+      // применяется и при прямом acceptHeld без контроллера.
+      if (profile.l1Profile === undefined) {
+        profile = { ...profile, l1Profile: attempt.l1_profile };
+      }
+    }
     // Исполнитель из доверенной попытки (или профиля) и критик — разные семейства.
     // При настроенном арбитре проверяется вся триада: арбитр обязан быть из
     // третьего независимого семейства — как для первичного воркера, так и после

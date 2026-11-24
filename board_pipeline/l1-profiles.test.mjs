@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { DEFAULT_L1_PROFILE, defaultL1ProfileForRepo, effectiveL1ProfileId,
   isValidL1Profile, L1_PROFILES, REPO_DEFAULT_L1_PROFILES, resolveL1Profile }
   from './l1-profiles.mjs';
-import { _internals } from './acceptance.mjs';
+import { accept, acceptHeld, _internals } from './acceptance.mjs';
 import { offlineDockerRunner, offlineProfileRunner, offlineVisualRunner,
   SANDBOX_ENV } from './runtime.mjs';
 import { buildEnqueuePlan } from '../ops/factory-enqueue.mjs';
@@ -128,6 +128,173 @@ test('acceptance: l1_profile попытки — реестр fail-closed, stray 
   // Метка без остального контракта — неполный закреп, отклоняется.
   assert.throws(() => _internals.validateContract({ l1_profile: 'node' }),
     err => err?.reason === 'subject_contract_incomplete');
+});
+
+test('acceptance: l1Profile рецептов — fail-closed и мисматч с профилем', () => {
+  const review = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
+  const policy = profile => ({ version: 1, profiles: { p: { review, ...profile } } });
+  const recipe = { argv: ['npm', 'test'], cwd: '.', timeoutMs: 1000 };
+  // Невалидный l1Profile в любом рецепте — отказ, даже при has_ui=false.
+  for (const bad of ['bogus', null, '__proto__']) {
+    assert.throws(() => _internals.validatePolicy(
+      policy({ checks: [{ ...recipe, l1Profile: bad }] }), 'p'),
+      err => err?.reason === `unknown_l1_profile:${String(bad)}`, JSON.stringify(bad));
+    assert.throws(() => _internals.validatePolicy(
+      policy({ check: { ...recipe, l1Profile: bad } }), 'p'),
+      err => err?.reason === `unknown_l1_profile:${String(bad)}`, JSON.stringify(bad));
+    assert.throws(() => _internals.validatePolicy(
+      policy({ has_ui: false, visual: { ...recipe, l1Profile: bad } }), 'p'),
+      err => err?.reason === `unknown_l1_profile:${String(bad)}`, JSON.stringify(bad));
+  }
+  // Явный рецепт против явного профиля — mismatch; совпадение и рецепт
+  // без profile.l1Profile — допустимы.
+  assert.throws(() => _internals.validatePolicy(
+    policy({ l1Profile: 'node', checks: [{ ...recipe, l1Profile: 'python-node' }] }), 'p'),
+    err => err?.reason === 'l1_profile_mismatch');
+  assert.throws(() => _internals.validatePolicy(
+    policy({ l1Profile: 'node', visual: { ...recipe, l1Profile: 'python-node' } }), 'p'),
+    err => err?.reason === 'l1_profile_mismatch');
+  assert.equal(_internals.validatePolicy(
+    policy({ l1Profile: 'python-node',
+      checks: [{ ...recipe, l1Profile: 'python-node' }] }), 'p').l1Profile, 'python-node');
+  assert.doesNotThrow(() => _internals.validatePolicy(
+    policy({ checks: [{ ...recipe, l1Profile: 'python-node' }] }), 'p'));
+});
+
+// Фикстуры прямого acceptHeld: та же форма, что в accept-held.test.mjs,
+// но на минимальном in-memory board-порту без native SDK.
+const HELD_CAND = 'c'.repeat(40);
+const HELD_SPEC = 'd'.repeat(64);
+const HELD_POL = 'e'.repeat(64);
+const HELD_REVIEW = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
+
+function heldAttempt(over = {}) {
+  return { attempt_id: 'att-1', task_id: '1', epoch: 1, bb_thread_id: 'thr_fixture',
+    worktree: '/tmp/wt', base_sha: SHA, check_profile: 'pilot', finish: 'verified', ...over };
+}
+// Метка l1_profile допустима только при полном закреплённом контракте.
+function heldContractAttempt(over = {}) {
+  return heldAttempt({ repo_id: 'repo', spec_digest: HELD_SPEC,
+    policy_digest: HELD_POL, fixtures_digest: null, ...over });
+}
+function heldSubmission(over = {}) {
+  return { task_id: '1', epoch: 1, attempt_id: 'att-1', worker_thread_id: 'thr_fixture',
+    candidate_sha: HELD_CAND, ...over };
+}
+function heldPolicy(profile) {
+  return { version: '2', profiles: { pilot: {
+    task: '1', worker: 'thr_fixture', worktree: '/tmp/wt', base: SHA,
+    review: HELD_REVIEW, ...profile } } };
+}
+function heldPorts(labels = {}) {
+  const calls = { inspect: 0, local: 0, tamper: 0, visual: 0, review: 0, board: 0 };
+  const seen = { localProfile: null };
+  const ports = {
+    board: {
+      lookup: async () => { calls.board++; return { state: 'claimed' }; },
+      claim: async () => { calls.board++; throw new Error('unexpected_claim'); },
+      verifyHeld: async () => { calls.board++; return { epoch: 1, until: Date.now() + 60000 }; },
+      block: async () => { calls.board++; },
+      complete: async () => { calls.board++; },
+      project: async () => { calls.board++; },
+      labels: async () => { calls.board++; return labels; },
+    },
+    inspect: async (binding) => {
+      calls.inspect++;
+      return { head: binding.candidate_sha, clean: true, baseAncestor: true,
+        tree: 'f'.repeat(40) };
+    },
+    local: async (binding, profile) => {
+      calls.local++;
+      seen.localProfile = profile;
+      return { sha: binding.candidate_sha, ok: true, evidence: 'checks.json', exit: 0 };
+    },
+    tamper: async (binding) => {
+      calls.tamper++;
+      return { ok: true, sha: binding.candidate_sha, base_sha: binding.base_sha,
+        violations: [], digest: 't'.repeat(64) };
+    },
+    visual: async () => {
+      calls.visual++;
+      return { ok: true, status: 'pass' };
+    },
+    review: async (binding) => {
+      calls.review++;
+      return { task: binding.task_id, sha: binding.candidate_sha,
+        actual: { ...HELD_REVIEW }, verdict: 'REVIEW_OK', checkpoint: 'feed80ab' };
+    },
+  };
+  return { calls, seen, ports };
+}
+
+test('acceptHeld: l1_profile попытки сверяется с профилем и рецептами до портов', async () => {
+  const journal = await tempdir();
+  try {
+    // Мисматч с явным profile.l1Profile — отказ до любого порта приёмки.
+    for (const profile of [
+      { l1Profile: 'node' },
+      { checks: [{ argv: ['npm', 'test'], cwd: '.', timeoutMs: 1000, l1Profile: 'node' }] },
+      { visual: { argv: ['shot'], cwd: '.', timeoutMs: 1000, l1Profile: 'node' } },
+    ]) {
+      const { calls, ports } = heldPorts();
+      const res = await acceptHeld({
+        attempt: heldContractAttempt({ l1_profile: 'python-node' }),
+        submission: heldSubmission(),
+        policy: heldPolicy(profile),
+        journal,
+        ports,
+      });
+      assert.equal(res.outcome, 'denied', JSON.stringify(profile));
+      assert.equal(res.reason, 'l1_profile_mismatch', JSON.stringify(profile));
+      assert.deepEqual(calls, { inspect: 0, local: 0, tamper: 0, visual: 0, review: 0, board: 0 });
+    }
+    // Политика без l1Profile: закреплённый выбор попытки пробрасывается
+    // в порт local эффективным профилем.
+    const { calls, seen, ports } = heldPorts({
+      repo_id: 'repo', profile_id: 'pilot', finish: 'verified',
+      spec_digest: HELD_SPEC, policy_digest: HELD_POL, l1_profile: 'python-node',
+    });
+    const res = await acceptHeld({
+      attempt: heldContractAttempt({ l1_profile: 'python-node' }),
+      submission: heldSubmission(),
+      policy: heldPolicy({}),
+      journal,
+      ports,
+    });
+    assert.equal(res.outcome, 'verified');
+    assert.equal(seen.localProfile.l1Profile, 'python-node');
+    assert.equal(calls.local, 1);
+    assert.equal(calls.review, 1);
+  } finally {
+    await rm(journal, { recursive: true, force: true });
+  }
+});
+
+test('accept/acceptHeld: visual.l1Profile=bogus отклоняется при has_ui=false до портов', async () => {
+  const journal = await tempdir();
+  try {
+    const profile = { has_ui: false,
+      visual: { argv: ['shot'], cwd: '.', timeoutMs: 1000, l1Profile: 'bogus' } };
+    const { calls, ports } = heldPorts();
+    const handoff = { task_id: '1', worker_thread_id: 'thr_fixture', base_sha: SHA,
+      candidate_sha: HELD_CAND, worktree: '/tmp/wt', check_profile: 'pilot' };
+    const manual = await accept({ handoff, policy: heldPolicy(profile),
+      journal, ports });
+    assert.equal(manual.outcome, 'denied');
+    assert.equal(manual.reason, 'unknown_l1_profile:bogus');
+    const held = await acceptHeld({
+      attempt: heldAttempt({ has_ui: false }),
+      submission: heldSubmission(),
+      policy: heldPolicy(profile),
+      journal,
+      ports,
+    });
+    assert.equal(held.outcome, 'denied');
+    assert.equal(held.reason, 'unknown_l1_profile:bogus');
+    assert.deepEqual(calls, { inspect: 0, local: 0, tamper: 0, visual: 0, review: 0, board: 0 });
+  } finally {
+    await rm(journal, { recursive: true, force: true });
+  }
 });
 
 test('runtime: runner отклоняет неизвестный l1Profile до вызова docker', async () => {
