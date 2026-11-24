@@ -33,6 +33,10 @@ function checkRoute(r) {
   if (!/^[1-9][0-9]{0,14}$/.test(r.taskId ?? '') && !isAllowlist(r.allowlist)) {
     throw new Error('A trusted, enrolled route is required');
   }
+  if (r.maxL2ReworkRounds !== undefined &&
+      (!Number.isSafeInteger(r.maxL2ReworkRounds) || r.maxL2ReworkRounds < 1)) {
+    throw new Error('A trusted, enrolled route is required');
+  }
 }
 
 // Фильтр claimReady: канал закреплён адаптером, остальное — allowlist маршрута.
@@ -501,6 +505,14 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         contradictory: result.contradictory === true,
       };
       roundsHistory = [...(record.roundsHistory ?? []), round];
+      // Circuit breaker L2 (Board #1666): лимитный L2-раунд останавливает
+      // попытку без следующего круга и до арбитража — directed_rework был бы
+      // пятым раундом. Эскалация — hold карточки владельцу с причиной.
+      const l2Limit = route.maxL2ReworkRounds ?? workerSelector.DEFAULT_L2_REWORK_LIMIT;
+      if (workerSelector.l2ReworkLimitExceeded({ roundsHistory, limit: l2Limit })) {
+        return stopWith('l2_rework_limit_exceeded', { roundsHistory },
+          JSON.stringify({ limit: l2Limit }));
+      }
       const progress = workerSelector.evaluateReworkProgress({ roundsHistory });
       if (progress.trigger === 'no_progress' && progress.deterministicGate) {
         // Красный детерминированный гейт без прогресса не арбитрируется.

@@ -504,6 +504,71 @@ test('three converging rework rounds complete without a round cap', async t => {
   assert.equal(record.roundsHistory.length, 3);
 });
 
+// Board #1666: circuit breaker L2 REWORK — четвёртый L2-раунд останавливает
+// попытку без пятого круга; даже триггер no_progress не доходит до арбитража.
+test('the fourth L2 rework round stops with l2_rework_limit_exceeded and no fifth round', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => { arbitrations++; } });
+  await x.tick();
+  const rework = (finding, extra = {}) => ({ outcome: 'rework',
+    reason: 'review_verdict:REVIEW_BLOCKED',
+    feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings: [finding] }, ...extra });
+  const bad = {
+    [BAD1]: rework({ file: 'a.js', expected: 'e1', actual: 'x1' }),
+    [BAD2]: rework({ file: 'b.js', expected: 'e2', actual: 'x2' }),
+    [BAD3]: rework({ file: 'c.js', expected: 'e3', actual: 'x3' }),
+    // Четвёртый раунд повторяет находку третьего: без потолка здесь был бы
+    // триггер repeated_l2_finding и арбитраж; потолок срабатывает раньше.
+    ['b' + '4'.repeat(39)]: rework({ file: 'c.js', expected: 'e3', actual: 'x3' }),
+  };
+  x.cfg.verify = async (attempt, submission) => {
+    x.effects.verify++;
+    const scripted = bad[submission.candidate_sha];
+    if (scripted) return scripted;
+    await x.cfg.board.complete(attempt.task_id, attempt.epoch, { sha: submission.candidate_sha });
+    return { outcome: 'verified', receipt: { settle: 'completed' } };
+  };
+  for (const sha of Object.keys(bad).slice(0, 3)) {
+    x.submit(sha);
+    assert.equal((await x.tick()).phase, 'working', `раунд ${sha.slice(-2)} — обычный возврат`);
+  }
+  x.submit('b' + '4'.repeat(39));
+  const stopped = await x.tick();
+  assert.equal(stopped.phase, 'hold');
+  assert.equal(stopped.reason, 'l2_rework_limit_exceeded');
+  assert.equal(x.effects.feedback.length, 3, 'четвёртый REWORK не вернулся воркеру — пятого круга нет');
+  assert.equal(arbitrations, 0, 'арбитраж после лимитного раунда не запускается');
+  const record = await x.cfg.state.load();
+  assert.equal(record.roundsHistory.length, 4);
+  assert.match((await x.inspect()).blocked.reason, /l2_rework_limit_exceeded/);
+  // Пятый раунд невозможен: новый handoff по той же попытке не возобновляет проверку.
+  const verifies = x.effects.verify;
+  x.submit('c');
+  const after = await x.tick();
+  assert.equal(after.phase, 'hold');
+  assert.equal(x.effects.verify, verifies, 'verify на пятый раунд не вызывался');
+});
+
+test('route.maxL2ReworkRounds настраивает потолок L2-раундов', async t => {
+  const x = await lab(t);
+  x.cfg.route.maxL2ReworkRounds = 2;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => ({ decision: 'directed_rework' }) });
+  await x.tick();
+  const rework = finding => ({ outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+    feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings: [finding] } });
+  x.cfg.verify = async (attempt, submission) => submission.candidate_sha === BAD1
+    ? rework({ file: 'a.js', expected: 'e1', actual: 'x1' })
+    : rework({ file: 'b.js', expected: 'e2', actual: 'x2' });
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  const stopped = await x.tick();
+  assert.equal(stopped.phase, 'hold');
+  assert.equal(stopped.reason, 'l2_rework_limit_exceeded');
+  assert.equal(x.effects.feedback.length, 1);
+});
+
 // Пункт 6: L1 починил тест A, упал тест B — разные сигнатуры, починка сходится.
 test('different failing checks in L1 converge instead of stalling', async t => {
   const x = await lab(t);

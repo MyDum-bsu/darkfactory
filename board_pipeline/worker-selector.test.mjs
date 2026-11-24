@@ -11,6 +11,8 @@ import {
   evaluateReworkProgress,
   FALLBACK_ANTIGRAVITY_NEON,
   hasDodViolation,
+  l2ReworkLimitExceeded,
+  DEFAULT_L2_REWORK_LIMIT,
   maxHarmOf,
   NARROW_RESERVE_PI,
   normalizeRoutingPolicy,
@@ -301,6 +303,39 @@ const detRound = (gate, sig, over = {}) => ({
   sha: 'b'.repeat(40), tree_sha: null, gate, signature: `${gate}|${sig}`,
   blocking: null, findings: [], excerpt: null, checkpoint: null,
   dispute: null, contradictory: false, ...over,
+});
+
+// Board #1666: circuit breaker L2 REWORK — потолок раундов критика, по
+// умолчанию 4, настраиваемый; детерминированные гейты лимит не расходуют.
+test('l2ReworkLimitExceeded: четвёртый L2-раунд достигает дефолтного потолка', () => {
+  assert.equal(DEFAULT_L2_REWORK_LIMIT, 4);
+  const l2 = n => Array.from({ length: n }, (_, i) => l2Round({ signature: `s${i}` }));
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(3) }), false);
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(4) }), true);
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(5) }), true);
+  // Раунды l1/tamper/l3 не считаются — лимит только за L2-критиком.
+  const mixed = [detRound('l1', 'a'), detRound('tamper', 'b'), ...l2(3), detRound('l3', 'c')];
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: mixed }), false);
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: [...mixed, l2Round({ signature: 's4' })] }), true);
+  // Настраиваемый лимит; невалидный — fail-closed на дефолт.
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(2), limit: 2 }), true);
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(1), limit: 2 }), false);
+  for (const bad of [0, -1, 1.5, '4', NaN]) {
+    assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(4), limit: bad }), true, `${bad}`);
+  }
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: [] }), false);
+});
+
+// Дефолтная триада (Board #1666): первичный L2-критик — Gemini 4 Neon
+// medium, Pi/Sol — только арбитр; семейства независимы.
+test('дефолтный критик — Gemini 4 Neon medium, дефолтный арбитр — Sol', () => {
+  assert.deepEqual(DEFAULT_CRITIC,
+    { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' });
+  assert.deepEqual(DEFAULT_ARBITER,
+    { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' });
+  const triad = assertTriadIndependent({ executor: PRIMARY_WORKER });
+  assert.notEqual(triad.executor, triad.critic);
+  assert.notEqual(triad.critic, triad.arbiter);
 });
 
 test('сходящаяся починка любой длины не даёт триггеров — нет правила «два круга»', () => {

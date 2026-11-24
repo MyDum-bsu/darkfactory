@@ -391,6 +391,17 @@ function contradicting(prev, latest) {
   return false;
 }
 
+// Жёсткий потолок L2-раундов попытки (Board #1666): на лимитном REWORK
+// контроллер останавливается без следующего круга и эскалирует карточку
+// владельцу ('l2_rework_limit_exceeded'). Считаются только раунды с
+// gate === 'l2' — детерминированные гейты лимит не расходуют. Лимит
+// настраивается маршрутом (route.maxL2ReworkRounds), по умолчанию 4.
+export const DEFAULT_L2_REWORK_LIMIT = 4;
+export function l2ReworkLimitExceeded({ roundsHistory = [], limit = DEFAULT_L2_REWORK_LIMIT } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1) limit = DEFAULT_L2_REWORK_LIMIT;
+  return roundsHistory.filter(r => r?.gate === 'l2').length >= limit;
+}
+
 // Детектор отсутствия прогресса и содержательного спора. roundsHistory —
 // включая последний раунд (поля: gate, signature, blocking, findings, excerpt,
 // checkpoint, tree_sha, dispute, contradictory). Сходящаяся починка любой
