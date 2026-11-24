@@ -49,7 +49,8 @@ const within = (root, p) => {
   return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
 
-async function canonicalInput(path, { worktrees = [], mustBe, storage = false } = {}) {
+async function canonicalInput(path,
+    { worktrees = [], mustBe, storage = false, outside = [] } = {}) {
   if (typeof path !== 'string' || !path) fail('path_required');
   if (!isAbsolute(path)) fail('path_not_absolute');
   const real = await realpath(path).catch(() => fail('path_missing'));
@@ -62,9 +63,13 @@ async function canonicalInput(path, { worktrees = [], mustBe, storage = false } 
   // граница, что у factory-run/контроллера (canonicalOutside): хранилище
   // (для файла журнала — его родительский каталог) не содержит worktree
   // и не содержится в нём, иначе в Board ушла бы карточка с путями,
-  // которые контроллер отклонит при запуске.
+  // которые контроллер отклонит при запуске. outside — те же операторские
+  // каталоги вне рабочего каталога сдачи (handoffDir): хранилище внутри
+  // inbox сдачи или содержащее его контроллер отклонил бы так же.
   if (worktrees.some(w => within(w, real) ||
-      (storage && (within(real, w) || within(dirname(real), w))))) {
+      (storage && (within(real, w) || within(dirname(real), w)))) ||
+      outside.some(d => within(d, real) ||
+      (storage && (within(real, d) || within(dirname(real), d))))) {
     fail('path_inside_worktree');
   }
   return real;
@@ -192,26 +197,6 @@ export async function buildEnqueuePlan(values) {
       // И сам файл политики обязан лежать вне дерева воркера.
       policyFile = await canonicalInput(values.policy, { worktrees, mustBe: 'file' });
     }
-    // Пути хранилищ из политики — та же граница, что и у флагов
-    // --ledger-path/--memory-dir: журнал и память внутри worktree (или
-    // содержащие его) контроллер отклонил бы при запуске; карточка с
-    // незапускаемой закреплённой политикой на Board не создаётся.
-    const policyLedger = policyStoragePath(policyJson.decisionLedger, ['path']);
-    if (policyLedger !== undefined) {
-      await canonicalInput(policyLedger, { worktrees, mustBe: 'file', storage: true });
-    }
-    const policyMemory = policyStoragePath(policyJson.projectMemory,
-      ['storeDir', 'dir', 'path']);
-    if (policyMemory !== undefined) {
-      await canonicalInput(policyMemory, { worktrees, mustBe: 'dir', storage: true });
-    }
-    // projectMemory.trustedReceiptDir — то же семейство хранилищ, что и
-    // storeDir (проверка factory-run/контроллера): та же двусторонняя
-    // storage-граница вне worktree.
-    if (policyJson?.projectMemory?.trustedReceiptDir !== undefined) {
-      await canonicalInput(policyJson.projectMemory.trustedReceiptDir,
-        { worktrees, mustBe: 'dir', storage: true });
-    }
     // handoffDir — inbox сдачи контроллера: двусторонняя граница против
     // worktree ('Handoff inbox must be separate') и операторские файлы
     // (сам файл политики, brief, reviewPrompt, reviewGate, routes.json,
@@ -223,6 +208,30 @@ export async function buildEnqueuePlan(values) {
           within(handoff, policyFile)) {
         fail('path_inside_worktree');
       }
+    }
+    // Пути хранилищ из политики — та же граница, что и у флагов
+    // --ledger-path/--memory-dir: журнал и память внутри worktree или
+    // handoffDir (или содержащие их) контроллер отклонил бы при запуске;
+    // карточка с незапускаемой закреплённой политикой на Board не
+    // создаётся.
+    const outside = handoff === undefined ? [] : [handoff];
+    const policyLedger = policyStoragePath(policyJson.decisionLedger, ['path']);
+    if (policyLedger !== undefined) {
+      await canonicalInput(policyLedger,
+        { worktrees, mustBe: 'file', storage: true, outside });
+    }
+    const policyMemory = policyStoragePath(policyJson.projectMemory,
+      ['storeDir', 'dir', 'path']);
+    if (policyMemory !== undefined) {
+      await canonicalInput(policyMemory,
+        { worktrees, mustBe: 'dir', storage: true, outside });
+    }
+    // projectMemory.trustedReceiptDir — то же семейство хранилищ, что и
+    // storeDir (проверка factory-run/контроллера): та же двусторонняя
+    // storage-граница вне worktree и handoffDir.
+    if (policyJson?.projectMemory?.trustedReceiptDir !== undefined) {
+      await canonicalInput(policyJson.projectMemory.trustedReceiptDir,
+        { worktrees, mustBe: 'dir', storage: true, outside });
     }
   }
   let specDigest = values['spec-digest'];
@@ -251,9 +260,12 @@ export async function buildEnqueuePlan(values) {
   const extra = {};
   for (const [flag, key] of [['memory-dir', 'memory_dir'], ['ledger-path', 'ledger_path']]) {
     if (values[flag] !== undefined) {
+      // Та же двусторонняя storage-граница действует и против handoffDir:
+      // журнал/память — операторские пути вне рабочего каталога сдачи.
       extra[key] = await canonicalInput(values[flag],
         { worktrees, mustBe: flag === 'memory-dir' ? 'dir' : 'file',
-          storage: true });
+          storage: true,
+          outside: handoff === undefined ? [] : [handoff] });
     }
   }
   if (values.ticket !== undefined) {

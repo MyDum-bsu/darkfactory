@@ -273,11 +273,54 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
         'policy-digest': undefined, policy: policyFile }),
         /path_inside_worktree/);
     }
-    // Канонические хранилища вне дерева в политике проходят.
+    // Хранилища и handoffDir не пересекаются в обе стороны: журнал,
+    // память и trustedReceiptDir внутри inbox сдачи (или inbox внутри
+    // каталога хранилища / родителя файла журнала) контроллер отклонил
+    // бы — карточка с такой политикой не создаётся.
+    const hoInbox = join(dir, 'ho-inbox');
+    await mkdir(hoInbox);
+    const hoLedger = join(hoInbox, 'ledger.jsonl');
+    await writeFile(hoLedger, '');
+    const hoMemory = join(hoInbox, 'memory');
+    await mkdir(hoMemory);
+    const hoReceipts = join(hoInbox, 'receipts');
+    await mkdir(hoReceipts);
+    for (const embedded of [
+      { decisionLedger: hoLedger },
+      { decisionLedger: { path: hoLedger } },
+      { projectMemory: { storeDir: hoMemory } },
+      { projectMemory: { trustedReceiptDir: hoReceipts } },
+      // Обратное направление: handoffDir внутри родительского каталога
+      // файла журнала и внутри storeDir памяти — тоже отказ.
+      { decisionLedger: join(dir, 'sub', 'ledger2.jsonl'),
+        handoffDir: join(dir, 'sub') },
+      { projectMemory: { storeDir: join(dir, 'sub') },
+        handoffDir: store },
+    ]) {
+      await writeFile(join(dir, 'sub', 'ledger2.jsonl'), '');
+      await writeFile(policyFile, JSON.stringify({
+        brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
+        handoffDir: hoInbox, ...embedded }));
+      await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+        'policy-digest': undefined, policy: policyFile }),
+        /path_inside_worktree/);
+    }
+    // Та же граница действует на CLI-флаги --ledger-path/--memory-dir.
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
+      handoffDir: hoInbox }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile,
+      'ledger-path': hoLedger }), /path_inside_worktree/);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile,
+      'memory-dir': hoMemory }), /path_inside_worktree/);
+    // Канонические хранилища вне дерева в политике проходят, когда
+    // handoffDir — отдельный каталог, не пересекающийся с ними.
     await writeFile(policyFile, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
       decisionLedger: storeLedger, projectMemory: { storeDir: store },
-      handoffDir: store }));
+      handoffDir: hoInbox }));
     const embeddedPlan = await buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile });
     assert.match(embeddedPlan.labels.policy_digest, /^[0-9a-f]{64}$/);
@@ -999,6 +1042,36 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const fHbOk = await withPolicy(dir, hbOk);
     const hbPlan = await runPlan(runValues(fHbOk, state));
     assert.equal(hbPlan.handoff, inbox);
+    // Пути хранилищ не пересекаются с handoffDir в обе стороны:
+    // ledger/memory/trustedReceiptDir внутри inbox сдачи или inbox
+    // внутри каталога хранилища (родителя файла журнала) — отказ до
+    // Git-конфига и запуска контроллера.
+    const inboxLedger = join(inbox, 'ledger.jsonl');
+    await writeFile(inboxLedger, '');
+    const inboxMemory = join(inbox, 'memory');
+    await mkdir(inboxMemory);
+    const inboxReceipts = join(inbox, 'receipts');
+    await mkdir(inboxReceipts);
+    for (const badStorage of [
+      { decisionLedger: inboxLedger },
+      { decisionLedger: { path: inboxLedger } },
+      { projectMemory: { storeDir: inboxMemory } },
+      { projectMemory: { trustedReceiptDir: inboxReceipts } },
+      // Обратное направление: родительский каталог журнала содержит inbox.
+      { decisionLedger: ledger },
+      // и storeDir памяти содержит inbox.
+      { projectMemory: { storeDir: ops } },
+    ]) {
+      const fBadStorage = await withPolicy(dir,
+        { ...policySpec(wt), handoffDir: inbox, ...badStorage });
+      await assert.rejects(() => runPlan(runValues(fBadStorage, state)),
+        /path_inside_worktree/);
+    }
+    // Та же граница действует на CLI-флаги --ledger-path/--memory-dir.
+    await assert.rejects(() => runPlan(runValues(fHbOk, state,
+      { 'ledger-path': inboxLedger })), /path_inside_worktree/);
+    await assert.rejects(() => runPlan(runValues(fHbOk, state,
+      { 'memory-dir': inboxMemory })), /path_inside_worktree/);
     const hbInner = { ...policySpec(wt), handoffDir: join(wt, 'inbox') };
     const fHbInner = await withPolicy(dir, hbInner);
     await assert.rejects(() => runPlan(runValues(fHbInner, state)),

@@ -325,8 +325,12 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     if (swSt !== null && !swSt.isFile()) fail('path_not_file');
     if (treeAliases.some(t => inside(t, daemonSwitch))) fail('path_inside_worktree');
   }
-  if (ledger !== null) await canonicalOutside(ledger, treeAliases, 'file');
-  if (memory !== null) await canonicalOutside(memory, treeAliases, 'dir');
+  const ledgerReal = ledger !== null
+    ? await canonicalOutside(ledger, treeAliases, 'file')
+    : null;
+  const memoryReal = memory !== null
+    ? await canonicalOutside(memory, treeAliases, 'dir')
+    : null;
   // Опциональные операторские каталоги политики — та же строгая проверка
   // канонического каталога вне worktree. Parent-граница действует только
   // для trustedReceiptDir (семейство projectMemory, как storeDir);
@@ -335,9 +339,9 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // Явно заданное значение (включая null — контроллер не считает его
   // отсутствующим) обязано быть каноническим абсолютным путём к каталогу:
   // нестроковое/неканоническое отклоняется до Git-конфига и dry-run.
-  if (policy?.projectMemory?.trustedReceiptDir !== undefined) {
-    await canonicalOutside(policy.projectMemory.trustedReceiptDir, treeAliases, 'dir');
-  }
+  const receiptsReal = policy?.projectMemory?.trustedReceiptDir !== undefined
+    ? await canonicalOutside(policy.projectMemory.trustedReceiptDir, treeAliases, 'dir')
+    : null;
   // Канонические пути сохраняются для перекрёстных границ ниже:
   // ownerAnswerSource отделяет questionGate.inbox от handoffDir, а
   // releaseSetup — release.directory от tree, inbox и --state.
@@ -366,6 +370,18 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   if (policy.handoffDir === undefined) fail('handoff_required');
   const handoff = await canonicalOutside(policy.handoffDir, treeAliases, 'dir', { parent: false });
   if (inside(state, handoff) || inside(handoff, state)) fail('path_inside_worktree');
+  // Пути хранилищ (ledger/memory/trustedReceiptDir) — операторские пути
+  // вне рабочего каталога сдачи: двусторонняя граница против handoffDir
+  // (для файла журнала — его родительский каталог), та же семантика, что
+  // у worktree-границы canonicalOutside выше.
+  for (const [storage, isFile] of [[ledgerReal, true], [memoryReal, false],
+    [receiptsReal, false]]) {
+    if (storage === null) continue;
+    if (inside(handoff, storage) || inside(storage, handoff) ||
+        (isFile && inside(dirname(storage), handoff))) {
+      fail('path_inside_worktree');
+    }
+  }
   // Inbox сдачи — рабочий путь воркера: операторский файл внутри него
   // контроллер отклонил бы («Operator files must be outside worker
   // paths») уже после записи Git-конфига; отказ здесь, до эффекта.
