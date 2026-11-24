@@ -293,6 +293,14 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     if (treeAliases.some(t => inside(t, swDirReal) || inside(swDirReal, t))) {
       fail('path_inside_worktree');
     }
+    // privateDirectory контроллера (createPilotSwitch): каталог стоп-файла
+    // обязан быть приватным — каталог владельца без прав для группы и
+    // остальных, иначе запуск отклоняется после Git-конфига.
+    const swDirSt = await lstat(swDirReal);
+    if (!swDirSt.isDirectory() || swDirSt.uid !== process.getuid() ||
+        (swDirSt.mode & 0o077) !== 0) {
+      fail('switch_dir_not_private');
+    }
     swDirs.push(swDirReal);
     // Стоп-файл может ещё не существовать (ENOENT), но любая другая
     // ошибка — включая ENOTDIR (родительский компонент не каталог) —

@@ -184,7 +184,10 @@ export async function buildEnqueuePlan(values) {
     repo_id: values['repo-id'], profile_id: values.profile, finish: values.finish, ...extra };
   for (const item of values.label ?? []) {
     const i = item.indexOf('=');
-    const key = i < 0 ? item : item.slice(0, i);
+    // Метка обязана быть в синтаксисе k=v: без разделителя значение не
+    // выводится из ключа — отказ до вызова vb, а не --label k=k.
+    if (i < 0) fail('label_invalid');
+    const key = item.slice(0, i);
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(key) || RESERVED_LABELS.has(key)) fail('label_invalid');
     const value = item.slice(i + 1);
     // fixtures_digest — контрактная метка приёмки: как в

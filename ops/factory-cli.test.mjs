@@ -4,7 +4,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile }
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile }
   from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -95,6 +95,12 @@ test('enqueue: отказы до эффекта', async () => {
   const fdOk = await buildEnqueuePlan({ ...baseValues(),
     label: [`fixtures_digest=${'c'.repeat(64)}`] });
   assert.equal(fdOk.labels.fixtures_digest, 'c'.repeat(64));
+  // Метка без разделителя '=' — отказ до вызова vb: значение не
+  // выводится из ключа (k=v, а не k=k).
+  await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+    label: ['domain'] }), /label_invalid/);
+  await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+    label: ['fixtures_digest'] }), /label_invalid/);
 });
 
 test('enqueue: brief/policy файлы, симлинк и путь внутри worktree отклоняются', async () => {
@@ -577,6 +583,8 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     // контроллер отклоняет так же, как и путь внутри дерева.
     const ops = join(dir, 'ops');
     await mkdir(ops);
+    // Каталог стоп-файлов — приватный (privateDirectory контроллера).
+    await chmod(ops, 0o700);
     const ledger = join(ops, 'ledger.jsonl');
     await writeFile(ledger, '');
     const memory = join(ops, 'memory');
@@ -840,6 +848,9 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     await mkdir(wt);
     await mkdir(ops);
     await mkdir(state);
+    // Каталоги стоп-файлов — приватные (privateDirectory контроллера).
+    await chmod(ops, 0o700);
+    await chmod(state, 0o700);
     const policy = await withPolicy(dir, policySpec(wt));
     // Завершающий '/' — неканоническая строка: отказ до lstat и запуска.
     await assert.rejects(() => runPlan(runValues(policy, state,
@@ -858,7 +869,18 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     await writeFile(notDir, 'x');
     await assert.rejects(() => runPlan(runValues(policy, state,
       { switch: join(notDir, 'stop') })),
-      /non_canonical_or_symlink_path|path_missing/);
+      /non_canonical_or_symlink_path|path_missing|switch_dir_not_private/);
+    // Родительский каталог стоп-файла обязан быть приватным
+    // (privateDirectory createPilotSwitch): режим 0755 — отказ до
+    // Git-конфига, для всех источников стоп-пути.
+    const pubDir = join(dir, 'pub');
+    await mkdir(pubDir);
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { switch: join(pubDir, 'stop') })), /switch_dir_not_private/);
+    const abPub = { ...policySpec(wt), abPilot: { switch: join(pubDir, 'ab-stop') } };
+    const fAbPub = await withPolicy(dir, abPub);
+    await assert.rejects(() => runPlan(runValues(fAbPub, state)),
+      /switch_dir_not_private/);
     const ok = await runPlan(runValues(policy, state,
       { switch: join(ops, 'stop') }));
     assert.ok(ok.argv.includes('--switch'));
