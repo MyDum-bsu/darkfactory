@@ -708,7 +708,7 @@ export function l2ReviewRetryGuard({ port, taskId, epoch, owner, label, contract
       if (!live) throw new Error('contract_labels_unavailable');
       if (contract) {
         for (const key of ['repo_id', 'spec_digest', 'policy_digest',
-            'profile_id', 'finish', 'fixtures_digest']) {
+            'profile_id', 'finish', 'fixtures_digest', 'l1_profile']) {
           if ((live[key] ?? null) !== (contract[key] ?? null)) {
             throw new Error(`contract_drift:${key}`);
           }

@@ -315,6 +315,22 @@ test('queue mode pins the card contract into the attempt for the subject manifes
   assert.equal(x.effects.spawn, 1);
 });
 
+test('queue mode pins the card l1_profile label into the attempt', async t => {
+  // Явный L1-выбор оператора при постановке — контрактная метка:
+  // попытка несёт её в verify, а не дефолт repo_id контроллера.
+  const x = await queueLab(t, { labels: { ...CONTRACT, l1_profile: 'python-node' } });
+  await x.tick();
+  x.submit('c');
+  await x.tick();
+  assert.equal(x.effects.attempts.at(-1).l1_profile, 'python-node');
+  // Без метки попытка не несёт явного выбора — действует дефолт.
+  const plain = await queueLab(t);
+  await plain.tick();
+  plain.submit('c');
+  await plain.tick();
+  assert.equal(plain.effects.attempts.at(-1).l1_profile, undefined);
+});
+
 test('queue mode does not claim foreign, unauthorized, incomplete-contract or held cards', async t => {
   for (const [opts, phase, reason] of [
     [{ owner: 'board:other' }, 'idle', undefined],

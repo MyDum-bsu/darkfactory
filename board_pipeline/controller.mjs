@@ -60,6 +60,9 @@ function contractOf(labels) {
     spec_digest: labels?.spec_digest,
     policy_digest: labels?.policy_digest,
     fixtures_digest: typeof labels?.fixtures_digest === 'string' ? labels.fixtures_digest : null,
+    // Явный L1-выбор оператора при постановке — контрактная метка:
+    // контроллер обязан применить именно её, а не свой дефолт repo_id.
+    l1_profile: typeof labels?.l1_profile === 'string' ? labels.l1_profile : undefined,
     // Метка has_ui карточки может только ВКЛЮЧИТЬ L3; 'false' не выключает
     // обязательный profile.has_ui — решение остаётся у оператора.
     has_ui: labels?.has_ui === 'true' ? true : undefined,
@@ -81,6 +84,7 @@ function attemptOf(record, route) {
     attempt.spec_digest = record.contract.spec_digest;
     attempt.policy_digest = record.contract.policy_digest;
     attempt.fixtures_digest = record.contract.fixtures_digest ?? null;
+    if (record.contract.l1_profile !== undefined) attempt.l1_profile = record.contract.l1_profile;
     if (record.contract.has_ui !== undefined) attempt.has_ui = record.contract.has_ui;
   }
   return attempt;

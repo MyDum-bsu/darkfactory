@@ -63,19 +63,20 @@ export function resolveL1Profile({ l1Profile, repoId } = {}) {
   return L1_PROFILES[l1Profile];
 }
 
-// Эффективный L1-профиль попытки: явный --l1-profile > l1Profile
-// выбранного профиля политики > дефолт repoId. Любое заданное
-// неизвестное имя и два явных различных источника — fail-closed отказ
-// до любой проверки и эффекта.
-export function effectiveL1ProfileId({ cliProfile, profileL1, repoId } = {}) {
-  if (profileL1 !== undefined && !isValidL1Profile(profileL1)) {
-    throw new Error(`unknown_l1_profile:${String(profileL1)}`);
+// Эффективный L1-профиль попытки: явные источники — --l1-profile,
+// l1Profile выбранного профиля политики и закреплённая метка
+// l1_profile карточки — обязаны совпадать; иначе — дефолт repoId.
+// Любое заданное неизвестное имя и два различных явных значения —
+// fail-closed отказ до любой проверки и эффекта.
+export function effectiveL1ProfileId({ cliProfile, profileL1, cardL1, repoId } = {}) {
+  for (const explicit of [cliProfile, profileL1, cardL1]) {
+    if (explicit !== undefined && !isValidL1Profile(explicit)) {
+      throw new Error(`unknown_l1_profile:${String(explicit)}`);
+    }
   }
-  if (cliProfile !== undefined && !isValidL1Profile(cliProfile)) {
-    throw new Error(`unknown_l1_profile:${String(cliProfile)}`);
-  }
-  if (cliProfile !== undefined && profileL1 !== undefined && cliProfile !== profileL1) {
+  const first = [cliProfile, profileL1, cardL1].find(value => value !== undefined);
+  if ([cliProfile, profileL1, cardL1].some(value => value !== undefined && value !== first)) {
     throw new Error('l1_profile_mismatch');
   }
-  return resolveL1Profile({ l1Profile: cliProfile ?? profileL1, repoId }).id;
+  return resolveL1Profile({ l1Profile: cliProfile ?? profileL1 ?? cardL1, repoId }).id;
 }

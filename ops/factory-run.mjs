@@ -23,8 +23,7 @@ import { parseArgs, promisify } from 'node:util';
 import { createPilotSwitch } from '../board_pipeline/pilot-gate.mjs';
 import { opencodeGoPolicyViolation, retiredProviderViolation }
   from '../board_pipeline/worker-selector.mjs';
-import { DEFAULT_L1_PROFILE, isValidL1Profile, resolveL1Profile }
-  from '../board_pipeline/l1-profiles.mjs';
+import { isValidL1Profile, resolveL1Profile } from '../board_pipeline/l1-profiles.mjs';
 
 const execFileAsync = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -558,10 +557,12 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   for (const flag of PASSTHROUGH_VALUE) {
     if (values[flag] !== undefined) argv.push(`--${flag}`, values[flag]);
   }
-  // Эффективный L1-профиль передаётся контроллеру, когда выбор отличается
-  // от дефолта 'node' или задан явно: иначе run-isolated применил бы
-  // дефолт репозитория/реестра вместо проверенного здесь значения.
-  if (values['l1-profile'] !== undefined || l1Profile !== DEFAULT_L1_PROFILE) {
+  // Только ЯВНЫЙ выбор оператора передаётся контроллеру как --l1-profile:
+  // резолвленный здесь дефолт репозитория не пробрасывается — контроллер
+  // считал бы его явным, и явный l1Profile рецепта конфликтовал бы с
+  // неявным дефолтом (l1_profile_mismatch), хотя прямой запуск
+  // контроллера такую политику принимает.
+  if (values['l1-profile'] !== undefined) {
     argv.push('--l1-profile', l1Profile);
   }
   return { node: process.execPath, argv, env: envOverrides,

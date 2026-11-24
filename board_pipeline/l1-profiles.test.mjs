@@ -301,11 +301,18 @@ test('run: l1Profile — дефолт, авто-репозиторий, mismatch
     await writeFile(autoFile, JSON.stringify(autoPolicy));
     const auto = await buildRunPlan(values(autoFile), { env: {} });
     assert.equal(auto.l1Profile, 'python-node');
-    // Не-дефолтный эффективный профиль пробрасывается контроллеру —
-    // иначе run-isolated применил бы дефолт вместо проверенного выбора.
-    assert.deepEqual(auto.argv.slice(auto.argv.indexOf('--l1-profile')),
-      ['--l1-profile', 'python-node']);
-    // Явный флаг и закреплённый профиль при совпадении — проходят.
+    // Резолвленный дефолт НЕ пробрасывается как --l1-profile: контроллер
+    // считал бы его явным выбором, и явный l1Profile рецепта дал бы
+    // l1_profile_mismatch, хотя прямой запуск контроллера его принимает.
+    assert.equal(auto.argv.includes('--l1-profile'), false);
+    // Закреплённый в политике профиль без CLI-флага — тоже неявный для
+    // контроллера выбор: флаг не пробрасывается, политику читает сам
+    // контроллер.
+    const policyOnly = await buildRunPlan(values(fPinned), { env: {} });
+    assert.equal(policyOnly.l1Profile, 'python-node');
+    assert.equal(policyOnly.argv.includes('--l1-profile'), false);
+    // Явный флаг и закреплённый профиль при совпадении — проходят,
+    // и операторский выбор пробрасывается контроллеру.
     const pinned = await buildRunPlan(
       values(fPinned, { 'l1-profile': 'python-node' }), { env: {} });
     assert.equal(pinned.l1Profile, 'python-node');
@@ -352,10 +359,25 @@ test('run-isolated: эффективный l1Profile — CLI, политика, 
     { cliProfile: 'python-node', profileL1: 'python-node' }), 'python-node');
   assert.throws(() => effectiveL1ProfileId(
     { cliProfile: 'node', profileL1: 'python-node' }), /l1_profile_mismatch/);
+  // Закреплённая метка карточки — третий явный источник: принятый выбор
+  // node на python-репозитории применяется, а не заменяется дефолтом.
+  assert.equal(effectiveL1ProfileId({ cardL1: 'node', repoId: 'optimization' }), 'node');
+  assert.equal(effectiveL1ProfileId(
+    { cardL1: 'python-node', profileL1: 'python-node' }), 'python-node');
+  for (const combo of [
+    { cardL1: 'node', profileL1: 'python-node' },
+    { cardL1: 'python-node', cliProfile: 'node' },
+    { cardL1: 'node', cliProfile: 'python-node', profileL1: 'python-node' },
+  ]) {
+    assert.throws(() => effectiveL1ProfileId(combo),
+      /l1_profile_mismatch/, JSON.stringify(combo));
+  }
   for (const bad of ['bogus', '', null, '__proto__', 'toString', 'constructor']) {
     assert.throws(() => effectiveL1ProfileId({ cliProfile: bad }),
       /^Error: unknown_l1_profile:/, JSON.stringify(bad));
     assert.throws(() => effectiveL1ProfileId({ profileL1: bad }),
+      /^Error: unknown_l1_profile:/, JSON.stringify(bad));
+    assert.throws(() => effectiveL1ProfileId({ cardL1: bad }),
       /^Error: unknown_l1_profile:/, JSON.stringify(bad));
   }
 });
@@ -373,8 +395,10 @@ test('run-isolated: --l1-profile разобран, резолвлен и при�
   // attempt.repo_id с откатом на route.repoId — queue-маршрут без
   // repoId получает дефолт repo_id захваченной карточки.
   assert.match(source, /effectiveL1ProfileId\(\{[\s\S]*?repoId:\s*attempt\.repo_id\s*\?\?\s*route\.repoId/);
+  // Закреплённая метка карточки — явный источник попытки.
+  assert.match(source, /cardL1:\s*attempt\.l1_profile/);
   // Явный выбор идёт в l1Profile (mismatch с рецептом), неявный дефолт —
   // в l1Default: явный l1Profile рецепта не конфликтует с дефолтом.
   assert.match(source, /l1Profile:\s*explicitL1/);
-  assert.match(source, /l1Default:\s*attemptL1Default/);
+  assert.match(source, /l1Default:\s*attemptL1/);
 });

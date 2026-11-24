@@ -589,6 +589,7 @@ async function execute() {
       if (contract && (labels.repo_id !== contract.repo_id || labels.spec_digest !== contract.spec_digest ||
           labels.policy_digest !== contract.policy_digest || labels.profile_id !== route.checkProfile ||
           (labels.fixtures_digest ?? null) !== (contract.fixtures_digest ?? null) || labels.finish !== route.finish ||
+          (labels.l1_profile ?? null) !== (contract.l1_profile ?? null) ||
           (labels.has_ui === 'true') !== (contract.has_ui === true))) return false;
       return await stableCheckpoint(threadId, question.checkpoint.turn_seq) === question.checkpoint.sha;
     },
@@ -632,6 +633,7 @@ async function execute() {
       : { repo_id: attempt.repo_id, spec_digest: attempt.spec_digest,
           policy_digest: attempt.policy_digest, profile_id: attempt.check_profile,
           fixtures_digest: attempt.fixtures_digest ?? null,
+          l1_profile: attempt.l1_profile ?? null,
           has_ui: attempt.has_ui, finish: route.finish };
     const retryGuard = l2ReviewRetryGuard({ port, taskId: attempt.task_id,
       epoch: attempt.epoch, owner: p.owner, label: p.label,
@@ -670,19 +672,20 @@ async function execute() {
     // файлов маршрута. Дайджест карточки сюда не подставляется: контракт
     // сверяется с доверенным значением, а не сам с собой.
     // Эффективный L1-профиль попытки: дефолт репозитория — по
-    // подтверждённому attempt.repo_id (иначе route.repoId). Явный выбор
-    // (CLI/политика) идёт в l1Profile и сверяется с рецептом; неявный
-    // дефолт — в l1Default и не считается конфликтующим явным выбором:
-    // явный l1Profile рецепта сохраняет прежнее поведение.
-    const explicitL1 = (values['l1-profile'] ?? profile.l1Profile) === undefined ? undefined
-      : effectiveL1ProfileId({ cliProfile: values['l1-profile'],
-        profileL1: profile.l1Profile, repoId: attempt.repo_id ?? route.repoId });
-    const attemptL1Default = effectiveL1ProfileId({ cliProfile: values['l1-profile'],
-      profileL1: profile.l1Profile, repoId: attempt.repo_id ?? route.repoId });
+    // подтверждённому attempt.repo_id (иначе route.repoId). Явные
+    // источники (CLI, профиль политики, метка l1_profile карточки) идут
+    // в l1Profile и сверяются с рецептом; неявный дефолт — в l1Default
+    // и не считается конфликтующим явным выбором: явный l1Profile
+    // рецепта сохраняет прежнее поведение.
+    const attemptL1 = effectiveL1ProfileId({ cliProfile: values['l1-profile'],
+      profileL1: profile.l1Profile, cardL1: attempt.l1_profile,
+      repoId: attempt.repo_id ?? route.repoId });
+    const explicitL1 = (values['l1-profile'] ?? profile.l1Profile ??
+      attempt.l1_profile) === undefined ? undefined : attemptL1;
     const policy = { version: p.version,
       digest: p.policyDigest ?? route.policyDigest,
       profiles: { [attempt.check_profile]: { ...profile, l1Profile: explicitL1,
-        l1Default: attemptL1Default, visual: profile.visual,
+        l1Default: attemptL1, visual: profile.visual,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
       arbiter: attemptArbiter,
