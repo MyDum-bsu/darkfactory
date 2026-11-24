@@ -40,7 +40,12 @@ export const REPO_DEFAULT_L1_PROFILES = freeze({
 });
 
 export function defaultL1ProfileForRepo(repoId) {
-  return REPO_DEFAULT_L1_PROFILES[repoId] ?? DEFAULT_L1_PROFILE;
+  // Object.hasOwn, не доступ через прототип: repoId вида 'constructor',
+  // 'toString', '__proto__' обязан дать дефолт, а не унаследованное
+  // свойство Object.prototype.
+  return typeof repoId === 'string' && Object.hasOwn(REPO_DEFAULT_L1_PROFILES, repoId)
+    ? REPO_DEFAULT_L1_PROFILES[repoId]
+    : DEFAULT_L1_PROFILE;
 }
 
 export function isValidL1Profile(name) {

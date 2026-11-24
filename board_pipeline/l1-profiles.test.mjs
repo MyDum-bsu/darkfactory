@@ -3,6 +3,7 @@
 // acceptance, runtime и операторские CLI (factory-enqueue/factory-run).
 // Без внешних зависимостей и host-путей: временные каталоги — в tmpdir,
 // в finally удаляются; docker и vb не вызываются.
+import { execFile } from 'node:child_process';
 import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile }
   from 'node:fs/promises';
@@ -11,6 +12,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { promisify } from 'node:util';
 import { DEFAULT_L1_PROFILE, defaultL1ProfileForRepo, isValidL1Profile,
   L1_PROFILES, REPO_DEFAULT_L1_PROFILES, resolveL1Profile }
   from './l1-profiles.mjs';
@@ -19,6 +21,9 @@ import { offlineDockerRunner, offlineProfileRunner, SANDBOX_ENV }
   from './runtime.mjs';
 import { buildEnqueuePlan } from '../ops/factory-enqueue.mjs';
 import { buildRunPlan } from '../ops/factory-run.mjs';
+import { effectiveL1ProfileId } from './run-isolated.mjs';
+
+const execFileAsync = promisify(execFile);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -42,6 +47,17 @@ test('реестр: дефолт node, python-node для optimization/autoresea
   assert.equal(defaultL1ProfileForRepo('autoresearcher'), 'python-node');
   assert.equal(defaultL1ProfileForRepo('other'), 'node');
   assert.equal(defaultL1ProfileForRepo(undefined), 'node');
+  // Прототипные ключи Object.prototype — не записи реестра: lookup только
+  // через Object.hasOwn, иначе 'constructor'/'toString' дали бы объект,
+  // а не 'node'.
+  for (const protoKey of ['constructor', 'toString', '__proto__',
+    'hasOwnProperty', 'valueOf']) {
+    assert.equal(defaultL1ProfileForRepo(protoKey), 'node', protoKey);
+    assert.equal(resolveL1Profile({ repoId: protoKey }).id, 'node', protoKey);
+  }
+  for (const nonString of [null, 0, {}, ['optimization'], ['node']]) {
+    assert.equal(defaultL1ProfileForRepo(nonString), 'node', JSON.stringify(nonString));
+  }
   assert.equal(resolveL1Profile({}).id, 'node');
   assert.equal(resolveL1Profile({ repoId: 'optimization' }).id, 'python-node');
   assert.equal(resolveL1Profile({ l1Profile: 'python-node' }).id, 'python-node');
@@ -114,6 +130,23 @@ test('runtime: runner отклоняет неизвестный l1Profile до �
       await assert.rejects(() => runner(handoff,
         { l1Profile: '__proto__', check: recipe, checks: [recipe] }),
         /unknown_l1_profile:/);
+      // Явный null — не «отсутствует»: ?? скрыл бы его за дефолтом
+      // рецепта, раздельная проверка отклоняет до docker.
+      await assert.rejects(() => runner(handoff,
+        { l1Profile: null, check: recipe, checks: [recipe] }),
+        /unknown_l1_profile:null/);
+      // Невалидный рецепт не маскируется валидным профилем.
+      await assert.rejects(() => runner(handoff,
+        { l1Profile: 'node',
+          check: { ...recipe, l1Profile: 'bogus' },
+          checks: [{ ...recipe, l1Profile: 'bogus' }] }),
+        /unknown_l1_profile:bogus/);
+      // Оба явных и различных — fail-closed mismatch, а не приоритет.
+      await assert.rejects(() => runner(handoff,
+        { l1Profile: 'node',
+          check: { ...recipe, l1Profile: 'python-node' },
+          checks: [{ ...recipe, l1Profile: 'python-node' }] }),
+        /l1_profile_mismatch/);
     }
   } finally {
     await rm(journal, { recursive: true, force: true });
@@ -247,6 +280,9 @@ test('run: l1Profile — дефолт, авто-репозиторий, mismatch
     const fBad = await write({ l1Profile: 'bogus' });
     const plain = await buildRunPlan(values(fPlain), { env: {} });
     assert.equal(plain.l1Profile, 'node');
+    // Дефолт 'node' без явного выбора не пробрасывается: контроллер сам
+    // резолвит дефолт репозитория.
+    assert.equal(plain.argv.includes('--l1-profile'), false);
     // repoId репозитория с python-дефолтом выбирает python-node сам.
     const autoPolicy = JSON.parse(await readFile(fPlain, 'utf8'));
     autoPolicy.route.repoId = 'autoresearcher';
@@ -254,10 +290,23 @@ test('run: l1Profile — дефолт, авто-репозиторий, mismatch
     await writeFile(autoFile, JSON.stringify(autoPolicy));
     const auto = await buildRunPlan(values(autoFile), { env: {} });
     assert.equal(auto.l1Profile, 'python-node');
+    // Не-дефолтный эффективный профиль пробрасывается контроллеру —
+    // иначе run-isolated применил бы дефолт вместо проверенного выбора.
+    assert.deepEqual(auto.argv.slice(auto.argv.indexOf('--l1-profile')),
+      ['--l1-profile', 'python-node']);
     // Явный флаг и закреплённый профиль при совпадении — проходят.
     const pinned = await buildRunPlan(
       values(fPinned, { 'l1-profile': 'python-node' }), { env: {} });
     assert.equal(pinned.l1Profile, 'python-node');
+    assert.deepEqual(pinned.argv.slice(pinned.argv.indexOf('--l1-profile')),
+      ['--l1-profile', 'python-node']);
+    // Явный --l1-profile node на дефолтной политике — тоже пробрасывается:
+    // контроллер обязан применить именно явный выбор, а не свой дефолт.
+    const explicit = await buildRunPlan(
+      values(fPlain, { 'l1-profile': 'node' }), { env: {} });
+    assert.equal(explicit.l1Profile, 'node');
+    assert.deepEqual(explicit.argv.slice(explicit.argv.indexOf('--l1-profile')),
+      ['--l1-profile', 'node']);
     await assert.rejects(() => buildRunPlan(
       values(fPinned, { 'l1-profile': 'node' }), { env: {} }),
       /l1_profile_mismatch/);
@@ -276,6 +325,89 @@ test('run: l1Profile — дефолт, авто-репозиторий, mismatch
     await writeFile(otherFile, JSON.stringify(other));
     await assert.rejects(() => buildRunPlan(values(otherFile), { env: {} }),
       /unknown_l1_profile:bogus/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run-isolated: эффективный l1Profile — CLI, политика, дефолт repoId', () => {
+  // Дефолт реестра и дефолт репозитория.
+  assert.equal(effectiveL1ProfileId({}), 'node');
+  assert.equal(effectiveL1ProfileId({ repoId: 'optimization' }), 'python-node');
+  // Явный CLI сильнее закреплённого профиля? Нет: расхождение — отказ.
+  assert.equal(effectiveL1ProfileId({ cliProfile: 'python-node' }), 'python-node');
+  assert.equal(effectiveL1ProfileId({ profileL1: 'python-node' }), 'python-node');
+  assert.equal(effectiveL1ProfileId(
+    { cliProfile: 'python-node', profileL1: 'python-node' }), 'python-node');
+  assert.throws(() => effectiveL1ProfileId(
+    { cliProfile: 'node', profileL1: 'python-node' }), /l1_profile_mismatch/);
+  for (const bad of ['bogus', '', null, '__proto__', 'toString', 'constructor']) {
+    assert.throws(() => effectiveL1ProfileId({ cliProfile: bad }),
+      /^Error: unknown_l1_profile:/, JSON.stringify(bad));
+    assert.throws(() => effectiveL1ProfileId({ profileL1: bad }),
+      /^Error: unknown_l1_profile:/, JSON.stringify(bad));
+  }
+});
+
+// Сквозная проверка контроллера: --l1-profile доходит до валидации
+// run-isolated.mjs, а не теряется в argv. Политика без waitMs: пройденная
+// валидация профиля падает позже на 'Configure the pilot wait time'.
+test('run-isolated: --l1-profile валидируется контроллером fail-closed', async () => {
+  const dir = await tempdir();
+  try {
+    const ops = join(dir, 'ops');
+    const wt = join(dir, 'wt');
+    const state = join(dir, 'state');
+    const inbox = join(dir, 'inbox');
+    mkdirSync(ops);
+    mkdirSync(wt);
+    mkdirSync(state, { mode: 0o700 });
+    mkdirSync(inbox);
+    writeFileSync(join(ops, 'brief.md'), 'b');
+    writeFileSync(join(ops, 'review.md'), 'r');
+    writeFileSync(join(ops, 'gate.json'), '{}');
+    writeFileSync(join(ops, 'routes.json'), '{}');
+    const write = async l1 => {
+      const file = join(dir, `iso-${Math.random().toString(36).slice(2)}.json`);
+      await writeFile(file, JSON.stringify({
+        handoffDir: inbox, brief: join(ops, 'brief.md'),
+        reviewPrompt: join(ops, 'review.md'), reviewGate: join(ops, 'gate.json'),
+        scope: 'isolated', channel: 'pilot',
+        boardUrl: 'http://127.0.0.1:44101/api/board', owner: 'o',
+        label: { key: 'k', value: 'v' }, version: 1,
+        bb: { provider: 'acp-devin', model: 'swe-2-high', project: 'proj_x' },
+        route: { worktree: wt, checkProfile: 'default', finish: 'verified',
+          repoId: 'r', policyVersion: 1 },
+        profiles: { default: { branch: 'b',
+          review: { provider: 'openai', model: 'gpt-6.2-sol',
+            reasoningLevel: 'medium' },
+          ...(l1 === undefined ? {} : { l1Profile: l1 }) } },
+      }));
+      return file;
+    };
+    const controller = join(ROOT, 'board_pipeline', 'run-isolated.mjs');
+    const run = (policy, extra = []) => execFileAsync(process.execPath,
+      [controller, '--execute', '--policy', policy, '--state', state, ...extra],
+      { timeout: 30_000 });
+    const fails = async (policy, extra, pattern) => {
+      await assert.rejects(() => run(policy, extra), error => {
+        assert.match(String(error?.stderr ?? ''), pattern);
+        return true;
+      });
+    };
+    const fPlain = await write(undefined);
+    const fPinned = await write('python-node');
+    // Неизвестный --l1-profile и неизвестный профиль политики — отказ.
+    await fails(fPlain, ['--l1-profile', 'bogus'], /unknown_l1_profile:bogus/);
+    await fails(await write('bogus'), [], /unknown_l1_profile:bogus/);
+    // Явный CLI при другом закреплённом профиле — mismatch, не приоритет.
+    await fails(fPinned, ['--l1-profile', 'node'], /l1_profile_mismatch/);
+    // Совпадающий явный выбор и отсутствие флага проходят валидацию:
+    // следующий fail-closed рубеж — отсутствующий waitMs политики.
+    for (const extra of [[], ['--l1-profile', 'python-node']]) {
+      await fails(fPinned, extra, /Configure the pilot wait time/);
+    }
+    await fails(fPlain, [], /Configure the pilot wait time/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

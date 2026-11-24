@@ -40,7 +40,7 @@ import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
 import * as workerSelector from './worker-selector.mjs';
 import { abEffectGuard, enrollAbPilot, guardAbBoard, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
 import { pilotWriterWorkspaceReady } from './bb-stage-adapter.mjs';
-import { isValidL1Profile } from './l1-profiles.mjs';
+import { isValidL1Profile, resolveL1Profile } from './l1-profiles.mjs';
 
 const exec = promisify(execFile);
 const inside = (root, p) => {
@@ -59,6 +59,23 @@ const isApprovedWorker = bb =>
   (bb?.provider === 'pi' && typeof bb.model === 'string' &&
     /^opencode-go\//i.test(bb.model) &&
     workerSelector.workerFamily(bb) === 'deepseek');
+
+// Эффективный L1-профиль попытки: явный --l1-profile > l1Profile
+// выбранного профиля политики > дефолт repoId. Любое заданное
+// неизвестное имя и два явных различных источника — fail-closed отказ
+// до любой проверки и эффекта.
+export function effectiveL1ProfileId({ cliProfile, profileL1, repoId } = {}) {
+  if (profileL1 !== undefined && !isValidL1Profile(profileL1)) {
+    throw new Error(`unknown_l1_profile:${String(profileL1)}`);
+  }
+  if (cliProfile !== undefined && !isValidL1Profile(cliProfile)) {
+    throw new Error(`unknown_l1_profile:${String(cliProfile)}`);
+  }
+  if (cliProfile !== undefined && profileL1 !== undefined && cliProfile !== profileL1) {
+    throw new Error('l1_profile_mismatch');
+  }
+  return resolveL1Profile({ l1Profile: cliProfile ?? profileL1, repoId }).id;
+}
 
 async function readOperatorInputs(paths) {
   const inputs = new Map(await Promise.all(paths.map(async path => [path, await readFile(path)])));
@@ -170,7 +187,8 @@ async function execute() {
   const { values } = parseArgs({ options: { execute: { type: 'boolean' }, policy: { type: 'string' },
     state: { type: 'string' }, 'recheck-rejected-handoff': { type: 'boolean' },
     'stop-on-idle': { type: 'boolean' }, 'allow-live-pilot': { type: 'boolean' },
-    daemon: { type: 'boolean' }, 'interval-ms': { type: 'string' }, switch: { type: 'string' } } });
+    daemon: { type: 'boolean' }, 'interval-ms': { type: 'string' }, switch: { type: 'string' },
+    'l1-profile': { type: 'string' } } });
   if (!values.execute || !values.policy || !values.state) throw new Error('Use --execute --policy FILE --state DIR');
   const policyFile = await realpath(values.policy);
   const policyBytes = await readFile(policyFile);
@@ -243,12 +261,14 @@ async function execute() {
   };
   if (p.version !== route.policyVersion || !p.owner || !p.label?.key || !p.label?.value ||
       !p.profiles?.[route.checkProfile]?.branch) throw new Error('Incomplete enrolled policy');
-  // Явный l1Profile выбранного профиля — строго из реестра, fail-closed
-  // на старте, до любой проверки и эффекта.
-  const l1Profile = p.profiles[route.checkProfile].l1Profile;
-  if (l1Profile !== undefined && !isValidL1Profile(l1Profile)) {
-    throw new Error(`unknown_l1_profile:${String(l1Profile)}`);
-  }
+  // Явный l1Profile выбранного профиля и CLI --l1-profile — строго из
+  // реестра, fail-closed на старте, до любой проверки и эффекта. Оба
+  // заданных различных значения — отказ; эффективный профиль иначе —
+  // дефолт repoId.
+  const effectiveL1Profile = effectiveL1ProfileId({
+    cliProfile: values['l1-profile'],
+    profileL1: p.profiles[route.checkProfile].l1Profile,
+    repoId: route.repoId });
   if (!Number.isSafeInteger(p.waitMs) || p.waitMs < 1) throw new Error('Configure the pilot wait time');
   delete process.env.BOARD_TOKEN;
   process.env.BOARD_URL = p.boardUrl;
@@ -667,7 +687,7 @@ async function execute() {
     // сверяется с доверенным значением, а не сам с собой.
     const policy = { version: p.version,
       digest: p.policyDigest ?? route.policyDigest,
-      profiles: { [attempt.check_profile]: { ...profile, visual: profile.visual,
+      profiles: { [attempt.check_profile]: { ...profile, l1Profile: effectiveL1Profile, visual: profile.visual,
       worker: attempt.bb_thread_id, task: attempt.task_id, worktree: tree, base: route.base, finish: route.finish,
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
       arbiter: attemptArbiter,

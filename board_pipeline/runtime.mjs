@@ -114,11 +114,22 @@ export function offlineDockerRunner(journal, { beforeEffect } = {}) {
   return async (handoff, profile) => {
     const recipe = checkCommand(profile.check ?? {});
     const { image, argv, cwd, timeoutMs } = recipe;
-    // Явный l1Profile профиля/рецепта — fail-closed до любого вызова docker;
-    // его defaultEnv подмешивается только в ключи, не заданные в recipe.env.
-    const l1 = profile.l1Profile ?? recipe.l1Profile;
+    // Явный l1Profile профиля и рецепта проверяется раздельно fail-closed
+    // до любого вызова docker: ?? проглотил бы явный null и скрыл бы
+    // недопустимый recipe.l1Profile за валидным profile.l1Profile. Оба
+    // заданных и разных значения — отказ, а не выбор приоритетного.
+    const l1Profile = profile.l1Profile === undefined ? undefined
+      : resolveL1Profile({ l1Profile: profile.l1Profile });
+    const l1Recipe = recipe.l1Profile === undefined ? undefined
+      : resolveL1Profile({ l1Profile: recipe.l1Profile });
+    if (l1Profile !== undefined && l1Recipe !== undefined && l1Profile.id !== l1Recipe.id) {
+      throw new Error('l1_profile_mismatch');
+    }
+    // defaultEnv выбранного профиля подмешивается только в ключи, не
+    // заданные в recipe.env.
+    const l1 = l1Profile ?? l1Recipe;
     const effective = l1 === undefined ? recipe
-      : { ...recipe, env: { ...resolveL1Profile({ l1Profile: l1 }).defaultEnv, ...recipe.env } };
+      : { ...recipe, env: { ...l1.defaultEnv, ...recipe.env } };
     if (!SHA.test(handoff.candidate_sha)) throw new Error('Local runner requires a full SHA');
     const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
       timeout: 12_000,
@@ -295,8 +306,11 @@ export function offlineProfileRunner(journal, options) {
     if (!Array.isArray(profile.checks) || !profile.checks.length) throw new Error('An approved check list is required');
     const evidence = [];
     for (const recipe of profile.checks) {
+      // l1Profile профиля и рецепта передаются раздельно: сверка и
+      // fail-closed валидация каждого — в раннере, ?? здесь скрыл бы
+      // недопустимый рецепт за валидным профилем.
       const result = await check(handoff,
-        { check: recipe, l1Profile: profile.l1Profile ?? recipe.l1Profile });
+        { check: recipe, l1Profile: profile.l1Profile });
       evidence.push(result.evidence);
       if (!result.ok) return { sha: result.sha, ok: false, evidence };
     }
