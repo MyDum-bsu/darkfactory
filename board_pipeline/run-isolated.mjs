@@ -351,7 +351,11 @@ async function execute() {
         worktree: tree })
     : undefined;
   const assertOpen = activation && (async () => { await assertPinned(); await switchOpen(); });
-  const port = guardAbBoard(ab, nativeBoardPort(board(), { channel: p.channel, isolatedQuestionOwner: Boolean(ownerAnswers),
+  // Явная аренда: та же константа — якорь старта writer-фазы при учёте
+  // фазового бюджета (record.until минус аренда).
+  const boardLeaseSec = 1800;
+  const port = guardAbBoard(ab, nativeBoardPort(board(), { channel: p.channel,
+    isolatedQuestionOwner: Boolean(ownerAnswers), lease: boardLeaseSec,
     pilot: activation && { scope: activation.scope, assertOpen } }));
   // Компактная строка телеметрии в квитанции закрытия карточки: без секретов
   // и сырых логов; не влезает в лимит 1000 — квитанция уходит без неё.
@@ -676,27 +680,19 @@ async function execute() {
     if (attemptCritic === null) throw new Error('route_critic_not_runnable');
     if (attemptArbiter === null) throw new Error('route_arbiter_not_runnable');
     const neon = isNeonReview(attemptCritic);
-    // VS-5.2: единый сигнал попытки для Stage/Foreman — kill-switch, живая
-    // lease (verifyHeld/epoch), фазовые бюджеты и общий deadline. Dispose
-    // обязателен в finally — висячих таймеров не остаётся.
-    const attemptSignals = createAttemptSignals({
-      deadline: ab ? ab.deadline
-        : (foreman?.deadlineMs === undefined ? undefined : Date.now() + foreman.deadlineMs),
-      phaseBudgets: foreman?.phaseBudgets,
-      assertOpen: ab?.assertOpen ?? assertOpen ?? undefined,
-      lease: { verifyHeld: (id, ep) => port.verifyHeld(id, ep),
-        taskId: attempt.task_id, epoch: attempt.epoch },
-      disk: { path: tree },
-    });
-    // Обязательный дисковый preflight ДО любых эффектов фазы проверок:
-    // невозможность измерить свободное место — fail-closed отказ.
-    await attemptSignals.checkDiskPreflight();
-    // Вход в фазу только когда она настроена: без phaseBudgets фазовый
-    // учёт выключен, с бюджетами незаданная фаза не трогается.
-    const enterPhase = name => {
-      const budget = attemptSignals.phaseBudget;
-      if (budget !== null && budget.budgets[name] !== undefined) attemptSignals.phase(name);
-    };
+    // Уже прошедшая writer-фаза учитывается в её бюджете по фактическому
+    // времени: старт ≈ record.until минус аренда (момент claim). Якорь
+    // неизмерим — бюджет writer честно не применяется (аренда всё равно
+    // ограничивает попытку через lease-опрос).
+    let phaseSpent;
+    if (foreman?.phaseBudgets?.writer !== undefined) {
+      const saved = await state.load();
+      const claimedUntil = typeof saved?.until === 'string' ? Date.parse(saved.until) : NaN;
+      if (Number.isFinite(claimedUntil)) {
+        phaseSpent = { writer: Math.max(0, Date.now() - (claimedUntil - boardLeaseSec * 1000)) };
+      }
+    }
+    let attemptSignals = null;
     let lost = false;
     let renewal = Promise.resolve();
     // Те же живые гейты повтора применяются и на границе запуска читателя:
@@ -783,6 +779,35 @@ async function execute() {
         .catch(() => { lost = true; });
     }, 20_000);
     try {
+      // VS-5.2: единый сигнал попытки для Stage/Foreman — kill-switch, живая
+      // lease (verifyHeld/epoch), фазовые бюджеты и общий deadline. Создание —
+      // внутри try: любой отказ (дисковый preflight, учёт writer) завершается
+      // dispose() и снятием всех таймеров попытки.
+      attemptSignals = createAttemptSignals({
+        deadline: ab ? ab.deadline
+          : (foreman?.deadlineMs === undefined ? undefined : Date.now() + foreman.deadlineMs),
+        phaseBudgets: foreman?.phaseBudgets,
+        phaseSpent,
+        assertOpen: ab?.assertOpen ?? assertOpen ?? undefined,
+        lease: { verifyHeld: (id, ep) => port.verifyHeld(id, ep),
+          taskId: attempt.task_id, epoch: attempt.epoch },
+        disk: { path: tree },
+      });
+      // Обязательный дисковый preflight ДО любых эффектов фазы проверок:
+      // невозможность измерить свободное место — fail-closed отказ.
+      await attemptSignals.checkDiskPreflight();
+      // Прошедшая writer-фаза списывается в бюджет по факту; перерасход —
+      // немедленный abort до любых проверок.
+      if (attemptSignals.phaseBudget?.budgets.writer !== undefined) {
+        attemptSignals.phase('writer');
+        attemptSignals.leavePhase();
+      }
+      // Вход в фазу только когда она настроена: без phaseBudgets фазовый
+      // учёт выключен, с бюджетами незаданная фаза не трогается.
+      const enterPhase = name => {
+        const budget = attemptSignals.phaseBudget;
+        if (budget !== null && budget.budgets[name] !== undefined) attemptSignals.phase(name);
+      };
       // VS-3: фазы приёмки (L1 local, tamper, L3 visual, L2 critic) замеряются
       // вокруг портов; usage критика — из квитанции ревью, иначе null.
       telemetry.roundStart();
@@ -790,11 +815,12 @@ async function execute() {
       const inspect = worktreeInspector(policy);
       const runLocal = offlineProfileRunner(root, { beforeEffect });
       const runVisual = offlineVisualRunner(root, { beforeEffect });
-      let diff, localEvidence;
+      let diff, localEvidence, visualEvidence = null;
       const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', inspect),
         local: telemetry.port('l1_local', async (binding, trusted) => {
           enterPhase('l1_l3');
+          if (attemptSignals.signal.aborted) throw attemptSignals.signal.reason;
           if (!ab && !foreman) return runLocal(binding, trusted);
           diff = ab ? await inspectPilotDiff(ab, { git: rawGit, base: route.base, candidate: binding.candidate_sha })
             : await foremanDiff({ git: rawGit, base: route.base, candidate: binding.candidate_sha });
@@ -804,7 +830,9 @@ async function execute() {
         tamper: telemetry.port('tamper', tamperGate),
         visual: telemetry.port('l3_visual', async (binding, trusted) => {
           enterPhase('l1_l3');
-          return runVisual(binding, trusted);
+          if (attemptSignals.signal.aborted) throw attemptSignals.signal.reason;
+          visualEvidence = await runVisual(binding, trusted);
+          return visualEvidence;
         }),
         // Смена брифа/файлов политики во время проверок останавливает кандидата до complete.
         verifyPinned: assertPinned,
@@ -817,7 +845,8 @@ async function execute() {
             // Доверенные артефакты под verifier каждой стадии: 'inventory'
             // и 'change-set' измеряются фактически, прочие — fail-closed.
             const readArtifact = foremanArtifacts({ candidate: handoff.candidate_sha, diff, localEvidence,
-              brief: pinned.inputs.get(brief), review: reviewSpec, git: rawGit });
+              brief: pinned.inputs.get(brief), review: reviewSpec, git: rawGit,
+              visual: visualEvidence, journal: root });
             // Общий (без abPilot) foreman-контур: живая загрузка реестра и
             // сверка digest на каждом входе — тот же fail-closed, что у ab.
             const seat = ab?.arm === 'foreman' ? ab : await (async () => {
@@ -855,16 +884,20 @@ async function execute() {
           // публикуется до вызова — beforeEffect раннера проверяет гейты и
           // субъект заново непосредственно перед docker run каждого вызова.
           launchBinding = { ...handoff, worktree: tree, branch: profile.branch };
-          const receipt = await telemetry.phase('l2_critic', () => {
+          const receipt = await telemetry.phase('l2_critic', async () => {
             enterPhase('l2_critic');
             try {
-              return l2ReviewWithTransientRetry({
+              const critic = await l2ReviewWithTransientRetry({
                 review, retry: retryReview, binding: handoff, profile: trusted,
                 beforeRetry: retryGuard,
                 verifySubject: b => assertRetrySubjectUnchanged({ ...b, worktree: tree,
                   branch: profile.branch }),
                 log: note => console.log(JSON.stringify(note)),
               });
+              // Просроченный/отменённый результат не принимается: таймер фазы
+              // вооружён до завершения критика (return await, не return).
+              if (attemptSignals.signal.aborted) throw attemptSignals.signal.reason;
+              return critic;
             } finally {
               attemptSignals.leavePhase();
             }
@@ -901,7 +934,7 @@ async function execute() {
       return result;
     } finally {
       clearInterval(timer);
-      attemptSignals.dispose();
+      attemptSignals?.dispose();
       await renewal;
     }
   };

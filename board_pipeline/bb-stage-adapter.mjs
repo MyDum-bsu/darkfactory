@@ -214,18 +214,23 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     if (request.model.reasoning !== null) argv.push('--reasoning-level', request.model.reasoning);
     await assertCurrent(request.binding);
     await checkTransport();
+    // Отменённый до spawn вызов не запускает дочерний тред.
+    if (signals?.signal?.aborted) throw signals.signal.reason ?? new Error('stage_aborted');
     const spawned = await run(argv, Math.min(35_000, deadline - Date.now()));
     if (!BB_ID.test(spawned?.id ?? '')) throw new Error('stage_spawn_unconfirmed');
     // Stop is cleanup of an already-launched, specifically identified child,
     // not progression of the attempt; it remains needed after gate loss.
     // Сбой промежуточного thread show не отменяет остановку: spawned.id —
     // наш подтверждённый дочерний тред, осиротевших процессов быть не должно.
+    // environment ещё не назначено (null, статус starting) — тоже наш тред.
     const stopSpawned = async () => {
       let current = null;
       try { current = await run(['thread', 'show', spawned.id, '--json']); } catch { /* show недоступен */ }
       if (current === null ||
           (current.thread?.parentThreadId === parentThread && current.thread?.projectId === project &&
-          current.environment?.path === workspace && current.thread?.id === spawned.id)) {
+          (current.environment === null || current.environment === undefined ||
+            current.environment?.path === workspace) &&
+          current.thread?.id === spawned.id)) {
         await execBb(['thread', 'stop', spawned.id], { timeout: 12_000 }).catch(() => {});
       }
     };
@@ -235,9 +240,23 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
       try {
         const seconds = Math.min(maxSeconds, Math.floor((deadline - Date.now()) / 1000));
         if (seconds < 1) throw new Error('stage_dispatch_deadline');
-        await run(['thread', 'wait', '--status', 'idle', '--timeout', `${seconds}s`, spawned.id, '--json'], (seconds + 5) * 1000);
+        const waiting = run(['thread', 'wait', '--status', 'idle', '--timeout', `${seconds}s`,
+          spawned.id, '--json'], (seconds + 5) * 1000);
+        const sig = signals?.signal;
+        if (sig === undefined || sig === null) await waiting;
+        else await new Promise((resolve, reject) => {
+          const onAbort = () => Promise.resolve(stopSpawned()).catch(() => {})
+            .finally(() => reject(sig.reason ?? new Error('stage_aborted')));
+          if (sig.aborted) return void onAbort();
+          sig.addEventListener('abort', onAbort, { once: true });
+          waiting.then(value => { sig.removeEventListener('abort', onAbort); resolve(value); },
+            cause => { sig.removeEventListener('abort', onAbort); reject(cause); });
+        });
       }
       catch (cause) {
+        // Приоритет сигнала отмены: обрыв wait по kill-switch/lease/дедлайну
+        // отражается исходной причиной, а не обёрткой.
+        if (signals?.signal?.aborted) throw signals.signal.reason ?? cause;
         throw new Error('stage_wait_unconfirmed', { cause });
       }
       const snapshot = await run(['thread', 'show', spawned.id, '--json']);

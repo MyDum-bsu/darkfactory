@@ -21,15 +21,22 @@ const abortError = reason => new AttemptSignalError(reason);
 // Фазовые бюджеты поверх общего deadline попытки. budgets: { writer, l1_l3,
 // stages, l2_critic } в мс. enter()/leave() накапливают время фазы между
 // повторными входами; remaining() учитывает и фазовый остаток, и общий
-// deadline — меньший из двух определяет границу.
-export function createPhaseBudget({ deadline, budgets = {}, now = () => Date.now() } = {}) {
+// deadline — меньший из двух определяет границу. Опциональный spent —
+// уже измеренное время фаз (например, завершившийся writer до создания
+// сигналов): бюджет учитывает его при проверке остатка.
+export function createPhaseBudget({ deadline, budgets = {}, spent: initial = {}, now = () => Date.now() } = {}) {
   if (!Number.isSafeInteger(deadline)) throw new AttemptSignalError('phase_budget_invalid');
   for (const [phase, ms] of Object.entries(budgets)) {
     if (!PHASES.includes(phase) || !Number.isSafeInteger(ms) || ms < 1) {
       throw new AttemptSignalError('phase_budget_invalid');
     }
   }
-  const spent = new Map();
+  for (const [phase, ms] of Object.entries(initial)) {
+    if (!PHASES.includes(phase) || !Number.isSafeInteger(ms) || ms < 0) {
+      throw new AttemptSignalError('phase_budget_invalid');
+    }
+  }
+  const spent = new Map(Object.entries(initial));
   let active = null;
   const elapsed = phase => (spent.get(phase) ?? 0) +
     (active?.phase === phase ? Math.max(0, now() - active.since) : 0);
@@ -82,12 +89,13 @@ export async function checkDiskPreflight(path, { minBytes = 1n, statfsImpl = sta
 // Опции:
 //   deadline       — абсолютная метка времени попытки (мс epoch), опционально;
 //   phaseBudgets   — { writer, l1_l3, stages, l2_critic } мс, опционально;
+//   phaseSpent     — уже измеренное время фаз, опционально;
 //   assertOpen     — операторский kill-switch/гейт, опционально;
 //   lease          — { verifyHeld, taskId, epoch }, опционально;
 //   disk           — { path, minBytes }, опционально;
 //   pollMs         — период опроса kill-switch и lease (по умолчанию 5000);
 //   now / statfsImpl / setTimeoutImpl / setIntervalImpl — для инъекции.
-export function createAttemptSignals({ deadline, phaseBudgets, assertOpen, lease, disk,
+export function createAttemptSignals({ deadline, phaseBudgets, phaseSpent, assertOpen, lease, disk,
   pollMs = 5000, now = () => Date.now(), statfsImpl = statfs } = {}) {
   if (deadline !== undefined && !Number.isSafeInteger(deadline)) {
     throw new AttemptSignalError('attempt_signals_invalid');
@@ -107,7 +115,8 @@ export function createAttemptSignals({ deadline, phaseBudgets, assertOpen, lease
     return timer;
   };
   const budget = phaseBudgets === undefined ? null
-    : createPhaseBudget({ deadline: deadline ?? Number.MAX_SAFE_INTEGER - 1, budgets: phaseBudgets, now });
+    : createPhaseBudget({ deadline: deadline ?? Number.MAX_SAFE_INTEGER - 1,
+      budgets: phaseBudgets, spent: phaseSpent ?? {}, now });
 
   if (deadline !== undefined) {
     arm(() => setTimeout(() => abort(abortError('deadline_exceeded')),

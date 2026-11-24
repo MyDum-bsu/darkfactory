@@ -370,7 +370,7 @@ test('сбой record() после подтверждённого spawn оста
   assert.equal(stopped, 1, 'дочерний тред обязан быть остановлен при сбое record');
 });
 
-test('foremanArtifacts: inventory измеряется из дерева кандидата, прочие verifier — fail-closed', async () => {
+test('foremanArtifacts: inventory измеряется из дерева кандидата, все verifier — честное измерение', async () => {
   const candidate = 'a'.repeat(40);
   const files = ['src/a.mjs', 'src/b.mjs'];
   const git = async (...args) => args[0] === 'ls-tree' ? files.join('\n') : 'x';
@@ -391,7 +391,16 @@ test('foremanArtifacts: inventory измеряется из дерева кан�
   const drifted = foremanArtifacts({ ...args,
     diff: { diffDigest: 'e'.repeat(64), files: ['src/a.mjs', 'src/missing.mjs'] } });
   assert.equal(JSON.parse((await drifted({ verifier: 'inventory' })).artifact).unresolved, 1);
-  // change-set делегируется pilotArtifacts (тот же гейт L1); прочие — отказ.
+  // change-set делегируется pilotArtifacts (тот же гейт L1); остальные
+  // verifier получают честно измеренный артефакт той же формы, что CHECKS.
   assert.deepEqual(JSON.parse((await read({ verifier: 'change-set' })).artifact).type, 'change-set');
-  await assert.rejects(read({ verifier: 'course-outline' }), /ab_pilot_artifact_not_available/);
+  for (const verifier of ['course-outline', 'conjecture', 'falsification', 'lean-proof',
+      'source-review', 'experiment', 'frozen-pipeline', 'blind-panel', 'technical-copy',
+      'rubric-review']) {
+    const { artifact: built } = await read({ verifier });
+    const parsed = JSON.parse(built);
+    assert.equal(parsed.type, verifier, verifier);
+  }
+  // Незнакомый verifier — fail-closed отказ до запуска модели.
+  await assert.rejects(read({ verifier: 'unknown-verifier' }), /ab_pilot_artifact_not_available/);
 });

@@ -15,7 +15,7 @@
 
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, relative } from 'node:path';
 import { promisify } from 'node:util';
@@ -314,15 +314,24 @@ export function createStageSandboxTransport({
         if (signal?.aborted) throw signal.reason ?? new StageDenied('stage_aborted');
         // Остановка активного контейнера по сигналу: уникальный cfgDir
         // (mkdtemp) идентифицирует ровно этот запуск — rm -f завершает
-        // docker run, cleanup выполняет finally самого раннера.
+        // docker run, cleanup выполняет finally самого раннера. Опрос
+        // повторяется: сигнал может прийти в окне между docker info и
+        // созданием контейнера, пока фильтру ещё нечего найти.
         const stopRun = async () => {
-          try {
-            const { stdout: ps } = await exec('docker',
-              ['ps', '-aq', '--filter', `volume=${cfgDir}`], { timeout: 10_000 });
-            for (const id of ps.split('\n').map(line => line.trim()).filter(Boolean)) {
-              await exec('docker', ['rm', '-f', id], { timeout: 15_000 }).catch(() => {});
-            }
-          } catch { /* best effort: timeoutMs раннера — запасная граница */ }
+          for (let poll = 0; poll < 8; poll++) {
+            try {
+              const { stdout: ps } = await exec('docker',
+                ['ps', '-aq', '--filter', `volume=${cfgDir}`], { timeout: 10_000 });
+              const ids = ps.split('\n').map(line => line.trim()).filter(Boolean);
+              if (ids.length) {
+                for (const id of ids) {
+                  await exec('docker', ['rm', '-f', id], { timeout: 15_000 }).catch(() => {});
+                }
+                return;
+              }
+            } catch { /* docker недоступен — timeoutMs раннера остаётся границей */ }
+            await new Promise(resolve => setTimeout(resolve, 400));
+          }
         };
         run = await settleWithAbort(dockerSandbox({ snapshot: source, argv, image, env, mounts,
           allow, timeoutMs: effectiveTimeout(callMs), beforeEffect, signal }), signal, stopRun);
@@ -394,20 +403,42 @@ export function createStageSandboxTransport({
       try {
         // Отменённый до запуска вызов не запускает модель.
         if (signal?.aborted) throw signal.reason ?? new StageDenied('stage_aborted');
-        // Остановка активного agy-процесса по сигналу: launcher agy-landlock.py
-        // несёт boundary-JSON с уникальным scratch-путём этого запуска — группа
-        // процесса добивается SIGKILL, cleanup выполняет сам транспорт.
+        // Остановка активного agy-процесса по сигналу: уникальный scratch-путь
+        // (mkdtemp) этого запуска ищется в /proc/*/cmdline и environ — так
+        // процесс находится и после того, как launcher заменил себя через
+        // execv (agy-landlock.py больше нет в argv). Из /proc/pid/stat
+        // берётся группа процесса и добивается SIGKILL; cleanup выполняет
+        // сам транспорт.
         const stopRun = async () => {
+          const zap = target => {
+            try { process.kill(target, 'SIGKILL'); } catch { /* уже завершён */ }
+          };
           try {
-            const { stdout: pids } = await exec('pgrep', ['-f', `agy-landlock.py.*${scratch}`],
-              { timeout: 8_000 });
-            for (const pid of pids.split('\n').map(line => Number(line.trim()))
-              .filter(pid => Number.isSafeInteger(pid) && pid > 1)) {
-              try { process.kill(-pid, 'SIGKILL'); }
-              catch {
-                try { process.kill(pid, 'SIGKILL'); } catch { /* уже завершён */ }
-              }
+            const ownStat = await readFile('/proc/self/stat', 'utf8');
+            const ownPgrp = Number(ownStat.slice(ownStat.lastIndexOf(')') + 2).trim()
+              .split(' ')[2]);
+            const needle = Buffer.from(scratch);
+            const groups = new Set();
+            for (const pid of await readdir('/proc')) {
+              if (!/^\d+$/.test(pid)) continue;
+              let stat, touched = false;
+              try {
+                const [cmdline, environ] = await Promise.all([
+                  readFile(`/proc/${pid}/cmdline`).catch(() => Buffer.alloc(0)),
+                  readFile(`/proc/${pid}/environ`).catch(() => Buffer.alloc(0)),
+                ]);
+                touched = cmdline.includes(needle) || environ.includes(needle);
+                if (!touched) continue;
+                stat = await readFile(`/proc/${pid}/stat`, 'utf8');
+              } catch { continue; /* процесс ушёл между чтениями */ }
+              // Формат stat: pid (comm) state ppid pgrp ... — comm может
+              // содержать пробелы, поэтому разбор после последней ')'.
+              const rest = stat.slice(stat.lastIndexOf(')') + 2).trim().split(' ');
+              const pgrp = Number(rest[2]);
+              if (Number.isSafeInteger(pgrp) && pgrp > 1 && pgrp !== ownPgrp) groups.add(pgrp);
+              else zap(Number(pid));
             }
+            for (const pgrp of groups) zap(-pgrp);
           } catch { /* best effort: timeoutMs транспорта — запасная граница */ }
         };
         live = await settleWithAbort(agyTransport({ prompt: instruction, snapshot: view,

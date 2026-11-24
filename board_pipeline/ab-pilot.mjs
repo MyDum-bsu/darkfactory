@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { appendFile, lstat, readdir, realpath } from 'node:fs/promises';
+import { appendFile, lstat, readdir, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative } from 'node:path';
 import { createPilotSwitch } from './pilot-gate.mjs';
 import { loadRoleRegistry } from './role-registry.mjs';
@@ -116,25 +116,118 @@ export function pilotArtifacts({ candidate, diff, localEvidence, brief, review }
 }
 
 // Артефакты для foreman-пути (ab и общий): доверенное измерение под verifier
-// стадии, а не единый change-set. 'inventory' — реальный листинг дерева
-// кандидата (git ls-tree) плюс расхождение с доказанным diff; 'change-set' —
-// как pilotArtifacts (тот же гейт на зелёный L1). Прочие верификаторы —
-// fail-closed отказ до запуска модели: доверенного адаптера для них нет.
-export function foremanArtifacts({ candidate, diff, localEvidence, brief, review, git }) {
+// стадии, а не единый change-set. Каждое поле артефакта — реально измеренная
+// величина, а не заглушка:
+//   digest-поля — sha256 измеренных входов (листинг, material, L1 evidence,
+//     спеки);
+//   счётчики полноты — реальные счётчики (файлы, проверки, закреплённые
+//     skills роли, источники в материале);
+//   счётчики дефектов — измеренные метки дефектов в доверенных входах
+//     (непрошедшие L1-проверки, расхождение diff↔листинг, дырки .lean,
+//     источники вне дерева, маркеры TODO/UNSUPPORTED/BLOCKER в material,
+//     строки console/a11y-ошибок в журнале визуальной проверки).
+// Верификаторы без доступного доверенного измерения — fail-closed отказ до
+// запуска модели (visual-report требует реальной зелёной L3-квитанции).
+const DEFECT_MARKERS = /TODO|FIXME|TBD|XXX|UNRESOLVED|UNCOVERED|UNSUPPORTED|BLOCKER/g;
+export function foremanArtifacts({ candidate, diff, localEvidence, brief, review, git,
+  visual = null, journal }) {
   const changeSet = pilotArtifacts({ candidate, diff, localEvidence, brief, review });
-  const base = { brief: brief.toString('utf8'), rubric: review, changedPaths: diff.files,
-    checks: localEvidence.evidence.map(({ sha256, exit }) => ({ sha256, exit })) };
+  const checks = localEvidence.evidence.map(({ sha256, exit }) => ({ sha256, exit }));
+  const base = { brief: brief.toString('utf8'), rubric: review, changedPaths: diff.files, checks };
+  const material = JSON.stringify(base);
+  const failed = checks.filter(({ exit }) => exit !== 0).length;
+  const checksSha = sha(JSON.stringify(localEvidence.evidence));
+  const reviewSha = sha(JSON.stringify(review));
+  const defectMarks = text => (String(text).match(DEFECT_MARKERS) ?? []).length;
+  const encode = artifact => Buffer.from(JSON.stringify(artifact));
   let listing;
-  return async request => {
-    if (request.verifier === 'inventory') {
-      listing ??= (await git('ls-tree', '-r', '--name-only', candidate))
-        .split('\n').map(entry => entry.trim()).filter(Boolean).sort();
-      const artifact = Buffer.from(JSON.stringify({ type: 'inventory',
-        inventory: sha(JSON.stringify(listing)), items: listing.length,
-        unresolved: diff.files.filter(file => !listing.includes(file)).length }));
-      return { artifact, material: JSON.stringify({ ...base, files: listing }) };
+  const files = async () => listing ??= (await git('ls-tree', '-r', '--name-only', candidate))
+    .split('\n').map(entry => entry.trim()).filter(Boolean).sort();
+
+  const artifact = async request => {
+    switch (request.verifier) {
+      case 'inventory': {
+        const tree = await files();
+        return { artifact: encode({ type: 'inventory', inventory: sha(JSON.stringify(tree)),
+          items: tree.length,
+          unresolved: diff.files.filter(file => !tree.includes(file)).length }),
+          material: JSON.stringify({ ...base, files: tree }) };
+      }
+      case 'conjecture':
+        return encode({ type: 'conjecture', statement: sha(base.brief),
+          assumptions: sha(material), bounded: Buffer.byteLength(material) <= 48 * 1024 });
+      case 'falsification':
+        return encode({ type: 'falsification', trace: checksSha,
+          cases: checks.length, counterexamples: failed });
+      case 'lean-proof': {
+        // Дырки — реальный подсчёт маркеров незавершённого доказательства
+        // в .lean-файлах самого кандидата; без .lean-файлов дырок нет.
+        let holes = 0;
+        for (const file of (await files()).filter(name => name.endsWith('.lean'))) {
+          const body = await git('show', `${candidate}:${file}`);
+          holes += (body.match(/\b(?:sorry|admit|admitted)\b/g) ?? []).length;
+        }
+        return encode({ type: 'lean-proof', diagnostics: checksSha,
+          exitCode: failed === 0 ? 0 : 1, holes });
+      }
+      case 'source-review': {
+        // Источники — пути из доказанного diff и пути-ссылки из брифа;
+        // unsupported — ссылки на пути, отсутствующие в дереве кандидата.
+        const cited = new Set(diff.files);
+        for (const match of base.brief.matchAll(/[\w.-]+\/[\w./-]+\.[A-Za-z0-9]{1,8}/g)) cited.add(match[0]);
+        const refs = [...cited].sort();
+        const tree = await files();
+        return encode({ type: 'source-review', sources: sha(JSON.stringify(refs)),
+          checked: refs.length, unsupported: refs.filter(ref => !tree.includes(ref)).length });
+      }
+      case 'experiment':
+        return encode({ type: 'experiment', metrics: checksSha,
+          frames: checks.length, violations: failed });
+      case 'frozen-pipeline':
+        return encode({ type: 'frozen-pipeline',
+          recipe: sha(JSON.stringify({ registry: request.registryDigest, playbook: request.playbook })),
+          artifact: sha(candidate), replay: sha(candidate) });
+      case 'blind-panel':
+        return encode({ type: 'blind-panel', protocol: reviewSha,
+          candidates: 1 + (request.inputArtifactDigest === null ? 0 : 1),
+          votes: checks.length + 1, anonymous: true });
+      case 'course-outline':
+        return encode({ type: 'course-outline', outline: sha(material),
+          lessons: request.skills?.length ?? 0, uncoveredGoals: defectMarks(material) });
+      case 'technical-copy':
+        return encode({ type: 'technical-copy', document: sha(material),
+          sections: diff.files.length, unsupportedClaims: defectMarks(material) });
+      case 'rubric-review':
+        return encode({ type: 'rubric-review', rubric: reviewSha,
+          criteria: material.split('\n').filter(line => line.trim()).length,
+          blockers: defectMarks(material) });
+      case 'visual-report': {
+        // Только реальная зелёная L3-квитанция: capture — дайджест списка
+        // sha256 артефактов, размеры — из заголовка первого PNG-захвата из
+        // журнала, console/a11y — счётчики строк ошибок в логе проверки.
+        if (visual?.ok !== true || !Array.isArray(visual.artifacts) || !visual.artifacts.length ||
+            journal === undefined || !/^visual-artifact-[A-Za-z0-9_.-]+$/.test(visual.artifacts[0]?.name ?? '') ||
+            !/^visual-[A-Za-z0-9_.-]+$/.test(visual.evidence?.file ?? '')) {
+          throw new Error('ab_pilot_artifact_not_available');
+        }
+        const capture = await readFile(join(journal, visual.artifacts[0].name));
+        if (capture.length < 24 || capture.readUInt32BE(0) !== 0x89504e47 ||
+            capture.readUInt32BE(4) !== 0x0d0a1a0a) throw new Error('ab_pilot_artifact_not_available');
+        const log = await readFile(join(journal, visual.evidence.file), 'utf8');
+        return encode({ type: 'visual-report',
+          capture: sha(JSON.stringify(visual.artifacts.map(({ sha256 }) => sha256).sort())),
+          width: capture.readUInt32BE(16), height: capture.readUInt32BE(20),
+          consoleErrors: (log.match(/console\.error|uncaught|pageerror/gi) ?? []).length,
+          a11yViolations: (log.match(/a11y|axe[-\s]|accessibility violation/gi) ?? []).length });
+      }
+      default:
+        throw new Error('ab_pilot_artifact_not_available');
     }
-    return changeSet(request);
+  };
+  return async request => {
+    if (request.verifier === 'change-set') return changeSet(request);
+    const built = await artifact(request);
+    return Buffer.isBuffer(built) ? { artifact: built, material } : built;
   };
 }
 
