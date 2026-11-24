@@ -195,6 +195,9 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   if (!isAbsolute(values.policy)) fail('path_not_absolute');
   const policyPathReal = await realpath(values.policy).catch(() => fail('path_missing'));
   if (policyPathReal !== values.policy) fail('non_canonical_or_symlink_path');
+  // Каталог или FIFO вместо файла политики: EISDIR/зависание на readFile —
+  // не та ошибка; проверка isFile до чтения, отказ до Git-конфига.
+  if (!(await lstat(policyPathReal)).isFile()) fail('path_not_file');
   const policy = JSON.parse(await readFile(policyPathReal, 'utf8'));
   // CLI-спека обязана совпасть с закреплённой policy.bb: без bb проверять
   // нечего — политика недопустима, контроллер отклонил бы её позже.
@@ -348,6 +351,13 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // сверки со строкой; каноничность и двусторонняя граница worktree
   // проверяются здесь (parent-граница относится к ledger/memory).
   const state = await canonicalOutside(values.state, treeAliases, 'dir', { parent: false });
+  // Каталог состояния — приватный каталог владельца (та же проверка, что
+  // у контроллера: 'State must be private'), иначе отказ до Git-конфига.
+  const stateSt = await lstat(state);
+  if (!stateSt.isDirectory() || stateSt.uid !== process.getuid() ||
+      (stateSt.mode & 0o077) !== 0) {
+    fail('state_not_private');
+  }
   // handoffDir — обязательный inbox сдачи контроллера (realpath без
   // проверки на undefined): канонический каталог вне worktree и вне
   // state в обе стороны (inside(root,inbox)||inside(inbox,root)||

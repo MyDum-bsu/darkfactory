@@ -496,6 +496,8 @@ test('run: --worktree обязан совпадать с policy.route.worktree',
     await mkdir(wt);
     await mkdir(other);
     await mkdir(state);
+    // Каталог --state — приватный (та же проверка контроллера).
+    await chmod(state, 0o700);
     const policy = await withPolicy(dir, policySpec(wt));
     const plan = await runPlan(runValues(policy, state, { worktree: wt }));
     assert.equal(plan.worktree, wt);
@@ -523,6 +525,8 @@ test('run: валидный dry-run печатает план без вызов�
     await mkdir(wt);
     const state = join(dir, 'state');
     await mkdir(state);
+    // Каталог --state — приватный (та же проверка контроллера).
+    await chmod(state, 0o700);
     // Каталог стоп-файла демона — приватный (privateDirectory контроллера);
     // сам стоп-файл в daemon-режиме может ещё не существовать.
     const ops = join(dir, 'ops');
@@ -589,6 +593,8 @@ test('run: NTFS core.fileMode=false guard и mocked runner', async t => {
     const git = await initGitRepo(wt);
     const state = join(dir, 'state');
     await mkdir(state);
+    // Каталог --state — приватный (та же проверка контроллера).
+    await chmod(state, 0o700);
     const policy = await withPolicy(dir, policySpec(wt));
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', policy, '--state', state];
@@ -635,6 +641,8 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await symlink(ledger, link);
     const state = join(dir, 'st');
     await mkdir(state);
+    // Каталог --state — приватный (та же проверка контроллера).
+    await chmod(state, 0o700);
 
     // Путь политики внутрь worktree — отказ даже при внешнем CLI-флаге.
     const badPolicy = { ...policySpec(wt), decisionLedger: insideLedger };
@@ -800,8 +808,23 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
       /non_canonical_or_symlink_path/);
     const innerState = join(wt, 'state');
     await mkdir(innerState);
+    await chmod(innerState, 0o700);
     await assert.rejects(() => runPlan(runValues(ok, innerState)),
       /path_inside_worktree/);
+    // --state обязан быть приватным каталогом владельца (та же проверка,
+    // что у контроллера): каталог с правами для группы/остальных —
+    // отказ до Git-конфига и в dry-run.
+    const pubState = join(dir, 'pub-state');
+    await mkdir(pubState);
+    await chmod(pubState, 0o755);
+    await assert.rejects(() => runPlan(runValues(ok, pubState)),
+      /state_not_private/);
+    // --policy, указывающий не на файл (каталог): отказ до readFile —
+    // path_not_file, а не EISDIR/зависание на FIFO.
+    const policyDir = join(dir, 'policy-dir');
+    await mkdir(policyDir);
+    await assert.rejects(() => runPlan(runValues(policyDir, state)),
+      /path_not_file/);
     // routes.json — закрепляемый вход рядом с каноническим reviewGate:
     // симлинк (даже на внешнюю цель) отклоняется до Git-конфига.
     const gateDir = join(ops, 'gate');
@@ -888,9 +911,10 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     await mkdir(wt);
     await mkdir(ops);
     await mkdir(state);
+    // Каталог --state — приватный (та же проверка контроллера).
+    await chmod(state, 0o700);
     // Каталоги стоп-файлов — приватные (privateDirectory контроллера).
     await chmod(ops, 0o700);
-    await chmod(state, 0o700);
     const policy = await withPolicy(dir, policySpec(wt));
     // Завершающий '/' — неканоническая строка: отказ до lstat и запуска.
     await assert.rejects(() => runPlan(runValues(policy, state,
@@ -1105,6 +1129,8 @@ test('run: policy operator dirs — trustedReceiptDir/questionGate.inbox/release
     await mkdir(wt);
     await mkdir(ops);
     await mkdir(state);
+    // Каталог --state — приватный (та же проверка контроллера).
+    await chmod(state, 0o700);
     const receipts = join(ops, 'receipts');
     await mkdir(receipts);
     const inbox = join(ops, 'qg-inbox');
@@ -1168,6 +1194,8 @@ test('run: нестроковое значение приоритетного п
     await mkdir(wt);
     await mkdir(ops);
     await mkdir(state);
+    // Каталог --state — приватный (та же проверка контроллера).
+    await chmod(state, 0o700);
     // Контроллер берёт первое non-nullish значение ?? -цепочки:
     // {storeDir: false, dir: <каноничный>} резолвится в false и
     // отклоняется до записи Git-конфига, а не проскакивает к dir.
