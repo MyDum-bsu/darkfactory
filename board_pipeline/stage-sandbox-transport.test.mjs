@@ -168,11 +168,17 @@ test('AbortSignal и таймаут: гарантированный cleanup, 0 �
   const transport = createStageSandboxTransport({ worktree, journal, piRoot, unpack,
     probeDocker: async () => true, worktreeFingerprintImpl: fp, signal: controller.signal,
     dockerSandbox: async () => {
-      try { await new Promise(resolve => setTimeout(resolve, 60)); return { code: 0, stdout: 'T' }; }
+      try {
+        // Abort изнутри активного запуска: сигнал гарантированно приходит
+        // после входа в песочницу, иначе под нагрузкой отмена могла
+        // произойти до вызова dockerSandbox и cleanup был бы нечему ставить.
+        controller.abort(new Error('stage_aborted'));
+        await new Promise(resolve => setTimeout(resolve, 60));
+        return { code: 0, stdout: 'T' };
+      }
       finally { cleaned = true; }
     } });
   const pending = transport.observe(request(sol));
-  setTimeout(() => controller.abort(new Error('stage_aborted')), 10);
   await assert.rejects(pending, /stage_aborted/);
   assert.equal(cleaned, true, 'cleanup транспорта обязан завершиться до отказа');
   // Общий deadline fail-closed до запуска песочницы.
@@ -320,23 +326,25 @@ test('abort во время docker run через stageDockerSandbox: отказ
   // может держать свои board-review-* контейнеры — трогаем только те, у
   // которых docker inspect подтверждает DF_STAGE_TEST_ID этого теста.
   const marker = `DF_STAGE_TEST_ID=${randomUUID()}`;
-  const ours = async () => {
+  // inspect идёт параллельно и обход нужен только до первого подтверждения:
+  // после нахождения oursId cleanup работает по известному id, не перебирая
+  // чужие контейнеры повторно — задержки inspect соседей не съедают бюджет.
+  let oursId = null;
+  const findOurs = async () => {
     const ids = (await exec('docker',
       ['ps', '-aq', '--filter', 'name=board-review-'], { timeout: 10_000 }))
       .stdout.split('\n').map(line => line.trim()).filter(Boolean);
-    const matched = [];
-    for (const id of ids) {
+    const hits = await Promise.all(ids.map(async id => {
       const info = await exec('docker', ['inspect', id], { timeout: 10_000 }).catch(() => null);
-      if (info === null) continue;
+      if (info === null) return null;
       const env = JSON.parse(info.stdout)?.[0]?.Config?.Env ?? [];
-      if (env.includes(marker)) matched.push(id);
-    }
-    return matched;
+      return env.includes(marker) ? id : null;
+    }));
+    return hits.filter(Boolean);
   };
   const rmOurs = async () => {
-    for (const id of await ours()) {
-      await exec('docker', ['rm', '-f', id], { timeout: 15_000 }).catch(() => {});
-    }
+    if (oursId === null) return;
+    await exec('docker', ['rm', '-f', oursId], { timeout: 15_000 }).catch(() => {});
   };
   t.after(rmOurs);
   const controller = new AbortController();
@@ -355,9 +363,8 @@ test('abort во время docker run через stageDockerSandbox: отказ
     rmOurs);
   // Подтверждённый старт: ждём появления контейнера с маркером именно этого
   // запуска — чужие board-review-* без нашего env не считаются.
-  let oursId = null;
   for (let poll = 0; poll < 40 && oursId === null; poll++) {
-    const matched = await ours();
+    const matched = await findOurs();
     if (matched.length) oursId = matched[0];
     else await new Promise(resolve => setTimeout(resolve, 250));
   }
