@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile }
   from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { devNull, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -853,15 +853,18 @@ async function initGitRepo(dir) {
   // Без GIT_*-перенаправлений окружения (наследуются, например, из
   // Git-хука): init/config и проверочные вызовы действуют строго на
   // временный репозиторий -C dir, а не на внешний GIT_DIR.
-  const env = Object.fromEntries(
-    Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
+  // Пользовательская и системная Git-конфигурация отключается полностью
+  // (commit.gpgSign, fsck-параметры и т.п. из ~/.gitconfig не должны
+  // ломать фикстуру); коммит тестам не нужен — проверяются корень
+  // worktree и core.fileMode, rev-parse работает и в пустом репозитории.
+  const env = { ...Object.fromEntries(
+      Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_'))),
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull,
+    GIT_CONFIG_SYSTEM: devNull };
   const git = args => execFileAsync('git', ['-C', dir, ...args], { env });
   await git(['init']);
-  await git(['config', 'user.email', 't@t']);
-  await git(['config', 'user.name', 't']);
   await writeFile(join(dir, 'f.txt'), 'x');
   await git(['add', 'f.txt']);
-  await git(['commit', '-m', 'init']);
   // Возвращаемая обёртка — то же очищенное окружение: ни одна
   // Git-команда теста не затрагивает внешний репозиторий при запуске
   // из Git-хука (унаследованные GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/
