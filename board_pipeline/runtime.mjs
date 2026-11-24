@@ -120,11 +120,11 @@ async function cleanupContainer(name) {
 // запускает: старые политики без явного l1Profile сохраняют прежний
 // pinned образ без метки и продолжают работать — defaultEnv дефолта
 // при этом подмешивается как раньше.
-async function assertL1Image(recipe, l1) {
+async function assertL1Image(recipe, l1, execDocker = exec) {
   if (l1?.dockerfile === undefined) return;
   let labels;
   try {
-    labels = JSON.parse((await exec('docker',
+    labels = JSON.parse((await execDocker('docker',
       ['image', 'inspect', recipe.image, '--format', '{{json .Config.Labels}}'],
       { timeout: 12_000 })).stdout);
   } catch (error) {
@@ -135,8 +135,9 @@ async function assertL1Image(recipe, l1) {
   }
 }
 
-export function offlineDockerRunner(journal, { beforeEffect } = {}) {
+export function offlineDockerRunner(journal, { beforeEffect, execDocker } = {}) {
   return async (handoff, profile) => {
+    const dockerExec = execDocker ?? exec;
     const recipe = checkCommand(profile.check ?? {});
     const { image, argv, cwd, timeoutMs } = recipe;
     // Явный l1Profile профиля и рецепта проверяется раздельно fail-closed
@@ -161,13 +162,13 @@ export function offlineDockerRunner(journal, { beforeEffect } = {}) {
     const effective = l1 === undefined ? recipe
       : { ...recipe, env: { ...l1.defaultEnv, ...recipe.env } };
     if (!SHA.test(handoff.candidate_sha)) throw new Error('Local runner requires a full SHA');
-    const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
+    const security = JSON.parse((await dockerExec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
       timeout: 12_000,
     })).stdout);
     if (!security.includes('name=rootless')) throw new Error('The test runner requires rootless Docker');
     // Аттестация образа — только при явном выборе: l1Default неявен,
     // его образ без OCI-метки не отклоняется (обратная совместимость).
-    await assertL1Image(recipe, l1Profile ?? l1Recipe);
+    await assertL1Image(recipe, l1Profile ?? l1Recipe, dockerExec);
 
     const scratch = await mkdtemp(join(tmpdir(), 'board-check-'));
     const name = `board-check-${randomUUID()}`;
@@ -248,8 +249,9 @@ export async function collectVisualArtifacts(dropped, journal, binding) {
 
 // L3 визуальный гейт: та же изоляция rootless Docker, плюс каталог артефактов,
 // смонтированный rw только для выгрузки скриншотов в приватный журнал контроллера.
-export function offlineVisualRunner(journal, { beforeEffect } = {}) {
+export function offlineVisualRunner(journal, { beforeEffect, execDocker } = {}) {
   return async (binding, profile) => {
+    const dockerExec = execDocker ?? exec;
     const recipe = checkCommand(profile.visual ?? {});
     const { image, argv, cwd, timeoutMs } = recipe;
     // Тот же контракт l1Profile, что у проверочных рецептов и обеих
@@ -266,7 +268,7 @@ export function offlineVisualRunner(journal, { beforeEffect } = {}) {
     const l1Default = profile.l1Default === undefined ? undefined
       : resolveL1Profile({ l1Profile: profile.l1Default });
     if (!SHA.test(binding.candidate_sha)) throw new Error('Visual runner requires a full SHA');
-    const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
+    const security = JSON.parse((await dockerExec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
       timeout: 12_000,
     })).stdout);
     if (!security.includes('name=rootless')) throw new Error('The visual runner requires rootless Docker');
@@ -275,7 +277,7 @@ export function offlineVisualRunner(journal, { beforeEffect } = {}) {
     // аттестованном образе. Неявный l1Default отдельный образ гейта не
     // аттестует — как и у проверочного раннера, дефолт репозитория не
     // отклоняет прежний pinned образ без метки.
-    await assertL1Image(recipe, l1Profile ?? l1Recipe);
+    await assertL1Image(recipe, l1Profile ?? l1Recipe, dockerExec);
 
     const scratch = await mkdtemp(join(tmpdir(), 'board-visual-'));
     const name = `board-visual-${randomUUID()}`;
