@@ -220,8 +220,12 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // createPilotSwitch — абсолютный путь вне дерева воркера; родительский
   // каталог каноничен (сам стоп-файл может ещё не существовать, но
   // существующий не должен быть симлинком).
-  const daemonSwitch = values.switch ?? policy?.pilot?.killSwitch;
-  if (daemonSwitch !== undefined && daemonSwitch !== null) {
+  // Каждый действующий путь проверяется независимо: контроллер использует
+  // activation.killSwitch (pilot.killSwitch) для допуска пилота, а
+  // --switch (или pilot.killSwitch при его отсутствии) — как daemon-стоп.
+  // Поэтому явный --switch не маскирует pilot.killSwitch из проверки.
+  for (const daemonSwitch of new Set([values.switch, policy?.pilot?.killSwitch])) {
+    if (daemonSwitch === undefined || daemonSwitch === null) continue;
     if (!isAbsolute(daemonSwitch)) fail('path_not_absolute');
     // Неканоническая строка (завершающий '/', '.', '..', повторные '//')
     // отклоняется до lstat: нормализация обязана быть тождественной.
@@ -242,11 +246,17 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   if (ledger !== null) await canonicalOutside(ledger, treeAliases, 'file');
   if (memory !== null) await canonicalOutside(memory, treeAliases, 'dir');
   // Опциональные операторские каталоги политики — та же строгая проверка
-  // канонического каталога вне worktree, включая родителя (как storeDir).
-  for (const dir of [policy?.projectMemory?.trustedReceiptDir,
-    policy?.questionGate?.inbox, policy?.release?.directory]) {
+  // канонического каталога вне worktree. Parent-граница действует только
+  // для trustedReceiptDir (семейство projectMemory, как storeDir);
+  // questionGate.inbox и release.directory — соседние каталоги рядом с
+  // worktree допустимы (контроллер их не ограничивает по родителю).
+  if (policy?.projectMemory?.trustedReceiptDir !== undefined &&
+      policy?.projectMemory?.trustedReceiptDir !== null) {
+    await canonicalOutside(policy.projectMemory.trustedReceiptDir, treeAliases, 'dir');
+  }
+  for (const dir of [policy?.questionGate?.inbox, policy?.release?.directory]) {
     if (dir !== undefined && dir !== null) {
-      await canonicalOutside(dir, treeAliases, 'dir');
+      await canonicalOutside(dir, treeAliases, 'dir', { parent: false });
     }
   }
   // --state — тоже операторский путь: контроллер делает лишь realpath без

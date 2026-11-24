@@ -790,6 +790,21 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     const ok = await buildRunPlan(runValues(policy, state,
       { switch: join(ops, 'stop') }));
     assert.ok(ok.argv.includes('--switch'));
+    // Явный --switch не маскирует pilot.killSwitch: контроллер использует
+    // activation.killSwitch для допуска пилота — завершающий '/' в нём
+    // отклоняется до Git-конфига и запуска.
+    const pilotStop = join(ops, 'pilot-stop');
+    const pilotBad = { ...policySpec(wt), scope: 'pilot',
+      pilot: { killSwitch: `${pilotStop}/` } };
+    const fPilotBad = await withPolicy(dir, pilotBad);
+    await assert.rejects(() => buildRunPlan(runValues(fPilotBad, state,
+      { switch: join(ops, 'daemon-stop') })), /non_canonical_or_symlink_path/);
+    const pilotOk = { ...policySpec(wt), scope: 'pilot',
+      pilot: { killSwitch: pilotStop } };
+    const fPilotOk = await withPolicy(dir, pilotOk);
+    const pilotPlan = await buildRunPlan(runValues(fPilotOk, state,
+      { switch: join(ops, 'daemon-stop') }));
+    assert.ok(pilotPlan.argv.includes('--switch'));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -840,6 +855,16 @@ test('run: policy operator dirs — trustedReceiptDir/questionGate.inbox/release
       questionGate: { inbox }, release: { directory: releaseDir } };
     const fOk = await withPolicy(dir, okPolicy);
     await buildRunPlan(runValues(fOk, state));
+    // Соседние каталоги рядом с worktree (общий родитель <dir> содержит
+    // wt): parent-граница на них не действует — контроллер допускает
+    // такую раскладку для questionGate.inbox и release.directory.
+    const sibInbox = join(dir, 'answers');
+    const sibRelease = join(dir, 'release-out');
+    await mkdir(sibInbox);
+    await mkdir(sibRelease);
+    const fSib = await withPolicy(dir, { ...base,
+      questionGate: { inbox: sibInbox }, release: { directory: sibRelease } });
+    await buildRunPlan(runValues(fSib, state));
     // trustedReceiptDir через симлинк-предка — неканонический операторский
     // каталог: отказ до Git-конфига и запуска.
     const linkOps = join(dir, 'ops-link');
