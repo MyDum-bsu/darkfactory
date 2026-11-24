@@ -299,11 +299,25 @@ function attemptSubject(attempt, submission, treeSha) {
   });
 }
 
+// Явный L1-выбор, определяющий среду проверок запуска: закреплённая метка
+// попытки, иначе явный l1Profile профиля (в т.ч. эффективный выбор CLI,
+// подставленный контроллером). Значения сверены заранее fail-closed —
+// оба заданных равны; undefined — выбора нет, среда из дефолта/рецептов,
+// а те уже закреплены policy_digest.
+function contractL1Profile(attempt, profile) {
+  const l1 = attempt.l1_profile ?? profile?.l1Profile;
+  return l1 === undefined ? null : l1;
+}
+
 // Ключ контракта для журнала: смена spec/policy/fixtures/release/tree при том же SHA
 // создаёт новый запуск вместо переиспользования старого терминального вердикта.
 // Закреплённый tree_sha входит в ключ; когда дерево берётся из снимка, в ключе null.
-function contractKey(attempt) {
+// Явный L1-выбор добавляется в ключ только заданным: попытка без выбора
+// получает прежний ключ и прежнюю запись журнала (повтор/восстановление),
+// а смена выбора — новый запуск, результат под другим L1 не переиспользуется.
+function contractKey(attempt, profile) {
   if (attempt.spec_digest === undefined) return null;
+  const l1 = contractL1Profile(attempt, profile);
   return createHash('sha256').update(canonicalJson({
     repo_id: attempt.repo_id,
     base_sha: attempt.base_sha,
@@ -314,13 +328,13 @@ function contractKey(attempt) {
     release_target: attempt.release_target ?? null,
     finish: attempt.finish,
     has_ui: attempt.has_ui ?? null,
-    l1_profile: attempt.l1_profile ?? null,
+    ...(l1 === null ? {} : { l1_profile: l1 }),
   })).digest('hex');
 }
 
 // Сверка контракта записи журнала с текущей попыткой: ключ совпал, а контракт нет —
 // журнал не может подтвердить вердикт для этого манифеста.
-function sameContract(runEntry, attempt) {
+function sameContract(runEntry, attempt, profile) {
   if (attempt.spec_digest === undefined) return true;
   const recorded = runEntry?.contract;
   if (recorded === null || typeof recorded !== 'object') return false;
@@ -332,7 +346,7 @@ function sameContract(runEntry, attempt) {
     (JSON.stringify(recorded.release_target ?? null) ===
       JSON.stringify(attempt.release_target ?? null)) &&
     (recorded.has_ui ?? null) === (attempt.has_ui ?? null) &&
-    (recorded.l1_profile ?? null) === (attempt.l1_profile ?? null);
+    (recorded.l1_profile ?? null) === contractL1Profile(attempt, profile);
 }
 
 // Сверка сдачи с доверенной попыткой. Любое расхождение — отказ до эффекта.
@@ -1005,7 +1019,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     }
     throw e;
   }
-  const key = contractKey(attempt);
+  const key = contractKey(attempt, profile);
 
   const binding = {
     task_id: attempt.task_id,
@@ -1056,7 +1070,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         run: id,
       };
     }
-    if (!sameContract(runEntry, attempt)) {
+    if (!sameContract(runEntry, attempt, profile)) {
       return {
         outcome: 'denied',
         reason: 'journal_subject_mismatch',
@@ -1115,7 +1129,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       fixtures_digest: attempt.fixtures_digest ?? null,
       release_target: attempt.release_target ?? null,
       has_ui: attempt.has_ui ?? null,
-      l1_profile: attempt.l1_profile ?? null,
+      l1_profile: contractL1Profile(attempt, profile),
     } } : {}),
   });
 

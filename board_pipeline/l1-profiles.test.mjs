@@ -284,6 +284,56 @@ test('acceptHeld: l1_profile попытки сверяется с профиле
     assert.equal(second.seen.localProfile.l1Profile, 'node');
     assert.equal(second.calls.local, 1);
     assert.equal(second.calls.review, 1);
+    // Тот же вход повторно — та же запись журнала: терминальный исход
+    // возвращается repeated без новых проверок.
+    const same = await acceptHeld({
+      attempt: heldContractAttempt({ l1_profile: 'node' }),
+      submission: heldSubmission(),
+      policy: heldPolicy({}),
+      journal,
+      ports: second.ports,
+    });
+    assert.equal(same.outcome, 'verified');
+    assert.equal(same.repeated, true);
+    assert.equal(second.calls.local, 1);
+    // Явный l1Profile профиля (выбор CLI, подставленный контроллером при
+    // отсутствии метки попытки) — тоже часть ключа: повтор той же
+    // попытки с другим выбором — новый запуск, а не verified от прежнего
+    // профиля. Отдельный журнал: эффективный 'python-node' уже встречался
+    // выше как метка попытки и по ключу тождествен ему.
+    const journal2 = await tempdir();
+    try {
+      const first = heldPorts({
+        repo_id: 'repo', profile_id: 'pilot', finish: 'verified',
+        spec_digest: HELD_SPEC, policy_digest: HELD_POL,
+      });
+      const run1 = await acceptHeld({
+        attempt: heldContractAttempt({}),
+        submission: heldSubmission(),
+        policy: heldPolicy({ l1Profile: 'node' }),
+        journal: journal2,
+        ports: first.ports,
+      });
+      assert.equal(run1.outcome, 'verified');
+      assert.equal(first.seen.localProfile.l1Profile, 'node');
+      const third = heldPorts({
+        repo_id: 'repo', profile_id: 'pilot', finish: 'verified',
+        spec_digest: HELD_SPEC, policy_digest: HELD_POL,
+      });
+      const cliRun = await acceptHeld({
+        attempt: heldContractAttempt({}),
+        submission: heldSubmission(),
+        policy: heldPolicy({ l1Profile: 'python-node' }),
+        journal: journal2,
+        ports: third.ports,
+      });
+      assert.equal(cliRun.outcome, 'verified');
+      assert.equal(cliRun.repeated, undefined);
+      assert.equal(third.seen.localProfile.l1Profile, 'python-node');
+      assert.equal(third.calls.local, 1);
+    } finally {
+      await rm(journal2, { recursive: true, force: true });
+    }
   } finally {
     await rm(journal, { recursive: true, force: true });
   }
