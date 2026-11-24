@@ -76,9 +76,9 @@ export function partitionFindingsBySeverity(findings) {
 }
 
 // P2/nit никогда не блокируют: выносятся в приватный append-only sidecar-лог
-// журнала (0600) и не имеют права выдать REVIEW_BLOCKED. REWORK только по
-// P2/nit программно переводится в PASS; при наличии P0/P1 исход сохраняется,
-// а non-blocking находки уходят в sidecar_findings.
+// журнала (0600) и не имеют права выдать REVIEW_BLOCKED. REWORK и ESCALATE
+// только по P2/nit программно переводятся в PASS; при наличии P0/P1 исход
+// сохраняется, а non-blocking находки уходят в sidecar_findings.
 export async function applySeverityGating(verdict, { journal, taskId, candidateSha, round } = {}) {
   if (verdict === null || typeof verdict !== 'object') throw new Error('severity_gating_verdict_invalid');
   const { blocking, nonBlocking } = partitionFindingsBySeverity(verdict.findings);
@@ -100,7 +100,8 @@ export async function applySeverityGating(verdict, { journal, taskId, candidateS
     return { ...base, status: 'REWORK', verdict: 'REVIEW_BLOCKED', findings: blocking,
       severity_gated: true, excerpt };
   }
-  if (verdict.status === 'REWORK' && Array.isArray(verdict.findings) &&
+  if ((verdict.status === 'REWORK' || verdict.status === 'ESCALATE') &&
+      Array.isArray(verdict.findings) &&
       verdict.findings.length > 0 && blocking.length === 0) {
     return { ...base, status: 'PASS', verdict: 'REVIEW_OK', findings: [],
       sidecar_findings: nonBlocking, severity_gated: true, excerpt: undefined };

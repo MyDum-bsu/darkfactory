@@ -163,3 +163,31 @@ test('stage-verifier: four new verifiers PASS/REWORK', () => {
   assert.equal(verdict('guide-pack', { guideDigest: h, packDigest: h, guidesChecked: 3,
     missingSections: 0, brokenLinks: 2 }), 'REWORK');
 });
+
+test('red run: TAP not ok от TypeError в setup — non-target crash, не целевое падение', () => {
+  // node --test падает в top-level setup до ассерта: exit 1 + 'not ok' без
+  // доказанного провала ассерта — JS runtime crash отклоняется.
+  const tapCrash = [
+    'TAP version 13',
+    'not ok 1 - tests/f.test.mjs',
+    '  ---',
+    '  duration_ms: 12.3',
+    '  failureType: testCodeFailure',
+    '  error: TypeError: suite.setup is not a function',
+    '    at file:///repo/tests/f.test.mjs:4:9',
+    '  ...',
+  ].join('\n');
+  assert.ok(isNonTargetFailure(tapCrash, 1));
+  assert.ok(!isTargetFailure(tapCrash, 1));
+  // Прочие runtime-краши (не TypeError) — тоже non-target.
+  assert.ok(isNonTargetFailure('not ok 1\n  error: RangeError: Maximum call stack', 1));
+  assert.ok(!isTargetFailure('not ok 1\n  error: RangeError: Maximum call stack', 1));
+  // Реальное падение ассерта по-прежнему целевое: AssertionError — не crash.
+  const tapAssert = [
+    'not ok 1 - tests/f.test.mjs',
+    "  error: 'expected 2, got 1'",
+    "  code: 'ERR_ASSERTION'",
+  ].join('\n');
+  assert.ok(!isNonTargetFailure(tapAssert, 1));
+  assert.ok(isTargetFailure(tapAssert, 1));
+});

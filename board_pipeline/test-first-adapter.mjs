@@ -21,9 +21,11 @@ export function isTestFilePath(filePath) {
     /(?:^test_|_test\.|\.test\.|\.spec\.|_spec\.)/.test(base);
 }
 
-// Нецелевое падение красного прогона: инфраструктурные коды выхода и ошибки
-// синтаксиса/импорта/модуля — тест не дошёл до целевого утверждения.
-const NON_TARGET = /SyntaxError|ReferenceError|ERR_MODULE_NOT_FOUND|Cannot find module|ImportError|ModuleNotFoundError|IndentationError/;
+// Нецелевое падение красного прогона: инфраструктурные коды выхода, ошибки
+// синтаксиса/импорта/модуля и краши JS-runtime (TypeError и прочие) — тест
+// не дошёл до целевого утверждения: TAP 'not ok' от setup-crash без доказанного
+// провала ассерта целевым падением не считается.
+const NON_TARGET = /SyntaxError|TypeError|ReferenceError|RangeError|EvalError|URIError|AggregateError|ERR_MODULE_NOT_FOUND|Cannot find module|ImportError|ModuleNotFoundError|IndentationError|uncaughtException|Unhandled/;
 // Целевое падение теста — код выхода раннера на assertion-failure. Коды 125+
 // — инфраструктурная зона (125-127 коды оболочки/раннера, 128+ сигналы,
 // включая 139 SIGSEGV): авария не доказывает целевую проверку — non-target.

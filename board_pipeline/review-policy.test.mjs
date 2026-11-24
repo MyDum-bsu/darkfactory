@@ -175,3 +175,25 @@ test('loadApprovalPolicy: symlink and tampering fail-closed', async t => {
   await symlink(outside, file);
   await assert.rejects(loadApprovalPolicy(tree), /approval_policy_invalid/);
 });
+
+test('severity gating: P2/nit-only ESCALATE нейтрализуется так же, как REWORK', async t => {
+  const journal = await mkdtemp(join(tmpdir(), 'df-sidecar-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+  const gated = await applySeverityGating({ status: 'ESCALATE', verdict: 'REVIEW_ESCALATE',
+    findings: [f('P2'), f('nit')], summary: 's' },
+    { journal, taskId: '12', candidateSha: SHA, round: 1 });
+  assert.equal(gated.status, 'PASS');
+  assert.equal(gated.verdict, 'REVIEW_OK');
+  assert.deepEqual(gated.findings, []);
+  assert.equal(gated.severity_gated, true);
+  assert.equal(gated.sidecar_findings.length, 2);
+  const lines = (await readFile(join(journal, `review-sidecar-12-${SHA}.jsonl`), 'utf8'))
+    .trim().split('\n');
+  assert.equal(JSON.parse(lines[0]).findings.length, 2);
+  // ESCALATE с блокирующей находкой сохраняет исход.
+  const blocking = await applySeverityGating({ status: 'ESCALATE', verdict: 'REVIEW_ESCALATE',
+    findings: [f('P1'), f('nit')], summary: 's' },
+    { journal, taskId: '13', candidateSha: SHA, round: 1 });
+  assert.equal(blocking.status, 'ESCALATE');
+  assert.equal(blocking.verdict, 'REVIEW_ESCALATE');
+});

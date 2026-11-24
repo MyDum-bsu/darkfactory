@@ -295,8 +295,10 @@ function validateAttempt(attempt) {
         !attempt.prior_findings.every(f => f !== null && typeof f === 'object' &&
           !Array.isArray(f) &&
           Object.entries(f).every(([k, v]) =>
-            ['file', 'line', 'input', 'expected', 'actual', 'freq', 'frequency', 'harm', 'severity'].includes(k) &&
+            ['file', 'line', 'input', 'expected', 'actual', 'freq', 'frequency', 'harm',
+              'severity', 'dod_violation'].includes(k) &&
             (v === undefined || v === null || typeof v === 'number' ||
+              typeof v === 'boolean' ||
               (typeof v === 'string' && v.length <= 2000)))))) {
     throw new Denied('invalid_prior_findings');
   }
@@ -719,8 +721,12 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   // применяется только после зелёной L1 и чистого Tamper Gate. Одобрение
   // allowlist-категории (docs/typo/deps) снимает L2-критика, но никогда не
   // ослабляет гейты выше; любой отказ политики возвращает обычный путь L2.
+  // Повторный раунд с неперепроверенными блокирующими находками обязан пройти
+  // L2 re-review: auto-approve по allowlist-категории не снимает эту обязанность.
+  const reReviewRequired = (binding.review_round ?? 1) > 1 ||
+    (Array.isArray(binding.prior_findings) && binding.prior_findings.length > 0);
   let autoApprove = null;
-  if (typeof binding.category === 'string' && binding.category) {
+  if (typeof binding.category === 'string' && binding.category && !reReviewRequired) {
     // Правила auto-approve — операторские, не кандидатские: политика читается
     // из байтов закреплённого base_sha. Кандидат может менять
     // .darkfactory/approval-policy.yaml в своём дереве — это не влияет на
@@ -744,9 +750,9 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
       let changedLines = 0;
       try {
         const names = await execGit('git', ['-C', binding.worktree, 'diff', '--no-renames',
-          '--name-only', binding.base_sha, binding.candidate_sha, '--'],
+          '-z', '--name-only', binding.base_sha, binding.candidate_sha, '--'],
           { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
-        changedFiles = names.stdout.split('\n').map(line => line.trim()).filter(Boolean);
+        changedFiles = names.stdout.split('\0').filter(name => name.length > 0);
         const numstat = await execGit('git', ['-C', binding.worktree, 'diff', '--no-renames',
           '--numstat', binding.base_sha, binding.candidate_sha, '--'],
           { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });

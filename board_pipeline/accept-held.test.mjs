@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -2093,4 +2094,111 @@ test('routed-профиль без закреплённой триады и с �
     journal: await tmpJournal(), ports: { ...ports, board: pB } });
   assert.equal(unattested.outcome, 'denied');
   assert.equal(unattested.reason, 'review_profile_not_approved');
+});
+
+// --- V2-2 L2 раунд 4: guardrails policy auto-approve и prior_findings ---
+
+const APPROVAL_YAML = `version: 1
+autoApprove:
+  enabled: true
+  allowedCategories:
+    - docs
+    - deps
+  maxChangedFiles: 10
+  maxChangedLines: 400
+  requireGreenL1: true
+  requireCleanTamper: true
+  allowPathPatterns:
+    - "docs/**/*.md"
+    - "package-lock.json"
+  denyPathPatterns: []
+`;
+
+async function gitRepo(t, mutate) {
+  const dir = await mkdtemp(path.join(testRoot, 'repo-'));
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  git('init', '-q');
+  await mkdir(path.join(dir, '.darkfactory'), { recursive: true });
+  await writeFile(path.join(dir, '.darkfactory', 'approval-policy.yaml'), APPROVAL_YAML);
+  const commit = async (msg) => {
+    git('add', '-A');
+    git('-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false',
+      'commit', '-q', '-m', msg);
+    return git('rev-parse', 'HEAD');
+  };
+  const base = await commit('base');
+  await mutate(dir);
+  const cand = await commit('cand');
+  return { dir, base, cand };
+}
+
+async function heldAccept(t, { repo, attemptOver = {}, submissionOver = {}, policyOver = {} } = {}) {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port: boardPort } = await held(ported, id);
+  const journal = await tmpJournal();
+  const { ports, calls } = stubs();
+  const res = await acceptHeld({
+    attempt: attempt(id, epoch, {
+      worktree: repo.dir, base_sha: repo.base, ...attemptOver,
+    }),
+    submission: submission(id, epoch, { candidate_sha: repo.cand, ...submissionOver }),
+    policy: policy(id, { worktree: repo.dir, base: repo.base, ...policyOver }),
+    journal,
+    ports: { ...ports, board: boardPort },
+  });
+  return { res, calls };
+}
+
+test('auto-approve: пробельное имя файла не схлопывается в allowlist', async (t) => {
+  // deps-кандидат меняет " package-lock.json" (ведущий пробел): -z-парсинг
+  // обязан проверять точный путь, а не trim-нутый — иначе обход allowlist.
+  const repo = await gitRepo(t, async (dir) => {
+    await writeFile(path.join(dir, ' package-lock.json'), '{}\n');
+  });
+  const { res, calls } = await heldAccept(t, { repo, attemptOver: { category: 'deps' } });
+  assert.equal(res.outcome, 'verified');
+  assert.equal(calls.review, 1, 'auto-approve по пробельному пути запрещён — обычный L2');
+});
+
+test('auto-approve: раунд 2+ с prior_findings обязан пройти L2 re-review', async (t) => {
+  const repo = await gitRepo(t, async (dir) => {
+    await mkdir(path.join(dir, 'docs'), { recursive: true });
+    await writeFile(path.join(dir, 'docs', 'note.md'), 'x\n');
+  });
+  // Контроль: раунд 1 docs-кандидат авто-одобряется без вызова L2.
+  const ok = await heldAccept(t, { repo, attemptOver: { category: 'docs' } });
+  assert.equal(ok.res.outcome, 'verified');
+  assert.equal(ok.calls.review, 0);
+  // Раунд 2 с неперепроверенной P1: тот же diff — только полный re-review.
+  const r2 = await heldAccept(t, {
+    repo,
+    attemptOver: {
+      category: 'docs',
+      review_round: 2,
+      prior_findings: [{ file: 'README.md', line: 1, expected: 'e', actual: 'a', severity: 'P1' }],
+      prior_sha: repo.base,
+    },
+  });
+  assert.equal(r2.res.outcome, 'verified');
+  assert.equal(r2.calls.review, 1, 'prior P1 не перепроверена — auto-approve запрещён');
+});
+
+test('prior_findings: поддерживаемое поле dod_violation не отклоняется', async (t) => {
+  const repo = await gitRepo(t, async (dir) => {
+    await mkdir(path.join(dir, 'docs'), { recursive: true });
+    await writeFile(path.join(dir, 'docs', 'note.md'), 'x\n');
+  });
+  const { res, calls } = await heldAccept(t, {
+    repo,
+    attemptOver: {
+      review_round: 2,
+      prior_findings: [{ file: 'a.js', line: 3, expected: 'e', actual: 'x',
+        severity: 'P1', dod_violation: true }],
+      prior_sha: repo.base,
+    },
+  });
+  assert.equal(res.outcome, 'verified', 'перенос P1 с dod_violation — не invalid_prior_findings');
+  assert.equal(calls.review, 1);
 });
