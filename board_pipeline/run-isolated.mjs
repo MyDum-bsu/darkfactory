@@ -40,7 +40,7 @@ import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
 import * as workerSelector from './worker-selector.mjs';
 import { abEffectGuard, enrollAbPilot, guardAbBoard, inspectPilotDiff, pilotArtifacts, runPilotForeman } from './ab-pilot.mjs';
 import { pilotWriterWorkspaceReady } from './bb-stage-adapter.mjs';
-import { effectiveL1ProfileId } from './l1-profiles.mjs';
+import { effectiveL1ProfileId, resolveL1Profile } from './l1-profiles.mjs';
 
 const exec = promisify(execFile);
 const inside = (root, p) => {
@@ -682,6 +682,19 @@ async function execute() {
       repoId: attempt.repo_id ?? route.repoId });
     const explicitL1 = (values['l1-profile'] ?? profile.l1Profile ??
       attempt.l1_profile) === undefined ? undefined : attemptL1;
+    // Явный l1Profile каждого рецепта выбранного профиля сверяется с
+    // эффективным явным выбором до запуска проверок — тот же отказ, что
+    // в factory-run/factory-enqueue. Иначе конфликтующий рецепт за
+    // валидным исполнялся бы частично и выдавался за ошибку кандидата.
+    for (const recipe of [...(profile.checks ?? []),
+      ...(profile.visual === undefined ? [] : [profile.visual])]) {
+      if (recipe?.l1Profile !== undefined) {
+        resolveL1Profile({ l1Profile: recipe.l1Profile });
+        if (explicitL1 !== undefined && recipe.l1Profile !== explicitL1) {
+          throw new Error('l1_profile_mismatch');
+        }
+      }
+    }
     const policy = { version: p.version,
       digest: p.policyDigest ?? route.policyDigest,
       profiles: { [attempt.check_profile]: { ...profile, l1Profile: explicitL1,

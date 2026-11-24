@@ -15,8 +15,8 @@ import { DEFAULT_L1_PROFILE, defaultL1ProfileForRepo, effectiveL1ProfileId,
   isValidL1Profile, L1_PROFILES, REPO_DEFAULT_L1_PROFILES, resolveL1Profile }
   from './l1-profiles.mjs';
 import { _internals } from './acceptance.mjs';
-import { offlineDockerRunner, offlineProfileRunner, SANDBOX_ENV }
-  from './runtime.mjs';
+import { offlineDockerRunner, offlineProfileRunner, offlineVisualRunner,
+  SANDBOX_ENV } from './runtime.mjs';
 import { buildEnqueuePlan } from '../ops/factory-enqueue.mjs';
 import { buildRunPlan } from '../ops/factory-run.mjs';
 
@@ -179,6 +179,23 @@ test('runtime: runner отклоняет неизвестный l1Profile до �
         { l1Default: 'python-node', check: recipe, checks: [recipe] }),
         /full SHA/);
     }
+    // Тот же контракт у визуального гейта: недопустимое или
+    // конфликтующее visual.l1Profile отклоняется до docker.
+    const visual = offlineVisualRunner(journal);
+    await assert.rejects(() => visual(handoff,
+      { visual: { ...recipe, l1Profile: 'bogus' } }),
+      /unknown_l1_profile:bogus/);
+    await assert.rejects(() => visual(handoff,
+      { l1Profile: 'node', visual: { ...recipe, l1Profile: 'python-node' } }),
+      /l1_profile_mismatch/);
+    // Совпадающий явный выбор не конфликтует: отказ — уже по формату
+    // SHA кандидата, а не по L1.
+    const badSha = { ...handoff, candidate_sha: 'x' };
+    await assert.rejects(() => visual(badSha,
+      { l1Profile: 'python-node', visual: { ...recipe, l1Profile: 'python-node' } }),
+      /full SHA/);
+    await assert.rejects(() => visual(badSha,
+      { l1Default: 'bogus', visual: recipe }), /unknown_l1_profile:bogus/);
   } finally {
     await rm(journal, { recursive: true, force: true });
   }
@@ -247,6 +264,11 @@ test('enqueue: l1Profile политики валидируется и сверя
     const write = l1 => writeFile(policyFile, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate,
       route: { checkProfile: 'prof' },
+      // Арбитр закреплён явно другим семейством: дефолт
+      // operatorReviewSetup читает keyring из process.env и при
+      // зачисленном OpenAI дал бы arbiter_family_not_independent ещё до
+      // проверок L1 — фикстура обязана быть независима от окружения.
+      arbiter: { provider: 'google', model: 'gemini-4-neon' },
       profiles: { prof: { l1Profile: l1,
         review: { provider: 'openai', model: 'gpt-6.2-sol',
           reasoningLevel: 'medium' } } },
@@ -274,6 +296,7 @@ test('enqueue: l1Profile политики валидируется и сверя
     const recipePolicy = l1 => writeFile(policyFile, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate,
       route: { checkProfile: 'prof' },
+      arbiter: { provider: 'google', model: 'gemini-4-neon' },
       profiles: { prof: {
         review: { provider: 'openai', model: 'gpt-6.2-sol',
           reasoningLevel: 'medium' },

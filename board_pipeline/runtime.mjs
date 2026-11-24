@@ -224,6 +224,20 @@ export function offlineVisualRunner(journal, { beforeEffect } = {}) {
   return async (binding, profile) => {
     const recipe = checkCommand(profile.visual ?? {});
     const { image, argv, cwd, timeoutMs } = recipe;
+    // Тот же контракт l1Profile, что у проверочных рецептов и обеих
+    // CLI-обёрток: явные значения профиля и рецепта — строго из реестра,
+    // два различных явных — отказ до docker; неявный l1Default
+    // контроллера валидируется fail-closed, но конфликтом не считается.
+    const l1Profile = profile.l1Profile === undefined ? undefined
+      : resolveL1Profile({ l1Profile: profile.l1Profile });
+    const l1Recipe = recipe.l1Profile === undefined ? undefined
+      : resolveL1Profile({ l1Profile: recipe.l1Profile });
+    if (l1Profile !== undefined && l1Recipe !== undefined && l1Profile.id !== l1Recipe.id) {
+      throw new Error('l1_profile_mismatch');
+    }
+    if (profile.l1Default !== undefined) {
+      resolveL1Profile({ l1Profile: profile.l1Default });
+    }
     if (!SHA.test(binding.candidate_sha)) throw new Error('Visual runner requires a full SHA');
     const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
       timeout: 12_000,
