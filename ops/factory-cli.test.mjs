@@ -157,6 +157,29 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile, worktree: wt }),
       /path_inside_worktree/);
+
+    // Граница из policy.route.worktree действует и без флага --worktree.
+    await writeFile(policyFile, JSON.stringify({
+      brief: innerBrief, reviewPrompt, reviewGate: gate,
+      route: { checkProfile: 'p', worktree: wt },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } },
+    }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }), /path_inside_worktree/);
+    // Исходный путь review skill через симлинк внутри worktree — отказ.
+    const skill = join(wt, 'skill.md');
+    await writeFile(join(dir, 'skill-real.md'), 's');
+    await symlink(join(dir, 'skill-real.md'), skill);
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, reviewSkillFiles: { logika: skill },
+      route: { checkProfile: 'p', worktree: wt },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium', skills: ['logika'] } } },
+    }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }),
+      /path_inside_worktree|symlink|review_skill/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -197,6 +220,16 @@ test('run: отказ без явных --provider/--model и при несов�
   const dir = await tempdir();
   try {
     const policy = await withPolicy(dir, policySpec(join(dir, 'wt')));
+    // Политика без bb и без route.worktree отклоняется до guard'а.
+    const noBb = policySpec(join(dir, 'wt'));
+    delete noBb.bb;
+    const fNoBb = await withPolicy(dir, noBb);
+    await assert.rejects(() => buildRunPlan(runValues(fNoBb, 's')), /policy_bb_missing/);
+    const noTree = policySpec(undefined);
+    delete noTree.route.worktree;
+    const fNoTree = await withPolicy(dir, noTree);
+    await assert.rejects(() => buildRunPlan(runValues(fNoTree, 's',
+      { worktree: join(dir, 'wt') })), /worktree_required/);
     await assert.rejects(() => buildRunPlan({ model: 'm', policy, state: 's' }),
       /provider_required/);
     await assert.rejects(() => buildRunPlan({ provider: 'p', policy, state: 's' }),
@@ -382,6 +415,15 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await symlink(dir, linkDir);
     await assert.rejects(() => buildRunPlan(runValues(ok, state,
       { 'ledger-path': join(linkDir, 'ledger.jsonl') })), /path_inside_worktree/);
+    // Алиас worktree: симлинк-предок, разрешающийся внутрь дерева, — отказ.
+    const alias = join(dir, 'alias');
+    await symlink(wt, alias);
+    const linkInWt = join(wt, 'via');
+    await symlink(dir, linkInWt);
+    const aliasPolicy = { ...policySpec(alias), decisionLedger: ledger };
+    const f5 = await withPolicy(dir, aliasPolicy);
+    await assert.rejects(() => buildRunPlan(runValues(f5, state,
+      { 'memory-dir': join(alias, 'via', 'memory') })), /path_inside_worktree/);
     // Путь контроллера не переопределяется флагами.
     await assert.rejects(() => runFactory(['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', ok, '--state', state, '--run-isolated', '/tmp/evil.mjs'], {}),

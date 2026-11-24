@@ -83,18 +83,24 @@ export function assertModelMatrix({ cli, policy }) {
 // отсекается буквальной сверкой до записи Git-конфига и запуска.
 async function canonicalOutside(path, worktreeReal, mustBe) {
   if (!isAbsolute(path ?? '')) fail('path_not_absolute');
+  const inside = p => worktreeReal && (p === worktreeReal || p.startsWith(`${worktreeReal}/`));
   const literal = resolve(path);
-  if (worktreeReal && (literal === worktreeReal || literal.startsWith(`${worktreeReal}/`))) {
-    fail('path_inside_worktree');
+  if (inside(literal)) fail('path_inside_worktree');
+  // Симлинк-предок, разрешающийся внутрь worktree (alias -> wt при пути
+  // alias/link/...): исходный путь контроллера шёл бы через дерево воркера
+  // даже при внешнем realpath — отказ до записи Git-конфига и запуска.
+  for (let probe = dirname(literal), prev; probe !== prev; prev = probe, probe = dirname(probe)) {
+    const st = await lstat(probe).catch(() => null);
+    if (st?.isSymbolicLink() && inside(await realpath(probe).catch(() => probe))) {
+      fail('path_inside_worktree');
+    }
   }
   const st = await lstat(literal).catch(() => fail('path_missing'));
   if (st.isSymbolicLink()) fail('path_symlink_refused');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   const real = await realpath(literal);
-  if (worktreeReal && (real === worktreeReal || real.startsWith(`${worktreeReal}/`))) {
-    fail('path_inside_worktree');
-  }
+  if (inside(real)) fail('path_inside_worktree');
   return real;
 }
 
@@ -131,20 +137,22 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
 
   const policyPathReal = await realpath(values.policy);
   const policy = JSON.parse(await readFile(policyPathReal, 'utf8'));
-  if (policy?.bb) {
-    if (policy.bb.provider !== values.provider || policy.bb.model !== values.model) {
-      fail('cli_spec_mismatch_policy_bb');
-    }
+  // CLI-спека обязана совпасть с закреплённой policy.bb: без bb проверять
+  // нечего — политика недопустима, контроллер отклонил бы её позже.
+  if (!policy?.bb || typeof policy.bb !== 'object') fail('policy_bb_missing');
+  if (policy.bb.provider !== values.provider || policy.bb.model !== values.model) {
+    fail('cli_spec_mismatch_policy_bb');
   }
   assertModelMatrix({ cli: values, policy });
 
-  // Guard привязан к worktree контроллера: --worktree может лишь подтвердить
-  // путь из политики, несовпадающий override — отказ.
+  // Guard привязан к worktree контроллера: политика обязана закрепить
+  // route.worktree, --worktree может лишь подтвердить тот же путь.
   const policyTree = policy?.route?.worktree;
-  const worktreeReal = await realpath(values.worktree ?? policyTree)
-    .catch(() => fail('worktree_missing'));
-  if (values.worktree !== undefined && policyTree !== undefined) {
-    if (await realpath(policyTree) !== worktreeReal) fail('worktree_mismatch');
+  if (typeof policyTree !== 'string' || !policyTree) fail('worktree_required');
+  const worktreeReal = await realpath(policyTree).catch(() => fail('worktree_missing'));
+  if (values.worktree !== undefined &&
+      await realpath(values.worktree).catch(() => fail('worktree_missing')) !== worktreeReal) {
+    fail('worktree_mismatch');
   }
 
   const ledger = effectivePath({ explicit: values['ledger-path'],
@@ -189,6 +197,16 @@ export async function ensureFilemodeGuard(worktree, { git = defaultGit } = {}) {
     .catch(() => fail('worktree_not_git'));
   if (inside !== 'true') fail('worktree_not_git');
   await git(['-C', worktree, 'config', '--local', 'core.fileMode', 'false']);
+  // Эффективное значение важнее записанного: более приоритетный
+  // worktree-конфиг (extensions.worktreeConfig) может перекрывать --local.
+  // Запуск только при реально действующем core.fileMode=false.
+  const effective = async () =>
+    (await git(['-C', worktree, 'config', '--get', 'core.fileMode']).catch(() => '')) === 'false';
+  if (!(await effective())) {
+    await git(['-C', worktree, 'config', '--worktree', 'core.fileMode', 'false'])
+      .catch(() => fail('filemode_guard_ineffective'));
+    if (!(await effective())) fail('filemode_guard_ineffective');
+  }
 }
 
 // Вывод контроллера идёт в консоль оператора по мере работы (spawn +

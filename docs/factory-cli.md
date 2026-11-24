@@ -35,8 +35,12 @@ node ops/factory-enqueue.mjs \
 завершится `policy_digest_drift` после всех проверок.
 
 **Проверки путей** до эффекта: `lstat` на конечном пути (симлинк — отказ),
-сверка буквального и resolved пути с `--worktree` — вход внутри worktree
-(включая через симлинк-предок `wt/link/...`) отклоняется до чтения файла.
+сверка буквального и resolved пути с `--worktree` **и** `route.worktree` из
+`--policy` — вход внутри worktree (включая через симлинк-предок
+`wt/link/...` или alias worktree) отклоняется до чтения файла. Те же
+проверки применяются к вложенным входам политики (`brief`, `reviewPrompt`,
+`reviewGate`, `routes.json`, исходные пути review-скиллов) — дайджест
+непригодной политики не попадает на Board.
 
 ## Запуск контроллера — `ops/factory-run.mjs`
 
@@ -70,8 +74,11 @@ node ops/factory-run.mjs \
 Worktree берётся из `policy.route.worktree`; `--worktree` может только
 подтвердить тот же канонический путь — несовпадающий override отклоняется
 (`worktree_mismatch`), иначе guard менял бы конфиг чужого репозитория.
-До запуска проверяется `git rev-parse --is-inside-work-tree`, затем
-локально `git -C <worktree> config --local core.fileMode false`.
+Политика обязана закрепить `bb` (совпадает с CLI-спекой) и
+`route.worktree`. До запуска проверяется `git rev-parse
+--is-inside-work-tree`, затем выставляется `core.fileMode false` и
+сверяется **эффективное** значение: при перекрытии worktree-конфигом
+ставится `--worktree`-уровень; если `false` не действует — отказ.
 
 ### Чистый старт с Project Memory и Owner Decision Ledger
 
@@ -82,7 +89,8 @@ Worktree берётся из `policy.route.worktree`; `--worktree` может т
 `*_mismatch`, отказ. CLI-override без конфликта передаётся контроллеру
 через соответствующий env. Каждый путь — абсолютный, каноничный (не
 симлинк) и строго вне worktree как буквально, так и после `realpath` —
-симлинк-предок `wt/link -> наружу` отсекается до запуска.
+симлинк-предок `wt/link -> наружу` или alias worktree отсекается до
+запуска.
 
 ### Делегирование
 

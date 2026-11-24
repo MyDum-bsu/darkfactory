@@ -37,27 +37,28 @@ const RESERVED_LABELS = new Set(
 
 function fail(code) { throw new Error(code); }
 
-// Канонический путь существующего входа: без симлинка ни на конечном пути,
-// ни среди предков (отсечение обхода вида wt/link -> внешний файл), и ни
-// буквальный, ни resolved путь не лежат внутри worktree (если задан).
-async function canonicalInput(path, { worktreeReal, mustBe } = {}) {
+// Канонический путь существующего входа: без симлинка на конечном пути, и
+// ни буквальный, ни resolved путь не лежат внутри ни одного worktree из
+// списка. Симлинк-предок, разрешающийся внутрь worktree (alias -> wt при
+// пути alias/link/...), тоже отсекается: исходный путь контроллера проходил
+// бы через дерево воркера даже при внешнем realpath.
+async function canonicalInput(path, { worktrees = [], mustBe } = {}) {
   if (typeof path !== 'string' || !path) fail('path_required');
+  const inside = p => worktrees.some(w => p === w || p.startsWith(`${w}/`));
   const literal = resolve(path);
-  if (worktreeReal && (literal === worktreeReal || literal.startsWith(`${worktreeReal}/`))) {
-    fail('path_inside_worktree');
+  if (inside(literal)) fail('path_inside_worktree');
+  for (let probe = dirname(literal), prev; probe !== prev; prev = probe, probe = dirname(probe)) {
+    const st = await lstat(probe).catch(() => null);
+    if (st?.isSymbolicLink() && inside(await realpath(probe).catch(() => probe))) {
+      fail('path_inside_worktree');
+    }
   }
-  // Симлинк-предок внутри worktree (wt/link -> наружу) отсекается проверкой
-  // буквального пути выше; предок снаружи, ведущий внутрь worktree, —
-  // сверкой realpath ниже. Проверка каждого предка отклоняла бы легальные
-  // входы под симлинкованными tmp/монтированиями.
   const st = await lstat(literal).catch(() => fail('path_missing'));
   if (st.isSymbolicLink()) fail('path_symlink_refused');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
   const real = await realpath(literal);
-  if (worktreeReal && (real === worktreeReal || real.startsWith(`${worktreeReal}/`))) {
-    fail('path_inside_worktree');
-  }
+  if (inside(real)) fail('path_inside_worktree');
   return real;
 }
 
@@ -69,15 +70,28 @@ const sha256File = async path =>
 // Каждый вложенный вход проходит ту же проверку, что и --brief/--policy:
 // не симлинк и строго вне worktree — контроллер отклонил бы такую политику
 // ('Operator files must be outside worker paths'), карточка не создаётся.
-async function pinnedPolicyDigest(policyFile, { worktreeReal } = {}) {
+async function pinnedPolicyDigest(policyFile, { worktrees = [] } = {}) {
   const file = await realpath(policyFile);
   const policy = JSON.parse(await readFile(file, 'utf8'));
+  // Граница — не только --worktree CLI: policy.route.worktree — то же
+  // дерево, которое контроллер объявит рабочим.
+  const boundaries = [...worktrees];
+  if (typeof policy?.route?.worktree === 'string' && policy.route.worktree) {
+    boundaries.push(await realpath(policy.route.worktree).catch(() => fail('worktree_missing')));
+  }
   const reviewSetup = await operatorReviewSetup(policy);
-  const check = p => canonicalInput(p, { worktreeReal, mustBe: 'file' });
+  const check = p => canonicalInput(p, { worktrees: boundaries, mustBe: 'file' });
   const gate = await check(policy.reviewGate);
+  // Исходные пути навыков проверяются до realpath, который заранее делает
+  // operatorReviewSetup: иначе wt/link/skill.md проходит через симлинк
+  // воркера. Resolved путь обязан совпасть с привязкой допуска.
+  const skillFiles = await Promise.all(reviewSetup.skills.map(async (skill, i) => {
+    const real = await check(policy.reviewSkillFiles?.[skill]);
+    if (real !== reviewSetup.skillPaths[i]) fail('review_skill_path_mismatch');
+    return real;
+  }));
   const files = [file, await check(policy.brief), await check(policy.reviewPrompt),
-    gate, await check(join(dirname(gate), 'routes.json')),
-    ...await Promise.all(reviewSetup.skillPaths.map(check))];
+    gate, await check(join(dirname(gate), 'routes.json')), ...skillFiles];
   const hashes = await Promise.all(files.map(sha256File));
   return createHash('sha256').update(JSON.stringify(hashes)).digest('hex');
 }
@@ -102,17 +116,17 @@ export async function buildEnqueuePlan(values) {
   if (typeof title !== 'string' || !title.trim()) fail('title_or_text_required');
   if (!FINISH.has(values.finish)) fail('finish_invalid');
 
-  const worktreeReal = values.worktree === undefined ? null
-    : await canonicalInput(values.worktree, { mustBe: 'dir' });
+  const worktrees = values.worktree === undefined ? []
+    : [await canonicalInput(values.worktree, { mustBe: 'dir' })];
   let specDigest = values['spec-digest'];
   if (values.brief !== undefined) {
     specDigest = await sha256File(
-      await canonicalInput(values.brief, { worktreeReal, mustBe: 'file' }));
+      await canonicalInput(values.brief, { worktrees, mustBe: 'file' }));
   }
   let policyDigest = values['policy-digest'];
   if (values.policy !== undefined) {
     policyDigest = await pinnedPolicyDigest(
-      await canonicalInput(values.policy, { worktreeReal, mustBe: 'file' }), { worktreeReal });
+      await canonicalInput(values.policy, { worktrees, mustBe: 'file' }), { worktrees });
   }
   if (!HEX64.test(specDigest ?? '')) fail('spec_digest_invalid');
   if (!HEX64.test(policyDigest ?? '')) fail('policy_digest_invalid');
@@ -121,14 +135,14 @@ export async function buildEnqueuePlan(values) {
   for (const [flag, key] of [['memory-dir', 'memory_dir'], ['ledger-path', 'ledger_path']]) {
     if (values[flag] !== undefined) {
       extra[key] = await canonicalInput(values[flag],
-        { worktreeReal, mustBe: flag === 'memory-dir' ? 'dir' : 'file' });
+        { worktrees, mustBe: flag === 'memory-dir' ? 'dir' : 'file' });
     }
   }
   if (values.ticket !== undefined) {
     if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(values.ticket)) fail('ticket_invalid');
     extra.ticket = values.ticket;
   }
-  if (worktreeReal) extra.worktree = worktreeReal;
+  if (worktrees.length) extra.worktree = worktrees[0];
 
   const labels = { spec_digest: specDigest, policy_digest: policyDigest,
     repo_id: values['repo-id'], profile_id: values.profile, finish: values.finish, ...extra };
