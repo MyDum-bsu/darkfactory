@@ -46,8 +46,31 @@ PASS возможен только одновременно при:
 6. Оцени satisfactionScore по взвешенным пунктам rubric; каждый вычет обязан
    ссылаться на capture, viewport и область дефекта.
 
-## Выходной артефакт
-Верни ровно `{"type":"satisfaction-report",...}` со счётчиками, score и
-структурированными violations. Для REWORK каждая blocking violation содержит:
-`category`, `viewport`, `selector` и/или `coordinates` (`x`, `y`, `width`, `height`).
-Не включай исходники сценариев, содержимое файлов, host-пути, PII или секреты.
+## Выходной машинный артефакт
+Stage-артефакт — ровно один JSON object без дополнительных ключей:
+
+```json
+{
+  "type": "satisfaction-report",
+  "capture": "<64 lowercase hex sha256>",
+  "viewports": 2,
+  "consoleErrors": 0,
+  "a11yViolations": 0,
+  "unstyledControls": 0,
+  "uncollapsedLongLists": 0,
+  "missingStates": 0,
+  "holdoutFailures": 0,
+  "satisfactionScore": 100
+}
+```
+
+`viewports` — positive integer число покрытых viewport; в профиле V2-4 MO Tracker
+это значение `2` (`1440x900` и `1024x768`). Остальные счётчики — canonical
+nonnegative integers, `satisfactionScore` — целое `0..100`. Любой ключ сверх
+этих девяти скалярных полей и `type` делает артефакт невалидным; violations,
+defects, prose, nested objects и массивы в машинный stage-артефакт не входят.
+
+Расширенный текстовый/JSON разбор — отдельный critic report, а не stage artifact.
+Для REWORK каждая blocking violation в этом расширенном отчёте содержит `category`,
+`viewport`, `selector` и/или `coordinates` (`x`, `y`, `width`, `height`). Не включай
+исходники сценариев, содержимое файлов, host-пути, PII или секреты.

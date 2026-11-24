@@ -6,7 +6,7 @@ import { basename, isAbsolute, join, posix } from 'node:path';
 import { promisify } from 'node:util';
 import { resolveL1Profile } from './l1-profiles.mjs';
 import { holdoutDigest, sanitizeHoldoutFeedback, validateHoldoutDir } from './holdout-runner.mjs';
-import { validatePngFile } from './visual-captures.mjs';
+import { PNG_CAPTURE_LIMITS, validatePngBytes } from './visual-captures.mjs';
 
 const exec = promisify(execFile);
 const SHA = /^[a-f0-9]{40}$/;
@@ -134,15 +134,17 @@ export function evaluateSatisfactionReport(report) {
   const detailed = category => sanitizedDetails.filter(item =>
     detailCategory(item.failed_assertion_category) === category || detailCategory(item.category) === category);
   let malformed = false;
+  const metrics = {};
   for (const [key, category] of SATISFACTION_COUNTERS) {
     const value = counterValue(report, key);
+    metrics[key] = value;
     if (value === null) {
       malformed = true;
       continue;
     }
     if (!value) continue;
     const matches = detailed(category);
-    for (let index = 0; index < value; index++) {
+    for (let index = 0; index < Math.min(value, 64); index++) {
       const detail = matches[index] ?? matches[0];
       defects.push(Object.freeze({ category,
         ...(detail?.viewport ? { viewport: detail.viewport } : {}),
@@ -156,20 +158,33 @@ export function evaluateSatisfactionReport(report) {
   if (!requiredViewportsCovered(report)) defects.push(Object.freeze({ category: 'viewport-coverage-missing' }));
   if (malformed) defects.push(Object.freeze({ category: 'malformed-report' }));
   const verdict = defects.length ? 'REWORK' : 'PASS';
-  return Object.freeze({ verdict, status: verdict, defects: Object.freeze(defects) });
+  return Object.freeze({ verdict, status: verdict, metrics: Object.freeze(metrics), defects: Object.freeze(defects) });
 }
 
 function forbiddenTrackerDb(value) {
   if (typeof value !== 'string') return true;
-  const normalized = value.replaceAll('\\', '/').replace(/\/+/g, '/').replace(/^\.\//, '');
-  return normalized === 'tracker/data/tracker.db' || normalized.endsWith('/tracker/data/tracker.db') ||
-    /\/(?:home|Users|media)\//.test(normalized) || /production|live|pii/i.test(normalized);
+  const slash = value.replaceAll('\\', '/').replace(/\/+/g, '/');
+  const candidates = [slash, ...slash.split(/[=:]/).slice(1)];
+  return candidates.some(candidate => {
+    const normalized = posix.normalize(candidate);
+    return normalized === 'tracker/data/tracker.db' || normalized.endsWith('/tracker/data/tracker.db') ||
+      /\/(?:home|Users|media)\//.test(normalized) || /production|live|pii/i.test(normalized);
+  });
+}
+
+function canonicalTmpPath(path, reason) {
+  if (typeof path !== 'string' || !path || /[\x00-\x1f\x7f]/.test(path) ||
+      !posix.isAbsolute(path) || path.split('/').includes('..') ||
+      posix.normalize(path) !== path || posix.normalize(path) === '/tmp' ||
+      !posix.normalize(path).startsWith('/tmp/')) {
+    throw new Error(reason);
+  }
+  return posix.normalize(path);
 }
 
 export function assertSyntheticMoTrackerDb(path) {
   if (forbiddenTrackerDb(path)) throw new Error('mo_tracker_live_db_forbidden');
-  if (isAbsolute(path) && !path.startsWith('/tmp/')) throw new Error('mo_tracker_synthetic_db_invalid');
-  return path;
+  return canonicalTmpPath(path, 'mo_tracker_synthetic_db_invalid');
 }
 
 function pushOnce(argv, ...args) {
@@ -190,10 +205,8 @@ export function buildUiVisualL3Profile({ image, argv, cwd = 'tracker/web', timeo
       argv.some(arg => forbiddenTrackerDb(arg))) {
     throw new Error('mo_tracker_visual_recipe_invalid');
   }
-  if (typeof syntheticDataDir !== 'string' || forbiddenTrackerDb(syntheticDataDir) ||
-      (isAbsolute(syntheticDataDir) && !syntheticDataDir.startsWith('/tmp/'))) {
-    throw new Error('mo_tracker_synthetic_data_invalid');
-  }
+  if (forbiddenTrackerDb(syntheticDataDir)) throw new Error('mo_tracker_synthetic_data_invalid');
+  const dataDir = canonicalTmpPath(syntheticDataDir, 'mo_tracker_synthetic_data_invalid');
   const visualArgv = [...argv];
   for (const viewport of MO_TRACKER_VIEWPORTS) {
     pushOnce(visualArgv, '--viewport', `${viewport.width}x${viewport.height}`);
@@ -202,7 +215,7 @@ export function buildUiVisualL3Profile({ image, argv, cwd = 'tracker/web', timeo
   pushOnce(visualArgv, '--axe-core-dump', '/artifacts/axe-core.json');
   pushOnce(visualArgv, '--require-states', 'loading,empty,error,ready');
   const visual = checkCommand({ image, argv: visualArgv, cwd, timeoutMs,
-    env: { MO_TRACKER_DATA: syntheticDataDir, MO_TRACKER_DB: db },
+    env: { MO_TRACKER_DATA: dataDir, MO_TRACKER_DB: db },
     ...(holdoutDir !== undefined ? { holdoutDir } : {}),
     ...(l1Profile !== undefined ? { l1Profile } : {}) });
   return Object.freeze({
@@ -446,18 +459,31 @@ export async function collectVisualArtifacts(dropped, journal, binding, observeC
 
 async function persistVisualCaptures(journal, binding, captures) {
   if (!captures.length) return null;
-  if (captures.length > 16) throw new Error('visual_capture_count_limit');
-  const canonicalJournal = await realpath(journal);
-  const dir = join(canonicalJournal, `visual-captures-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}`);
-  await mkdir(dir, { mode: 0o700 });
+  if (captures.length > PNG_CAPTURE_LIMITS.maxFiles) throw new Error('visual_capture_count_limit');
   const names = new Set();
+  const validated = [];
+  let totalBytes = 0;
+  // Validate every byte before creating the output directory: bad input never
+  // leaves a partially published capture package in the journal.
   for (const capture of captures) {
     const match = /^captures\/([A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.png)$/.exec(capture.rel);
     if (!match || names.has(match[1])) throw new Error('visual_capture_invalid');
+    validatePngBytes(capture.data);
+    totalBytes += capture.data.length;
+    if (totalBytes > PNG_CAPTURE_LIMITS.maxTotalBytes) throw new Error('visual_capture_total_limit');
     names.add(match[1]);
-    const target = join(dir, match[1]);
-    await writeFile(target, capture.data, { flag: 'wx', mode: 0o600 });
-    await validatePngFile(target);
+    validated.push({ name: match[1], data: capture.data });
+  }
+  const canonicalJournal = await realpath(journal);
+  const dir = join(canonicalJournal, `visual-captures-${binding.task_id}-${binding.candidate_sha}-${randomUUID()}`);
+  await mkdir(dir, { mode: 0o700 });
+  try {
+    for (const capture of validated) {
+      await writeFile(join(dir, capture.name), capture.data, { flag: 'wx', mode: 0o600 });
+    }
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true });
+    throw error;
   }
   return { capture_dir: dir, capture_count: captures.length };
 }

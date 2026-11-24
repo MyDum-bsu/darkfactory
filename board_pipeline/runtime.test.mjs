@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -54,6 +54,8 @@ test('buildUiVisualL3Profile emits synthetic MO Tracker recipe with two viewport
 test('buildUiVisualL3Profile rejects live tracker DB, host paths and conflicting database inputs', () => {
   const base = { image: IMAGE, argv: ['node', 'visual-check.mjs'] };
   for (const bad of ['tracker/data/tracker.db', './tracker/data/tracker.db', '/tmp/copy/tracker/data/tracker.db',
+    '../data/tracker.db', 'tracker/data/./tracker.db', '/tmp/../var/lib/real.db',
+    '/tmp/../candidate/tracker/data/./tracker.db', 'file:tracker/data/tracker.db', '',
     '/' + 'home/operator/tracker.db', '/' + 'Users/operator/tracker.db', '/' + 'media/disk/tracker.db',
     '/tmp/production-tracker.db', '/tmp/pii-tracker.db']) {
     assert.throws(() => buildUiVisualL3Profile({ ...base, trackerDb: bad }),
@@ -61,6 +63,12 @@ test('buildUiVisualL3Profile rejects live tracker DB, host paths and conflicting
   }
   assert.throws(() => buildUiVisualL3Profile({ ...base, argv: ['node', 'x', 'tracker/data/tracker.db'] }),
     /mo_tracker_visual_recipe_invalid/);
+  assert.throws(() => buildUiVisualL3Profile({ ...base, argv: ['node', 'x', '--db=tracker/data/tracker.db'] }),
+    /mo_tracker_visual_recipe_invalid/);
+  assert.throws(() => buildUiVisualL3Profile({ ...base, argv: ['node', 'x', 'file:tracker/data/./tracker.db'] }),
+    /mo_tracker_visual_recipe_invalid/);
+  assert.throws(() => buildUiVisualL3Profile({ ...base, syntheticDataDir: '/tmp/../var/data' }),
+    /mo_tracker_synthetic_data_invalid/);
   assert.throws(() => buildUiVisualL3Profile({ ...base, trackerDb: '/tmp/a.db', databasePath: '/tmp/b.db' }),
     /mo_tracker_synthetic_db_conflict/);
   assert.throws(() => buildUiVisualL3Profile({ image: 'node:latest', argv: ['node'] }), /operator check profile/);
@@ -110,6 +118,29 @@ test('offline visual runner mounts validated holdouts read-only through injected
   assert.equal(calls.length, before, 'docker is not called for an inside-worktree holdout');
 });
 
+test('offline visual runner rejects invalid capture bytes without leaving a partial capture directory', async t => {
+  const { root, repo, sha } = await repoFixture(t);
+  const journal = join(root, 'journal');
+  await mkdir(journal);
+  const artifactSource = join(root, 'bad-artifact-source');
+  await mkdir(join(artifactSource, 'captures'), { recursive: true });
+  await writeFile(join(artifactSource, 'captures', 'bad.png'), 'not a png');
+  const artifactTar = execFileSync('tar', ['-C', artifactSource, '-cf', '-', '.'], { encoding: 'buffer' });
+  const execDocker = async (file, args) => {
+    if (args[0] === 'info') return { stdout: '["name=rootless"]', stderr: '' };
+    if (args[0] === 'run') return { stdout: 'container\n', stderr: '' };
+    if (args[0] === 'exec' && args.includes('tar')) return { stdout: artifactTar, stderr: '' };
+    if (args[0] === 'exec') return { stdout: 'visual ok', stderr: '' };
+    if (args[0] === 'rm') return { stdout: '', stderr: '' };
+    throw new Error(`unexpected docker call ${args.join(' ')}`);
+  };
+  const profile = buildUiVisualL3Profile({ image: IMAGE, argv: ['node', 'visual-check.mjs'] });
+  await assert.rejects(offlineVisualRunner(journal, { execDocker })({ task_id: '1674', worktree: repo, candidate_sha: sha },
+    { visual: profile.visual }), /png_invalid/);
+  const names = await readdir(journal);
+  assert.equal(names.some(name => name.startsWith('visual-captures-')), false);
+});
+
 test('evaluateSatisfactionReport is deterministic for boundary PASS and blocking counters', () => {
   const pass = { viewports: ['1440x900', '1024x768'], consoleErrors: 0, a11yViolations: 0,
     unstyledControls: 0, uncollapsedLongLists: 0, missingStates: 0, holdoutFailures: 0,
@@ -120,4 +151,11 @@ test('evaluateSatisfactionReport is deterministic for boundary PASS and blocking
   assert.equal(evaluateSatisfactionReport({ ...pass, unstyledControls: 1 }).verdict, 'REWORK');
   assert.equal(evaluateSatisfactionReport({ ...pass, uncollapsedLongLists: 1 }).verdict, 'REWORK');
   assert.equal(evaluateSatisfactionReport({ ...pass, a11yCritical: 1 }).verdict, 'REWORK');
+  const huge = evaluateSatisfactionReport({ ...pass, unstyledControls: 50000 });
+  assert.equal(huge.verdict, 'REWORK');
+  assert.equal(huge.metrics.unstyledControls, 50000);
+  assert.equal(huge.defects.filter(defect => defect.category === 'unstyled-control').length, 64);
+  const billion = evaluateSatisfactionReport({ ...pass, uncollapsedLongLists: 1e9 });
+  assert.equal(billion.metrics.uncollapsedLongLists, 1e9);
+  assert.equal(billion.defects.filter(defect => defect.category === 'uncollapsed-long-list').length, 64);
 });

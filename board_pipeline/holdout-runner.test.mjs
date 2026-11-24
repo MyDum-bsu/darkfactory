@@ -13,7 +13,7 @@ import {
   validateHoldoutDir,
 } from './holdout-runner.mjs';
 import { buildUiVisualL3Profile, evaluateSatisfactionReport } from './runtime.mjs';
-import { collectValidatedPngs, stageVisualCaptures, validatePngBytes, validatePngFile } from './visual-captures.mjs';
+import { assertPackagedCaptures, collectValidatedPngs, stageVisualCaptures, validatePngBytes, validatePngFile } from './visual-captures.mjs';
 import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { agyStreamFixture, commitFile, neonFixture } from './review-test-fixture.mjs';
 
@@ -52,6 +52,7 @@ test('holdoutDir validation rejects worktree placement and symlink escapes', asy
 
   await writeScenario(outside, { id: 'ok', assertions: { unstyledControls: 0 } });
   assert.equal(await validateHoldoutDir(outside, worktree), outside);
+  await assert.rejects(validateHoldoutDir('/', worktree), /holdout_dir_invalid/);
 
   const escaping = join(root, 'escaping');
   await mkdir(escaping);
@@ -83,6 +84,10 @@ test('offline holdout docker argv is array-safe, read-only and digest-bound', as
   assert.ok(argv.includes('--read-only'));
   assert.ok(argv.includes(`type=bind,src=${outside},dst=/holdouts,readonly`));
   assert.equal(argv.at(-1), 'ui-check.mjs');
+  assert.throws(() => buildHoldoutDockerArgv({ holdoutDir: outside, image: IMAGE,
+    argv: ['node'], cwd: '/candidate-evil' }), /holdout_recipe_invalid/);
+  assert.throws(() => buildHoldoutDockerArgv({ holdoutDir: '/tmp/h,readonly=false', image: IMAGE,
+    argv: ['node'] }), /holdout_dir_invalid/);
 
   const calls = [];
   const injected = async (file, args) => {
@@ -110,6 +115,13 @@ test('offline holdout docker argv is array-safe, read-only and digest-bound', as
         viewport: '1024x768', selector: '.mo-row:nth-child(25)', coordinates: { x: 12, y: 420 } }] }), stderr: '' }); } });
   assert.equal(structured.feedback.failures[0].failed_assertion_category, 'uncollapsed-long-list');
   assert.deepEqual(structured.feedback.failures[0].coordinates, { x: 12, y: 420 });
+
+  const exitZeroFailure = await runHoldoutL3({ holdoutDir: outside, worktree, image: IMAGE,
+    argv: ['node', 'ui-check.mjs'], execDocker: async () => ({ stdout: JSON.stringify({ failures: [{
+      scenario_id: 'rows', failed_assertion_category: 'uncollapsed-long-list' }] }), stderr: '' }) });
+  assert.equal(exitZeroFailure.exit, 0);
+  assert.equal(exitZeroFailure.feedback.verdict, 'REWORK');
+  assert.equal(exitZeroFailure.ok, false, 'structured failure dominates a zero process exit');
 });
 
 test('sanitizeHoldoutFeedback emits only structured symptoms with zero source, secret, ANSI or path leaks', () => {
@@ -135,6 +147,22 @@ test('sanitizeHoldoutFeedback emits only structured symptoms with zero source, s
   assert.deepEqual(feedback.failures[1], { scenario_id: 'mo-tracker-rows', failed_assertion_category: 'uncollapsed-long-list',
     viewport: { width: 1024, height: 768 }, selector: '.mo-row:nth-child(25)',
     coordinates: { x: 16, y: 420, width: 900, height: 28 } });
+});
+
+test('sanitizer neutralizes bidi controls and both OSC termination forms', () => {
+  const bidi = `mo-\u202e\u2066rows`;
+  const oscBel = `row-\x1b]0;secret-title\x07visible`;
+  const oscSt = `row-\x1b]0;secret-title\x1b\\visible`;
+  const feedback = sanitizeHoldoutFeedback({ failures: [
+    { scenario_id: bidi, failed_assertion_category: 'unstyled-control' },
+    { scenario_id: oscBel, failed_assertion_category: 'unstyled-control' },
+    { scenario_id: oscSt, failed_assertion_category: 'unstyled-control' },
+  ] });
+  const encoded = JSON.stringify(feedback);
+  for (const forbidden of ['\u202e', '\u2066', 'secret-title', '\x1b']) {
+    assert.equal(encoded.includes(forbidden), false, forbidden);
+  }
+  assert.equal(feedback.failures[0].scenario_id, 'scenario-1');
 });
 
 test('sanitizer blocks token-shaped ids and free-text selector payloads', () => {
@@ -179,6 +207,12 @@ test('PNG validation is fail-closed for magic, truncation, symlink, traversal an
   assert.equal(staged.count, 1);
   assert.equal(staged.files[0].file, 'captures/screen.png');
   assert.equal((await readFile(join(target, 'screen.png'))).equals(PNG_1X1), true);
+  assert.deepEqual(await assertPackagedCaptures(join(root, 'snapshot')), { present: true, count: 1 });
+  await writeFile(join(target, 'evil.txt'), 'not a capture');
+  await assert.rejects(assertPackagedCaptures(join(root, 'snapshot')), /png_capture_unexpected_file/);
+  await rm(join(target, 'evil.txt'));
+  await rm(join(target, 'screen.png'));
+  await assert.rejects(assertPackagedCaptures(join(root, 'snapshot')), /png_capture_missing/);
 });
 
 test('validated PNG captures are packaged into the Neon review snapshot and invalid bytes stop before transport', async t => {

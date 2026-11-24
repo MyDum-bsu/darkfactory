@@ -30,7 +30,8 @@ async function canonicalExistingDirectory(path, reason) {
 }
 
 function inside(child, parent) {
-  return child === parent || child.startsWith(`${parent}${sep}`);
+  return parent === sep ? child.startsWith(sep)
+    : child === parent || child.startsWith(`${parent}${sep}`);
 }
 
 // The private StrongDM holdout catalog must be outside the writable candidate
@@ -40,6 +41,7 @@ function inside(child, parent) {
 export async function validateHoldoutDir(holdoutDir, worktree) {
   const holdout = await canonicalExistingDirectory(holdoutDir, 'holdout_dir_invalid');
   const tree = await canonicalExistingDirectory(worktree, 'holdout_worktree_invalid');
+  if (holdout === sep) throw fail('holdout_dir_invalid');
   if (inside(holdout, tree)) throw fail('holdout_inside_worktree');
   if (inside(tree, holdout)) throw fail('holdout_overlaps_worktree');
   // Docker --mount uses comma-separated key/value text even when argv itself is
@@ -109,7 +111,8 @@ export async function holdoutDigest(holdoutDir) {
 function safeDockerRecipe({ image, argv, cwd = '/candidate' } = {}) {
   if (!IMAGE.test(image ?? '') || !Array.isArray(argv) || !argv.length ||
       !argv.every(arg => typeof arg === 'string' && arg.length > 0 && !arg.includes('\0')) ||
-      typeof cwd !== 'string' || !cwd.startsWith('/candidate') || cwd.split('/').includes('..')) {
+      typeof cwd !== 'string' || CONTROL.test(cwd) ||
+      !(cwd === '/candidate' || cwd.startsWith('/candidate/')) || cwd.split('/').includes('..')) {
     throw fail('holdout_recipe_invalid');
   }
   return { image, argv: [...argv], cwd };
@@ -118,7 +121,7 @@ function safeDockerRecipe({ image, argv, cwd = '/candidate' } = {}) {
 // Docker argv is data, never shell text. The private catalog is the only extra
 // mount and it is read-only at /holdouts.
 export function buildHoldoutDockerArgv({ holdoutDir, image, argv, cwd = '/candidate' } = {}) {
-  if (!isAbsolute(holdoutDir ?? '')) throw fail('holdout_dir_invalid');
+  if (!isAbsolute(holdoutDir ?? '') || /[\x00-\x1f\x7f,]/.test(holdoutDir)) throw fail('holdout_dir_invalid');
   const recipe = safeDockerRecipe({ image, argv, cwd });
   return ['run', '--rm', '--pull=never', '--network=none', '--read-only',
     '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
@@ -145,7 +148,7 @@ export async function runHoldoutL3({ holdoutDir, worktree, image, argv, cwd = '/
   const workerFeedback = exit !== 0 && !feedback.failures.length
     ? sanitizeHoldoutFeedback({ failures: [{ failed_assertion_category: 'execution-failure' }] })
     : feedback;
-  return { ok: exit === 0, exit, holdout_digest: provenance.holdout_digest,
+  return { ok: exit === 0 && workerFeedback.verdict === 'PASS', exit, holdout_digest: provenance.holdout_digest,
     scenario_files: provenance.files.length, docker_argv: Object.freeze(args), feedback: workerFeedback };
 }
 

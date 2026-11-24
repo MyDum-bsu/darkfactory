@@ -157,5 +157,8 @@ export async function assertPackagedCaptures(snapshotDir, options = {}) {
   });
   if (!present) return { present: false, count: 0 };
   const captures = await collectValidatedPngs(dir, options);
+  const names = await readdir(dir);
+  if (names.some(name => !name.endsWith('.png'))) throw fail('png_capture_unexpected_file');
+  if (!captures.length) throw fail('png_capture_missing');
   return { present: true, count: captures.length };
 }
