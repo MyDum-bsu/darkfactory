@@ -3,6 +3,7 @@
 // runner'ы, временные каталоги удаляются в finally.
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile }
   from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -317,7 +318,27 @@ test('enqueue: policy.policyDigest закреплён и сверяется с -
   }
 });
 
+// Обязательные операторские входы политики (handoffDir, brief,
+// reviewPrompt, reviewGate): общий канонический набор вне любого
+// тестового worktree — политика без них отклоняется при построении
+// плана, поэтому валидный минимум задаётся здесь.
+let opsFixture = null;
+function opsPaths() {
+  if (opsFixture) return opsFixture;
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'factory-ops-')));
+  const inbox = join(dir, 'inbox');
+  mkdirSync(inbox);
+  writeFileSync(join(dir, 'brief.md'), 'brief');
+  writeFileSync(join(dir, 'review.md'), 'review');
+  writeFileSync(join(dir, 'gate.json'), '{}');
+  writeFileSync(join(dir, 'routes.json'), '{}');
+  opsFixture = { handoffDir: inbox, brief: join(dir, 'brief.md'),
+    reviewPrompt: join(dir, 'review.md'), reviewGate: join(dir, 'gate.json') };
+  return opsFixture;
+}
+
 const policySpec = worktree => ({
+  ...opsPaths(),
   version: 1,
   bb: { provider: 'acp-devin', model: 'swe-2-high', project: 'proj_x' },
   route: { worktree, checkProfile: 'default', finish: 'verified', repoId: 'r' },
@@ -873,6 +894,20 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     const fHbNull = await withPolicy(dir, hbNull);
     await assert.rejects(() => runPlan(runValues(fHbNull, state)),
       /path_not_absolute/);
+    // handoffDir — обязательный операторский путь (realpath контроллера
+    // безусловен): отсутствие — отказ при построении плана.
+    const hbMissing = { ...policySpec(wt), handoffDir: undefined };
+    const fHbMissing = await withPolicy(dir, hbMissing);
+    await assert.rejects(() => runPlan(runValues(fHbMissing, state)),
+      /handoff_required/);
+    // brief/reviewPrompt/reviewGate — тоже обязательные входы
+    // контроллера: без них план не строится.
+    for (const key of ['brief', 'reviewPrompt', 'reviewGate']) {
+      const missing = { ...policySpec(wt), [key]: undefined };
+      const fMissing = await withPolicy(dir, missing);
+      await assert.rejects(() => runPlan(runValues(fMissing, state)),
+        /operator_files_required/);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1064,6 +1099,16 @@ test('run: нестроковое значение приоритетного п
       { 'ledger-path': null })), /path_not_absolute/);
     await assert.rejects(() => runPlan(runValues(fOk, state,
       { 'memory-dir': null })), /path_not_absolute/);
+    // Явный null или '' в нижестоящем поле пути отклоняется и при
+    // валидном поле более высокого приоритета — инвариант валидации
+    // действует на всю форму, а не только на резолвленное значение.
+    for (const bad of [
+      { projectMemory: { storeDir: extMem, dir: null } },
+      { projectMemory: { storeDir: extMem, path: '' } },
+    ]) {
+      const fBad = await withPolicy(dir, { ...policySpec(wt), ...bad });
+      await assert.rejects(() => runPlan(runValues(fBad, state)), /path_not_absolute/);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

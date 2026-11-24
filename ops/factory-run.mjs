@@ -142,10 +142,11 @@ const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 
 // Путь из политики в форме контроллера: строка или объект ({path} для
 // ledger; {storeDir|dir|path} для memory — resolveMemoryStoreDir).
-// Берётся первое заданное (не undefined) значение: явный null — не
-// «отсутствует» (контроллер подставил бы следующий ключ или env, а
-// dry-run подтвердил бы нерабочую конфигурацию), как и нестроковое
-// значение приоритетного поля — отклоняется здесь, до Git-конфига.
+// Берётся первое заданное (не undefined) значение: явный null или
+// пустая строка в любом поле — не «отсутствует» (контроллер подставил
+// бы следующий ключ или env, а dry-run подтвердил бы нерабочую
+// конфигурацию) и отклоняется даже при валидном поле выше, как и
+// нестроковое значение приоритетного поля — отказ здесь, до Git-конфига.
 const policyPath = (cfg, keys) => {
   if (cfg === undefined) return undefined;
   if (cfg === null) fail('path_not_absolute');
@@ -154,11 +155,14 @@ const policyPath = (cfg, keys) => {
   // бы её в ledgerPolicyConfig/memoryPolicyConfig после записи
   // Git-конфига; L2 отклоняет такой вход при построении плана.
   if (typeof cfg !== 'object' || Array.isArray(cfg)) fail('policy_invalid');
+  let found;
   for (const k of keys) {
-    if (cfg[k] === null) fail('path_not_absolute');
-    if (cfg[k] !== undefined) return cfg[k];
+    const v = cfg[k];
+    if (v === undefined) continue;
+    if (v === null || v === '') fail('path_not_absolute');
+    if (found === undefined) found = v;
   }
-  return undefined;
+  return found;
 };
 
 // Чистый старт: резолвит тот же путь, что реально использует контроллер
@@ -232,6 +236,12 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // Вложенные операторские входы политики — та же каноничность, что и у
   // --policy: исходная строка brief/reviewPrompt/reviewGate/skillFiles
   // обязана совпадать с realpath и лежать вне worktree.
+  // brief/reviewPrompt/reviewGate — обязательные операторские входы:
+  // контроллер делает их realpath безусловно, поэтому отсутствие —
+  // отказ при построении плана, до Git-конфига.
+  for (const p of [policy.brief, policy.reviewPrompt, policy.reviewGate]) {
+    if (p === undefined) fail('operator_files_required');
+  }
   const operatorFiles = [policyPathReal];
   for (const p of [policy.brief, policy.reviewPrompt, policy.reviewGate,
     ...Object.values(policy.reviewSkillFiles ?? {})]) {
@@ -311,38 +321,36 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // сверки со строкой; каноничность и двусторонняя граница worktree
   // проверяются здесь (parent-граница относится к ledger/memory).
   const state = await canonicalOutside(values.state, treeAliases, 'dir', { parent: false });
-  // handoffDir — inbox сдачи контроллера: канонический каталог вне
-  // worktree и вне state в обе стороны (inside(root,inbox)||
-  // inside(inbox,root)||inside(tree,inbox) контроллера).
-  let handoff = null;
-  // Явный null — не «отсутствует»: отклоняется в canonicalOutside до
-  // Git-конфига, как и любое нестроковое значение.
-  if (policy.handoffDir !== undefined) {
-    handoff = await canonicalOutside(policy.handoffDir, treeAliases, 'dir', { parent: false });
-    if (inside(state, handoff) || inside(handoff, state)) fail('path_inside_worktree');
-    // Inbox сдачи — рабочий путь воркера: операторский файл внутри него
-    // контроллер отклонил бы («Operator files must be outside worker
-    // paths») уже после записи Git-конфига; отказ здесь, до эффекта.
-    if (operatorFiles.some(f => inside(handoff, f))) fail('path_inside_worktree');
-  }
+  // handoffDir — обязательный inbox сдачи контроллера (realpath без
+  // проверки на undefined): канонический каталог вне worktree и вне
+  // state в обе стороны (inside(root,inbox)||inside(inbox,root)||
+  // inside(tree,inbox) контроллера). Явный null — не «отсутствует»:
+  // отклоняется в canonicalOutside до Git-конфига.
+  if (policy.handoffDir === undefined) fail('handoff_required');
+  const handoff = await canonicalOutside(policy.handoffDir, treeAliases, 'dir', { parent: false });
+  if (inside(state, handoff) || inside(handoff, state)) fail('path_inside_worktree');
+  // Inbox сдачи — рабочий путь воркера: операторский файл внутри него
+  // контроллер отклонил бы («Operator files must be outside worker
+  // paths») уже после записи Git-конфига; отказ здесь, до эффекта.
+  if (operatorFiles.some(f => inside(handoff, f))) fail('path_inside_worktree');
   // Перекрёстные границы опциональных каталогов политики (как у
   // ownerAnswerSource/releaseSetup контроллера): questionGate.inbox
   // отделён от handoffDir, release.directory — от state и handoffDir,
   // в обе стороны. Отказ до Git-конфига и в dry-run.
-  if (qgInbox !== null && handoff !== null &&
+  if (qgInbox !== null &&
       (inside(qgInbox, handoff) || inside(handoff, qgInbox))) {
     fail('path_inside_worktree');
   }
   if (relDir !== null &&
       (inside(relDir, state) || inside(state, relDir) ||
-       (handoff !== null && (inside(relDir, handoff) || inside(handoff, relDir))))) {
+       inside(relDir, handoff) || inside(handoff, relDir))) {
     fail('path_inside_worktree');
   }
   // Каталоги стоп-файлов — та же двусторонняя permitDirectory-граница
-  // против state и handoffDir (inbox сдачи контроллера), когда он задан.
+  // против state и handoffDir (inbox сдачи контроллера).
   for (const swDir of swDirs) {
     if (inside(state, swDir) || inside(swDir, state) ||
-        (handoff !== null && (inside(handoff, swDir) || inside(swDir, handoff)))) {
+        inside(handoff, swDir) || inside(swDir, handoff)) {
       fail('path_inside_worktree');
     }
   }
