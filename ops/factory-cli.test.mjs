@@ -146,6 +146,16 @@ test('enqueue: brief/policy файлы, симлинк и путь внутри 
     const ok = await buildEnqueuePlan({ ...baseValues(), 'spec-digest': undefined,
       brief: outBrief, worktree });
     assert.match(ok.labels.spec_digest, /^[0-9a-f]{64}$/);
+    // Явный --spec-digest вместе с --brief: недопустимый дайджест
+    // отклоняется до вызова vb, а не перезаписывается хэшем файла;
+    // валидный, но несовпадающий — та же привязка к версии спеки.
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), 'spec-digest': 'zz',
+      brief, worktree }), /spec_digest_invalid/);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), 'spec-digest': HEX2,
+      brief, worktree }), /spec_digest_mismatch/);
+    const pinned = await buildEnqueuePlan({ ...baseValues(),
+      'spec-digest': await sha256File(brief), brief, worktree });
+    assert.equal(pinned.labels.spec_digest, await sha256File(brief));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

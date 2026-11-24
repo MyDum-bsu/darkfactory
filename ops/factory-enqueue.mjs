@@ -266,7 +266,16 @@ export async function buildEnqueuePlan(values) {
     if (handoff !== undefined && within(handoff, briefReal)) {
       fail('path_inside_worktree');
     }
-    specDigest = await sha256File(briefReal);
+    const briefDigest = await sha256File(briefReal);
+    // Явный --spec-digest обязан совпадать с хэшем файла спеки — иначе
+    // в Board ушла бы метка, не сходящаяся с приёмкой. Недопустимый или
+    // несовпадающий дайджест отклоняется до вызова vb, а не
+    // перезаписывается вычисленным значением.
+    if (specDigest !== undefined) {
+      if (!HEX64.test(specDigest)) fail('spec_digest_invalid');
+      if (specDigest !== briefDigest) fail('spec_digest_mismatch');
+    }
+    specDigest = briefDigest;
   }
   let policyDigest = values['policy-digest'];
   if (values.policy !== undefined) {
