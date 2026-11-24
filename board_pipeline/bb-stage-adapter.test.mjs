@@ -454,3 +454,49 @@ test('stopLostSpawn: сверка challenge — чужой соседний тр
   assert.deepEqual(stopped, ['thr_lostmine'],
     'останавливается только тред с уникальным challenge этого запуска — соседний не трогается');
 });
+
+test('stopLostSpawn: сверка читает только начало журнала через --limit, не --all', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'df-stage-lost-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'observer'), journal = join(root, 'journal');
+  await mkdir(workspace, { mode: 0o700 });
+  await mkdir(journal, { mode: 0o700 });
+  const artifact = Buffer.from(JSON.stringify({ type: 'inventory', inventory: 'a'.repeat(64), items: 1, unresolved: 0 }));
+  const stopped = [], logCalls = [];
+  let nonce = null;
+  const execBb = async argv => {
+    if (argv[1] === 'spawn') {
+      const prompt = await readFile(argv[argv.indexOf('--prompt-file') + 1], 'utf8');
+      nonce = /Challenge: ([a-f0-9]{64})/.exec(prompt)[1];
+      throw new Error('lost transport response');
+    }
+    if (argv[1] === 'list') return { stdout: JSON.stringify([
+      { id: 'thr_lostmine', parentThreadId: parentThread }]) };
+    if (argv[1] === 'show') return { stdout: JSON.stringify({
+      thread: { id: argv[2], parentThreadId: parentThread, projectId: project },
+      environment: null }) };
+    if (argv[1] === 'log') {
+      logCalls.push(argv);
+      // Многомегабайтный хвост журнала недостижим: seq 1 читается из первых
+      // событий — --all с обрывом по maxBuffer потерял бы наш тред.
+      assert.ok(!argv.includes('--all'), 'stopLostSpawn не запрашивает весь лог');
+      assert.ok(argv.includes('--limit'), 'stopLostSpawn читает только начало лога');
+      return { stdout: JSON.stringify(
+        [{ seq: 1, type: 'client/turn/requested', data: { input: [{ type: 'text', text: `… Challenge: ${nonce}` }] } }]) };
+    }
+    if (argv[1] === 'stop') { stopped.push(argv[2]); return { stdout: '{}' }; }
+    return { stdout: '{}' };
+  };
+  const observer = await createBbStageObserver({ workspace, project, journal, parentThread,
+    deadline: Date.now() + 60_000 }, {
+    assertCurrent() {}, assertReadOnly: () => true,
+    readArtifact: () => ({ artifact, material: 'm' }), record: () => {}, recordWitness: () => {}, execBb });
+  const req = { stage: 'intake', role: 'r', verifier: 'inventory', registryDigest: 'a'.repeat(64),
+    model: { provider, model, reasoning: null },
+    binding: { task_id: '1', candidate_sha: 'a'.repeat(40), subject_digest: 'b'.repeat(64) },
+    skills: [{ text: 's' }] };
+  await assert.rejects(observer(req), /lost transport response/);
+  assert.ok(logCalls.length > 0, 'сверка обязана читать журнал кандидата');
+  assert.deepEqual(stopped, ['thr_lostmine'],
+    'потерянный spawn с подтверждённым challenge останавливается и по усечённому чтению');
+});

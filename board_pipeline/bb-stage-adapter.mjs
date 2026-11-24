@@ -262,8 +262,11 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
         // Маркер доказывает запуск только в исходном событии spawn: seq 1,
         // source spawn (как в bb-reconcile). Первый по seq tell с цитатой
         // challenge в чужом треде — не подтверждение нашего запуска.
+        // Исходное событие spawn — seq 1, первое в журнале: читаем только
+        // начало лога через --limit (первые N событий, как в bb-reconcile),
+        // --all на многомегабайтном логе упирается в maxBuffer и теряет тред.
         let events = null;
-        try { events = await run(['thread', 'log', item.id, '--all', '--json']); } catch { continue; }
+        try { events = await run(['thread', 'log', item.id, '--limit', '5', '--json']); } catch { continue; }
         const entries = Array.isArray(events) ? events : (Array.isArray(events?.events) ? events.events : []);
         const spawned = entries.some(entry =>
           entry?.type === 'client/turn/requested' && entry?.seq === 1 &&

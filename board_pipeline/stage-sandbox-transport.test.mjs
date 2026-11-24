@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -316,10 +316,29 @@ test('abort во время docker run через stageDockerSandbox: отказ
   t.after(() => rm(empty, { recursive: true, force: true }));
   const fakeSock = join(empty, 'upstream.sock');
   await writeFile(fakeSock, '');
-  const containers = async () => (await exec('docker',
-    ['ps', '-aq', '--filter', 'name=board-review-'], { timeout: 10_000 }))
-    .stdout.split('\n').map(line => line.trim()).filter(Boolean);
-  const before = new Set(await containers());
+  // Уникальный маркер этого запуска в env контейнера: параллельное ревью
+  // может держать свои board-review-* контейнеры — трогаем только те, у
+  // которых docker inspect подтверждает DF_STAGE_TEST_ID этого теста.
+  const marker = `DF_STAGE_TEST_ID=${randomUUID()}`;
+  const ours = async () => {
+    const ids = (await exec('docker',
+      ['ps', '-aq', '--filter', 'name=board-review-'], { timeout: 10_000 }))
+      .stdout.split('\n').map(line => line.trim()).filter(Boolean);
+    const matched = [];
+    for (const id of ids) {
+      const info = await exec('docker', ['inspect', id], { timeout: 10_000 }).catch(() => null);
+      if (info === null) continue;
+      const env = JSON.parse(info.stdout)?.[0]?.Config?.Env ?? [];
+      if (env.includes(marker)) matched.push(id);
+    }
+    return matched;
+  };
+  const rmOurs = async () => {
+    for (const id of await ours()) {
+      await exec('docker', ['rm', '-f', id], { timeout: 15_000 }).catch(() => {});
+    }
+  };
+  t.after(rmOurs);
   const controller = new AbortController();
   // Запуск идёт именно через обёртку stageDockerSandbox с реальным
   // runInReadOnlySandbox: abort должен добить контейнер ЭТОГО запуска.
@@ -329,30 +348,26 @@ test('abort во время docker run через stageDockerSandbox: отказ
   // имени внутри раннера проверяется на настоящем Docker.
   const pending = settleWithAbort(
     stageDockerSandbox({ allow: ['api.openai.com:443'], snapshot: empty,
-      argv: ['/bin/sh', '-c', 'sleep 60'], timeoutMs: 60_000, signal: controller.signal }, {
+      argv: ['/bin/sh', '-c', 'sleep 60'], env: { DF_STAGE_TEST_ID: marker.split('=')[1] },
+      timeoutMs: 60_000, signal: controller.signal }, {
       withProxy: async (opts, cb) => cb(fakeSock) }),
     controller.signal,
-    async () => {
-      const fresh = (await containers()).filter(id => !before.has(id));
-      for (const id of fresh) {
-        await exec('docker', ['rm', '-f', id], { timeout: 15_000 }).catch(() => {});
-      }
-    });
-  // Подтверждённый старт: ждём появления нового контейнера (diff со снимком
-  // до запуска — параллельные чужие контейнеры не путаются).
-  let ours = null;
-  for (let poll = 0; poll < 40 && ours === null; poll++) {
-    const fresh = (await containers()).filter(id => !before.has(id));
-    if (fresh.length) ours = fresh[0];
+    rmOurs);
+  // Подтверждённый старт: ждём появления контейнера с маркером именно этого
+  // запуска — чужие board-review-* без нашего env не считаются.
+  let oursId = null;
+  for (let poll = 0; poll < 40 && oursId === null; poll++) {
+    const matched = await ours();
+    if (matched.length) oursId = matched[0];
     else await new Promise(resolve => setTimeout(resolve, 250));
   }
-  assert.ok(ours, 'контейнер этого запуска обязан появиться до abort');
+  assert.ok(oursId, 'контейнер этого запуска обязан появиться до abort');
   controller.abort(new Error('kill_switch'));
   await assert.rejects(pending, /kill_switch/);
   assert.ok(Date.now() - started < 30_000,
     'отмена останавливает контейнер немедленно, не дожидаясь 60-секундного сна');
   // К моменту отказа именно этот контейнер уже удалён — cleanup завершён.
-  const inspect = await exec('docker', ['inspect', ours], { timeout: 10_000 }).catch(e => e);
+  const inspect = await exec('docker', ['inspect', oursId], { timeout: 10_000 }).catch(e => e);
   assert.ok(inspect instanceof Error && /No such (object|container)/i.test(String(inspect.stderr ?? inspect)),
     'осиротевшего контейнера этого запуска не остаётся');
 });
