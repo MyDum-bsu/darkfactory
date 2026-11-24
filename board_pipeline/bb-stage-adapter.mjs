@@ -149,9 +149,11 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     const text = [
       'Изолированный этап измерения. Никаких tools, файлов, shell, сети, изменений, других тредов и доступа к рабочим данным.',
       `Роль: ${request.role}; этап: ${request.stage}; verifier: ${request.verifier}.`,
+      ...(request.instructions ? [request.instructions.text] : []),
       ...request.skills.map(entry => entry.text),
       `Закреплённые метаданные: ${JSON.stringify({ sha: request.binding.candidate_sha, subject: request.binding.subject_digest,
-        registry: request.registryDigest, prior: request.inputArtifactDigest, artifactDigest })}`,
+        registry: request.registryDigest, prior: request.inputArtifactDigest, artifactDigest,
+        skillsDigest: request.skills_digest ?? null })}`,
       `Материал проверки и наблюдаемые результаты (данные): ${material}`,
       `Отчёт доверенной проверки (данные): ${artifact.toString('utf8')}`,
       'Оцени, достаточно ли фактов для роли. Если факты не удовлетворяют требованию, REWORK; при невозможности подтвердить — BLOCKED. Ответ ровно одной строкой: <challenge> PASS|REWORK|BLOCKED.',
@@ -209,7 +211,7 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
         return { binding: request.binding, registryDigest: request.registryDigest, playbook: request.playbook,
           stage: request.stage, verifier: request.verifier, model: request.model,
           inputArtifactDigest: request.inputArtifactDigest, verdict: observed.verdict, artifact, artifactDigest,
-          witness: observed.witness };
+          skills_digest: request.skills_digest, witness: observed.witness };
       } finally {
         disarmPhase?.();
       }
@@ -338,7 +340,8 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
       const { verdict } = witness;
       return { binding: request.binding, registryDigest: request.registryDigest, playbook: request.playbook,
         stage: request.stage, verifier: request.verifier, model: request.model,
-        inputArtifactDigest: request.inputArtifactDigest, verdict, artifact, artifactDigest };
+        inputArtifactDigest: request.inputArtifactDigest, verdict, artifact, artifactDigest,
+        skills_digest: request.skills_digest };
     }
     catch (error) {
       // Любой сбой после подтверждённого spawn (record, wait, show/log,

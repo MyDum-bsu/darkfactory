@@ -38,17 +38,25 @@ const result=check(invalid); assert.ok(Number.isInteger(result.status)&&result.s
 
 async function writeCatalog(catalog, name) {
   await mkdir(join(catalog, '.darkfactory'), { recursive: true, mode: 0o700 });
-  await cp(join(SOURCE, '.darkfactory/stage-skills'), join(catalog, '.darkfactory/stage-skills'), { recursive: true });
+  await cp(join(SOURCE, '.darkfactory/shared-skills'), join(catalog, '.darkfactory/shared-skills'), { recursive: true });
   const role = (kind, model, verifier, skills) => ({ kind, model, verifier, skills,
+    mode: kind === 'writer' ? 'write' : 'read-only', phaseBudgetMs: 120000,
     reasoning: kind === 'verifier' ? 'medium' : 'inherit', tools: kind === 'writer' ? ['snapshot-read', 'worktree-edit'] : ['snapshot-read'] });
   const roles = {
     implementation: role('writer', 'executor', 'change-set', name === 'policy'
-      ? ['feature-blueprint', 'property-testing'] : ['writer-course', 'session-handoff']),
-    verification: role('verifier', 'critic', 'change-set', ['sparring', 'issue-register']),
+      ? ['feature-blueprint', 'property-testing'] : ['goal-rules', 'session-handoff']),
+    verification: role('verifier', 'critic', 'change-set', ['three-pass-review', 'issue-register']),
   };
   const steps = Object.keys(roles);
+  for (const id of steps) {
+    await mkdir(join(catalog, '.darkfactory/stations', id, 'skills'), { recursive: true, mode: 0o700 });
+    await writeFile(join(catalog, '.darkfactory/stations', id, 'instructions.md'),
+      `# ${id}\n\nСтанция ${id} A/B-пилота: протокол роли, запреты и формат выхода.\n`, { mode: 0o600 });
+  }
   const stages = steps.map((id, i) => ({ id, role: id, next: { pass: steps[i + 1] ?? 'ready', rework: 'hold' } }));
-  await writeFile(join(catalog, '.darkfactory/factory.yaml'), JSON.stringify({ version: 1, roles, playbooks: { [name]: { entry: steps[0], stages } } }), { mode: 0o600 });
+  const manifest = { version: 2, stations: roles, playbooks: { [name]: { entry: steps[0], stages } },
+    skillPicker: { defaults: ['goal-rules'], rules: [] } };
+  await writeFile(join(catalog, '.darkfactory/factory.yaml'), JSON.stringify(manifest), { mode: 0o600 });
   return (await loadRoleRegistry(catalog)).digest;
 }
 

@@ -1,96 +1,158 @@
-version: 1
-roles:
+version: 2
+stations:
   materials-reader:
     kind: analyst
+    mode: read-only
     model: arbiter
     reasoning: inherit
     verifier: inventory
+    phaseBudgetMs: 120000
     tools: [snapshot-read]
     skills: [materials-intake]
   ui-builder:
     kind: writer
+    mode: write
     model: executor
     reasoning: inherit
     verifier: change-set
-    tools: [snapshot-read, worktree-edit, unit-check]
-    skills: [feature-blueprint, ui]
+    phaseBudgetMs: 600000
+    tools: [snapshot-read, worktree-edit, unit-check, test-first-check]
+    skills: [feature-blueprint, test-first, ui-ux-craft]
   visual-verifier:
     kind: verifier
+    mode: read-only
     model: critic
     reasoning: medium
     verifier: visual-report
+    phaseBudgetMs: 180000
     tools: [snapshot-read, browser-observe]
-    skills: [ui, property-testing]
+    skills: [three-pass-review, visual-rubric]
+  ux-visual-critic:
+    kind: verifier
+    mode: read-only
+    model: critic
+    reasoning: medium
+    verifier: satisfaction-report
+    phaseBudgetMs: 180000
+    tools: [snapshot-read, browser-observe, satisfaction-check]
+    skills: [three-pass-review, visual-rubric]
   conjecturer:
     kind: analyst
+    mode: read-only
     model: arbiter
     reasoning: inherit
     verifier: conjecture
+    phaseBudgetMs: 120000
     tools: [snapshot-read]
-    skills: [feature-blueprint, math-lean]
+    skills: [feature-blueprint, goal-rules]
   falsify-first-oracle:
     kind: verifier
+    mode: read-only
     model: critic
     reasoning: medium
     verifier: falsification
+    phaseBudgetMs: 300000
     tools: [snapshot-read, counterexample-search]
-    skills: [property-testing, math-lean]
+    skills: [property-testing, falsify-t1-t7]
   lean-prover:
     kind: writer
+    mode: write
     model: executor
     reasoning: inherit
     verifier: lean-proof
+    phaseBudgetMs: 900000
     tools: [snapshot-read, worktree-edit, lean-check]
-    skills: [math-lean, session-handoff]
+    skills: [lean4-frozen-core, session-handoff]
+  math-referee:
+    kind: verifier
+    mode: read-only
+    model: critic
+    reasoning: medium
+    verifier: semantic-fidelity
+    phaseBudgetMs: 180000
+    tools: [snapshot-read, guide-check]
+    skills: [semantic-fidelity, three-pass-review]
   literature-radar:
     kind: analyst
+    mode: read-only
     model: arbiter
     reasoning: inherit
     verifier: source-review
+    phaseBudgetMs: 120000
     tools: [snapshot-read, literature-read]
-    skills: [math-lean, issue-register]
+    skills: [prod-recon, issue-register]
+  thesis-writer:
+    kind: writer
+    mode: write
+    model: executor
+    reasoning: inherit
+    verifier: guide-pack
+    phaseBudgetMs: 600000
+    tools: [snapshot-read, worktree-edit, guide-check]
+    skills: [guide-and-learnharness, session-handoff]
   dsp-experimenter:
     kind: writer
+    mode: write
     model: executor
     reasoning: inherit
     verifier: experiment
+    phaseBudgetMs: 600000
     tools: [snapshot-read, worktree-edit, audio-measure]
     skills: [dsp-audio, property-testing]
   pipeline-freezer:
     kind: analyst
+    mode: read-only
     model: arbiter
     reasoning: inherit
     verifier: frozen-pipeline
+    phaseBudgetMs: 120000
     tools: [snapshot-read, replay-check]
-    skills: [dsp-audio, session-handoff]
+    skills: [prod-recon, session-handoff]
   blind-panel:
     kind: verifier
+    mode: read-only
     model: critic
     reasoning: medium
     verifier: blind-panel
+    phaseBudgetMs: 180000
     tools: [snapshot-read, blind-score]
-    skills: [dsp-audio, sparring]
+    skills: [three-pass-review, issue-register]
   course-designer:
     kind: analyst
+    mode: read-only
     model: arbiter
     reasoning: inherit
     verifier: course-outline
+    phaseBudgetMs: 120000
     tools: [snapshot-read, rubric-read]
     skills: [feature-blueprint, writer-course]
   technical-writer:
     kind: writer
+    mode: write
     model: executor
     reasoning: inherit
     verifier: technical-copy
+    phaseBudgetMs: 600000
     tools: [snapshot-read, worktree-edit]
     skills: [writer-course, session-handoff]
   sparring-critic:
     kind: verifier
+    mode: read-only
     model: critic
     reasoning: medium
     verifier: rubric-review
+    phaseBudgetMs: 180000
     tools: [snapshot-read, rubric-read]
     skills: [sparring, issue-register]
+  ci-healer:
+    kind: writer
+    mode: write
+    model: executor
+    reasoning: inherit
+    verifier: test-first
+    phaseBudgetMs: 600000
+    tools: [snapshot-read, worktree-edit, unit-check, test-first-check]
+    skills: [test-first, ci-triage]
 playbooks:
   ui:
     entry: intake
@@ -155,3 +217,22 @@ playbooks:
       - id: sparring
         role: sparring-critic
         next: { pass: ready, rework: hold }
+skillPicker:
+  defaults: [goal-rules, session-handoff]
+  rules:
+    - match: { domain: ui }
+      add: [feature-blueprint]
+    - match: { has_ui: true }
+      add: [three-pass-review]
+    - match: { requires_lean: true }
+      add: [property-testing]
+    - match: { requires_colab: true }
+      add: [prod-recon]
+    - match: { touches_migrations: true }
+      add: [prod-recon]
+    - match: { pr_ci_red: true }
+      add: [test-first]
+    - match: { test_first: true }
+      add: [test-first]
+    - match: { playbook: ui }
+      add: [feature-blueprint]

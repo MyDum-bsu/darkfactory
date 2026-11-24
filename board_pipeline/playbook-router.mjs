@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { isRoleRegistry } from './role-registry.mjs';
+import { pickSkills } from './skill-picker.mjs';
 import { artifactVerdict } from './stage-verifier.mjs';
 import { assertTriadIndependent, retiredProviderViolation } from './worker-selector.mjs';
 import { stageTransportKind } from './stage-sandbox-transport.mjs';
@@ -85,6 +86,7 @@ async function guard(assertKernel, binding, models) {
 function inspectReceipt(request, receipt) {
   const { binding, model, verifier } = request;
   if (!same(request, receipt, ['registryDigest', 'playbook', 'stage', 'verifier', 'inputArtifactDigest']) ||
+      (receipt.skills_digest !== undefined && receipt.skills_digest !== request.skills_digest) ||
       !same(binding, receipt.binding, SUBJECT) || !same(model, receipt.model, ['provider', 'model', 'reasoning']) ||
       !['PASS', 'REWORK', 'BLOCKED'].includes(receipt.verdict)) throw new Error('playbook_receipt_unbound');
   if (receipt.verdict === 'BLOCKED') return { verdict: 'BLOCKED', digest: null };
@@ -114,8 +116,13 @@ export async function runPlaybook({ registry, playbook, attempt }, { assertKerne
     const role = registry.roles[stage.role];
     const model = models[role.model];
     if (role.reasoning !== 'inherit' && role.reasoning !== model.reasoning) throw new Error('playbook_reasoning_not_enrolled');
+    // On-demand подбор скиллов станции по меткам попытки: без скиллов чужих
+    // станций и без чтения ФС — строго из закреплённого реестра.
+    const picked = pickSkills({ registry, labels: attempt.labels ?? {}, stationId: stage.role });
     return [stage.id, Object.freeze({ binding, registryDigest: registry.digest, playbook, stage: stage.id,
-      role: stage.role, verifier: role.verifier, model, skills: role.skills, toolRequirements: role.tools })];
+      role: stage.role, verifier: role.verifier, model, instructions: role.instructions,
+      skills: picked.skills, skills_digest: picked.skills_digest, mode: role.mode,
+      phaseBudgetMs: role.phaseBudgetMs, toolRequirements: role.tools })];
   }));
   let next = graph.entry;
   let green = true;
@@ -125,7 +132,7 @@ export async function runPlaybook({ registry, playbook, attempt }, { assertKerne
     const request = Object.freeze({ ...plan[next], inputArtifactDigest: history.at(-1)?.digest ?? null });
     const observation = inspectReceipt(request, await observeStage(request));
     await guard(assertKernel, binding, models);
-    history.push({ stage: next, role: request.role, ...observation });
+    history.push({ stage: next, role: request.role, skills_digest: request.skills_digest, ...observation });
     if (observation.verdict === 'BLOCKED') return { status: 'hold', history };
     const pass = observation.verdict === 'PASS';
     green &&= pass;

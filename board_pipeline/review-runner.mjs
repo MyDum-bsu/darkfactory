@@ -13,6 +13,7 @@ import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { unpackExact } from './runtime.mjs';
 import { withModelProxy } from './model-proxy.mjs';
+import { applySeverityGating, buildReviewInstruction } from './review-policy.mjs';
 import { sumUsages } from './telemetry.mjs';
 
 const exec = promisify(execFile);
@@ -966,23 +967,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           'Echo that exact string as "subject_digest" inside the verdict JSON — ' +
           'copy it verbatim, do NOT compute or invent a digest yourself.'
         : '';
-      const instruction = [
-        `Independent, read-only review for Board #${binding.task_id} at ${binding.candidate_sha}.`,
-        `The candidate tree is mounted read-only at /candidate, ${diffLine}.`,
-        'Review against the spec below. You have read-only tools only;',
-        'do not attempt to write.',
-        'Finish with exactly one verdict: a JSON code block {"verdict":"PASS"|"REWORK"|"ESCALATE",',
-        '"summary":"...","findings":[{"file","line","input","expected","actual","freq","harm"}],',
-        '"checked_invariants":["..."]}, or a final line REVIEW_OK or REVIEW_BLOCKED.',
-        'A REWORK verdict is rejected unless "findings" contains at least one object',
-        'with non-empty "file", "expected" and "actual" (or an explicit "excerpt" string).',
-        'Return REVIEW_BLOCKED only for real bugs, broken contracts or tests, or a violation',
-        'of an explicit invariant inside this card\'s scope. Do not demand new hardening,',
-        'refactors or features outside the spec scope.',
-        subjectLine,
-        '',
-        prompt,
-      ].join('\n');
+      const instruction = buildReviewInstruction({ binding, diffLine, subjectLine,
+        prompt, round: binding.review_round ?? 1,
+        priorBlockingFindings: binding.prior_findings ?? [] });
 
       // Каталоги pi — симлинки на read-only монтирования кода; конфиги
       // копируются в tmpfs (pi кладёт <name>.lock рядом), guard — в /tmp.
@@ -1052,7 +1039,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         }
       }
       assertToolsAllowed(parsed.toolsAdded);
-      const verdict = parseReviewVerdict(parsed.finalText);
+      const verdict = await applySeverityGating(parseReviewVerdict(parsed.finalText),
+        { journal, taskId: binding.task_id, candidateSha: binding.candidate_sha,
+          round: binding.review_round ?? 1 });
       if (binding.subject_digest != null
           ? verdict.subject_digest !== binding.subject_digest
           : nonEmpty(verdict.subject_digest)) {
@@ -1090,6 +1079,8 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         status: verdict.status,
         summary: verdict.summary,
         findings: verdict.findings,
+        sidecar_findings: verdict.sidecar_findings ?? [],
+        severity_gated: verdict.severity_gated === true,
         checked_invariants: verdict.checked_invariants,
         excerpt: verdict.excerpt,
         checkpoint,

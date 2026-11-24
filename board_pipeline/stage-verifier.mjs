@@ -6,6 +6,7 @@ const MAX_COUNT = BigInt(Number.MAX_SAFE_INTEGER);
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const positive = value => count(value) && value > 0;
 const digest = value => typeof value === 'string' && HEX.test(value);
+const sha40 = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 
 // These are contracts for observations made by trusted adapters, not commands
 // or a substitute for L1/L2/L3. For example, a Lean adapter must run the check.
@@ -25,6 +26,21 @@ const CHECKS = Object.freeze({
   'course-outline': [{ outline: digest, lessons: positive, uncoveredGoals: count }, a => a.uncoveredGoals === 0],
   'technical-copy': [{ document: digest, sections: positive, unsupportedClaims: count }, a => a.unsupportedClaims === 0],
   'rubric-review': [{ rubric: digest, criteria: positive, blockers: count }, a => a.blockers === 0],
+  'test-first': [{ redSha: sha40, testDiff: digest, redExitCode: count, failureReasonDigest: digest,
+    touchesProdCode: b => typeof b === 'boolean' },
+    a => a.redExitCode !== 0 && ![125, 126, 127].includes(a.redExitCode) && a.touchesProdCode === false],
+  'semantic-fidelity': [{ specDigest: digest, goalsFrozen: b => typeof b === 'boolean',
+    vacuousRisk: count, unprovenAssumptions: count, controlsPassed: positive },
+    a => a.goalsFrozen === true && a.vacuousRisk === 0 && a.unprovenAssumptions === 0],
+  'satisfaction-report': [{ capture: digest, viewports: positive, consoleErrors: count,
+    a11yViolations: count, unstyledControls: count, uncollapsedLongLists: count, missingStates: count,
+    holdoutFailures: count, satisfactionScore: count },
+    a => a.viewports >= 2 && a.consoleErrors === 0 && a.a11yViolations === 0 && a.unstyledControls === 0 &&
+      a.uncollapsedLongLists === 0 && a.missingStates === 0 && a.holdoutFailures === 0 &&
+      a.satisfactionScore >= 85 && a.satisfactionScore <= 100],
+  'guide-pack': [{ guideDigest: digest, packDigest: digest, guidesChecked: positive,
+    missingSections: count, brokenLinks: count },
+    a => a.missingSections === 0 && a.brokenLinks === 0],
 });
 
 export const isStageVerifier = value => typeof value === 'string' && Object.hasOwn(CHECKS, value);

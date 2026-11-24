@@ -9,7 +9,7 @@
 // второго писателя.
 
 import { executorFamily, l2RunnableSpec, ReviewDenied } from './review-runner.mjs';
-import { NEON_CRITIC, SOL_ARBITER, isSolArbiter } from './review-policy.mjs';
+import { NEON_CRITIC, SOL_ARBITER, detectStalledReview, isSolArbiter } from './review-policy.mjs';
 import {
   DEFAULT_MIN_OBSERVATIONS,
   modelKey,
@@ -432,6 +432,16 @@ export function evaluateReworkProgress({ roundsHistory = [] } = {}) {
       (latest.contradictory === true || contradicting(prev, latest))) {
     return { trigger: 'substantive_dispute', kind: 'contradictory_l2_findings',
       evidence: latest };
+  }
+  // Ранняя стагнация L2 (V2-2): повтор SHA-сигнатуры блокирующих находок
+  // любого предыдущего L2-раунда — даже не подряд (раунд 1 и 3) — запускает
+  // арбитра на раундах 2–3, до исчерпания лимита.
+  if (latest.gate === 'l2') {
+    const stalled = detectStalledReview({ roundsHistory });
+    if (stalled.stalled) {
+      return { trigger: 'no_progress', kind: stalled.kind,
+        deterministicGate: false, signatureSha: stalled.signatureSha, evidence: latest };
+    }
   }
   // Повторный tree_sha уже встречался в этой попытке — прогресса нет.
   if (typeof latest.tree_sha === 'string' && latest.tree_sha &&

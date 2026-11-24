@@ -415,7 +415,7 @@ test('VS-5 beta: stale catalog, substituted triad and missing receipt cannot rea
     assert.equal((await x.tick()).phase, 'working');
     if (fault === 'catalog') {
       await cp(join(checkout, '.darkfactory'), join(x.root, '.darkfactory'), { recursive: true });
-      await writeFile(join(x.root, '.darkfactory/stage-skills/materials-intake.md'), 'Changed after enrollment.\n');
+      await writeFile(join(x.root, '.darkfactory/shared-skills/materials-intake.md'), 'Changed after enrollment.\n');
       reloaded = await loadRoleRegistry(x.root);
       assert.notEqual(reloaded.digest, registry.digest);
     }

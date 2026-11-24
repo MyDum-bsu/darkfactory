@@ -29,7 +29,7 @@ test('operator registry pins all four graphs and the exact bytes of embedded ski
   const skill = prior.roles['materials-reader'].skills[0];
   assert.equal(skill.id, 'materials-intake');
   assert.match(skill.text, /опись/);
-  const skillPath = join(tree, '.darkfactory/stage-skills/materials-intake.md');
+  const skillPath = join(tree, '.darkfactory/shared-skills/materials-intake.md');
   await writeFile(skillPath, 'An amended trusted stage skill.\n');
   const next = await loadRoleRegistry(tree);
   assert.notEqual(next.digest, prior.digest);
@@ -142,4 +142,48 @@ test('несовместимая с RO-транспортом триада от�
       reasoningLevel: 'high' } } } },
     { assertKernel: proven, observeStage }), /foreman_triad_transport_incompatible/);
   assert.equal(observed, 0, 'ни одна стадия не доходит до наблюдения');
+});
+
+test('v2 manifest: mode/kind mismatch, station symlink and skills_digest binding', async t => {
+  const { tree, yaml, original } = await copyCatalog(t);
+  // mode: write у analyst-станции и режим без обязательного поля — fail-closed.
+  for (const [text, code] of [
+    [original.replace('mode: read-only', 'mode: write'), /factory_role_invalid/],
+    [original.replace('    mode: read-only\n', ''), /factory_role_invalid/],
+    [original.replace('phaseBudgetMs: 120000', 'phaseBudgetMs: 0'), /factory_role_invalid/],
+    [original.replace('version: 2', 'version: 1'), /factory_manifest_invalid/],
+    [original.replace('skillPicker:', 'picker:'), /factory_manifest_invalid/],
+    [original.replace('reasoning: medium', 'reasoning: ultra'), /factory_role_invalid/],
+  ]) {
+    assert.notEqual(text, original);
+    await writeFile(yaml, text);
+    await assert.rejects(loadRoleRegistry(tree), code);
+    await writeFile(yaml, original);
+  }
+  // Симлинк на файл станции — fail-closed как и на общий скилл.
+  const instructionsPath = join(tree, '.darkfactory/stations/materials-reader/instructions.md');
+  const outside = join(tree, 'external.md');
+  await rename(instructionsPath, outside);
+  await symlink(outside, instructionsPath);
+  await assert.rejects(loadRoleRegistry(tree), /factory_file_invalid/);
+  await rename(outside, instructionsPath);
+  // Станция writer без станции instructions — отсутствующий файл.
+  const registry = await loadRoleRegistry(tree);
+  assert.equal(registry.version, 2);
+  assert.equal(registry.roles, registry.stations);
+  assert.ok(Object.hasOwn(registry.sharedSkills, 'materials-intake'));
+  assert.equal(registry.roles['materials-reader'].mode, 'read-only');
+  assert.equal(registry.roles['ui-builder'].mode, 'write');
+  // skills_digest в квитанции обязан совпасть с закреплённым запросом.
+  const pinned = { ...attempt, playbook: 'ui', registry_digest: registry.digest };
+  await assert.rejects(runPlaybook({ registry, playbook: 'ui', attempt: pinned }, {
+    assertKernel: proven,
+    observeStage: req => ({ ...stageObservation(req), skills_digest: 'f'.repeat(64) }),
+  }), /playbook_receipt_unbound/);
+  const ok = await runPlaybook({ registry, playbook: 'ui', attempt: pinned }, {
+    assertKernel: proven,
+    observeStage: req => ({ ...stageObservation(req), skills_digest: req.skills_digest }),
+  });
+  assert.equal(ok.status, 'ready_for_native_acceptance');
+  assert.ok(ok.history.every(h => /^[a-f0-9]{64}$/.test(h.skills_digest)));
 });
