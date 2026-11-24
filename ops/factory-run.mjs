@@ -270,6 +270,14 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   if (policy?.abPilot !== undefined && policy.abPilot?.switch === undefined) {
     fail('path_not_absolute');
   }
+  // Демон без kill-switch не стартует: daemonSwitchPath контроллера
+  // (--switch ?? pilot.killSwitch) обязан быть задан — контроллер
+  // отклонил бы его отсутствие уже после записи Git-конфига; отказ при
+  // построении плана, в том числе в dry-run.
+  if (values.daemon && values.switch === undefined &&
+      policy?.pilot?.killSwitch === undefined) {
+    fail('daemon_switch_required');
+  }
   const swDirs = [];
   for (const daemonSwitch of new Set(
     [values.switch, policy?.pilot?.killSwitch, policy?.abPilot?.switch])) {

@@ -523,16 +523,34 @@ test('run: валидный dry-run печатает план без вызов�
     await mkdir(wt);
     const state = join(dir, 'state');
     await mkdir(state);
+    // Каталог стоп-файла демона — приватный (privateDirectory контроллера);
+    // сам стоп-файл в daemon-режиме может ещё не существовать.
+    const ops = join(dir, 'ops');
+    await mkdir(ops);
+    await chmod(ops, 0o700);
+    const stop = join(ops, 'stop');
     const policy = await withPolicy(dir, policySpec(wt));
     const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
-      '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50'];
+      '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50',
+      '--switch', stop];
+    // --daemon без --switch и pilot.killSwitch: контроллер отклонил бы
+    // запуск уже после записи Git-конфига («Daemon mode requires
+    // --switch or pilot.killSwitch») — отказ при построении плана,
+    // и в dry-run конфигурация не подтверждается.
+    const gitCalls0 = [];
+    const git0 = async a => { gitCalls0.push(a); return wt; };
+    await assert.rejects(() => runFactory(
+      ['--provider', 'acp-devin', '--model', 'swe-2-high',
+        '--policy', policy, '--state', state, '--daemon', '--dry-run'],
+      { git: git0, env: {} }), /daemon_switch_required/);
     // git-вызов dry-run — только read-only rev-parse; мокаем.
     const gitCalls = [];
     const git = async a => { gitCalls.push(a); return a.includes('--show-toplevel') ? wt : 'true'; };
     const dry = await runFactory([...args, '--dry-run'], { git, env: {} });
     assert.equal(dry.dryRun, true);
     assert.deepEqual(dry.plan.argv.slice(1),
-      ['--execute', '--policy', policy, '--state', state, '--daemon', '--interval-ms', '50']);
+      ['--execute', '--policy', policy, '--state', state, '--daemon',
+        '--switch', stop, '--interval-ms', '50']);
     assert.deepEqual(gitCalls, [['-C', wt, 'rev-parse', '--show-toplevel']]);
     // Не-git worktree в dry-run — отказ.
     const notGit = async () => 'false';
