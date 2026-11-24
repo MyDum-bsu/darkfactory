@@ -38,7 +38,7 @@ export function forbiddenModelViolation(spec) {
     if (typeof spec.model === 'string') ids.push(spec.model);
   } else return null;
   for (const id of ids) {
-    for (const seg of id.toLowerCase().split('/')) {
+    for (const seg of id.toLowerCase().split(/[/\\]/)) {
       if (seg === 'gpt-6.1-terra') return 'model_gpt_6_1_terra_disallowed';
       if (seg.includes('zcode')) return 'zcode_provider_disallowed';
       if (seg === 'glm' || seg.startsWith('glm-')) return 'model_glm_disallowed';
@@ -210,12 +210,40 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     ...Object.values(policy.reviewSkillFiles ?? {})]) {
     await nestedPolicyFile(p, treeAliases);
   }
+  // routes.json — закрепляемый вход ревью рядом с reviewGate (как в
+  // factory-enqueue): симлинк на внешнюю цель контроллер разрешил бы
+  // молча — отказ здесь.
+  if (policy.reviewGate !== undefined && policy.reviewGate !== null) {
+    await nestedPolicyFile(join(dirname(policy.reviewGate), 'routes.json'), treeAliases);
+  }
+  // Эффективный kill-switch демона (--switch > pilot.killSwitch): как у
+  // createPilotSwitch — абсолютный путь вне дерева воркера; родительский
+  // каталог каноничен (сам стоп-файл может ещё не существовать, но
+  // существующий не должен быть симлинком).
+  const daemonSwitch = values.switch ?? policy?.pilot?.killSwitch;
+  if (daemonSwitch !== undefined && daemonSwitch !== null) {
+    if (!isAbsolute(daemonSwitch)) fail('path_not_absolute');
+    const swDir = dirname(daemonSwitch);
+    const swDirReal = await realpath(swDir).catch(() => fail('path_missing'));
+    if (swDirReal !== swDir) fail('non_canonical_or_symlink_path');
+    const swSt = await lstat(daemonSwitch).catch(() => null);
+    if (swSt?.isSymbolicLink()) fail('non_canonical_or_symlink_path');
+    if (treeAliases.some(t => inside(t, daemonSwitch))) fail('path_inside_worktree');
+  }
   if (ledger !== null) await canonicalOutside(ledger, treeAliases, 'file');
   if (memory !== null) await canonicalOutside(memory, treeAliases, 'dir');
   // --state — тоже операторский путь: контроллер делает лишь realpath без
   // сверки со строкой; каноничность и двусторонняя граница worktree
   // проверяются здесь (parent-граница относится к ledger/memory).
   const state = await canonicalOutside(values.state, treeAliases, 'dir', { parent: false });
+  // handoffDir — inbox сдачи контроллера: канонический каталог вне
+  // worktree и вне state в обе стороны (inside(root,inbox)||
+  // inside(inbox,root)||inside(tree,inbox) контроллера).
+  let handoff = null;
+  if (policy.handoffDir !== undefined && policy.handoffDir !== null) {
+    handoff = await canonicalOutside(policy.handoffDir, treeAliases, 'dir', { parent: false });
+    if (inside(state, handoff) || inside(handoff, state)) fail('path_inside_worktree');
+  }
 
   // CLI-override без конфликта с политикой передаётся контроллеру через
   // тот же env-канал (DF_DECISION_LEDGER_PATH / DF_PROJECT_MEMORY_DIR):
@@ -235,7 +263,7 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   }
   return { node: process.execPath, argv, env: envOverrides,
     worktree: worktreeReal, spec: { provider: values.provider, model: values.model },
-    policy: policyPathReal, state, ledger, memory };
+    policy: policyPathReal, state, ledger, memory, handoff };
 }
 
 async function defaultGit(args) {

@@ -3,7 +3,8 @@
 // runner'ы, временные каталоги удаляются в finally.
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile }
+  from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -19,8 +20,10 @@ const HEX2 = 'b'.repeat(64);
 const sha256Text = text => createHash('sha256').update(text).digest('hex');
 const sha256File = async path => createHash('sha256').update(await readFile(path)).digest('hex');
 
+// Канонический каталог фикстур: TMPDIR может идти через симлинк-предка —
+// позитивные сценарии обязаны передавать CLI канонические пути.
 async function tempdir() {
-  return mkdtemp(join(tmpdir(), 'factory-cli-'));
+  return realpath(await mkdtemp(join(tmpdir(), 'factory-cli-')));
 }
 
 const baseValues = () => ({
@@ -336,6 +339,7 @@ test('run: матрица моделей — жёсткая блокировка
     { provider: 'pi', model: 'openai/gpt-6.1-terra' },
     'zcode', 'pi/acp-zcode-start/m', 'acp-zcode-start',
     'glm', 'glm-5.3-flash', 'pi/opencode-go/glm-5',
+    'builtin:zai-start-plan\\glm-5.3-flash',
     { provider: 'openai', model: 'GPT-6.1-TERRA' },
   ]) {
     assert.ok(modelViolation(spec), JSON.stringify(spec));
@@ -706,6 +710,46 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     await mkdir(innerState);
     await assert.rejects(() => buildRunPlan(runValues(ok, innerState)),
       /path_inside_worktree/);
+    // routes.json — закрепляемый вход рядом с каноническим reviewGate:
+    // симлинк (даже на внешнюю цель) отклоняется до Git-конфига.
+    const gateDir = join(ops, 'gate');
+    await mkdir(gateDir);
+    await writeFile(join(gateDir, 'board-review.mjs'), 'g');
+    await writeFile(join(ops, 'routes-real.json'), '{}');
+    await symlink(join(ops, 'routes-real.json'), join(gateDir, 'routes.json'));
+    const gatePolicy = { ...policySpec(wt), reviewGate: join(gateDir, 'board-review.mjs') };
+    const fGate = await withPolicy(dir, gatePolicy);
+    await assert.rejects(() => buildRunPlan(runValues(fGate, state)),
+      /non_canonical_or_symlink_path/);
+    // --switch: относительный путь и симлинк-родитель — отказ в плане;
+    // канонический путь (ещё несуществующий стоп-файл) проходит.
+    await assert.rejects(() => buildRunPlan(runValues(ok, state, { switch: './stop' })),
+      /path_not_absolute/);
+    const swLink = join(dir, 'sw-link');
+    await symlink(ops, swLink);
+    await assert.rejects(() => buildRunPlan(runValues(ok, state,
+      { switch: join(swLink, 'stop') })), /non_canonical_or_symlink_path/);
+    const swPlan = await buildRunPlan(runValues(ok, state,
+      { switch: join(ops, 'stop') }));
+    assert.ok(swPlan.argv.includes('--switch'));
+    // handoffDir: симлинк — отказ; канонический каталог вне worktree и
+    // вне state проходит; каталог внутри worktree — отказ.
+    const handoffLink = join(dir, 'handoff-link');
+    await symlink(ops, handoffLink);
+    const hbLink = { ...policySpec(wt), handoffDir: join(handoffLink, 'inbox') };
+    const fHbLink = await withPolicy(dir, hbLink);
+    await assert.rejects(() => buildRunPlan(runValues(fHbLink, state)),
+      /non_canonical_or_symlink_path|path_missing/);
+    const inbox = join(ops, 'inbox');
+    await mkdir(inbox);
+    const hbOk = { ...policySpec(wt), handoffDir: inbox };
+    const fHbOk = await withPolicy(dir, hbOk);
+    const hbPlan = await buildRunPlan(runValues(fHbOk, state));
+    assert.equal(hbPlan.handoff, inbox);
+    const hbInner = { ...policySpec(wt), handoffDir: join(wt, 'inbox') };
+    const fHbInner = await withPolicy(dir, hbInner);
+    await assert.rejects(() => buildRunPlan(runValues(fHbInner, state)),
+      /path_inside_worktree|path_missing/);
     // Путь контроллера не переопределяется флагами.
     await assert.rejects(() => runFactory(['--provider', 'acp-devin', '--model', 'swe-2-high',
       '--policy', ok, '--state', state, '--run-isolated', '/tmp/evil.mjs'], {}),

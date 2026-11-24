@@ -71,12 +71,16 @@ node ops/factory-run.mjs \
 совпадает с исходной строкой; относительные пути и пути через
 симлинк-компоненты отклоняются): `--policy`, `--state`, `--worktree`,
 `route.worktree` из политики и вложенные входы `brief`, `reviewPrompt`,
-`reviewGate`, `reviewSkillFiles`. `--state` — существующий каталог, не
-пересекающийся с worktree ни в одну сторону (соседний каталог рядом с
-worktree допустим; родительская граница действует только для
-`decisionLedger`/`projectMemory`). `--policy` не может лежать внутри
-собственного `route.worktree`. Все границы проверяются до записи
-Git-конфига и запуска контроллера, включая `--dry-run`.
+`reviewGate`, `reviewSkillFiles` и соседний `routes.json`. `--state` —
+существующий каталог, не пересекающийся с worktree ни в одну сторону
+(соседний каталог рядом с worktree допустим; родительская граница
+действует только для `decisionLedger`/`projectMemory`). `handoffDir` —
+канонический каталог вне worktree и вне state в обе стороны.
+`--policy` не может лежать внутри собственного `route.worktree`.
+Эффективный kill-switch (`--switch` > `pilot.killSwitch`) — абсолютный
+путь с каноническим родительским каталогом, не симлинк и вне worktree.
+Все границы проверяются до записи Git-конфига и запуска контроллера,
+включая `--dry-run`.
 
 ### Матрица моделей (обязательна)
 
@@ -84,7 +88,8 @@ Git-конфига и запуска контроллера, включая `--d
 - Если передан `--policy`, CLI-спека обязана совпадать с
   `policy.bb.provider` / `policy.bb.model`.
 - Жёстко запрещены в любом сегменте `provider/model` (регистр не важен,
-  включая вложенные `pi/a/b/...`): `gpt-6.1-terra`, `zcode` /
+  включая вложенные `pi/a/b/...` и формы с `\` вроде
+  `builtin:zai-start-plan\glm-5.3-flash`): `gpt-6.1-terra`, `zcode` /
   `acp-zcode-start`, `glm` / `glm-*`.
 - Проверка применяется к CLI-спеке, `policy.bb`, **каждому**
   `profiles.*.review` (не только выбранному `route.checkProfile`),
