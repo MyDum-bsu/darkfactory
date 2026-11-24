@@ -27,8 +27,10 @@ const CHECKS = Object.freeze({
   'technical-copy': [{ document: digest, sections: positive, unsupportedClaims: count }, a => a.unsupportedClaims === 0],
   'rubric-review': [{ rubric: digest, criteria: positive, blockers: count }, a => a.blockers === 0],
   'test-first': [{ redSha: sha40, testDiff: digest, redExitCode: count, failureReasonDigest: digest,
-    touchesProdCode: b => typeof b === 'boolean' },
-    a => a.redExitCode !== 0 && ![125, 126, 127].includes(a.redExitCode) && a.touchesProdCode === false],
+    touchesProdCode: b => typeof b === 'boolean',
+    candidateExitCode: v => v === null || count(v) },
+    a => a.redExitCode !== 0 && a.redExitCode < 125 && a.touchesProdCode === false &&
+      a.candidateExitCode === 0],
   'semantic-fidelity': [{ specDigest: digest, goalsFrozen: b => typeof b === 'boolean',
     vacuousRisk: count, unprovenAssumptions: count, controlsPassed: positive },
     a => a.goalsFrozen === true && a.vacuousRisk === 0 && a.unprovenAssumptions === 0],

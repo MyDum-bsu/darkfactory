@@ -1,12 +1,15 @@
 // Ядро приёмки F1: submit → local_checks → review → completed | blocked.
 // Все внешние эффекты — только через порты. Журнал append-only: intent ДО эффекта.
 
+import { execFile } from 'node:child_process';
 import { open, readFile, appendFile, lstat, realpath, stat } from 'node:fs/promises';
+import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
-import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter, NEON_ISOLATION } from './review-policy.mjs';
+import { evaluateAutoApprove, isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter,
+  loadApprovalPolicy, NEON_ISOLATION, partitionFindingsBySeverity } from './review-policy.mjs';
 import { l2RunnableSpec, runnerReviewSpec } from './review-runner.mjs';
 import { assertTriadIndependent, opencodeGoPolicyViolation,
   retiredProviderViolation, workerFamily } from './worker-selector.mjs';
@@ -49,6 +52,9 @@ const ATTEMPT_OPTIONAL = [
   'triad',
   'fallback_reason',
   'attempted_workers',
+  'review_round',
+  'prior_findings',
+  'category',
 ];
 const CONTRACT_REQUIRED = ['repo_id', 'spec_digest', 'policy_digest'];
 const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
@@ -65,6 +71,7 @@ const REVIEW_OK = 'REVIEW_OK';
 const REVIEW_BLOCKED = 'REVIEW_BLOCKED';
 const REVIEW_ESCALATE = 'REVIEW_ESCALATE';
 const FINISH = new Set(['verified', 'deployed']);
+const execGit = promisify(execFile);
 
 class Denied extends Error {
   constructor(reason) {
@@ -272,6 +279,28 @@ function validateAttempt(attempt) {
         !attempt.attempted_workers.every(w => w !== null && typeof w === 'object' &&
           !Array.isArray(w) && typeof w.provider === 'string' && w.provider.length > 0))) {
     throw new Denied('invalid_attempted_workers');
+  }
+  // Раунд L2 и блокирующие находки прошлого раунда доверенно поставляет
+  // контроллер (история попытки), не воркер: diff-scoped пересмотр раунда 2+
+  // работает только с этой связкой. Невалидная форма — отказ до эффектов.
+  if (attempt.review_round !== undefined &&
+      (!Number.isSafeInteger(attempt.review_round) || attempt.review_round < 1 ||
+        attempt.review_round > 64)) {
+    throw new Denied('invalid_review_round');
+  }
+  if (attempt.prior_findings !== undefined &&
+      (!Array.isArray(attempt.prior_findings) || attempt.prior_findings.length > 256 ||
+        !attempt.prior_findings.every(f => f !== null && typeof f === 'object' &&
+          !Array.isArray(f) &&
+          Object.entries(f).every(([k, v]) =>
+            ['file', 'line', 'input', 'expected', 'actual', 'freq', 'harm', 'severity'].includes(k) &&
+            (v === undefined || v === null || typeof v === 'number' ||
+              (typeof v === 'string' && v.length <= 2000)))))) {
+    throw new Denied('invalid_prior_findings');
+  }
+  if (attempt.category !== undefined &&
+      (typeof attempt.category !== 'string' || !/^[a-z][a-z0-9-]{0,47}$/.test(attempt.category))) {
+    throw new Denied('invalid_category');
   }
   validateContract(attempt);
 }
@@ -669,6 +698,57 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     visual = vis;
   }
 
+  // Policy-Driven Auto-Approve (#1745): доверенная approval-политика
+  // применяется только после зелёной L1 и чистого Tamper Gate. Одобрение
+  // allowlist-категории (docs/typo/deps) снимает L2-критика, но никогда не
+  // ослабляет гейты выше; любой отказ политики возвращает обычный путь L2.
+  let autoApprove = null;
+  if (typeof binding.category === 'string' && binding.category) {
+    let loaded = null;
+    try {
+      loaded = await loadApprovalPolicy(binding.worktree);
+    } catch (e) {
+      if (e?.code !== 'ENOENT') {
+        await step('review', false, messageOf(e));
+        return { status: 'hold', reason: 'approval_policy_invalid' };
+      }
+    }
+    if (loaded !== null) {
+      let changedFiles = null;
+      let changedLines = 0;
+      try {
+        const names = await execGit('git', ['-C', binding.worktree, 'diff', '--no-renames',
+          '--name-only', binding.base_sha, binding.candidate_sha, '--'],
+          { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+        changedFiles = names.stdout.split('\n').map(line => line.trim()).filter(Boolean);
+        const numstat = await execGit('git', ['-C', binding.worktree, 'diff', '--no-renames',
+          '--numstat', binding.base_sha, binding.candidate_sha, '--'],
+          { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+        for (const line of numstat.stdout.split('\n')) {
+          const [add, del] = line.split('\t');
+          changedLines += (Number.parseInt(add, 10) || 0) + (Number.parseInt(del, 10) || 0);
+        }
+      } catch (e) {
+        await step('review', false, messageOf(e));
+        return { status: 'hold', reason: `auto_approve_diff_failed:${messageOf(e)}` };
+      }
+      const decision = evaluateAutoApprove({ policy: loaded.policy, digest: loaded.digest,
+        category: binding.category, changedFiles, changedLines,
+        l1Passed: true, tamperPassed: tamper?.ok === true });
+      if (decision.approved === true) autoApprove = decision;
+      await step('review', true, { auto_approve: decision });
+    }
+  }
+  if (autoApprove !== null) {
+    // Одобренный политикой кандидат получает синтетическую квитанцию L2:
+    // checkpoint — digest доверенной политики, находок нет, гейты зелёные.
+    const rev = { verdict: REVIEW_OK, status: 'PASS', summary: `auto-approved: ${autoApprove.reason}`,
+      findings: [], checked_invariants: ['policy_auto_approve'], checkpoint: autoApprove.policyDigest,
+      auto_approved: true, policy_digest: autoApprove.policyDigest,
+      actual: { provider: 'policy', model: 'auto-approve', reasoningLevel: null } };
+    return { status: 'verified', loc, review: rev, actual: rev.actual, tamper, visual };
+  }
+
   // Независимое ревью, квитанция на тот же SHA; не запускать после потери hold.
   if (beforeReview) {
     try { await beforeReview(); } catch (error) {
@@ -748,6 +828,24 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     } else if (rev.subject_digest !== digestNow) {
       return { status: 'hold', reason: 'review_subject_mismatch' };
     }
+  }
+  // Severity Gating (#1745) дублируется на границе приёмки: REVIEW_OK,
+  // несущий блокирующую находку (P0/P1 или неразмеченную), не считается
+  // зелёным — противоречивый вердикт идёт на доработку с теми же находками.
+  if (rev.verdict === REVIEW_OK && Array.isArray(rev.findings) &&
+      partitionFindingsBySeverity(rev.findings).blocking.length > 0) {
+    const blocking = partitionFindingsBySeverity(rev.findings).blocking;
+    return {
+      status: 'rework',
+      reason: `review_verdict:${REVIEW_BLOCKED}`,
+      feedback: { reason: `review_verdict:${REVIEW_BLOCKED}`, verdict: REVIEW_BLOCKED,
+        checkpoint: rev.checkpoint, threadId: rev.threadId,
+        excerpt: rev.excerpt ?? blocking.map(f =>
+          `${f.file ?? '?'}${f.line != null ? `:${f.line}` : ''}: expected ${f.expected ?? '?'}, ` +
+          `actual ${f.actual ?? '?'}`).join('\n').slice(0, 1400),
+        findings: blocking, summary: rev.summary },
+      loc, tamper, visual, review: rev, actual,
+    };
   }
   if (rev.verdict !== REVIEW_OK) {
     // REVIEW_BLOCKED/REWORK требует содержательного возражения: валидный finding
@@ -1030,6 +1128,9 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     candidate_sha: submission.candidate_sha,
     has_ui: attempt.has_ui,
     executor: attempt.executor ?? profile.executor,
+    review_round: attempt.review_round ?? 1,
+    prior_findings: attempt.prior_findings ?? [],
+    category: attempt.category,
   };
   // Ключ запуска включает контракт и требование L3: новый манифест или смена
   // has_ui при том же SHA не переиспользуют терминальный вердикт старого запуска.

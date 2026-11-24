@@ -38,7 +38,12 @@ test('isTestFilePath / isNonTargetFailure', () => {
   assert.ok(isNonTargetFailure('Cannot find module x', 1));
   assert.ok(isNonTargetFailure('ModuleNotFoundError', 1));
   assert.ok(isNonTargetFailure('', 126));
+  // Авария раннера (SIGSEGV → 139) и прочие коды >= 125 — нецелевое падение.
+  assert.ok(isNonTargetFailure('', 139));
+  assert.ok(isNonTargetFailure('Segmentation fault', 139));
+  assert.ok(isNonTargetFailure('', 130));
   assert.ok(!isNonTargetFailure('assert failed: expected 2 got 1', 1));
+  assert.ok(!isNonTargetFailure('2 failures', 2));
 });
 
 test('verifyTestFirst: red→green pass with valid artifact', async t => {
@@ -117,13 +122,21 @@ test('stage-verifier: four new verifiers PASS/REWORK', () => {
   const verdict = (type, fields) =>
     artifactVerdict(type, Buffer.from(JSON.stringify({ type, ...fields })));
   assert.equal(verdict('test-first', { redSha: s40, testDiff: h, redExitCode: 1,
-    failureReasonDigest: h, touchesProdCode: false }), 'PASS');
+    failureReasonDigest: h, touchesProdCode: false, candidateExitCode: 0 }), 'PASS');
   assert.equal(verdict('test-first', { redSha: s40, testDiff: h, redExitCode: 0,
-    failureReasonDigest: h, touchesProdCode: false }), 'REWORK');
+    failureReasonDigest: h, touchesProdCode: false, candidateExitCode: 0 }), 'REWORK');
   assert.equal(verdict('test-first', { redSha: s40, testDiff: h, redExitCode: 127,
-    failureReasonDigest: h, touchesProdCode: false }), 'REWORK');
+    failureReasonDigest: h, touchesProdCode: false, candidateExitCode: 0 }), 'REWORK');
+  assert.equal(verdict('test-first', { redSha: s40, testDiff: h, redExitCode: 139,
+    failureReasonDigest: h, touchesProdCode: false, candidateExitCode: 0 }), 'REWORK');
   assert.equal(verdict('test-first', { redSha: s40, testDiff: h, redExitCode: 1,
-    failureReasonDigest: h, touchesProdCode: true }), 'REWORK');
+    failureReasonDigest: h, touchesProdCode: true, candidateExitCode: 0 }), 'REWORK');
+  // Красный кандидат: артефакт не верифицируется зелёным — ни с реальным
+  // кодом выхода, ни когда прогон кандидата не выполнялся (null).
+  assert.equal(verdict('test-first', { redSha: s40, testDiff: h, redExitCode: 1,
+    failureReasonDigest: h, touchesProdCode: false, candidateExitCode: 1 }), 'REWORK');
+  assert.equal(verdict('test-first', { redSha: s40, testDiff: h, redExitCode: 1,
+    failureReasonDigest: h, touchesProdCode: false, candidateExitCode: null }), 'REWORK');
   assert.equal(verdict('semantic-fidelity', { specDigest: h, goalsFrozen: true,
     vacuousRisk: 0, unprovenAssumptions: 0, controlsPassed: 2 }), 'PASS');
   assert.equal(verdict('semantic-fidelity', { specDigest: h, goalsFrozen: false,

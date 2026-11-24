@@ -7,7 +7,8 @@ import { isAbsolute, join, relative } from 'node:path';
 import { unpackExact } from './runtime.mjs';
 import { assertCrossFamily, hasValidFinding, parseReviewVerdict, ReviewDenied, runInReadOnlySandbox,
   snapshotDigest, worktreeFingerprint } from './review-runner.mjs';
-import { isNeonReview, NEON_CRITIC, NEON_ISOLATION } from './review-policy.mjs';
+import { applySeverityGating, isNeonReview, NEON_CRITIC, NEON_ISOLATION,
+  normalizeSeverity, SEVERITY_RUBRIC } from './review-policy.mjs';
 import { hostAgyTransport } from './agy-transport.mjs';
 import agyStream from './agy-stream.cjs';
 
@@ -59,7 +60,7 @@ function neonVerdict(response, digest) {
   return parseReviewVerdict(text);
 }
 
-function neonBody({ task_id, candidate_sha, subject_digest }, prompt, files) {
+function neonBody({ task_id, candidate_sha, subject_digest, review_round, prior_findings }, prompt, files) {
   const system = [
     `Independent Standards and Spec review for task #${task_id} at ${candidate_sha}.`,
     'Read the complete tracked diff in diff.patch and consult files.json for the exact candidate inventory.',
@@ -69,6 +70,19 @@ function neonBody({ task_id, candidate_sha, subject_digest }, prompt, files) {
     'Return exactly one JSON object with verdict PASS, REWORK, or ESCALATE, summary (string),',
     'findings (array), and checked_invariants (array). For REWORK give at least one finding with',
     'nonempty file, input, expected and actual, plus line, frequency and harm (0–10).',
+    SEVERITY_RUBRIC,
+    ...((Number.isSafeInteger(review_round) && review_round > 1) ? [
+      `Diff-scoped re-review round ${review_round}: verify ONLY that each blocking (P0/P1)`,
+      'finding from the previous round is resolved in the current diff and that the diff',
+      'introduces no NEW P0/P1 regressions. Do NOT re-audit from scratch and never issue',
+      'REWORK for P2/nit alone. Blocking findings from the previous round:',
+      ...(Array.isArray(prior_findings) && prior_findings.length
+        ? prior_findings.map((f, i) =>
+            `${i + 1}. ${f?.file ?? '?'}${f?.line != null ? `:${f.line}` : ''}` +
+            ` — expected: ${f?.expected ?? '?'}; actual: ${f?.actual ?? '?'}` +
+            ` [${normalizeSeverity(f?.severity)}]`)
+        : ['(none supplied)']),
+    ] : []),
     `Copy this exact subject_digest into the JSON: ${subject_digest}.`,
     prompt,
   ].join('\n');
@@ -166,8 +180,15 @@ export function isolatedNeonReviewRunner({ journal, prompt = '', timeoutMs = 480
       const transcript_sha256 = hash(transcript);
       const name = `review-${binding.candidate_sha}-${randomUUID()}.json`;
       await writeFile(join(journal, name), transcript, { mode: 0o600, flag: 'wx' });
-      const verdict = neonVerdict(observed.text, binding.subject_digest);
-      return { ...verdict, task: binding.task_id, sha: binding.candidate_sha, tree_sha: before.tree,
+      // Тот же severity-gating, что у Pi-раннера: P2/nit уходят в приватный
+      // sidecar и не имеют права REVIEW_BLOCKED; PASS с блокирующей находкой
+      // программно становится REWORK до возврата квитанции.
+      const verdict = await applySeverityGating(neonVerdict(observed.text, binding.subject_digest),
+        { journal, taskId: binding.task_id, candidateSha: binding.candidate_sha,
+          round: binding.review_round ?? 1 });
+      return { ...verdict, sidecar_findings: verdict.sidecar_findings ?? [],
+        severity_gated: verdict.severity_gated === true,
+        task: binding.task_id, sha: binding.candidate_sha, tree_sha: before.tree,
         checkpoint: transcript_sha256.slice(0, 32), transcript_sha256, transcript_file: name,
         actual: observed.actual, attestation: observed.evidence, snapshot_reads: observed.verifiedReads.length, isolation: NEON_ISOLATION,
         // VS-3: usage провайдера из потока agy; отсутствует — явный null.

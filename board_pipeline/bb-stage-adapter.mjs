@@ -159,7 +159,10 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
       'Оцени, достаточно ли фактов для роли. Если факты не удовлетворяют требованию, REWORK; при невозможности подтвердить — BLOCKED. Ответ ровно одной строкой: <challenge> PASS|REWORK|BLOCKED.',
       `Challenge: ${challenge}`,
     ].join('\n\n');
-    if (Buffer.byteLength(text) > 48 * 1024) throw new Error('stage_prompt_too_large');
+    // Бюджет применяется к ФИНАЛЬНОМУ рендеру промпта, а не только к связке
+    // скиллов: материал, артефакт и обрамление входят в те же 24 KiB — строго
+    // меньше, fail-closed до отправки модели.
+    if (Buffer.byteLength(text) >= 24 * 1024) throw new Error('stage_prompt_too_large');
     const checkTransport = async () => {
       if (sandboxTransport !== undefined) {
         if (await assertStageReadOnly(sandboxTransport, request.model) !== true) {

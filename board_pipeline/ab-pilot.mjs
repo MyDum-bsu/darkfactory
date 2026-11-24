@@ -243,7 +243,13 @@ export async function foremanDiff({ git, base, candidate }) {
 export async function runPilotForeman(ab, { attempt, handoff, project, journal, readArtifact,
   assertCurrent, inspect, readState, observeStage, transport, signals }) {
   const pin = { playbook: ab.playbook, registry_digest: ab.registry.digest };
-  const subject = { ...handoff, ...pin, attempt_id: attempt.attempt_id, epoch: attempt.epoch, triad: attempt.triad };
+  // Метки контракта карточки для skillPicker: правила has_ui/playbook обязаны
+  // срабатывать на том же выборе, что зафиксирован в манифесте. Доступные
+  // доверенные значения — закреплённый плейбук и has_ui попытки.
+  const labels = { playbook: ab.playbook };
+  if (typeof handoff.has_ui === 'boolean') labels.has_ui = handoff.has_ui;
+  const subject = { ...handoff, ...pin, labels, attempt_id: attempt.attempt_id, epoch: attempt.epoch,
+    triad: attempt.triad };
   const guard = async binding => {
     await assertCurrent();
     const state = await readState();

@@ -24,8 +24,12 @@ export function isTestFilePath(filePath) {
 // Нецелевое падение красного прогона: инфраструктурные коды выхода и ошибки
 // синтаксиса/импорта/модуля — тест не дошёл до целевого утверждения.
 const NON_TARGET = /SyntaxError|ReferenceError|ERR_MODULE_NOT_FOUND|Cannot find module|ImportError|ModuleNotFoundError|IndentationError/;
+// Целевое падение теста — код выхода раннера на assertion-failure. Коды 125+
+// — инфраструктурная зона (125-127 коды оболочки/раннера, 128+ сигналы,
+// включая 139 SIGSEGV): авария не доказывает целевую проверку — non-target.
 export function isNonTargetFailure(output, exitCode) {
-  return [125, 126, 127].includes(exitCode) || NON_TARGET.test(String(output ?? ''));
+  return !Number.isSafeInteger(exitCode) || exitCode >= 125 ||
+    NON_TARGET.test(String(output ?? ''));
 }
 
 function defaultGit(worktree) {
@@ -33,8 +37,13 @@ function defaultGit(worktree) {
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }).trim();
 }
 
-function artifact({ redSha, testDiff, redExitCode, failureReasonDigest, touchesProdCode }) {
-  const data = { type: 'test-first', redSha, testDiff, redExitCode, failureReasonDigest, touchesProdCode };
+// candidateExitCode — обязательное поле свидетельства: null, когда прогон
+// кандидата не выполнялся (ранние отказы до него). Верификатор PASS требует
+// ровно 0 — артефакт красного кандидата никогда не верифицируется зелёным.
+function artifact({ redSha, testDiff, redExitCode, failureReasonDigest, touchesProdCode,
+  candidateExitCode = null }) {
+  const data = { type: 'test-first', redSha, testDiff, redExitCode, failureReasonDigest,
+    touchesProdCode, candidateExitCode };
   const artifactBytes = Buffer.from(JSON.stringify(data));
   return { artifact: data, artifactBytes, artifactDigest: sha256(artifactBytes) };
 }
@@ -82,12 +91,13 @@ export async function verifyTestFirst({ worktree, baseSha, redSha, candidateSha,
         failureReasonDigest, touchesProdCode: false }) };
   }
   const green = await runTest({ sha: candidateSha, changedTestFiles: changedFiles });
+  const greenExitCode = Number.isSafeInteger(green?.exitCode) ? green.exitCode : null;
   if (green?.exitCode !== 0) {
     return { verdict: 'REWORK', reason: 'test_first_candidate_failed', changedTestFiles: changedFiles,
       ...artifact({ redSha, testDiff, redExitCode: red.exitCode, failureReasonDigest,
-        touchesProdCode: false }) };
+        touchesProdCode: false, candidateExitCode: greenExitCode ?? 1 }) };
   }
   return { verdict: 'PASS', reason: null, changedTestFiles: changedFiles,
     ...artifact({ redSha, testDiff, redExitCode: red.exitCode, failureReasonDigest,
-      touchesProdCode: false }) };
+      touchesProdCode: false, candidateExitCode: 0 }) };
 }

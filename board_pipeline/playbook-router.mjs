@@ -85,8 +85,10 @@ async function guard(assertKernel, binding, models) {
 
 function inspectReceipt(request, receipt) {
   const { binding, model, verifier } = request;
+  // Квитанция обязана аттестовать ровно тот набор скиллов, что ушёл в
+  // запрос: отсутствие поля — не «несколько возможных», а unbound evidence.
   if (!same(request, receipt, ['registryDigest', 'playbook', 'stage', 'verifier', 'inputArtifactDigest']) ||
-      (receipt.skills_digest !== undefined && receipt.skills_digest !== request.skills_digest) ||
+      receipt.skills_digest !== request.skills_digest ||
       !same(binding, receipt.binding, SUBJECT) || !same(model, receipt.model, ['provider', 'model', 'reasoning']) ||
       !['PASS', 'REWORK', 'BLOCKED'].includes(receipt.verdict)) throw new Error('playbook_receipt_unbound');
   if (receipt.verdict === 'BLOCKED') return { verdict: 'BLOCKED', digest: null };

@@ -185,6 +185,19 @@ export async function loadRoleRegistry(trustedCheckout) {
     role.instructions = Object.freeze({ path: instructionsRel, digest: sha256(instructions.bytes), text: instructionsText });
     fileDigests.push({ path: instructionsRel, digest: role.instructions.digest });
 
+    // Сам каталог скиллов станции — не симлинк и обычная директория:
+    // симлинк на пустой/чужой каталог делал бы leaf-lstat ENOENT и молча
+    // подменял локальные скиллы shared-копиями, нарушая no-symlink инвариант.
+    const skillsDir = join(root, 'stations', name, 'skills');
+    const skillsInfo = await lstat(skillsDir).catch(cause => {
+      if (cause?.code === 'ENOENT') return null;
+      throw cause;
+    });
+    if (skillsInfo !== null &&
+        (!skillsInfo.isDirectory() || await realpath(skillsDir) !== skillsDir)) {
+      throw new Error('factory_file_invalid');
+    }
+
     const pinned = [];
     for (const skillId of role.skills) {
       const stationRel = `stations/${name}/skills/${skillId}.md`;

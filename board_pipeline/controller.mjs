@@ -4,6 +4,7 @@ import { advanceQuestion, QUESTION_PHASES } from './question-resume.mjs';
 import { createReleasePackage, releaseQuestionDetails, ReleaseDenied } from './release-contract.mjs';
 import { advanceRelease, RELEASE_PHASES } from './release-flow.mjs';
 import { roundGate, roundSignature, effectiveL2ReworkLimit, l2ReworkLimitExceeded } from './worker-selector.mjs';
+import { partitionFindingsBySeverity } from './review-policy.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
@@ -69,6 +70,9 @@ function contractOf(labels) {
     // Метка has_ui карточки может только ВКЛЮЧИТЬ L3; 'false' не выключает
     // обязательный profile.has_ui — решение остаётся у оператора.
     has_ui: labels?.has_ui === 'true' ? true : undefined,
+    // Категория рутинной работы для policy-driven auto-approve (#1745):
+    // контрактная метка карточки, не слово воркера.
+    category: typeof labels?.category === 'string' ? labels.category : undefined,
   };
 }
 
@@ -89,6 +93,7 @@ function attemptOf(record, route) {
     attempt.fixtures_digest = record.contract.fixtures_digest ?? null;
     if (record.contract.l1_profile !== undefined) attempt.l1_profile = record.contract.l1_profile;
     if (record.contract.has_ui !== undefined) attempt.has_ui = record.contract.has_ui;
+    if (record.contract.category !== undefined) attempt.category = record.contract.category;
   }
   return attempt;
 }
@@ -498,8 +503,18 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     try { prepared = await release.prepare(submission.candidate_sha); }
     catch (cause) { return stopWith(cause instanceof ReleaseDenied ? cause.code : 'release_prepare_failed'); }
   }
-  const verification = prepared ? { ...attempt, release_target: { finish: 'deployed', target_id: prepared.target,
-    release_channel: 'isolated-static', previous_live_digest: prepared.previous.digest } } : attempt;
+  // Diff-Scoped Round 2+ (#1745): следующий критик получает номер L2-раунда и
+  // блокирующие находки прошлого раунда из доверенной истории попытки —
+  // верификация проверяет закрытие P0/P1 и отсутствие новых регрессий,
+  // а не полный аудит заново.
+  const priorL2 = (record.roundsHistory ?? []).filter(r => r?.gate === 'l2');
+  const verification = { ...attempt,
+    review_round: priorL2.length + 1,
+    prior_findings: priorL2.length
+      ? partitionFindingsBySeverity(priorL2.at(-1).findings).blocking
+      : [],
+    ...(prepared ? { release_target: { finish: 'deployed', target_id: prepared.target,
+      release_channel: 'isolated-static', previous_live_digest: prepared.previous.digest } } : {}) };
   const result = await verify(verification, { ...submission, task_id: taskId });
   if (result.outcome === 'rework') {
     let roundsHistory;

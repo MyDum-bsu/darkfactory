@@ -29,9 +29,11 @@ export const PLAYBOOK_TRIAD = Object.freeze({
   arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' },
 });
 
-export function stageObservation({ binding, registryDigest, playbook, stage, verifier, model, inputArtifactDigest },
+export function stageObservation({ binding, registryDigest, playbook, stage, verifier, model, inputArtifactDigest,
+  skills_digest },
   { verdict = 'PASS', changes } = {}) {
   const artifact = Buffer.from(JSON.stringify({ type: verifier, ...ARTIFACTS[verifier], ...changes }));
-  return { binding, registryDigest, playbook, stage, verifier, model, inputArtifactDigest, verdict, artifact,
+  return { binding, registryDigest, playbook, stage, verifier, model, inputArtifactDigest, skills_digest,
+    verdict, artifact,
     artifactDigest: createHash('sha256').update(artifact).digest('hex') };
 }

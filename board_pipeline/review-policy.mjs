@@ -90,6 +90,16 @@ export async function applySeverityGating(verdict, { journal, taskId, candidateS
   }
   const base = { ...verdict };
   if (nonBlocking.length) base.sidecar_findings = nonBlocking;
+  // Блокирующая находка не отменяется верхнеуровневым PASS: противоречивый
+  // вердикт программно переводится в REWORK до приёмки — REVIEW_OK с P0/P1
+  // (или неразмеченной) находкой никогда не доходит до settle.
+  if (verdict.status === 'PASS' && blocking.length) {
+    const excerpt = blocking.map(f =>
+      `${f.file ?? '?'}${f.line != null ? `:${f.line}` : ''}: expected ${f.expected ?? '?'}, ` +
+      `actual ${f.actual ?? '?'}`).join('\n').slice(0, 1400) || 'blocking finding under PASS verdict';
+    return { ...base, status: 'REWORK', verdict: 'REVIEW_BLOCKED', findings: blocking,
+      severity_gated: true, excerpt };
+  }
   if (verdict.status === 'REWORK' && Array.isArray(verdict.findings) &&
       verdict.findings.length > 0 && blocking.length === 0) {
     return { ...base, status: 'PASS', verdict: 'REVIEW_OK', findings: [],
@@ -101,7 +111,7 @@ export async function applySeverityGating(verdict, { journal, taskId, candidateS
   return base;
 }
 
-const SEVERITY_RUBRIC = [
+export const SEVERITY_RUBRIC = [
   'Grade every finding with "severity": "P0" (data loss, gate bypass, forged evidence),',
   '"P1" (spec contract violation, broken test, bug inside this card\'s scope),',
   '"P2" (real defect outside this card\'s scope — recorded, never blocking) or',
