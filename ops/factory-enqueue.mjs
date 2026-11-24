@@ -139,6 +139,9 @@ export async function buildEnqueuePlan(values) {
       const wtReal = await realpath(policyJson.route.worktree)
         .catch(() => fail('worktree_missing'));
       if (wtReal !== policyJson.route.worktree) fail('non_canonical_or_symlink_path');
+      // Как и явный --worktree, route.worktree обязан быть каталогом:
+      // обычный файл — непригодное рабочее дерево, отказ до вызова vb.
+      if (!(await lstat(wtReal)).isDirectory()) fail('path_not_dir');
       worktrees.push(wtReal);
       // И сам файл политики обязан лежать вне дерева воркера.
       policyFile = await canonicalInput(values.policy, { worktrees, mustBe: 'file' });

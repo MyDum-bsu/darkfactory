@@ -253,12 +253,14 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // для trustedReceiptDir (семейство projectMemory, как storeDir);
   // questionGate.inbox и release.directory — соседние каталоги рядом с
   // worktree допустимы (контроллер их не ограничивает по родителю).
-  if (policy?.projectMemory?.trustedReceiptDir !== undefined &&
-      policy?.projectMemory?.trustedReceiptDir !== null) {
+  // Явно заданное значение (включая null — контроллер не считает его
+  // отсутствующим) обязано быть каноническим абсолютным путём к каталогу:
+  // нестроковое/неканоническое отклоняется до Git-конфига и dry-run.
+  if (policy?.projectMemory?.trustedReceiptDir !== undefined) {
     await canonicalOutside(policy.projectMemory.trustedReceiptDir, treeAliases, 'dir');
   }
   for (const dir of [policy?.questionGate?.inbox, policy?.release?.directory]) {
-    if (dir !== undefined && dir !== null) {
+    if (dir !== undefined) {
       await canonicalOutside(dir, treeAliases, 'dir', { parent: false });
     }
   }

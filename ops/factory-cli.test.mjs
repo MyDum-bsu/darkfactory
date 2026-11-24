@@ -833,6 +833,27 @@ test('enqueue: явный --vb через симлинк отклоняется,
     // Относительный --vb — отказ.
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), vb: 'vb-real' }),
       /path_not_absolute/);
+    // route.worktree из политики обязан быть каталогом, как и явный
+    // --worktree: обычный файл — отказ до вызова vb.
+    const brief = join(dir, 'brief.md');
+    const reviewPrompt = join(dir, 'review.md');
+    const gateDir = join(dir, 'gate');
+    await mkdir(gateDir);
+    await writeFile(brief, 'b');
+    await writeFile(reviewPrompt, 'r');
+    await writeFile(join(gateDir, 'board-review.mjs'), 'g');
+    await writeFile(join(gateDir, 'routes.json'), '{}');
+    const wtFile = join(dir, 'wt-file');
+    await writeFile(wtFile, 'x');
+    const policyFile = join(dir, 'policy.json');
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: join(gateDir, 'board-review.mjs'),
+      route: { checkProfile: 'p', worktree: wtFile },
+      profiles: { p: { review: { provider: 'openai', model: 'gpt-6.2-sol',
+        reasoningLevel: 'medium' } } },
+    }));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile }), /path_not_dir/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -887,6 +908,15 @@ test('run: policy operator dirs — trustedReceiptDir/questionGate.inbox/release
     const fRel = await withPolicy(dir, { ...base, release: { directory: join(linkOps, 'release') } });
     await assert.rejects(() => runPlan(runValues(fRel, state)),
       /non_canonical_or_symlink_path/);
+    // Явный null — заданное значение, не отсутствие: контроллер требует
+    // абсолютный путь, поэтому обёртка отклоняет до Git-конфига и dry-run.
+    const fNullMem = await withPolicy(dir, { ...base,
+      projectMemory: { storeDir: receipts, trustedReceiptDir: null } });
+    await assert.rejects(() => runPlan(runValues(fNullMem, state)), /path_not_absolute/);
+    const fNullInbox = await withPolicy(dir, { ...base, questionGate: { inbox: null } });
+    await assert.rejects(() => runPlan(runValues(fNullInbox, state)), /path_not_absolute/);
+    const fNullRel = await withPolicy(dir, { ...base, release: { directory: null } });
+    await assert.rejects(() => runPlan(runValues(fNullRel, state)), /path_not_absolute/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
