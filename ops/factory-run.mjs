@@ -227,9 +227,15 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // activation.killSwitch (pilot.killSwitch) для допуска пилота, а
   // --switch (или pilot.killSwitch при его отсутствии) — как daemon-стоп.
   // Поэтому явный --switch не маскирует pilot.killSwitch из проверки.
+  const swDirs = [];
   for (const daemonSwitch of new Set([values.switch, policy?.pilot?.killSwitch])) {
-    if (daemonSwitch === undefined || daemonSwitch === null) continue;
-    if (!isAbsolute(daemonSwitch)) fail('path_not_absolute');
+    // Явный null (или нестроковое значение, отличное от undefined) — не
+    // «отсутствует»: контроллер подставил бы его в daemonSwitchPath, а
+    // L2 обязан отклонить такой вход до Git-конфига, а не пропустить.
+    if (daemonSwitch === undefined) continue;
+    if (typeof daemonSwitch !== 'string' || !isAbsolute(daemonSwitch)) {
+      fail('path_not_absolute');
+    }
     // Неканоническая строка (завершающий '/', '.', '..', повторные '//')
     // отклоняется до lstat: нормализация обязана быть тождественной.
     if (daemonSwitch !== posix.normalize(daemonSwitch) || daemonSwitch.endsWith('/')) {
@@ -238,6 +244,13 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     const swDir = dirname(daemonSwitch);
     const swDirReal = await realpath(swDir).catch(() => fail('path_missing'));
     if (swDirReal !== swDir) fail('non_canonical_or_symlink_path');
+    // Граница permitDirectory контроллера — двусторонняя: каталог
+    // стоп-файла не пересекается с worktree ни в одну сторону (случай
+    // --switch <dir>/stop при route.worktree=<dir>/wt).
+    if (treeAliases.some(t => inside(t, swDirReal) || inside(swDirReal, t))) {
+      fail('path_inside_worktree');
+    }
+    swDirs.push(swDirReal);
     // Стоп-файл может ещё не существовать (ENOENT), но любая другая
     // ошибка — включая ENOTDIR (родительский компонент не каталог) —
     // отказ до Git-конфига и запуска контроллера.
@@ -272,9 +285,19 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // worktree и вне state в обе стороны (inside(root,inbox)||
   // inside(inbox,root)||inside(tree,inbox) контроллера).
   let handoff = null;
-  if (policy.handoffDir !== undefined && policy.handoffDir !== null) {
+  // Явный null — не «отсутствует»: отклоняется в canonicalOutside до
+  // Git-конфига, как и любое нестроковое значение.
+  if (policy.handoffDir !== undefined) {
     handoff = await canonicalOutside(policy.handoffDir, treeAliases, 'dir', { parent: false });
     if (inside(state, handoff) || inside(handoff, state)) fail('path_inside_worktree');
+  }
+  // Каталоги стоп-файлов — та же двусторонняя permitDirectory-граница
+  // против state и handoffDir (inbox сдачи контроллера), когда он задан.
+  for (const swDir of swDirs) {
+    if (inside(state, swDir) || inside(swDir, state) ||
+        (handoff !== null && (inside(handoff, swDir) || inside(swDir, handoff)))) {
+      fail('path_inside_worktree');
+    }
   }
 
   // CLI-override без конфликта с политикой передаётся контроллеру через

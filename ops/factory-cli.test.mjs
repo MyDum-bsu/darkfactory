@@ -809,6 +809,32 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     const pilotPlan = await runPlan(runValues(fPilotOk, state,
       { switch: join(ops, 'daemon-stop') }));
     assert.ok(pilotPlan.argv.includes('--switch'));
+    // Каталог стоп-файла не пересекает worktree ни в одну сторону
+    // (permitDirectory контроллера): --daemon --switch <dir>/stop при
+    // route.worktree=<dir>/wt — отказ до Git-конфига и запуска.
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { daemon: true, switch: join(dir, 'stop') })), /path_inside_worktree/);
+    // Обратное направление: стоп-файл внутри worktree — тоже отказ.
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { switch: join(wt, 'stop') })), /path_inside_worktree/);
+    // Каталог стоп-файла не пересекается и со state.
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { switch: join(state, 'stop') })), /path_inside_worktree/);
+    // Явный pilot.killSwitch: null и нестроковое значение — не
+    // «отсутствует»: отказ до Git-конфига, а не молчаливый пропуск.
+    const pilotNull = { ...policySpec(wt), pilot: { killSwitch: null } };
+    const fPilotNull = await withPolicy(dir, pilotNull);
+    await assert.rejects(() => runPlan(runValues(fPilotNull, state)),
+      /path_not_absolute/);
+    const pilotNum = { ...policySpec(wt), pilot: { killSwitch: 42 } };
+    const fPilotNum = await withPolicy(dir, pilotNum);
+    await assert.rejects(() => runPlan(runValues(fPilotNum, state)),
+      /path_not_absolute/);
+    // Явный handoffDir: null — тот же отказ до Git-конфига.
+    const hbNull = { ...policySpec(wt), handoffDir: null };
+    const fHbNull = await withPolicy(dir, hbNull);
+    await assert.rejects(() => runPlan(runValues(fHbNull, state)),
+      /path_not_absolute/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -854,6 +880,15 @@ test('enqueue: явный --vb через симлинк отклоняется,
     }));
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       'policy-digest': undefined, policy: policyFile }), /path_not_dir/);
+    // Явно заданное route.worktree любого вида — операторский путь:
+    // "", null и не-строка отклоняются до вызова vb, а не пропускаются
+    // (ранее молча игнорировались без --worktree).
+    for (const badTree of ['', null, 42]) {
+      await writeFile(policyFile, JSON.stringify({
+        route: { checkProfile: 'p', worktree: badTree } }));
+      await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+        'policy-digest': undefined, policy: policyFile }), /path_not_absolute/);
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

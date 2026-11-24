@@ -131,11 +131,15 @@ export async function buildEnqueuePlan(values) {
   if (values.policy !== undefined) {
     policyFile = await canonicalInput(values.policy, { worktrees, mustBe: 'file' });
     policyJson = JSON.parse(await readFile(policyFile, 'utf8'));
-    if (typeof policyJson?.route?.worktree === 'string' && policyJson.route.worktree) {
+    // Любое явно заданное route.worktree (включая "", null и нестроковые
+    // значения) — операторский вход: невалидный путь к каталогу
+    // отклоняется до вызова vb, а не молча пропускается.
+    if (policyJson?.route?.worktree !== undefined) {
       // route.worktree — операторский путь: строго канонический абсолютный
       // (realpath обязан совпасть с исходной строкой), иначе граница
       // проверялась бы не по тому пути, что задал оператор.
-      if (!isAbsolute(policyJson.route.worktree)) fail('path_not_absolute');
+      if (typeof policyJson.route.worktree !== 'string' ||
+          !isAbsolute(policyJson.route.worktree)) fail('path_not_absolute');
       const wtReal = await realpath(policyJson.route.worktree)
         .catch(() => fail('worktree_missing'));
       if (wtReal !== policyJson.route.worktree) fail('non_canonical_or_symlink_path');
