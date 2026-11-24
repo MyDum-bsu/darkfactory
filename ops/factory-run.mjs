@@ -17,7 +17,7 @@
 //     [--dry-run] [--json]
 import { execFile, spawn } from 'node:child_process';
 import { lstat, realpath, readFile, readlink } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { opencodeGoPolicyViolation, retiredProviderViolation }
@@ -64,6 +64,7 @@ export function assertModelMatrix({ cli, policy }) {
     ['policy.bb', policy?.bb],
     ['arbiter', policy?.arbiter],
     ['route.critic', policy?.route?.critic],
+    ['route.arbiter', policy?.route?.arbiter],
   ];
   // Все profiles.*.review, а не только выбранный route.checkProfile:
   // инвариант матрицы действует на каждое поле модели политики.
@@ -128,13 +129,20 @@ async function canonicalOutside(path, treeAliases, mustBe) {
       }
     }
   }
-  const st = await lstat(literal).catch(() => fail('path_missing'));
+  // Фактический родитель исходного пути (dirTarget контроллера):
+  // resolve() сворачивает '..' лексически, а ФС раскрывает
+  // симлинк-предков до '..' — op/link/../x при link -> wt/deep даёт
+  // dirname -> wt, который и отклоняет контроллер.
+  const dirReal = await realpath(dirname(path)).catch(() => fail('path_missing'));
+  if (treeAliases.some(t => inside(t, dirReal) || inside(dirReal, t))) {
+    fail('path_inside_worktree');
+  }
+  // Фактический конечный компонент — не лексически свёрнутый: симлинк
+  // внутри worktree отклоняется, даже если его цель снаружи.
+  const st = await lstat(join(dirReal, basename(path))).catch(() => fail('path_missing'));
   if (st.isSymbolicLink()) fail('path_symlink_refused');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
-  // realpath по сырому пути: resolve() сворачивает '..' лексически, а ФС
-  // раскрывает симлинк-предков до '..' — op/link/../x при link -> wt/deep
-  // фактически разрешается в wt/x.
   const real = await realpath(path);
   if (overlap(real)) fail('path_inside_worktree');
   return real;

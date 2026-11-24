@@ -49,6 +49,9 @@ worktree) отклоняется до чтения файла и хэширов�
 (`alias1 -> alias2 -> wt/link -> наружу` — отказ по промежуточному хопу),
 а `realpath` берётся от сырого пути: `..` раскрывается ФС после симлинков,
 и `op/link/../x` при `link -> wt/deep` отклоняется как вход внутрь дерева.
+Проверяются фактические `dirname` и конечный компонент (не лексически
+свёрнутые): конечный симлинк внутри дерева отклоняется, даже если его
+цель снаружи.
 
 ## Запуск контроллера — `ops/factory-run.mjs`
 
@@ -72,7 +75,7 @@ node ops/factory-run.mjs \
   `acp-zcode-start`, `glm` / `glm-*`.
 - Проверка применяется к CLI-спеке, `policy.bb`, **каждому**
   `profiles.*.review` (не только выбранному `route.checkProfile`),
-  `policy.arbiter`, `route.critic` **и каждому
+  `policy.arbiter`, `route.critic`, `route.arbiter` **и каждому
   кандидату `policy.routing.allowlist.{worker,critic,arbiter}`** —
   активный роутинг закрепляет кандидата скоркардом, поэтому запрет
   действует до запуска. Плюс `opencodeGoPolicyViolation` и

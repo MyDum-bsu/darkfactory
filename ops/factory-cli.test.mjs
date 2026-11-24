@@ -210,6 +210,17 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
       'policy-digest': undefined, 'spec-digest': undefined,
       brief: join(chain, 'brief.md'), policy: policyFile }),
       /path_inside_worktree/);
+    // '..' после симлинка: фактический конечный компонент — симлинк
+    // внутри worktree (op/link -> wt/deep; wt/brief.md -> внешний файл).
+    const op = join(dir, 'op');
+    await mkdir(op);
+    await mkdir(join(wt, 'deep'));
+    await symlink(join(wt, 'deep'), join(op, 'link'));
+    await symlink(brief, join(wt, 'brief-via.md'));
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, 'spec-digest': undefined,
+      brief: `${op}/link/../brief-via.md`, policy: policyFile }),
+      /path_inside_worktree|path_symlink_refused/);
     // Исходный путь review skill через симлинк внутри worktree — отказ.
     const skill = join(wt, 'skill.md');
     await writeFile(join(dir, 'skill-real.md'), 's');
@@ -360,6 +371,13 @@ test('run: запрещённая модель в CLI, критике, арби�
     const f5 = await withPolicy(dir, badRoute);
     await assert.rejects(() => buildRunPlan(runValues(f5, 's')),
       /disallowed:route\.critic/);
+    // route.arbiter распознаётся контроллером — тот же запрет матрицы.
+    const badRouteArb = { ...policySpec(wt),
+      route: { ...policySpec(wt).route,
+        arbiter: { provider: 'openai', model: 'gpt-6.1-terra' } } };
+    const f6 = await withPolicy(dir, badRouteArb);
+    await assert.rejects(() => buildRunPlan(runValues(f6, 's')),
+      /disallowed:route\.arbiter/);
     const badArbiter = { ...policySpec(wt), arbiter: { provider: 'pi', model: 'acp-zcode-start/x' } };
     const f2 = await withPolicy(dir, badArbiter);
     await assert.rejects(() => buildRunPlan(runValues(f2, 's')), /zcode.*:arbiter/);
@@ -540,6 +558,16 @@ test('run: memory/ledger вне worktree, симлинк и mismatch откло�
     const fDot = await withPolicy(dir, dotdot);
     await assert.rejects(() => buildRunPlan(runValues(fDot, state)),
       /path_inside_worktree/);
+    // Тот же '..' со снова-внешней конечной целью: фактический dirname
+    // исходного пути разрешается в wt (dirTarget контроллера), а
+    // конечный компонент — симлинк внутри дерева.
+    await writeFile(join(operator, 'ledger2.jsonl'), '');
+    await symlink(join(operator, 'ledger2.jsonl'), join(wt, 'ledger2.jsonl'));
+    const dotdot2 = { ...policySpec(wt),
+      decisionLedger: `${operator}/link/../ledger2.jsonl` };
+    const fDot2 = await withPolicy(dir, dotdot2);
+    await assert.rejects(() => buildRunPlan(runValues(fDot2, state)),
+      /path_inside_worktree|path_symlink_refused/);
     // Alias общего корня (root-alias -> <root>, wt в <root>/worktrees/wt):
     // ни сам путь, ни его родитель не пересекаются с деревом — контроллер
     // не сравнивает произвольного общего предка, путь принимается.

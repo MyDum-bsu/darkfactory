@@ -20,7 +20,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstat, readFile, readlink, realpath } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
@@ -73,13 +73,16 @@ async function canonicalInput(path, { worktrees = [], mustBe } = {}) {
       }
     }
   }
-  const st = await lstat(literal).catch(() => fail('path_missing'));
+  // Фактический родитель и конечный компонент: resolve() сворачивает '..'
+  // лексически, а ФС раскрывает симлинк-предков до '..' — op/link/../x при
+  // link -> wt/deep фактически wt/x; конечный симлинк внутри дерева
+  // отклоняется, даже если его цель снаружи.
+  const dirReal = await realpath(dirname(path)).catch(() => fail('path_missing'));
+  if (inside(dirReal)) fail('path_inside_worktree');
+  const st = await lstat(join(dirReal, basename(path))).catch(() => fail('path_missing'));
   if (st.isSymbolicLink()) fail('path_symlink_refused');
   if (mustBe === 'file' && !st.isFile()) fail('path_not_file');
   if (mustBe === 'dir' && !st.isDirectory()) fail('path_not_dir');
-  // realpath по сырому пути: resolve() сворачивает '..' лексически, а ФС
-  // раскрывает симлинк-предков до '..' — op/link/../x при link -> wt/deep
-  // фактически разрешается в wt/x.
   const real = await realpath(path);
   if (inside(real)) fail('path_inside_worktree');
   return real;
