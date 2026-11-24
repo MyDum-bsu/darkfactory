@@ -11,6 +11,8 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { acceptHeld } from './acceptance.mjs';
 import { advance } from './controller.mjs';
+import { NEON_PI_ARBITER, PI_SOL_CRITIC } from './review-policy.mjs';
+import * as ws from './worker-selector.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
 import { loadSdk } from './sdk.mjs';
@@ -197,4 +199,118 @@ test('две связанные карточки на реальном vb serve:
   assert.equal((await advance(slot.cfg)).phase, 'idle');
   assert.equal(effects.spawn, 2);
   assert.equal(seen.claim, 2);
+});
+
+// Board #1666: circuit breaker L2 на реальном контуре — живой vb serve,
+// настоящий Git и настоящий acceptHeld; внешние границы WorkerPort и
+// L2-вердикт — детерминированные cut points, как в первом тесте файла.
+test('четыре L2 REWORK на реальном vb serve — l2_rework_limit_exceeded без пятого раунда', async t => {
+  const { url, dir } = await startBoard(boardCli(), t);
+  process.env.BOARD_URL = url;
+  const { board } = loadSdk();
+  const handle = board();
+
+  const root = await mkdtemp(join(tmpdir(), 'l2cb-worktree-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const tree = join(root, 'worktree');
+  await mkdir(tree, { mode: 0o700 });
+  git(tree, 'init', '--initial-branch=pilot');
+  await writeFile(join(tree, 'check.mjs'), 'process.exit(0);\n');
+  git(tree, 'add', 'check.mjs');
+  commit(tree, 'Synthetic base');
+  const base = git(tree, 'rev-parse', 'HEAD');
+  const candidates = [];
+  for (const round of [1, 2, 3, 4]) {
+    await writeFile(join(tree, 'check.mjs'), `console.log("round ${round}"); process.exit(0);\n`);
+    git(tree, 'add', 'check.mjs');
+    commit(tree, `Synthetic candidate ${round}`);
+    candidates.push(git(tree, 'rev-parse', 'HEAD'));
+  }
+
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await handle.createChannel('pilot');
+      break;
+    } catch (error) {
+      if (attempt === 5) throw error;
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+  }
+  const labels = { spec_digest: SPEC, policy_digest: POLICY_DIGEST, repo_id: REPO,
+    profile_id: 'pilot', finish: 'verified' };
+  const { task } = await handle.tasks.create('pilot', { text: 'Synthetic L2 circuit breaker',
+    noSync: true, labels });
+  const port = nativeBoardPort(handle, { channel: 'pilot', lease: 900 });
+  const card = async () => (await handle.thread(task.id, { limit: 1 })).message.task;
+
+  const effects = { spawn: 0, verify: 0, feedback: [], arbitrations: 0 };
+  const submitted = [];
+  let stored;
+  const cfg = {
+    route: { taskId: task.id, base, policyVersion: 'vs1-1', checkProfile: 'pilot',
+      worktree: tree, finish: 'verified' },
+    authorize: async () => true,
+    state: { load: async () => structuredClone(stored), save: async value => { stored = structuredClone(value); } },
+    board: port,
+    bb: { async spawn() { effects.spawn++; return { threadId: 'thr_l2cb' }; },
+      async feedback(packet) { effects.feedback.push(packet); return { confirmed: true }; } },
+    submissions: { async read(attempt, after) {
+      if (submitted.length <= after) return;
+      const turnSeq = submitted.length;
+      return { turnSeq, submission: {
+        task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+        worker_thread_id: attempt.bb_thread_id, candidate_sha: submitted[turnSeq - 1] } };
+    } },
+    async verify(attempt, submission) {
+      effects.verify++;
+      const policy = { version: 'vs1-1', digest: POLICY_DIGEST, profiles: { pilot: {
+        task: attempt.task_id, worker: attempt.bb_thread_id, worktree: tree, branch: 'pilot',
+        base: attempt.base_sha, finish: attempt.finish, review: REVIEW } } };
+      const journal = await mkdtemp(join(dir, 'journal-l2cb-'));
+      return acceptHeld({ attempt, submission, policy, journal, ports: {
+        board: port,
+        inspect: worktreeInspector(policy),
+        local: async binding => ({ sha: binding.candidate_sha, ok: true,
+          evidence: [{ file: 'checks-l2cb.log', sha256: 'c'.repeat(64), exit: 0 }] }),
+        tamper: tamperGate,
+        review: async binding => ({ task: binding.task_id, sha: binding.candidate_sha,
+          actual: REVIEW, verdict: 'REVIEW_BLOCKED', checkpoint: 'feed80ab',
+          excerpt: `defect at ${binding.candidate_sha.slice(0, 8)}` }),
+      } });
+    },
+    workerSelector: { ...ws, critic: PI_SOL_CRITIC, arbiter: NEON_PI_ARBITER,
+      arbitrate: async () => { effects.arbitrations++; return { decision: 'escalate_owner', question: 'q' }; } },
+  };
+
+  // Claim + spawn по живому Board.
+  assert.equal((await advance(cfg)).phase, 'working');
+  assert.equal(effects.spawn, 1);
+  assert.equal((await card()).state, 'claimed');
+
+  // Три L2-раунда возвращаются воркеру обычным feedback; handoff
+  // закрепляет candidate_sha — worktree обязан стоять на нём.
+  const submitRound = sha => { git(tree, 'reset', '--hard', '-q', sha); submitted.push(sha); };
+  for (const sha of candidates.slice(0, 3)) {
+    submitRound(sha);
+    assert.equal((await advance(cfg)).phase, 'working', `раунд ${sha.slice(-2)} — обычный возврат`);
+  }
+  assert.equal(effects.feedback.length, 3);
+
+  // Четвёртый L2-раунд — лимитный: hold до арбитража, feedback не уходит.
+  submitRound(candidates[3]);
+  const stopped = await advance(cfg);
+  assert.equal(stopped.phase, 'hold');
+  assert.equal(stopped.reason, 'l2_rework_limit_exceeded');
+  assert.equal(effects.feedback.length, 3, 'четвёртый REWORK не вернулся воркеру — пятого круга нет');
+  assert.equal(effects.arbitrations, 0, 'арбитраж после лимитного раунда не запускается');
+  const blocked = await card();
+  assert.equal(blocked.state, 'blocked');
+  assert.match(blocked.blocked?.reason ?? '', /l2_rework_limit_exceeded/);
+
+  // Чистая остановка: терминальный hold — новый handoff не возобновляет проверку.
+  const verifies = effects.verify;
+  submitted.push('d'.repeat(40));
+  const after = await advance(cfg);
+  assert.equal(after.phase, 'hold');
+  assert.equal(effects.verify, verifies, 'verify на пятый раунд не вызывался');
 });
