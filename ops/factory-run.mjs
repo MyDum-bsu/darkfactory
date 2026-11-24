@@ -16,7 +16,7 @@
 //     [--interval-ms N] [--allow-live-pilot] [--recheck-rejected-handoff] \
 //     [--dry-run] [--json]
 import { execFile, spawn } from 'node:child_process';
-import { lstat, realpath, readFile } from 'node:fs/promises';
+import { lstat, readdir, realpath, readFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
@@ -395,6 +395,10 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
          (inside(abCatalog, abWorkspace) || inside(abWorkspace, abCatalog)))) {
       fail('path_inside_worktree');
     }
+    // Контроллер принимает только пустой каталог наблюдателя
+    // ((await readdir(...)).length === 0 в enrollAbPilot): непустой
+    // отклоняется здесь, до Git-конфига, а не после него.
+    if ((await readdir(abWorkspace)).length !== 0) fail('path_not_empty');
   }
 
   // CLI-override без конфликта с политикой передаётся контроллеру через

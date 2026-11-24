@@ -875,6 +875,9 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     // Git-конфига, для всех источников стоп-пути.
     const pubDir = join(dir, 'pub');
     await mkdir(pubDir);
+    // Режим фикстуры — явный, а не от umask: под umask 077 mkdir дал бы
+    // приватный каталог и проверка отказа была бы ложной.
+    await chmod(pubDir, 0o755);
     await assert.rejects(() => runPlan(runValues(policy, state,
       { switch: join(pubDir, 'stop') })), /switch_dir_not_private/);
     const abPub = { ...policySpec(wt), abPilot: { switch: join(pubDir, 'ab-stop') } };
@@ -931,6 +934,16 @@ test('run: --switch неканоническая строка и lstat-ошиб�
     // Существующий каталог вместо стоп-файла: контроллер отклоняет
     // не-файл (isFile() === false) — отказ до Git-конфига для всех
     // источников стоп-пути.
+    // abPilot.observerWorkspace — только пустой каталог у контроллера:
+    // оставшийся файл отклоняется при построении плана, до Git-конфига.
+    const abWs = join(ops, 'observer');
+    await mkdir(abWs);
+    await writeFile(join(abWs, 'leftover'), 'x');
+    const abWsFull = { ...policySpec(wt),
+      abPilot: { switch: join(ops, 'ab-stop'), observerWorkspace: abWs } };
+    const fAbWsFull = await withPolicy(dir, abWsFull);
+    await assert.rejects(() => runPlan(runValues(fAbWsFull, state)),
+      /path_not_empty/);
     const swDir = join(ops, 'swdir');
     await mkdir(swDir);
     const abDirStop = { ...policySpec(wt), abPilot: { switch: swDir } };
