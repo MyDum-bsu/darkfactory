@@ -17,7 +17,7 @@
 //     [--dry-run] [--json]
 import { execFile, spawn } from 'node:child_process';
 import { lstat, readdir, realpath, readFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { createPilotSwitch } from '../board_pipeline/pilot-gate.mjs';
@@ -26,6 +26,11 @@ import { opencodeGoPolicyViolation, retiredProviderViolation }
 
 const execFileAsync = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
+
+// Тот же allowlist системных каталогов, что у sandboxExtras рантайма:
+// тождественное readonly-монтирование хоста (from === to).
+const HOST_SYSTEM_DIRS = new Set(
+  ['/usr', '/etc/fonts', '/etc/texmf', '/var/lib/texmf', '/opt/google/chrome']);
 
 function fail(code) { throw new Error(code); }
 
@@ -259,22 +264,36 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     operatorFiles.push(await nestedPolicyFile(
       join(dirname(policy.reviewGate), 'routes.json'), treeAliases));
   }
-  // mounts[].from проверок выбранного профиля (route.checkProfile) —
-  // операторские пути зависимостей: та же каноничность, что у
-  // sandboxExtras рантайма ('An operator dependency mount must be a
-  // canonical directory'). Без проверки при построении плана dry-run
-  // ложно подтверждал бы конфигурацию, которую обязательная локальная
-  // проверка отклонит уже при выполнении воркером.
-  for (const recipe of
-    policy?.profiles?.[policy?.route?.checkProfile]?.checks ?? []) {
+  // mounts[].from рецептов проверок и visual-гейта выбранного профиля
+  // (route.checkProfile) — операторские пути зависимостей: та же
+  // каноничность и тот же allowlist пар (from, to), что у sandboxExtras
+  // рантайма ('An operator dependency mount must be a canonical
+  // directory' / 'is outside the allowlist'). Без проверки при
+  // построении плана dry-run ложно подтверждал бы конфигурацию, которую
+  // обязательная локальная проверка отклонит уже при выполнении
+  // воркером.
+  const runProfile = policy?.profiles?.[policy?.route?.checkProfile];
+  const runRecipes = [...(runProfile?.checks ?? []),
+    ...(runProfile?.visual === undefined ? [] : [runProfile.visual])];
+  for (const recipe of runRecipes) {
     for (const mount of recipe?.mounts ?? []) {
       const from = mount?.from;
+      const to = mount?.to;
       if (typeof from !== 'string' || !isAbsolute(from)) fail('path_not_absolute');
       const real = await realpath(from).catch(() => fail('path_missing'));
       if (real !== from) fail('non_canonical_or_symlink_path');
       const st = await lstat(real);
       if (st.isSymbolicLink()) fail('non_canonical_or_symlink_path');
       if (!st.isDirectory()) fail('path_not_dir');
+      // Allowlist пар (from, to) sandboxExtras: /deps — только источник
+      // site-packages; системные каталоги — только тождественное from;
+      // node_modules — только в /candidate/tracker/web/node_modules.
+      if (!((to === '/deps' && basename(from) === 'site-packages') ||
+            (HOST_SYSTEM_DIRS.has(to) && from === to) ||
+            (to === '/candidate/tracker/web/node_modules' &&
+             basename(from) === 'node_modules'))) {
+        fail('mount_outside_allowlist');
+      }
     }
   }
   // Эффективный kill-switch демона (--switch > pilot.killSwitch): как у

@@ -708,28 +708,45 @@ test('run: --worktree обязан совпадать с policy.route.worktree',
       /non_canonical_or_symlink_path/);
     await assert.rejects(() => runPlan(runValues(policy, state,
       { worktree: wtLink })), /non_canonical_or_symlink_path/);
-    // mounts[].from выбранного профиля — операторский путь зависимости:
-    // неканонический (через симлинк) отклоняется при построении плана,
-    // до записи Git-конфига — как его отклонил бы sandboxExtras
-    // рантайма при обязательной локальной проверке. Канонический каталог
+    // mounts[].from проверок и visual-гейта выбранного профиля —
+    // операторский путь зависимости: неканонический (через симлинк)
+    // отклоняется при построении плана, до записи Git-конфига — как его
+    // отклонил бы sandboxExtras рантайма при обязательной локальной
+    // проверке. Канонический каталог с разрешённой парой (from, to)
     // проходит.
     const deps = join(dir, 'site-packages');
     await mkdir(deps);
     const depsLink = join(dir, 'deps-link');
     await symlink(deps, depsLink);
     const mountRecipe = { image: 'sha256:' + 'a'.repeat(64),
-      argv: ['pytest'], cwd: '.', timeout: 60,
+      argv: ['pytest'], cwd: '.', timeoutMs: 60_000,
       mounts: [{ from: depsLink, to: '/deps' }] };
-    const mountPolicy = await withPolicy(dir, { ...policySpec(wt),
+    const withChecks = checks => ({ ...policySpec(wt),
       profiles: { default: { branch: 'b',
         review: { provider: 'google', model: 'gemini-4-neon' },
-        checks: [mountRecipe] } } });
+        checks } } });
+    const mountPolicy = await withPolicy(dir, withChecks([mountRecipe]));
     await assert.rejects(() => runPlan(runValues(mountPolicy, state)),
       /non_canonical_or_symlink_path/);
-    const okMountPolicy = await withPolicy(dir, { ...policySpec(wt),
+    // Та же каноничность действует и на visual.mounts — offlineVisualRunner
+    // передаёт рецепт в тот же sandboxExtras.
+    const visualPolicy = await withPolicy(dir, { ...policySpec(wt),
       profiles: { default: { branch: 'b',
         review: { provider: 'google', model: 'gemini-4-neon' },
-        checks: [{ ...mountRecipe, mounts: [{ from: deps, to: '/deps' }] }] } } });
+        checks: [], visual: mountRecipe } } });
+    await assert.rejects(() => runPlan(runValues(visualPolicy, state)),
+      /non_canonical_or_symlink_path/);
+    // Allowlist пар (from, to) sandboxExtras: для '/deps' разрешён
+    // только источник с именем 'site-packages' — канонический каталог
+    // 'deps' отклоняется до Git-конфига.
+    const namedDeps = join(dir, 'deps');
+    await mkdir(namedDeps);
+    const badPairPolicy = await withPolicy(dir, withChecks([
+      { ...mountRecipe, mounts: [{ from: namedDeps, to: '/deps' }] }]));
+    await assert.rejects(() => runPlan(runValues(badPairPolicy, state)),
+      /mount_outside_allowlist/);
+    const okMountPolicy = await withPolicy(dir, withChecks([
+      { ...mountRecipe, mounts: [{ from: deps, to: '/deps' }] }]));
     const mountPlan = await runPlan(runValues(okMountPolicy, state));
     assert.equal(mountPlan.worktree, wt);
   } finally {
