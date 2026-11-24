@@ -31,7 +31,8 @@ import { worktreeInspector } from './runtime.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 import { createTelemetryRecorder } from './telemetry.mjs';
 import { loadRoleRegistry } from './role-registry.mjs';
-import { runPlaybook } from './playbook-router.mjs';
+import { assertTriadStageCompatible, runPlaybook } from './playbook-router.mjs';
+import { stageTransportKind } from './stage-sandbox-transport.mjs';
 import { foremanArtifacts, foremanDiff } from './ab-pilot.mjs';
 import { PLAYBOOK_TRIAD, stageObservation } from './playbook-test-fixture.mjs';
 import { createBbStageObserver } from './bb-stage-adapter.mjs';
@@ -405,7 +406,10 @@ test('VS-5 beta: stale catalog, substituted triad and missing receipt cannot rea
     await enrollBetaPlaybook(x, registry, 'writer-course', {
       currentRegistry: () => reloaded,
       chooseTriad: triad => fault === 'triad' ? { ...triad,
-        worker: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } } : triad,
+        // Подменённый worker обязан оставаться RO-совместимым (deepseek по
+        // аттестованной таблице): иначе сработает более ранняя граница
+        // foreman_triad_transport_incompatible, а не проверяемый kernel-гейт.
+        worker: { provider: 'pi', model: 'opencode-go/deepseek-v4' } } : triad,
       observeStage() { calls++; return undefined; },
     });
     assert.equal((await x.tick()).phase, 'working');
@@ -475,8 +479,15 @@ test('V2-1: Foreman RO stage transport → L2 → native complete на одно�
     };
     const roTransport = x => ({
       kind: 'attested', witnesses: [], orphans: 0,
-      async assertReadOnly() { return true; },
+      // Фикстура не подменяет допуск: модель стадии обязана реально пройти
+      // stageTransportKind, Landlock-контур — ровно на 'medium'.
+      async assertReadOnly(model) {
+        if (stageTransportKind(model) === 'landlock-ro-v1' &&
+            (model.reasoning ?? 'medium') !== 'medium') return false;
+        return true;
+      },
       async observe(req) {
+        stageTransportKind(req.model);
         assert.equal(req.binding.candidate_sha, x.candidate);
         assert.equal(req.binding.worktree, x.tree);
         assert.match(req.prompt, /Изолированный этап измерения/);
@@ -529,6 +540,40 @@ test('V2-1: Foreman RO stage transport → L2 → native complete на одно�
     assert.equal(y.effects.reviewCalls, 0);
     assert.equal(y.effects.completeCalls, 0);
     assert.equal(denied.orphans, 0);
+  });
+
+test('V2-1: триада, несовместимая с RO-транспортом плейбука, отклоняется до spawn писателя',
+  { timeout: 30_000 }, async t => {
+    const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+    // Devin в executor-слоте не проходит stageTransportKind: playbook
+    // 'writer-course' содержит writer-стадию (technical-writer → executor).
+    const incompatible = { worker: { provider: 'acp-devin', model: 'swe-2-high' },
+      critic: PLAYBOOK_TRIAD.critic, arbiter: PLAYBOOK_TRIAD.arbiter };
+    const pinForemanTriad = async triad => {
+      try {
+        assertTriadStageCompatible({ registry, playbook: 'writer-course', triad });
+      } catch (cause) {
+        return { outcome: 'rejected', reason: cause instanceof Error
+          ? cause.message : 'foreman_triad_transport_incompatible' };
+      }
+      return { plan: [triad.worker], critic: triad.critic, arbiter: triad.arbiter };
+    };
+    const x = await lab(t);
+    x.workerSelector({ pinTriad: () => pinForemanTriad(incompatible) });
+    const held = await x.tick();
+    assert.equal(held.phase, 'hold');
+    assert.equal(held.reason, 'foreman_triad_transport_incompatible');
+    assert.equal(x.effects.spawnCalls, 0, 'писатель не запускался на несовместимой триаде');
+    assert.equal(x.effects.reviewCalls, 0);
+    assert.equal(x.effects.completeCalls, 0);
+    assert.equal((await x.card()).state, 'blocked');
+    // Контрольный проход: совместимая триада той же формы пин не отклоняет.
+    assert.deepEqual(await pinForemanTriad(PLAYBOOK_TRIAD),
+      { plan: [PLAYBOOK_TRIAD.worker], critic: PLAYBOOK_TRIAD.critic, arbiter: PLAYBOOK_TRIAD.arbiter });
+    // Neon high под Landlock (medium-only) — та же fail-closed граница.
+    assert.deepEqual(await pinForemanTriad({ ...PLAYBOOK_TRIAD,
+      arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' } }),
+      { outcome: 'rejected', reason: 'foreman_triad_transport_incompatible' });
   });
 
 // ---------------------------------------------------------------------------

@@ -239,28 +239,31 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
       }
     };
     // Подтверждение spawn потеряно (обрыв/таймаут CLI) — дочерний тред мог
-    // быть создан. Read-only сверка списка: показанные show атрибуты нашего
-    // треда (parent, project, environment workspace или ещё не назначено)
-    // → остановка, затем исходная ошибка.
+    // быть создан. Read-only сверка без жёсткого лимита кандидатов:
+    // показанные show атрибуты нашего треда (parent, project, environment
+    // workspace или ещё не назначено) И уникальный challenge этого запуска
+    // в логе треда — двойное совпадение доказывает, что это наш потерянный
+    // spawn. Соседний тред под теми же parent/project/workspace, но без
+    // маркера этого запуска, никогда не останавливается.
     const stopLostSpawn = async () => {
       const args = ['thread', 'list', '--json'];
       if (project) args.push('--project', project);
       const listed = JSON.parse((await execBb(args, { timeout: 15_000 })).stdout);
       const items = Array.isArray(listed) ? listed : (Array.isArray(listed?.threads) ? listed.threads : []);
-      let shown = 0;
       for (const item of items) {
         if (!BB_ID.test(item?.id ?? '')) continue;
         if (item.parentThreadId !== undefined && item.parentThreadId !== parentThread) continue;
         if (item.environmentPath !== undefined && item.environmentPath !== workspace) continue;
-        if (shown >= 40) break;
-        shown++;
         let current = null;
         try { current = await run(['thread', 'show', item.id, '--json']); } catch { continue; }
-        if (current?.thread?.parentThreadId === parentThread && current?.thread?.projectId === project &&
-            (current?.environment === null || current?.environment === undefined ||
-              current?.environment?.path === workspace)) {
-          await stopThread(item.id);
-        }
+        if (current?.thread?.parentThreadId !== parentThread || current?.thread?.projectId !== project ||
+            !(current?.environment === null || current?.environment === undefined ||
+              current?.environment?.path === workspace)) continue;
+        let events = null;
+        try { events = await run(['thread', 'log', item.id, '--all', '--json']); } catch { continue; }
+        const entries = Array.isArray(events) ? events : (Array.isArray(events?.events) ? events.events : []);
+        if (!entries.some(entry => JSON.stringify(entry).includes(challenge))) continue;
+        await stopThread(item.id);
       }
     };
     let spawned;

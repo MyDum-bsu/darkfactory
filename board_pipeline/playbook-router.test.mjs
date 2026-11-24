@@ -126,3 +126,20 @@ test('mismatched pins, scope, model or switch prevent progression', async () => 
   }), reason('playbook_kernel_unconfirmed'));
   assert.equal(observed, 1);
 });
+
+test('несовместимая с RO-транспортом триада отклоняется до первой стадии', async () => {
+  const registry = await loadRoleRegistry(root);
+  const pinned = { ...attempt, playbook: 'ui', registry_digest: registry.digest };
+  let observed = 0;
+  const observeStage = req => { observed++; return stageObservation(req); };
+  // Devin в executor-слоте (ui-builder) — stage_model_denied на транспорте.
+  await assert.rejects(runPlaybook({ registry, playbook: 'ui', attempt: { ...pinned,
+    triad: { ...PLAYBOOK_TRIAD, worker: { provider: 'acp-devin', model: 'swe-2-high' } } } },
+    { assertKernel: proven, observeStage }), /foreman_triad_transport_incompatible/);
+  // Neon 'high' под Landlock (medium-only) — та же граница.
+  await assert.rejects(runPlaybook({ registry, playbook: 'ui', attempt: { ...pinned,
+    triad: { ...PLAYBOOK_TRIAD, arbiter: { provider: 'google', model: 'gemini-4-neon',
+      reasoningLevel: 'high' } } } },
+    { assertKernel: proven, observeStage }), /foreman_triad_transport_incompatible/);
+  assert.equal(observed, 0, 'ни одна стадия не доходит до наблюдения');
+});

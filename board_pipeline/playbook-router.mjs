@@ -3,6 +3,7 @@ import { isAbsolute } from 'node:path';
 import { isRoleRegistry } from './role-registry.mjs';
 import { artifactVerdict } from './stage-verifier.mjs';
 import { assertTriadIndependent, retiredProviderViolation } from './worker-selector.mjs';
+import { stageTransportKind } from './stage-sandbox-transport.mjs';
 
 const SUBJECT = ['task_id', 'attempt_id', 'epoch', 'worktree', 'candidate_sha', 'subject_digest', 'playbook', 'registry_digest'];
 const SLOTS = ['executor', 'critic', 'arbiter'];
@@ -41,6 +42,37 @@ function enrolledModels(selected) {
   return models;
 }
 
+// Fail-closed сверка закреплённой триады с аттестованным RO-транспортом
+// стадий плейбука. Каждая стадия графа исполняется через observeStage на
+// read-only контуре: слот-модель обязана пройти stageTransportKind, а для
+// Landlock-контура (gemini-4-neon) аттестуется ровно reasoning 'medium' —
+// как в observeLandlock (model.reasoning ?? 'medium'). Несовместимая
+// конфигурация отклоняется ДО запуска писателя (pinTriad) и повторно на
+// границе самого роутера — foreman_triad_transport_incompatible.
+function assertStagesTransportCompatible(graph, roles, models) {
+  for (const stage of Object.values(graph.stages)) {
+    const role = roles[stage.role];
+    const model = models[role.model];
+    if (role.reasoning !== 'inherit' && role.reasoning !== model.reasoning) {
+      throw new Error('playbook_reasoning_not_enrolled');
+    }
+    let kind;
+    try { kind = stageTransportKind(model); }
+    catch { throw new Error('foreman_triad_transport_incompatible'); }
+    if (kind === 'landlock-ro-v1' && (model.reasoning ?? 'medium') !== 'medium') {
+      throw new Error('foreman_triad_transport_incompatible');
+    }
+  }
+}
+
+// Та же проверка по сырой триаде — для границы до spawn (pinTriad в
+// run-isolated): реестр обязан быть уже аттестованным (isRoleRegistry).
+export function assertTriadStageCompatible({ registry, playbook, triad }) {
+  if (!isRoleRegistry(registry) || typeof playbook !== 'string' ||
+      !Object.hasOwn(registry.playbooks, playbook)) throw new Error('foreman_triad_transport_incompatible');
+  assertStagesTransportCompatible(registry.playbooks[playbook], registry.roles, enrolledModels(triad));
+}
+
 async function guard(assertKernel, binding, models) {
   const proof = await assertKernel(binding);
   if (!same(binding, proof, SUBJECT) || proof.held !== true || proof.switchOpen !== true ||
@@ -75,6 +107,9 @@ export async function runPlaybook({ registry, playbook, attempt }, { assertKerne
   if (binding.registry_digest !== registry.digest || binding.playbook !== playbook) throw new Error('playbook_pin_mismatch');
   const models = enrolledModels(attempt.triad);
   const graph = registry.playbooks[playbook];
+  // Триада сверяется с аттестованным RO-транспортом стадий ДО первой
+  // стадии: несовместимый слот не доходит до observeStage.
+  assertStagesTransportCompatible(graph, registry.roles, models);
   const plan = Object.fromEntries(Object.values(graph.stages).map(stage => {
     const role = registry.roles[stage.role];
     const model = models[role.model];

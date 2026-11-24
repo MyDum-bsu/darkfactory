@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { assertStageReadOnly, createStageSandboxTransport, observeStageInSandbox,
-  probeStageSandboxCapability, stageTransportKind, stageVerdictLine } from './stage-sandbox-transport.mjs';
+  probeStageSandboxCapability, stageDockerSandbox, stageTransportKind,
+  stageVerdictLine } from './stage-sandbox-transport.mjs';
 import { REVIEW_IMAGE, runInReadOnlySandbox } from './review-runner.mjs';
 
 const exec = promisify(execFile);
@@ -269,4 +270,26 @@ test('закреплённый reasoning: docker исполняет и атте�
   await assert.rejects(landlock.observe(request({ ...neon, reasoning: 'high' })),
     /stage_reasoning_unsupported/);
   assert.equal(agyCalls, 0, 'неподдерживаемый спек не доходит до запуска');
+});
+
+test('stageDockerSandbox пробрасывает signal в runInReadOnlySandbox через саму обёртку', async () => {
+  const controller = new AbortController();
+  let seen;
+  const result = await stageDockerSandbox({ allow: ['api.openai.com:443'], argv: ['--print'],
+    snapshot: '/tmp/candidate', env: { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', X: 'y' },
+    mounts: [{ src: '/tmp/cfg', dst: '/pi-cfg' }], timeoutMs: 60_000,
+    beforeEffect: async () => {}, signal: controller.signal }, {
+    withProxy: async (opts, cb) => {
+      assert.equal(opts.allow[0], 'api.openai.com:443');
+      return cb('/tmp/upstream.sock');
+    },
+    run: async opts => { seen = opts; return { code: 0, stdout: '' }; },
+  });
+  assert.equal(seen.signal, controller.signal, 'signal обязан дойти до раннера — только он ставит обработчик остановки именованного контейнера');
+  assert.equal(seen.argv[0], 'node');
+  assert.equal(seen.env.X, 'y');
+  assert.equal(seen.env.DF_CHILD_NODE_OPTIONS, '--require /tmp/pi-guard.cjs');
+  assert.equal(seen.env.NODE_OPTIONS, undefined);
+  assert.deepEqual(seen.mounts.map(m => m.dst), ['/pi-cfg', '/model-proxy/client.cjs', '/model-proxy/upstream.sock']);
+  assert.deepEqual(result, { code: 0, stdout: '' });
 });

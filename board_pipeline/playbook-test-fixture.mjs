@@ -18,10 +18,15 @@ const ARTIFACTS = {
   'rubric-review': { rubric: a, criteria: 4, blockers: 0 },
 };
 
+// Триада фикстуры обязана быть реально совместимой с аттестованным
+// RO-транспортом стадий (stageTransportKind): worker — deepseek через
+// pi-контур (docker-ro-v1), critic — openai/gpt-6.2-sol (docker-ro-v1),
+// arbiter — gemini-4-neon под Landlock только на 'medium'. Три разных
+// семейства для assertTriadIndependent сохранены.
 export const PLAYBOOK_TRIAD = Object.freeze({
-  worker: { provider: 'acp-devin', model: 'swe-2-high' },
+  worker: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
   critic: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' },
-  arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' },
+  arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' },
 });
 
 export function stageObservation({ binding, registryDigest, playbook, stage, verifier, model, inputArtifactDigest },

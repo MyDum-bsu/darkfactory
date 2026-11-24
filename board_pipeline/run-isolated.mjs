@@ -41,7 +41,8 @@ import * as workerSelector from './worker-selector.mjs';
 import { abEffectGuard, enrollAbPilot, foremanArtifacts, foremanDiff, guardAbBoard, inspectPilotDiff, runPilotForeman } from './ab-pilot.mjs';
 import { writerWorkspaceReady } from './bb-stage-adapter.mjs';
 import { createStageSandboxTransport } from './stage-sandbox-transport.mjs';
-import { createAttemptSignals } from './signals.mjs';
+import { combinedKillSwitch, createAttemptSignals } from './signals.mjs';
+import { assertTriadStageCompatible } from './playbook-router.mjs';
 import { loadRoleRegistry } from './role-registry.mjs';
 import { effectiveL1ProfileId, resolveL1Profile } from './l1-profiles.mjs';
 
@@ -800,7 +801,11 @@ async function execute() {
           : (foreman?.deadlineMs === undefined ? undefined : Date.now() + foreman.deadlineMs),
         phaseBudgets: foreman?.phaseBudgets,
         phaseSpent,
-        assertOpen: ab?.assertOpen ?? assertOpen ?? undefined,
+        // Все активные kill-switch проверки попытки: ab-пилот, операторский
+        // activation-стоп и daemon --switch. Раньше в isolated daemon-режиме
+        // daemonOpen не доходил до сигнала — перевод стоп-файла в 'stop'
+        // во время активной стадии не абортил попытку.
+        assertOpen: combinedKillSwitch(ab?.assertOpen, assertOpen, daemonOpen),
         lease: { verifyHeld: (id, ep) => port.verifyHeld(id, ep),
           taskId: attempt.task_id, epoch: attempt.epoch },
         disk: { path: tree },
@@ -832,19 +837,30 @@ async function execute() {
         board: port, inspect: telemetry.port('inspect', inspect),
         local: telemetry.port('l1_local', async (binding, trusted) => {
           enterPhase('l1_l3');
-          if (attemptSignals.signal.aborted) throw attemptSignals.signal.reason;
-          if (!ab && !foreman) return runLocal(binding, trusted);
-          diff = ab ? await inspectPilotDiff(ab, { git: rawGit, base: route.base, candidate: binding.candidate_sha })
-            : await foremanDiff({ git: rawGit, base: route.base, candidate: binding.candidate_sha });
-          localEvidence = await runLocal(binding, trusted);
-          return localEvidence;
+          try {
+            if (attemptSignals.signal.aborted) throw attemptSignals.signal.reason;
+            if (!ab && !foreman) return await runLocal(binding, trusted);
+            diff = ab ? await inspectPilotDiff(ab, { git: rawGit, base: route.base, candidate: binding.candidate_sha })
+              : await foremanDiff({ git: rawGit, base: route.base, candidate: binding.candidate_sha });
+            localEvidence = await runLocal(binding, trusted);
+            return localEvidence;
+          } finally {
+            // Таймер l1_l3 снимается на выходе из фазы: при частичном наборе
+            // бюджетов (только l1_l3) его остаток не должен ложно аборитить
+            // последующие review/stages/l2_critic.
+            attemptSignals.leavePhase();
+          }
         }),
         tamper: telemetry.port('tamper', tamperGate),
         visual: telemetry.port('l3_visual', async (binding, trusted) => {
           enterPhase('l1_l3');
-          if (attemptSignals.signal.aborted) throw attemptSignals.signal.reason;
-          visualEvidence = await runVisual(binding, trusted);
-          return visualEvidence;
+          try {
+            if (attemptSignals.signal.aborted) throw attemptSignals.signal.reason;
+            visualEvidence = await runVisual(binding, trusted);
+            return visualEvidence;
+          } finally {
+            attemptSignals.leavePhase();
+          }
         }),
         // Смена брифа/файлов политики во время проверок останавливает кандидата до complete.
         verifyPinned: assertPinned,
@@ -853,6 +869,10 @@ async function execute() {
           if (lost) throw new Error('Lease lost');
           await assertPinned();
           await beforeEffect?.();
+          // На входе в review остаток таймера завершённой фазы (l1_l3)
+          // снимается: ненастроенные phases ограничены только общим
+          // deadline, а не чужим фазовым бюджетом.
+          attemptSignals.leavePhase();
           if (ab?.arm === 'foreman' || foreman) {
             // Доверенные артефакты под verifier каждой стадии: 'inventory'
             // и 'change-set' измеряются фактически, прочие — fail-closed.
@@ -989,7 +1009,36 @@ async function execute() {
             critic: reviewSetup.critic, arbiter: reviewSetup.arbiter },
           log: note => console.log(JSON.stringify(note)),
         });
-        return pinAttemptTriad({ routed, reviewSetup });
+        const pinned = pinAttemptTriad({ routed, reviewSetup });
+        // Закреплённая триада сверяется с аттестованным RO-транспортом
+        // стадий выбранного плейбука ДО запуска писателя: несовместимый слот
+        // (например, Devin в executor-стадии или Neon high под Landlock)
+        // отклоняется здесь, а не после работы писателя и L1.
+        if (pinned?.outcome !== 'rejected' && (foreman !== null || ab?.arm === 'foreman')) {
+          const seat = ab?.arm === 'foreman'
+            ? { registry: ab.registry, playbook: ab.playbook }
+            : null;
+          const registry = seat?.registry ?? await loadRoleRegistry(foreman.catalog);
+          const playbook = seat?.playbook ?? foreman.playbook;
+          if (seat === null && (registry.digest !== foreman.registryDigest ||
+              !Object.hasOwn(registry.playbooks, playbook))) {
+            throw new Error('foreman_registry_unconfirmed');
+          }
+          // Каждый кандидат плана может стать фактическим исполнителем
+          // (резерв подменяет первичного) — проверяются все.
+          const workers = Array.isArray(pinned.plan) && pinned.plan.length
+            ? pinned.plan : workerSelector.selectWorker({ route });
+          for (const worker of workers) {
+            try {
+              assertTriadStageCompatible({ registry, playbook,
+                triad: { worker, critic: pinned.critic, arbiter: pinned.arbiter } });
+            } catch (cause) {
+              return { outcome: 'rejected', reason: cause instanceof Error
+                ? cause.message : 'foreman_triad_transport_incompatible' };
+            }
+          }
+        }
+        return pinned;
       } },
     decisionLedger });
   const observeTick = result => {

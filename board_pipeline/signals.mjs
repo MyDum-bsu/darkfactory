@@ -64,6 +64,18 @@ export function createPhaseBudget({ deadline, budgets = {}, spent: initial = {},
   });
 }
 
+// Объединение всех активных kill-switch проверок попытки в одну: ab-пилот,
+// операторский activation-стоп и daemon --switch. Любой закрытый гейт рвёт
+// опрос createAttemptSignals и абортит сигнал попытки — в isolated
+// daemon-режиме перевод стоп-файла в 'stop' тоже инициирует cleanup
+// активной стадии, а не только границу тика. Ни одной активной проверки —
+// undefined (гейт выключен).
+export function combinedKillSwitch(...checks) {
+  const active = checks.filter(check => typeof check === 'function');
+  if (!active.length) return undefined;
+  return async () => { for (const check of active) await check(); };
+}
+
 // Дисковый preflight: свободное место = bavail * bsize (тот же расчёт, что
 // ops/local/check-workspace-space.mjs). Нехватка или невозможность измерить —
 // fail-closed отказ disk_preflight_failed до любого эффекта.

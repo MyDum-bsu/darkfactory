@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { checkDiskPreflight, createAttemptSignals, createPhaseBudget } from './signals.mjs';
+import { checkDiskPreflight, combinedKillSwitch, createAttemptSignals,
+  createPhaseBudget } from './signals.mjs';
 
 const epoch = (live = { epoch: 7 }) => ({ verifyHeld: async () => live, taskId: '3', epoch: 7 });
 
@@ -123,4 +124,33 @@ test('leavePhase: неиспользованный бюджет покинуто
   await delay(20);
   reenter.phase('l1_l3' in reenter.phaseBudget.budgets ? 'l1_l3' : 'stages');
   reenter.dispose();
+});
+
+test('combinedKillSwitch объединяет все активные гейты: daemon stop-файл абортит попытку', async () => {
+  const seen = [];
+  const check = combinedKillSwitch(
+    async () => { seen.push('ab'); },
+    async () => { seen.push('activation'); },
+    async () => { seen.push('daemon'); throw new Error('kill_switch'); });
+  assert.equal(combinedKillSwitch(), undefined, 'без активных проверок гейт выключен');
+  assert.equal(combinedKillSwitch(null, undefined), undefined);
+  await assert.rejects(check(), /kill_switch/);
+  assert.deepEqual(seen, ['ab', 'activation', 'daemon'], 'каждый активный гейт опрашивается');
+  // daemon-гейт реально доходит до сигнала попытки: в isolated daemon-режиме
+  // stop-файл абортирует активную стадию, а не только границу тика.
+  const signals = createAttemptSignals({ assertOpen: check, pollMs: 10 });
+  await assert.rejects(signals.checkNow(), /kill_switch/);
+  assert.equal(signals.signal.aborted, true);
+  signals.dispose();
+});
+
+test('l1_l3-only бюджет: leavePhase на выходе из фазы снимает таймер — следующие фазы живут на общем deadline', async () => {
+  const signals = createAttemptSignals({ deadline: Date.now() + 60_000,
+    phaseBudgets: { l1_l3: 30 } });
+  signals.phase('l1_l3');
+  signals.leavePhase();
+  await delay(60);
+  assert.equal(signals.signal.aborted, false,
+    'остаток завершённой l1_l3 не должен ложно аборитить попытку');
+  signals.dispose();
 });

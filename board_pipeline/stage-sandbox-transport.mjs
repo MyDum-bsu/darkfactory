@@ -103,11 +103,16 @@ const STAGE_EGRESS = new Map([
   ['deepseek', ['api.deepseek.com:443']],
 ]);
 
-function stageDockerSandbox({ allow, argv, env = {}, mounts = [], signal, ...options }) {
+// signal пробрасывается в runInReadOnlySandbox: обработчик остановки
+// именованного контейнера (docker rm -f <name> раннера) ставится только из
+// переданного сигнала — внешний fallback по --filter volume не нужен.
+// Раннер и proxy инъецируемы вторым аргументом для детерминированных тестов.
+export function stageDockerSandbox({ allow, argv, env = {}, mounts = [], signal, ...options },
+  { withProxy = withModelProxy, run = runInReadOnlySandbox } = {}) {
   const { NODE_OPTIONS, ...bootEnv } = env;
   if (NODE_OPTIONS) bootEnv.DF_CHILD_NODE_OPTIONS = NODE_OPTIONS;
-  return withModelProxy({ allow, beforeConnect: options.beforeEffect },
-    socket => runInReadOnlySandbox({ ...options,
+  return withProxy({ allow, beforeConnect: options.beforeEffect },
+    socket => run({ ...options, signal,
       argv: ['node', '/model-proxy/client.cjs', ...argv], env: bootEnv,
       mounts: [...mounts, { src: PROXY_BOOTSTRAP, dst: '/model-proxy/client.cjs' },
         { src: socket, dst: '/model-proxy/upstream.sock' }] }));
