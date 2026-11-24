@@ -66,10 +66,13 @@ async function canonicalInput(path,
   // которые контроллер отклонит при запуске. outside — те же операторские
   // каталоги вне рабочего каталога сдачи (handoffDir): хранилище внутри
   // inbox сдачи или содержащее его контроллер отклонил бы так же.
+  // Общий родитель учитывается только для файла журнала (как в
+  // factory-run): соседние каталоги памяти/квитанций и сдачи — допустимая
+  // непересекающаяся раскладка, общий родитель их не блокирует.
   if (worktrees.some(w => within(w, real) ||
       (storage && (within(real, w) || within(dirname(real), w)))) ||
-      outside.some(d => within(d, real) ||
-      (storage && (within(real, d) || within(dirname(real), d))))) {
+      outside.some(d => within(d, real) || within(real, d) ||
+      (storage && mustBe === 'file' && within(dirname(real), d)))) {
     fail('path_inside_worktree');
   }
   return real;

@@ -316,7 +316,24 @@ test('enqueue: --policy вычисляет закреплённый policy_diges
       'policy-digest': undefined, policy: policyFile,
       'memory-dir': hoMemory }), /path_inside_worktree/);
     // Канонические хранилища вне дерева в политике проходят, когда
-    // handoffDir — отдельный каталог, не пересекающийся с ними.
+    // handoffDir — отдельный каталог, не пересекающийся с ними. Соседние
+    // каталоги памяти/квитанций и сдачи под общим родителем — допустимая
+    // раскладка (общий родитель учитывается только для файла журнала).
+    const sibBase = join(dir, 'sib');
+    const sibMemory = join(sibBase, 'memory');
+    const sibReceipts = join(sibBase, 'receipts');
+    const sibInbox = join(sibBase, 'inbox');
+    await mkdir(sibMemory, { recursive: true });
+    await mkdir(sibReceipts);
+    await mkdir(sibInbox);
+    await writeFile(policyFile, JSON.stringify({
+      brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
+      decisionLedger: storeLedger,
+      projectMemory: { storeDir: sibMemory, trustedReceiptDir: sibReceipts },
+      handoffDir: sibInbox }));
+    const sibPlan = await buildEnqueuePlan({ ...baseValues(),
+      'policy-digest': undefined, policy: policyFile });
+    assert.match(sibPlan.labels.policy_digest, /^[0-9a-f]{64}$/);
     await writeFile(policyFile, JSON.stringify({
       brief, reviewPrompt, reviewGate: gate, ...pinnedReview,
       decisionLedger: storeLedger, projectMemory: { storeDir: store },
