@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
+import { lstat, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { connect } from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { withModelProxy } from './model-proxy.mjs';
 
@@ -139,4 +142,38 @@ test('explicit DF_MODEL_PROXY_DIRECT=1 allows allowlisted direct mode while stil
     withModelProxy({ allow: ['chatgpt.com:443'], env: { DF_MODEL_PROXY_DIRECT: '0' } }, async () => assert.fail('unexpected')),
     /model_proxy_missing/,
   );
+});
+
+test('deep TMPDIR uses a short private unix socket path and removes it on close', async t => {
+  const originalTmpdir = process.env.TMPDIR;
+  const base = await mkdtemp(join(tmpdir(), 'df-long-tmpdir-test-'));
+  const deep = join(base, ...Array.from({ length: 6 }, (_, i) => `nested-${i}-${'x'.repeat(20)}`));
+  await mkdir(deep, { recursive: true, mode: 0o700 });
+  process.env.TMPDIR = deep;
+  t.after(async () => {
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+    await rm(base, { recursive: true, force: true });
+  });
+
+  const upstream = createServer();
+  upstream.on('connect', (_, socket) => {
+    socket.end('HTTP/1.1 200 Connection Established\r\n\r\nlong path response');
+  });
+  upstream.listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  t.after(() => new Promise(resolve => upstream.close(resolve)));
+
+  let endpoint;
+  await withModelProxy({ allow: ['chatgpt.com:443'], env: { HTTPS_PROXY: `http://127.0.0.1:${upstream.address().port}` } },
+    async path => {
+      endpoint = path;
+      assert.match(path, /^\/tmp\/df-mp-.+\/m\.sock$/);
+      assert.ok(Buffer.byteLength(path, 'utf8') <= 88);
+      assert.equal((await lstat(dirname(path))).mode & 0o077, 0);
+      assert.equal((await readdir(deep)).length, 1);
+      assert.match(await exchange(path, tunnel('chatgpt.com:443')), /long path response$/);
+    });
+  assert.deepEqual(await readdir(deep), []);
+  await assert.rejects(lstat(dirname(endpoint)), { code: 'ENOENT' });
 });

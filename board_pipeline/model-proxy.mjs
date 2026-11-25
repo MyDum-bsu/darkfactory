@@ -125,7 +125,8 @@ export async function withModelProxy({ allow, bootstrap = [], env = process.env,
   };
   const proxy = proxyConfig(env);
   const dir = await mkdtemp(join(tmpdir(), 'df-model-proxy-'));
-  const path = join(dir, 'model.sock');
+  let socketDir = dir;
+  let path = join(dir, 'model.sock');
   const password = hostClient ? randomBytes(32).toString('hex') : null;
   const auth = password === null ? null : Buffer.from(`Basic ${Buffer.from(`review:${password}`).toString('base64')}`);
   const pending = new Set();
@@ -157,6 +158,11 @@ export async function withModelProxy({ allow, bootstrap = [], env = process.env,
     }
   });
   try {
+    if (!hostClient && Buffer.byteLength(path, 'utf8') > 88) {
+      socketDir = await mkdtemp(join('/tmp', 'df-mp-'));
+      await chmod(socketDir, 0o700);
+      path = join(socketDir, 'm.sock');
+    }
     if (hostClient) server.listen(0, '127.0.0.1');
     else server.listen(path);
     await once(server, 'listening');
@@ -171,6 +177,7 @@ export async function withModelProxy({ allow, bootstrap = [], env = process.env,
     for (const request of pending) request.destroy();
     for (const socket of sockets) socket.destroy();
     if (server.listening) await new Promise(resolve => server.close(resolve));
+    if (socketDir !== dir) await rm(socketDir, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
   }
 }

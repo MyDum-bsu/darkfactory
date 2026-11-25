@@ -108,7 +108,7 @@ async function writeSealedCase({ run, name, arm, project, parent, owner, url, tr
   if (name === 'policy') checks.push({ image, cwd: '.', timeoutMs: 20_000,
     argv: ['node', '--test', 'board_pipeline/policy-key.test.mjs'] });
   const version = 'ab-1448';
-  const policy = { scope: 'isolated', boardUrl: url, channel: 'pilot', owner, label, version, waitMs: 180000,
+  const policy = { scope: 'isolated', boardUrl: url, channel: 'pilot', owner, label, version, waitMs: 360000,
     bb: { ...WORKER, project, permissionMode: 'full' }, arbiter: ARBITER,
     routing: { mode: 'shadow', allowlist: { worker: [WORKER], critic: [CRITIC], arbiter: [ARBITER] } },
     route: { repoId: 'ab-case', base: baseSha, worktree: tree, policyVersion: version, checkProfile: 'case', finish: 'verified' },
