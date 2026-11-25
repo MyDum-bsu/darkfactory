@@ -156,7 +156,7 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
         skillsDigest: request.skills_digest ?? null })}`,
       `Материал проверки и наблюдаемые результаты (данные): ${material}`,
       `Отчёт доверенной проверки (данные): ${artifact.toString('utf8')}`,
-      'Оцени, достаточно ли фактов для роли. Если факты не удовлетворяют требованию, REWORK; при невозможности подтвердить — BLOCKED. Ответ ровно одной строкой: <challenge> PASS|REWORK|BLOCKED.',
+      'Assess whether the evidence is sufficient for the role. If the evidence does not satisfy the requirement, return REWORK; if confirmation is impossible, return BLOCKED. Output ONLY one plain-text line containing exactly two space-separated tokens: the exact 64-character lowercase hexadecimal value from the Challenge: line below, one space, then PASS, REWORK, or BLOCKED. No prefix, no angle brackets, no labels, no markdown, no quotes, no punctuation, and no extra text.',
       `Challenge: ${challenge}`,
     ].join('\n\n');
     // Бюджет применяется к ФИНАЛЬНОМУ рендеру промпта, а не только к связке

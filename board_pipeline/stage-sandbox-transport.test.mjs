@@ -10,6 +10,7 @@ import { assertStageReadOnly, createStageSandboxTransport, observeStageInSandbox
   probeStageSandboxCapability, settleWithAbort, stageDockerSandbox, stageTransportKind,
   stageVerdictLine } from './stage-sandbox-transport.mjs';
 import { REVIEW_IMAGE, runInReadOnlySandbox } from './review-runner.mjs';
+import { STAGE_VERDICT_INSTRUCTION } from './stage-verifier.mjs';
 
 const exec = promisify(execFile);
 const hex = ch => ch.repeat(64);
@@ -40,6 +41,14 @@ async function fixture(t, { files = { 'a.txt': 'data' } } = {}) {
 
 const request = model => ({ binding: { task_id: '3', candidate_sha: sha, worktree: 'wt' },
   model, prompt: 'Изолированный этап', challenge, artifactDigest });
+
+test('stage verdict instruction: однозначный plain-text контракт без angle-bracket placeholder', () => {
+  assert.ok(STAGE_VERDICT_INSTRUCTION.startsWith('Output ONLY '));
+  assert.ok(STAGE_VERDICT_INSTRUCTION.includes('Output ONLY'));
+  assert.ok(!STAGE_VERDICT_INSTRUCTION.includes('<challenge>'));
+  assert.match(STAGE_VERDICT_INSTRUCTION, /exactly two space-separated tokens/);
+  assert.match(STAGE_VERDICT_INSTRUCTION, /64-character lowercase hexadecimal/);
+});
 
 test('маршрут модели: neon → landlock, sol/deepseek/pi-openai → docker, запрещённые — denied', () => {
   assert.equal(stageTransportKind(neon), 'landlock-ro-v1');
@@ -112,15 +121,22 @@ test('docker-ro-v1: аттестованный witness, конфигурация
   assert.match(instruction, /no markdown backticks, no bold, no punctuation/);
   assert.ok(instruction.indexOf('Output ONLY') > instruction.indexOf('Challenge:'),
     'однозначная verdict-инструкция завершает stage prompt');
+  const exactPass = `Exact PASS format: ${challenge} PASS`;
+  assert.ok(instruction.includes(exactPass));
+  assert.ok(instruction.indexOf(exactPass) > instruction.indexOf(`Challenge: ${challenge}`),
+    'конкретный PASS-пример следует после строки Challenge');
+  assert.ok(!instruction.includes('<challenge>'));
   const guard = await readFile(new URL('./pi-guard.cjs', import.meta.url), 'utf8');
   assert.match(guard, /44100/, 'pi-guard жёстко запрещает порт 44100');
 });
 
 test('landlock-ro-v1: publishSnapshot, stage_witness и агрегированный транскрипт', async t => {
   const { worktree, journal, piRoot, unpack } = await fixture(t);
+  const prompts = [];
   const transport = createStageSandboxTransport({ worktree, journal, piRoot, unpack,
     probeLandlock: async () => true, worktreeFingerprintImpl: fp,
-    agyTransport: async ({ snapshot, publishSnapshot }) => {
+    agyTransport: async ({ prompt, snapshot, publishSnapshot }) => {
+      prompts.push(prompt);
       await publishSnapshot();
       return { code: 0, stdout: 'stream-bytes', cwd: snapshot };
     },
@@ -133,6 +149,12 @@ test('landlock-ro-v1: publishSnapshot, stage_witness и агрегированн
   assert.equal(witness.transport, 'landlock-ro-v1');
   assert.equal(witness.mode, 'read-only');
   assert.equal(witness.challenge, challenge);
+  const [instruction] = prompts;
+  const exactPass = `Exact PASS format: ${challenge} PASS`;
+  assert.ok(instruction.includes(exactPass));
+  assert.ok(instruction.indexOf(exactPass) > instruction.indexOf(`Challenge: ${challenge}`),
+    'landlock prompt тоже показывает конкретный PASS-пример после Challenge');
+  assert.ok(!instruction.includes('<challenge>'));
   assert.match(witness.transcript_sha256, /^[a-f0-9]{64}$/);
   assert.equal(witness.checkpoint, witness.transcript_sha256.slice(0, 32));
 });
@@ -233,6 +255,7 @@ test('stageVerdictLine: markdown-обёртка и точка допускают
     `${foreign} PASS`,
     `**${foreign} REWORK**`,
     `the verdict is ${challenge} PASS`,
+    `<challenge> ${challenge} PASS`,
     `${challenge} PASS because tests passed`,
     `**${challenge} PASS`,
     `\`${challenge} PASS**`,

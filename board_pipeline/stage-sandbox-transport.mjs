@@ -357,6 +357,7 @@ export function createStageSandboxTransport({
         '',
         `Challenge: ${challenge}`,
         STAGE_VERDICT_INSTRUCTION,
+        `Exact PASS format: ${challenge} PASS`,
       ].join('\n');
       const argv = ['/bin/sh', '-c',
         'mkdir -p /tmp/.pi/agent /tmp/session; ' +
@@ -471,6 +472,7 @@ export function createStageSandboxTransport({
         'Файлы кандидата доступны read-only в candidate/ — прочитай их инструментами чтения (read_file, grep_search, find_by_name, list_dir).',
         `Challenge: ${challenge}`,
         STAGE_VERDICT_INSTRUCTION,
+        `Exact PASS format: ${challenge} PASS`,
       ].join('\n\n');
       let live;
       try {

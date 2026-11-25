@@ -9,8 +9,10 @@ const digest = value => typeof value === 'string' && HEX.test(value);
 const sha40 = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 
 export const STAGE_VERDICT_INSTRUCTION =
-  'Output ONLY the single plain-text line <challenge> PASS (or <challenge> REWORK / <challenge> BLOCKED): ' +
-  'the challenge value, one space, then the verdict. Use no markdown backticks, no bold, no punctuation, and no other text.';
+  'Output ONLY the single plain-text line containing exactly two space-separated tokens: ' +
+  'the exact 64-character lowercase hexadecimal value from the Challenge: line above, one space, ' +
+  'then PASS, REWORK, or BLOCKED. Use no markdown backticks, no bold, no punctuation, no labels, ' +
+  'no quotes, no angle brackets, no prefixes, and no other text; do not include the word challenge.';
 
 // These are contracts for observations made by trusted adapters, not commands
 // or a substitute for L1/L2/L3. For example, a Lean adapter must run the check.
