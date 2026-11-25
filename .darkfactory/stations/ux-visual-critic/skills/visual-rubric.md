@@ -1,30 +1,34 @@
-# visual-rubric — Satisfaction Testing для ux-visual-critic
+# visual-rubric — Satisfaction Testing for ux-visual-critic
 
-## Жёсткие блокеры
-- `unstyledControls`: нативный вид контрола или контрол вне дизайн-системы.
-  Порог: **0**.
-- `uncollapsedLongLists`: список/таблица длиннее **10** видимых элементов без
-  свёртки, пагинации или виртуализации. Порог: **0**.
-- `missingStates`: `loading`, `empty`, `error` или `ready` не показан/не доступен.
-  Порог: **0**.
-- `consoleErrors`, `a11yViolations`, `a11yCritical`: любое значение >0 — blocker.
-- `holdoutFailures`: любой провал скрытого сценария — blocker.
-- `satisfactionScore`: ниже **85** — REWORK даже при нулевых счётчиках.
+## Hard blockers
+- `unstyledControls`: native-looking control or control outside the design
+  system. Threshold: **0**.
+- `uncollapsedLongLists`: list/table longer than **10** visible items without
+  collapsing, pagination, or virtualization. Threshold: **0**.
+- `missingStates`: `loading`, `empty`, `error`, or `ready` is not shown/not
+  available. Threshold: **0**.
+- `consoleErrors`, `a11yViolations`, `a11yCritical`: any value >0 is a blocker.
+- `holdoutFailures`: any hidden scenario failure is a blocker.
+- `satisfactionScore`: below **85** means REWORK even with zero counters.
 
-## Обязательные viewport
-Оценивай отдельно `1440x900` и `1024x768`. Нет PNG одного viewport — покрытие
-неполное, PASS запрещён. Для каждого вычета укажи viewport.
+## Mandatory viewports
+Evaluate `1440x900` and `1024x768` separately. If one viewport has no PNG,
+coverage is incomplete and PASS is forbidden. Identify the viewport for every
+deduction.
 
-## Балл
-Начинай со 100 и вычитай только наблюдаемое:
-- blocker по контролу/списку/состоянию/a11y/holdout: минимум 15 за категорию;
-- визуальная иерархия нечитаема или primary action теряется: 10–20;
-- overflow, наложение, случайная сетка/типографика: 5–15 по тяжести;
-- мелкая полировка без нарушения сценария: не более 5 и не блокирует сама по себе.
+## Score
+Start at 100 and subtract only observed defects:
+- blocker by control/list/state/a11y/holdout: at least 15 per category;
+- unreadable visual hierarchy or lost primary action: 10–20;
+- overflow, overlap, accidental grid/typography: 5–15 by severity;
+- minor polish without scenario violation: at most 5 and not independently
+  blocking.
 
-Не поднимай итог до 85 «в целом». Итог — сумма пунктов, каждый с capture и областью.
+Do not raise the total to 85 "overall". The total is the sum of items, each
+with capture and area.
 
-## Координаты REWORK
-Каждая blocking violation обязана быть actionable для воркера без раскрытия
-holdout: category, viewport, CSS selector или bounding box `x/y/width/height`.
-Текст сценария, путь файла, секрет, host path и ANSI escape в violation запрещены.
+## REWORK coordinates
+Every blocking violation must be actionable for the worker without exposing
+the holdout: category, viewport, CSS selector or bounding box
+`x/y/width/height`. Scenario text, file path, secret, host path, and ANSI
+escape are forbidden in a violation.

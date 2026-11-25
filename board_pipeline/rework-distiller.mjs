@@ -67,32 +67,32 @@ const PATTERNS = Object.freeze([
     category: 'assert_under_optimize',
     match: /\bassert\b[\s\S]{0,160}(-\s?o\b|optimiz|production|-o\b)/i,
     alt: /(-\s?o\b|optimiz|production)[\s\S]{0,160}\bassert\b/i,
-    rule: 'Не используй assert для проверок, обязательных в релизе: под флагом оптимизации (-O, production) assert-ы стираются — проверяй явным if/throw.',
+    rule: 'Do not use assert for checks required in release: optimization flags (-O, production) erase asserts — check explicitly with if/throw.',
     risk_level: 'medium',
   },
   {
     category: 'host_path_leak',
     match: /(^|\s)\/(home|users)\/[a-z0-9._-]+/i,
-    rule: 'В коде и тестах нет путей вида /home/<user>/... — только параметры, env и пути, вычисляемые от корня.',
+    rule: 'Code and tests must not contain paths like /home/<user>/... — use only parameters, env, and paths computed from the root.',
     risk_level: 'medium',
   },
   {
     category: 'non_atomic_write',
     match: /(не\s)?атомарн|atomic|tmp.*rename|rename.*tmp|temporar/,
     context: /запис|write|файл|handoff|конверт/,
-    rule: 'Файлы пиши атомарно: временный файл в том же каталоге + rename; частичная запись недопустима.',
+    rule: 'Write files atomically: temporary file in the same directory + rename; partial writes are inadmissible.',
     risk_level: 'medium',
   },
   {
     category: 'missed_edge_case',
     match: /edge.?case|граничн|пуст(ой|ого|ую|ым|ом)|empty|boundary|overflow|null|undefined|none\b/,
-    rule: 'Перед сдачей проверь граничные случаи: пустой и минимальный вход, границы диапазона, null/undefined, повторный вызов.',
+    rule: 'Before handoff, check edge cases: empty and minimal input, range boundaries, null/undefined, repeated invocation.',
     risk_level: 'low',
   },
   {
     category: 'missing_evidence',
     match: /нет\s+(доказ|evidence|квитанц)|missing\s+(evidence|receipt)|без\s+квитанц/,
-    rule: 'Каждая сдача несёт квитанцию и доказательство проверки — утверждение без evidence не считается.',
+    rule: 'Every handoff carries a receipt and verification evidence — a claim without evidence does not count.',
     risk_level: 'low',
   },
 ]);
@@ -212,8 +212,8 @@ export function distillReworkLessons(roundsHistory, { cardId = 'unknown',
   }
   for (const [signature, entry] of seen) {
     if (entry.count < 2) continue;
-    const rule = 'Проверь до сдачи именно то замечание, что уже повторялось в этой попытке: ' +
-      `«${signature.slice(0, 80)}» — повторный блокер не допускается.`;
+    const rule = 'Before handoff, check the exact finding that already repeated in this attempt: ' +
+      `"${signature.slice(0, 80)}" — a repeated blocker is not allowed.`;
     candidates.push({
       id: lessonId('repeated_finding', rule),
       category: 'repeated_finding',

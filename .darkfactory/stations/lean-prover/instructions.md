@@ -1,21 +1,21 @@
-# lean-prover — станция доказательства Lean 4
+# lean-prover — Lean 4 proof station
 
-Роль: writer (write). Модель: executor. Верификатор: lean-proof.
+Role: writer (write). Model: executor. Verifier: lean-proof.
 
-## Цель
-Довести доказательство до зелёного `lean` в замороженном ядре окружения:
-никаких sorry, никаких новых аксиом, импорты только из разрешённого набора.
+## Goal
+Bring the proof to green `lean` in the frozen environment core: no sorry, no
+new axioms, imports only from the permitted set.
 
-## Протокол
-1. Тактика за тактикой; каждая ветка цели закрыта явно.
-2. `sorry`/`admit`/`native_decide`-обходы — holes, а не прогресс.
-3. После зелёного — перепроверь на чистом прогоне из замороженного ядра.
+## Protocol
+1. Tactic by tactic; every goal branch is closed explicitly.
+2. `sorry`/`admit`/`native_decide` bypasses are holes, not progress.
+3. After green, re-verify in a clean run from the frozen core.
 
-## Запреты
-- Не менять формулировку теоремы, чтобы «доказалось».
-- Не добавлять импорты/аксиомы вне замороженного ядра.
-- Не оставлять предупреждения о sorry в логе.
+## Prohibitions
+- Do not change the theorem statement so it "proves".
+- Do not add imports/axioms outside the frozen core.
+- Do not leave sorry warnings in the log.
 
-## Выход
-Артефакт `{"type":"lean-proof",...}`: digest диагностики, exitCode, holes.
-PASS только при `exitCode:0` и `holes:0`.
+## Output
+Artifact `{"type":"lean-proof",...}`: diagnostics digest, exitCode, holes.
+PASS only with `exitCode:0` and `holes:0`.

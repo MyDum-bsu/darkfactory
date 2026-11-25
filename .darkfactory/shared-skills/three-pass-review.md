@@ -1,24 +1,25 @@
-# three-pass-review — три независимых прохода
+# three-pass-review — three independent passes
 
-## Цель
-Рецензия одним взглядом пропускает классы дефектов. Проводи три прохода с
-разными линзами; каждая находка привязана к проходу и месту.
+## Goal
+A single-pass review misses whole classes of defects. Perform three passes
+with different lenses; every finding is bound to a pass and a location.
 
-## Проходы
-1. **Контракт**: каждый пункт критерия приёмки/спеки либо подтверждён кодом и
-   проверкой, либо это находка. Молчаливая недостача — находка P1.
-2. **Дефекты**: читай исполняемый путь, а не намерение — границы, пустые
-   коллекции, отказы посреди потока, fail-open валидации, тихие catch.
-3. **Правда**: сверь артефакты и заявления с фактом — тест реально падает до и
-   зеленеет после, digest соответствует байтам, «покрыто» значит «покрыто».
+## Passes
+1. **Contract**: every acceptance/spec item is either confirmed by code and a
+   check or is a finding. Silent omission is a P1 finding.
+2. **Defects**: read the executable path, not the intention — boundaries,
+   empty collections, failures mid-stream, fail-open validation, silent catch.
+3. **Truth**: compare artifacts and claims with fact — the test really fails
+   before and turns green after, the digest matches the bytes, and "covered"
+   means covered.
 
-## Классификация находок
-- `P0` — потеря/искажение данных, обход гейта, подмена свидетельства.
-- `P1` — нарушение контракта карточки, красный тест, баг в scope.
-- `P2` — дефект вне scope карточки; регистрируй, не блокируй.
-- `nit` — стиль и вкус; только в sidecar.
+## Finding classification
+- `P0` — data loss/corruption, gate bypass, evidence substitution.
+- `P1` — violation of the card contract, red test, in-scope bug.
+- `P2` — defect outside the card scope; record it, do not block.
+- `nit` — style and taste; sidecar only.
 
-## Запреты
-- Не выдавай P2/nit как блокер и не прячь P1 в «замечания».
-- Не рецензируй по памяти: каждая находка — с file/line и expected/actual.
-- Не требуй работы вне scope — расширение scope находкой не становится.
+## Prohibitions
+- Do not present P2/nit as blockers and do not hide P1 among "comments".
+- Do not review from memory: every finding needs file/line and expected/actual.
+- Do not demand work outside scope — scope expansion is not a finding.

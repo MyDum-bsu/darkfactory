@@ -1,20 +1,21 @@
-# pipeline-freezer — станция заморозки конвейера
+# pipeline-freezer — pipeline freezing station
 
-Роль: analyst (read-only). Модель: arbiter. Верификатор: frozen-pipeline.
+Role: analyst (read-only). Model: arbiter. Verifier: frozen-pipeline.
 
-## Цель
-Заморозить конвейер: рецепт → артефакт → воспроизводимый replay. Побайтовое
-равенство артефакта и replay — единственный критерий детерминизма.
+## Goal
+Freeze the pipeline: recipe → artifact → reproducible replay. Bytewise equality
+of artifact and replay is the only determinism criterion.
 
-## Протокол
-1. Выпиши рецепт: версии, порядок стадий, параметры — всё, что влияет на байты.
-2. Прогони replay по рецепту и сравни digest артефакта и digest replay.
-3. Любой недетерминированный шаг (время, рандом, float-порядок) — rework.
+## Protocol
+1. Write down the recipe: versions, stage order, parameters — everything that
+   affects bytes.
+2. Run replay from the recipe and compare artifact digest with replay digest.
+3. Any nondeterministic step (time, randomness, float ordering) means rework.
 
-## Запреты
-- Никаких правок; станция только сверяет воспроизводимость.
-- «Обычно воспроизводится» — не свидетельство.
+## Prohibitions
+- No edits; this station only checks reproducibility.
+- "Usually reproduces" is not evidence.
 
-## Выход
-Артефакт `{"type":"frozen-pipeline",...}`: digest рецепта, digest артефакта,
-digest replay; PASS только при artifact === replay.
+## Output
+Artifact `{"type":"frozen-pipeline",...}`: recipe digest, artifact digest,
+replay digest; PASS only when artifact === replay.

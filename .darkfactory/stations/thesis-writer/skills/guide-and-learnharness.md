@@ -1,19 +1,19 @@
-# guide-and-learnharness — пакет по гиду
+# guide-and-learnharness — guide-conformant package
 
-## Гид
-- Разделы пакета — строго в порядке гида; пропущенный или переименованный
-  раздел — missingSection.
-- Каждый раздел отвечает на вопрос гида, а не «занимает место»: абзац общей
-  воды в обязательном разделе считается отсутствующим.
-- Формат ссылок, заголовков и врезок — по гиду, буквально.
+## Guide
+- Package sections are strictly in guide order; a missing or renamed section
+  is a missingSection.
+- Every section answers the guide question rather than "occupying space":
+  generic filler in a required section counts as absent.
+- Link, heading, and callout formats follow the guide literally.
 
-## Learnharness-контракт
-- Пакет самодостаточен: читатель без исходного чата отвечает на контрольные
-  вопросы гида по тексту пакета.
-- Каждое фактическое утверждение разрешимо: ссылка на источник внутри пакета
-  или на код/артефакт — иначе brokenLink/unsupported.
-- Упражнения/вопросы разделов соответствуют уровню и целям карточки.
+## Learnharness contract
+- The package is self-contained: a reader without the original chat can answer
+  the guide control questions from the package text.
+- Every factual claim is resolvable: link to a source inside the package or
+  to code/artifact — otherwise brokenLink/unsupported.
+- Section exercises/questions match the card level and goals.
 
-## Финальная проверка
-Прогони чек-лист: guidesChecked разделов, missingSections=0, brokenLinks=0.
-Любой ноль/пропуск — rework к себе, не к гиду.
+## Final check
+Run the checklist: guidesChecked sections, missingSections=0, brokenLinks=0.
+Any zero/miss is rework to yourself, not to the guide.

@@ -1,25 +1,26 @@
-# session-handoff — передача сессии без потерь
+# session-handoff — lossless session transfer
 
-## Цель
-Следующая сессия должна продолжить с того же места без повторного исследования.
-Хендофф — единственная память между сессиями: всё важное — в нём, не в чате.
+## Goal
+The next session must continue from the same point without repeated research.
+The handoff is the only memory between sessions: everything important belongs
+in it, not in chat.
 
-## Структура
-1. **Состояние**: точный SHA кандидата, ветка, что уже принято и каким
-   свидетельством. Без SHA хендофф недействителен.
-2. **Сделано**: список изменений с файлами; каждый пункт — «что и зачем»,
-   не пересказ diff.
-3. **Осталось**: конкретные следующие шаги в порядке выполнения, с критерием
-   готовности каждого.
-4. **Ловушки**: что пробовал и не сработало, хрупкие места, недопустимые
-   короткие пути — чтобы следующий не повторил тупик.
-5. **Контекст**: ссылки на спеку/карточку/решения владельца, нужные команды
-   проверки.
+## Structure
+1. **State**: exact candidate SHA, branch, what is already accepted, and by
+   which evidence. Without a SHA the handoff is invalid.
+2. **Done**: list of changes with files; each item states "what and why",
+   not a retelling of the diff.
+3. **Remaining**: concrete next steps in execution order, with each step's
+   readiness criterion.
+4. **Traps**: what was tried and failed, fragile spots, forbidden shortcuts —
+   so the next session does not repeat a dead end.
+5. **Context**: links to spec/card/owner decisions and the verification
+   commands needed.
 
-## Запреты
-- Не пиши «всё почти готово» — либо принято со свидетельством, либо нет.
-- Не включай секреты, токены, пути сессий.
-- Не превышай страницу: хендофф — инструкция к продолжению, не отчёт.
+## Prohibitions
+- Do not write "almost done" — either accepted with evidence or not.
+- Do not include secrets, tokens, or session paths.
+- Do not exceed one page: a handoff is a continuation instruction, not a report.
 
-## Выход
-Один документ, по которому холодный читатель продолжает без единого вопроса.
+## Output
+One document from which a cold reader can continue without asking a question.

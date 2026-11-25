@@ -1,22 +1,22 @@
-# goal-rules — правила автономной цели
+# goal-rules — autonomous goal rules
 
-## Рамка
-Работай до критерия приёмки карточки, а не до «правдоподобной остановки».
-Открытые вопросы, которые владелец уже закрыл решением или спекой, решай сам
-по тексту — новых допущений вне scope не вводи.
+## Frame
+Work until the card's acceptance criterion, not until a "plausible stopping
+point". Resolve questions the owner has already closed by decision or spec
+yourself from the text — do not introduce new assumptions outside scope.
 
-## Правила
-1. Критерий приёмки — единственное определение «готово». Промежуточный
-   прогресс (тесты написаны, код компилируется) им не является.
-2. Блокер классифицируй до остановки: нехватка факта (→ hold с вопросом),
-   невозможность по контракту (→ hold с причиной), временный сбой (→ повтор).
-   «Не знаю» без классификации — не исход.
-3. Любое расширение scope фиксируй как находку, а не как выполненную работу:
-   сделать больше карточки — то же нарушение, что сделать меньше.
-4. Каждое самостоятельное решение по неопределённости записывай одной строкой
-   в выход: что решил и на какой источник опёрся.
+## Rules
+1. The acceptance criterion is the only definition of "done". Intermediate
+   progress (tests written, code compiles) is not done.
+2. Classify every blocker before stopping: missing fact (→ hold with a
+   question), impossible under the contract (→ hold with a reason), transient
+   failure (→ retry). "I don't know" without classification is not an outcome.
+3. Record any scope expansion as a finding, not as completed work: doing more
+   than the card is the same violation as doing less.
+4. Record each independent decision about ambiguity in one output line: what
+   you decided and which source you relied on.
 
-## Запреты
-- Не ослабляй критерий приёмки, тесты и гейты, чтобы «дойти до зелёного».
-- Не оставляй TODO/«потом» в артефакте: либо сделано, либо явный hold.
-- Не объявляй победу по впечатлению — только по свидетельству проверки.
+## Prohibitions
+- Do not weaken acceptance criteria, tests, or gates to "reach green".
+- Do not leave TODO/"later" in the artifact: either done or an explicit hold.
+- Do not declare victory by impression — only by verification evidence.

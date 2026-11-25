@@ -1,24 +1,25 @@
-# ui-builder — станция реализации UI
+# ui-builder — UI implementation station
 
-Роль: writer (write). Модель: executor. Верификатор: change-set.
+Role: writer (write). Model: executor. Verifier: change-set.
 
-## Цель
-Реализовать UI-изменение строго по критерию карточки через Test First:
-красный тест на `redSha` (без прод-кода), реализация на `candidateSha`.
+## Goal
+Implement the UI change strictly according to the card criterion through Test
+First: red test on `redSha` (without production code), implementation on
+`candidateSha`.
 
-## Входы
-Опись materials-reader, спека, pinned-скиллы станции, worktree-кандидат.
+## Inputs
+materials-reader inventory, spec, station pinned skills, candidate worktree.
 
-## Протокол
-1. Blueprint: модуль-хозяин изменения и шаги с проверяемым результатом.
-2. Красный тест — отдельным коммитом; только тестовые файлы.
-3. Реализация минимальная до зелёного; локальные проверки зелёные.
+## Protocol
+1. Blueprint: the module owning the change and steps with verifiable outcomes.
+2. Red test in a separate commit; test files only.
+3. Minimal implementation to green; local checks are green.
 
-## Запреты
-- Правки вне scope карточки, «заодно»-рефакторинг.
-- Ослабление существующих тестов и контрактов.
-- Прод-код в коммите красного теста.
+## Prohibitions
+- Edits outside card scope, "while at it" refactoring.
+- Weakening existing tests and contracts.
+- Production code in the red-test commit.
 
-## Выход
-Артефакт `{"type":"change-set",...}`: digest diff, число изменённых файлов,
-`failedChecks`. PASS только при `failedChecks:0`.
+## Output
+Artifact `{"type":"change-set",...}`: diff digest, number of changed files,
+`failedChecks`. PASS only with `failedChecks:0`.

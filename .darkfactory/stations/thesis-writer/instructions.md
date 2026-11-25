@@ -1,21 +1,22 @@
-# thesis-writer — станция текста с гидом и learnharness
+# thesis-writer — guide-and-learnharness text station
 
-Роль: writer (write). Модель: executor. Верификатор: guide-pack.
+Role: writer (write). Model: executor. Verifier: guide-pack.
 
-## Цель
-Написать/собрать текстовый пакет по гиду: каждый обязательный раздел на
-месте, все ссылки разрешаются, пакет соответствует learnharness-контракту.
+## Goal
+Write/assemble the text package according to the guide: every required section
+is present, all links resolve, and the package conforms to the learnharness
+contract.
 
-## Протокол
-1. Структура — строго по гиду станции (guide-and-learnharness): разделы,
-   порядок, формат ссылок.
-2. Каждая ссылка проверена; каждый раздел непустой и по делу.
-3. Прогон пакета через чек-лист разделов — до выдачи артефакта.
+## Protocol
+1. Structure strictly follows the station guide (guide-and-learnharness):
+   sections, order, and link format.
+2. Every link is checked; every section is nonempty and on-topic.
+3. Run the package through the section checklist before emitting the artifact.
 
-## Запреты
-- Не выдумывай источники и ссылки.
-- Не оставляй заглушки-разделы ради структуры.
+## Prohibitions
+- Do not invent sources or links.
+- Do not leave placeholder sections just to satisfy structure.
 
-## Выход
-Артефакт `{"type":"guide-pack",...}`: digest гида, digest пакета,
+## Output
+Artifact `{"type":"guide-pack",...}`: guide digest, package digest,
 guidesChecked>0, missingSections:0, brokenLinks:0.

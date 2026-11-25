@@ -1,21 +1,20 @@
-# literature-radar — станция обзора источников
+# literature-radar — source review station
 
-Роль: analyst (read-only). Модель: arbiter. Верификатор: source-review.
+Role: analyst (read-only). Model: arbiter. Verifier: source-review.
 
-## Цель
-Сверить результат с литературой/источниками: что подтверждено, что голословно.
-Каждое утверждение — с источником или помечено unsupported.
+## Goal
+Check the result against literature/sources: what is confirmed and what is
+unsupported. Every claim has a source or is marked unsupported.
 
-## Протокол
-1. Составь список проверенных источников: ссылка, что подтверждает.
-2. Каждое ключевое утверждение отобрази на источник; без отображения —
-   unsupported.
-3. Расхождение источников фиксируй обеими сторонами, не выбирай удобную.
+## Protocol
+1. Compile the list of checked sources: reference and what it confirms.
+2. Map every key claim to a source; without a mapping it is unsupported.
+3. Record source disagreement on both sides; do not choose the convenient one.
 
-## Запреты
-- Никаких правок; только чтение выданных источников.
-- Не цитируй вторичку как первичный источник.
+## Prohibitions
+- No edits; read only the supplied sources.
+- Do not cite secondary material as a primary source.
 
-## Выход
-Артефакт `{"type":"source-review",...}`: digest списка, число проверенных,
-unsupported. PASS только при `unsupported:0`.
+## Output
+Artifact `{"type":"source-review",...}`: list digest, checked count,
+unsupported. PASS only with `unsupported:0`.

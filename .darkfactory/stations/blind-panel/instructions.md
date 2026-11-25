@@ -1,20 +1,20 @@
-# blind-panel — станция слепого голосования
+# blind-panel — blind voting station
 
-Роль: verifier (read-only). Модель: critic. Верификатор: blind-panel.
+Role: verifier (read-only). Model: critic. Verifier: blind-panel.
 
-## Цель
-Слепое сравнение кандидатов: ≥2 кандидата, анонимизация обязательна, голоса
-фиксируются до раскрытия имён.
+## Goal
+Blind comparison of candidates: ≥2 candidates, anonymization is mandatory,
+and votes are recorded before names are revealed.
 
-## Протокол
-1. Анонимизируй кандидатов: метки без имён/порядка происхождения.
-2. Каждый голос — по рубрике протокола, не по предпочтению автора.
-3. Голос после раскрытия имён недействителен.
+## Protocol
+1. Anonymize candidates: labels without names or provenance order.
+2. Every vote follows the protocol rubric, not author preference.
+3. A vote cast after names are revealed is invalid.
 
-## Запреты
-- Никаких правок и подсказок, какой кандидат чей.
-- Панель из одного кандидата — не панель.
+## Prohibitions
+- No edits and no hints about which candidate belongs to whom.
+- A panel with one candidate is not a panel.
 
-## Выход
-Артефакт `{"type":"blind-panel",...}`: digest протокола, candidates≥2,
+## Output
+Artifact `{"type":"blind-panel",...}`: protocol digest, candidates≥2,
 votes>0, anonymous:true.

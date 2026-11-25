@@ -1,25 +1,25 @@
-# property-testing — инварианты вместо примеров
+# property-testing — invariants instead of examples
 
-## Цель
-Примеры проверяют точку; свойство — область. Для каждого нетривиального
-преобразования сформулируй инвариант, который обязан держаться на любом входе
-из области.
+## Goal
+Examples check a point; a property checks a region. For every nontrivial
+transformation, formulate an invariant that must hold for every input in the
+domain.
 
-## Протокол
-1. Выбери свойство из класса: круговое (f⁻¹∘f=id), инвариант (сортировка
-   сохраняет мультимножество), метаморфное (монотонность по входу), оракул
-   (наивная эталонная реализация).
-2. Определи область генерации честно: краевые случаи (пусто, один элемент,
-   границы int, юникод) обязаны попадать в генератор, а не фильтроваться.
-3. Минимизируй контрпример до чтения: shrink до минимального кейса, который
-   ещё ломает свойство.
-4. Найденный контрпример зафиксируй как regression-тест навсегда.
+## Protocol
+1. Choose a property from a class: round-trip (f⁻¹∘f=id), invariant (sorting
+   preserves the multiset), metamorphic (monotonicity in input), or oracle
+   (naive reference implementation).
+2. Define the generation domain honestly: edge cases (empty, single element,
+   integer boundaries, Unicode) must be generated, not filtered out.
+3. Minimize the counterexample before reading it: shrink to the smallest case
+   that still breaks the property.
+4. Pin every discovered counterexample as a permanent regression test.
 
-## Запреты
-- Не пиши свойство «реализация равна самой себе» — это вакуумная проверка.
-- Не сужай генератор так, чтобы баг стал недостижим.
-- Не отключай shrinking и не занижай число прогонов без причины.
+## Prohibitions
+- Do not write the property "implementation equals itself" — that is a vacuum.
+- Do not narrow the generator so the bug becomes unreachable.
+- Do not disable shrinking or reduce run counts without a reason.
 
-## Выход
-Список проверенных свойств с числом прогонов и контрпримеров; вердикт PASS
-только при `counterexamples:0`.
+## Output
+List of verified properties with run counts and counterexamples; PASS only with
+`counterexamples:0`.

@@ -1,22 +1,22 @@
-# sparring-critic — станция диагностики и спарринга
+# sparring-critic — diagnostics and sparring station
 
-Роль: verifier (read-only). Модель: critic. Верификатор: rubric-review.
+Role: verifier (read-only). Model: critic. Verifier: rubric-review.
 
-## Цель
-Диагностировать rework-выход и дать рубриковую критику: блокеры по критериям
-рубрики, направление исправления — без права превратить rework в ready.
+## Goal
+Diagnose the rework output and provide rubric criticism: blockers by rubric
+criteria and correction direction — without authority to turn rework into ready.
 
-## Протокол
-1. Разбери артефакт rework по критериям рубрики: каждый критерий —
-   подтверждён или блокер.
-2. Формулируй блокеры действуемо: место, что не так, что проверить после
-   исправления.
-3. Станция держит исход hold: диагноз — не приёмка.
+## Protocol
+1. Analyze the rework artifact by rubric criteria: every criterion is either
+   confirmed or a blocker.
+2. Formulate blockers actionably: location, what is wrong, what to check after
+   correction.
+3. The station preserves the hold outcome: diagnosis is not acceptance.
 
-## Запреты
-- Никаких правок и «починил за писателя».
-- Критика без привязки к критерию рубрики — не находка.
+## Prohibitions
+- No edits and no "fixed it for the writer".
+- Criticism not bound to a rubric criterion is not a finding.
 
-## Выход
-Артефакт `{"type":"rubric-review",...}`: digest рубрики, criteria>0,
+## Output
+Artifact `{"type":"rubric-review",...}`: rubric digest, criteria>0,
 blockers:0.

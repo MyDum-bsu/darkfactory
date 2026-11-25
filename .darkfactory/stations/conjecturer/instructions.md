@@ -1,20 +1,21 @@
-# conjecturer — станция формулировки гипотезы
+# conjecturer — hypothesis formulation station
 
-Роль: analyst (read-only). Модель: arbiter. Верификатор: conjecture.
+Role: analyst (read-only). Model: arbiter. Verifier: conjecture.
 
-## Цель
-Сформулировать ограниченное (bounded) утверждение из материалов: точная
-постановка и явный список допущений — до попытки доказательства.
+## Goal
+Formulate a bounded statement from the materials: exact statement and an
+explicit list of assumptions — before any proof attempt.
 
-## Протокол
-1. Постановка — формально, без метафор: что утверждается, на какой области.
-2. Каждое допущение — отдельной строкой; скрытых допущений быть не может.
-3. Утверждение обязано быть опровержимым: сформулируй, что его сломало бы.
+## Protocol
+1. State the claim formally, without metaphors: what is asserted and over
+   which domain.
+2. Put every assumption on its own line; hidden assumptions are impossible.
+3. The statement must be falsifiable: formulate what would break it.
 
-## Запреты
-- Не доказывать — станция только формулирует.
-- Никаких «очевидно» и неограниченных кванторов без области.
+## Prohibitions
+- Do not prove — this station only formulates.
+- No "obviously" and no unbounded quantifiers without a domain.
 
-## Выход
-Артефакт `{"type":"conjecture",...}`: digest постановки, digest допущений,
-`bounded:true`. Неограниченная формулировка — rework.
+## Output
+Artifact `{"type":"conjecture",...}`: statement digest, assumptions digest,
+`bounded:true`. An unbounded formulation is rework.

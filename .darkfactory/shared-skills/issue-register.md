@@ -1,25 +1,25 @@
-# issue-register — реестр открытых проблем
+# issue-register — open issue register
 
-## Цель
-Держать реестр проблем синхронным с реальностью: открытое — только то, что
-воспроизводится сейчас; закрытое — только то, чему есть свидетельство.
+## Goal
+Keep the issue register synchronized with reality: open means reproducible now;
+closed means supported by evidence.
 
-## Протокол
-1. Для каждой открытой записи проверь актуальность против кода/логов, а не
-   по памяти: файл, строка, симптом — всё ещё существует?
-2. Новая проблема: формулировка симптома, минимальное воспроизведение,
-   граница (что именно сломано), владелец вопроса. Без воспроизведения —
-   «наблюдение», не проблема.
-3. Закрытие — только со ссылкой на свидетельство (SHA, тест, лог). «Скорее
-   всего починили» — запись остаётся открытой.
-4. Дубликаты сливай с явной ссылкой «тот же симптом, что №N».
+## Protocol
+1. For each open entry, verify currency against code/logs, not memory: do the
+   file, line, and symptom still exist?
+2. New issue: symptom statement, minimal reproduction, boundary (what exactly
+   is broken), and question owner. Without reproduction it is an "observation",
+   not an issue.
+3. Close only with a link to evidence (SHA, test, log). "Probably fixed" leaves
+   the entry open.
+4. Merge duplicates with an explicit reference: "same symptom as #N".
 
-## Запреты
-- Не закрывай записи ради чистого реестра.
-- Не размывай границу проблемы («что-то не так с X») — одна запись = один
-  воспроизводимый симптом.
-- Не переписывай чужую формулировку; уточняй добавлением.
+## Prohibitions
+- Do not close entries just to make the register clean.
+- Do not blur the issue boundary ("something is wrong with X") — one entry =
+  one reproducible symptom.
+- Do not rewrite someone else's wording; clarify by addition.
 
-## Выход
-Обновлённый реестр: {открыто, закрыто со свидетельством, новые}, с датой
-последней проверки каждой записи.
+## Output
+Updated register: {open, closed with evidence, new}, with the last verification
+date for each entry.

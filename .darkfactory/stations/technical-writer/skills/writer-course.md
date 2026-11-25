@@ -1,15 +1,16 @@
-# writer-course — написание курса по структуре
+# writer-course — writing a course from structure
 
-## От структуры к тексту
-- Пиши урок строго под его цель из outline: всё, что не служит цели урока, —
-  в другой урок или вон.
-- Порядок внутри урока: зачем → что → как проверить себя. Проверка понимания
-  обязана решаться по тексту урока без внешних знаний.
-- Термин при первом использовании объясняется или ссылается на ранний урок.
+## From structure to text
+- Write the lesson strictly for its outline goal: anything that does not serve
+  the lesson goal belongs in another lesson or nowhere.
+- Order within a lesson: why → what → how to check yourself. The comprehension
+  check must be solvable from the lesson text without external knowledge.
+- A term is explained at first use or references an earlier lesson.
 
-## Качество текста
-- Каждое утверждение подтверждено: код, источник, измерение. «Как известно»
-  без опоры — unsupportedClaim.
-- Примеры — воспроизводимые и проверенные: пример, который нельзя запустить,
-  хуже отсутствия примера.
-- Объём урока — по outline; раздутие раздела не закрывает соседний пробел.
+## Text quality
+- Every claim is supported: code, source, measurement. "As is well known"
+  without support is an unsupportedClaim.
+- Examples are reproducible and verified: an example that cannot be run is
+  worse than no example.
+- Lesson length follows the outline; inflating one section does not close a
+  neighboring gap.

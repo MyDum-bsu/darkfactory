@@ -1,16 +1,18 @@
-# writer-course — проектирование курса
+# writer-course — course design
 
-## Цели → уроки
-- Цель формулируется глаголом измеримого результата («объяснит», «соберёт»,
-  «отладит»), не «поймёт»/«узнает».
-- Каждый урок покрывает ≥1 цели и объявляет это явно; урок без цели — груз.
-- Зависимости уроков образуют DAG: поздний урок опирается только на ранние.
+## Goals → lessons
+- A goal is formulated with a measurable-result verb ("explains", "builds",
+  "debugs"), not "understands"/"learns".
+- Every lesson covers ≥1 goal and declares this explicitly; a lesson without
+  a goal is dead weight.
+- Lesson dependencies form a DAG: a later lesson relies only on earlier ones.
 
-## Структура урока
-- Мотив → материал → проверка понимания (вопрос/упражнение), ответ которого
-  проверяем по тексту урока.
-- Нагрузка урока однородна: урок в 3 раза длиннее соседних — разделяй.
+## Lesson structure
+- Motivation → material → comprehension check (question/exercise) whose answer
+  is verifiable from the lesson text.
+- Lesson load is uniform: a lesson three times longer than its neighbors must
+  be split.
 
-## Покрытие
-Перед выдачей построй таблицу цель→урок: пустая строка — uncoveredGoal.
-Покрытие «косвенно, где-то в тексте» не засчитывается.
+## Coverage
+Before output, build a goal→lesson table: an empty row is an uncoveredGoal.
+Coverage "indirectly, somewhere in the text" does not count.

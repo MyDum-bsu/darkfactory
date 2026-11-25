@@ -1,22 +1,22 @@
-# falsify-t1-t7 — классы опровержения
+# falsify-t1-t7 — falsification classes
 
-Перебирай классы по порядку; каждый класс — минимум один честный эксперимент,
-даже если «очевидно не применимо» (запиши, почему).
+Walk the classes in order; each class gets at least one honest experiment,
+even if it is "obviously inapplicable" (record why).
 
-- **T1 Границы**: пусто, единица, дубликаты, min/max области, ноль и отрицательные.
-- **T2 Порядок**: перестановка входа меняет выход там, где порядок не должен
-  играть роли; нестабильная сортировка/итерация.
-- **T3 Типы и кодировки**: юникод, NaN/Infinity, смешанные типы, сериализация
-  туда-обратно ломает инвариант.
-- **T4 Ресурсы**: переполнение, очень длинные входы, вложенность глубже
-  ожидаемой, усечение.
-- **T5 Время и параллельность**: гонки, повторный вызов, повторение на границе
-  таймаута, недетерминизм seed'а.
-- **T6 Предпосылки**: нарушение каждого допущения гипотезы по одному — где
-  формулировка молча перестаёт держаться.
-- **T7 Композиция**: свойство по частям верно, но ломается на связке двух
-  корректных шагов (распределение, ассоциативность, побочный эффект).
+- **T1 Boundaries**: empty, one, duplicates, domain min/max, zero and negative.
+- **T2 Order**: permuting input changes output where order should not matter;
+  unstable sorting/iteration.
+- **T3 Types and encodings**: Unicode, NaN/Infinity, mixed types, round-trip
+  serialization breaks an invariant.
+- **T4 Resources**: overflow, very long inputs, nesting deeper than expected,
+  truncation.
+- **T5 Time and concurrency**: races, repeated invocation, repetition at a
+  timeout boundary, seed nondeterminism.
+- **T6 Premises**: violate each hypothesis assumption one at a time — where
+  the formulation silently stops holding.
+- **T7 Composition**: a property holds piecewise but breaks when two correct
+  steps are combined (distribution, associativity, side effect).
 
-## Фиксация
-Контрпример засчитывается только с минимальным воспроизведением и трассой.
-«Не смог сломать» без числа прогонов по классам — не результат.
+## Recording
+A counterexample counts only with minimal reproduction and a trace. "Could not
+break it" without per-class run counts is not a result.

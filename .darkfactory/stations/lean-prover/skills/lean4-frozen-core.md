@@ -1,19 +1,20 @@
-# lean4-frozen-core — работа в замороженном ядре
+# lean4-frozen-core — working in the frozen core
 
-## Разрешённое
-- Импорты строго из списка ядра карточки; новый импорт — отдельное решение
-  владельца, не твоё.
-- Тактики стандартной библиотеки ядра; кастомные тактики и macro — запрещены.
-- `decide`, `simp`, `omega`, `ring`, `exact`, `intro`, `apply`, конструкторы —
-  базовый набор; всё остальное проверяй по разрешённому списку.
+## Allowed
+- Imports strictly from the card core list; a new import is a separate owner
+  decision, not yours.
+- Tactics from the core standard library; custom tactics and macros are
+  forbidden.
+- `decide`, `simp`, `omega`, `ring`, `exact`, `intro`, `apply`, constructors —
+  the baseline set; check everything else against the permitted list.
 
-## Запрещённое (holes)
-- `sorry`, `admit`, `axiom`, `unsafe`, `native_decide` для пропуска проверки,
-  `set_option ... maxHeartbeats` ради обхода, закомментированные цели.
-- Изменение формулировки теоремы/сигнатуры — это подмена цели, не доказательство.
+## Forbidden (holes)
+- `sorry`, `admit`, `axiom`, `unsafe`, `native_decide` used to skip checking,
+  `set_option ... maxHeartbeats` as a bypass, commented-out goals.
+- Changing the theorem statement/signature is goal substitution, not proof.
 
-## Практика
-1. Доказывай локально: вспомогательная лемма рядом, не в чужом файле.
-2. После каждого закрытия — прогон; не накапливай десять правок до проверки.
-3. Диагностика компилятора — часть артефакта: warnings про sorry недопустимы
-   даже при exit 0.
+## Practice
+1. Prove locally: helper lemma nearby, not in someone else's file.
+2. Run after every closure; do not accumulate ten edits before checking.
+3. Compiler diagnostics are part of the artifact: sorry warnings are
+   inadmissible even with exit 0.

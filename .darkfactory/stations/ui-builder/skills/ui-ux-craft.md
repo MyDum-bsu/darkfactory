@@ -1,85 +1,86 @@
-# ui-ux-craft — боевой стандарт UI/UX
+# ui-ux-craft — production UI/UX standard
 
-Это контракт исполнения, а не рекомендации. Любое отклонение — дефект кандидата.
-Проверяй результат кодом и скриншотами на **1440x900** (desktop) и **1024x768**
-(compact/laptop) до сдачи.
+This is an execution contract, not advice. Any deviation is a candidate defect.
+Verify the result with code and screenshots at **1440x900** (desktop) and
+**1024x768** (compact/laptop) before handoff.
 
-## 1. Дизайн-контракт
+## 1. Design contract
 
-- Используй только семантические токены темы: цвет, фон, поверхность, border,
-  text-primary/secondary, danger/success/warning, focus-ring. Не вводи случайные
-  hex/rgb в компоненте; если токена нет — остановись и расширь дизайн-систему
-  в scope карточки.
-- Типографика фиксирована шкалой: заголовок страницы, заголовок секции, body,
-  caption/label. Не смешивай произвольные px; межстрочный интервал и вес должны
-  исходить из той же шкалы.
-- Сетка и отступы — по базовому шагу 4px: 4/8/12/16/24/32. Внешние края
-  связанных блоков выровнены; случайные 1–3px компенсации запрещены.
-- Контраст текста и интерактивных элементов — **не ниже 4.5:1**; для крупного
-  текста — не ниже 3:1. Не ставь disabled-палитру на активный контрол.
-- Одна колонка на compact viewport не должна порождать горизонтальный скролл;
-  широкие таблицы получают явную адаптивную модель (карточки, sticky column,
-  контролируемый overflow с подписью области).
+- Use only semantic theme tokens: color, background, surface, border,
+  text-primary/secondary, danger/success/warning, focus-ring. Do not introduce
+  random hex/rgb in a component; if a token is missing, stop and extend the
+  design system within the card scope.
+- Typography is fixed by scale: page heading, section heading, body,
+  caption/label. Do not mix arbitrary px values; line height and weight must
+  come from the same scale.
+- Grid and spacing use the 4px base step: 4/8/12/16/24/32. Outer edges of
+  related blocks are aligned; random 1–3px compensations are forbidden.
+- Text and interactive-element contrast is **at least 4.5:1**; for large text,
+  at least 3:1. Do not apply the disabled palette to an active control.
+- One column on a compact viewport must not create horizontal scrolling; wide
+  tables need an explicit adaptive model (cards, sticky column, controlled
+  overflow with the region labeled).
 
-## 2. Контролы и данные
+## 2. Controls and data
 
-- **Запрещены голые нативные контролы**: сырой `<select>`, `<input>`, `<button>`,
-  `<textarea>` без класса дизайн-системы/сброса и токенов; браузерный вид —
-  автоматический rework. То же относится к невыровненной таблице без стилей
-  header/cell/row/state.
-- Все интерактивные элементы имеют состояния default, hover, focus-visible,
-  active, disabled; focus-ring виден и не обрезан overflow.
-- Списки, таблицы и timeline **длиннее 10 элементов** обязаны быть свёрнуты,
-  виртуализированы, отфильтрованы или разбиты на страницы. По умолчанию показывай
-  первые 10 и явный контрол «Показать все/N ещё» с доступным состоянием expanded.
-- Длинные строки, юникод, пустые и очень большие значения проверяются реальными
-  данными. Переполнение обрезается многоточием/переносом по правилу компонента,
-  без налезания на соседние контролы.
-- Формат дат, чисел, валют и пустых значений строго по спеке карточки; не смешивай
-  локали и placeholders внутри одного экрана.
+- **Bare native controls are forbidden**: raw `<select>`, `<input>`, `<button>`,
+  `<textarea>` without a design-system class/reset and tokens; browser default
+  appearance is automatic rework. The same applies to an unaligned table without
+  header/cell/row/state styles.
+- Every interactive element has default, hover, focus-visible, active, and
+  disabled states; the focus ring is visible and not clipped by overflow.
+- Lists, tables, and timelines **longer than 10 items** must be collapsed,
+  virtualized, filtered, or paginated. By default show the first 10 and an
+  explicit "Show all/N more" control with an accessible expanded state.
+- Long strings, Unicode, empty values, and very large values are checked with
+  real data. Overflow is clipped with ellipsis/wrapping according to the
+  component rule, without overlapping neighboring controls.
+- Date, number, currency, and empty-value formats strictly follow the card spec;
+  do not mix locales and placeholders within one screen.
 
-## 3. Четыре обязательных состояния экрана
+## 3. Four required screen states
 
-Каждый экран/виджет с асинхронными данными реализует и визуально проверяет:
+Every screen/widget with asynchronous data implements and visually verifies:
 
-1. `loading` — skeleton/spinner с сохранённой компоновкой и `aria-busy` там,
-   где данные ещё подменены.
-2. `empty` — понятный заголовок, следующее действие и отсутствие ложной таблицы.
-3. `error` — читаемая причина/категория, действие retry/recovery, без сырого
-   stack trace и без потери уже введённых данных.
-4. `ready` — основное состояние с реальными длинными данными.
+1. `loading` — skeleton/spinner with layout preserved and `aria-busy` wherever
+   data is still substituted.
+2. `empty` — clear heading, next action, and no false table.
+3. `error` — readable reason/category, retry/recovery action, no raw stack
+   trace, and no loss of already entered data.
+4. `ready` — primary state with real long data.
 
-Пустой `div`, мигание layout shift или состояние, существующее только в коде,
-но недоступное тесту/скриншоту, считается отсутствующим.
+An empty `div`, layout-shift flicker, or a state that exists only in code but
+cannot be reached by test/screenshot counts as missing.
 
-## 4. Доступность (a11y)
+## 4. Accessibility (a11y)
 
-- Полный сценарий доступен с клавиатуры: Tab/Shift+Tab, Enter/Space, Escape для
-  слоёв; порядок фокуса совпадает с визуальной иерархией.
-- Каждый интерактивный элемент имеет доступное имя (`aria-label`, связанный
-  `<label>` или видимый текст). Иконочная кнопка без имени — blocker.
-- Используй семантические элементы и landmark/heading structure; не имитируй
-  кнопку div'ом. Для custom control добавь роль, состояние и keyboard contract.
-- `aria-expanded`, `aria-controls`, `aria-selected`, `aria-invalid` и live-region
-  обязаны отражать реальное состояние; decorative markup скрыт `aria-hidden`.
-- Не полагайся только на цвет для ошибки/статуса; добавь текст или иконку с именем.
+- The complete scenario is keyboard-accessible: Tab/Shift+Tab, Enter/Space,
+  Escape for layers; focus order matches the visual hierarchy.
+- Every interactive element has an accessible name (`aria-label`, associated
+  `<label>`, or visible text). An icon-only button without a name is a blocker.
+- Use semantic elements and landmark/heading structure; do not imitate a button
+  with a div. For a custom control add role, state, and keyboard contract.
+- `aria-expanded`, `aria-controls`, `aria-selected`, `aria-invalid`, and live
+  regions must reflect real state; decorative markup is hidden with
+  `aria-hidden`.
+- Do not rely only on color for error/status; add text or a named icon.
 
-## 5. Viewport-приёмка
+## 5. Viewport acceptance
 
-Обязательны два прогона и сохранённые captures:
+Two runs and saved captures are mandatory:
 
-- `1440x900`: desktop layout, без пустых мертвых зон и случайного overflow.
-- `1024x768`: compact/laptop layout, контент и основные действия доступны без
-  горизонтального скролла страницы.
+- `1440x900`: desktop layout, no empty dead zones or accidental overflow.
+- `1024x768`: compact/laptop layout, content and primary actions accessible
+  without page-level horizontal scrolling.
 
-На каждом viewport проверь ready plus применимые loading/empty/error. Скриншот —
-PNG, стабильное имя вида `mo-tracker-<state>-<width>x<height>.png`.
+On each viewport check ready plus applicable loading/empty/error. The screenshot
+is PNG with a stable name of form `mo-tracker-<state>-<width>x<height>.png`.
 
-## 6. Финальный self-check перед сдачей
+## 6. Final self-check before handoff
 
-- 0 неотстилизованных контролов; 0 несвёрнутых списков длиннее 10; 0 console errors;
-  0 critical a11y нарушений axe-core; satisfaction score рубрики >= 85.
-- Все строки кода и конфигурации не содержат host-путей; тестовые данные — синтетические,
-  без PII и без доступа к живой БД.
-- Если пункт «почти выполнен», он не выполнен. Не сдавай экран без двух viewport
-  captures и проверки состояний.
+- 0 unstyled controls; 0 uncollapsed lists longer than 10; 0 console errors;
+  0 critical axe-core a11y violations; rubric satisfaction score >= 85.
+- All code and configuration lines contain no host paths; test data is
+  synthetic, without PII and without access to the live database.
+- If an item is "almost done", it is not done. Do not hand off a screen without
+  two viewport captures and state verification.

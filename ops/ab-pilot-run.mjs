@@ -25,7 +25,7 @@ for (const s of ['',null,1,[],{},'A','1x','a b','a\\n','é','a'.repeat(25),'a_1'
 const DOC_ORACLE = `import assert from 'node:assert/strict';
 import fs from 'node:fs'; import {spawnSync} from 'node:child_process';
 const text=fs.readFileSync('docs/typed-handoff-quickstart.md','utf8');
-assert.deepEqual([...text.matchAll(/^## (.+)$/gm)].map(x=>x[1]), ['Поля','Отказ','Проверка']);
+assert.deepEqual([...text.matchAll(/^## (.+)$/gm)].map(x=>x[1]), ['Fields','Rejection','Verification']);
 const blocks=[...text.matchAll(/\x60\x60\x60json\\r?\\n([\\s\\S]*?)\x60\x60\x60/g)];
 assert.equal(blocks.length,1);
 const example=JSON.parse(blocks[0][1]);
@@ -33,7 +33,7 @@ assert.deepEqual(Object.keys(example).sort(),['attempt_id','candidate_sha','epoc
 assert.match(example.candidate_sha,/^[a-f0-9]{40}$/);
 const check=(...args)=>spawnSync(process.execPath,['board_pipeline/handoff-doc-check.mjs',...args],{timeout:3000,encoding:'utf8'});
 assert.equal(check().status,0);
-const invalid='/tmp/ab-invalid-handoff-doc.md'; fs.writeFileSync(invalid,text.replace('## Отказ','## Пропущено'));
+const invalid='/tmp/ab-invalid-handoff-doc.md'; fs.writeFileSync(invalid,text.replace('## Rejection','## Missing'));
 const result=check(invalid); assert.ok(Number.isInteger(result.status)&&result.status!==0); assert.ok((result.stdout+result.stderr).trim());`;
 
 async function writeCatalog(catalog, name) {
@@ -51,7 +51,7 @@ async function writeCatalog(catalog, name) {
   for (const id of steps) {
     await mkdir(join(catalog, '.darkfactory/stations', id, 'skills'), { recursive: true, mode: 0o700 });
     await writeFile(join(catalog, '.darkfactory/stations', id, 'instructions.md'),
-      `# ${id}\n\nСтанция ${id} A/B-пилота: протокол роли, запреты и формат выхода.\n`, { mode: 0o600 });
+      `# ${id}\n\n${id} station of the A/B pilot: role protocol, prohibitions, and output format.\n`, { mode: 0o600 });
   }
   const stages = steps.map((id, i) => ({ id, role: id, next: { pass: steps[i + 1] ?? 'ready', rework: 'hold' } }));
   const manifest = { version: 2, stations: roles, playbooks: { [name]: { entry: steps[0], stages } },
@@ -89,8 +89,8 @@ async function writeSealedCase({ run, name, arm, project, parent, owner, url, tr
   await mkdir(dir, { mode: 0o700 });
   await mkdir(join(run, 'switch'), { mode: 0o700 });
   await writeFile(switchFile, 'run\n', { mode: 0o600 });
-  await writeFile(brief, CASES[name].brief + '\nРаботай только в указанной тестовой копии. Не обращайся к окружению, домашним файлам, внешним данным или другим тредам. Не пользуйся сетью, push, PR или Board. Только локальный commit и заданный конверт.\n', { mode: 0o600 });
-  await writeFile(reviewPrompt, `Независимая read-only проверка. ${CASES[name].brief}\nИзучи точный diff и синтетические тесты. Блокируй только доказанное несоответствие контракту или ослабление тестов. Не обращайся к сети, другим тредам или рабочим данным.`, { mode: 0o600 });
+  await writeFile(brief, CASES[name].brief + '\nWork only in the specified test copy. Do not access the environment, home files, external data, or other threads. Do not use network, push, PR, or Board. Only local commit and the specified envelope.\n', { mode: 0o600 });
+  await writeFile(reviewPrompt, `Independent read-only review. ${CASES[name].brief}\nInspect the exact diff and synthetic tests. Block only proven contract mismatch or test weakening. Do not access the network, other threads, or operational data.`, { mode: 0o600 });
   await cp(join(SOURCE, 'ops/local/board-review.mjs'), reviewGate);
   await writeFile(routes, '{}\n', { mode: 0o600 });
   const label = { key: 'queue', value: `ab-${name}-${arm}` };

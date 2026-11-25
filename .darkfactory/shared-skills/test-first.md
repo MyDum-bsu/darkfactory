@@ -1,25 +1,29 @@
-# test-first — красный тест до реализации
+# test-first — red test before implementation
 
-## Цель
-Любое поведенческое изменение начинается с падающего теста на отдельном
-коммите (`redSha`), воспроизводящего дефект или контракт. Код до красного —
-не Test First.
+## Goal
+Every behavioral change starts with a failing test on its own commit
+(`redSha`) that reproduces the defect or contract. Code before red is not
+Test First.
 
-## Протокол
-1. Зафиксируй `baseSha`; напиши тест(ы), которые падают ИМЕННО на целевом
-   поведении, закоммить как `redSha`. Прод-код в `redSha` трогать нельзя.
-2. Прогони тест на `redSha`: ожидаем exit≠0 с целевой причиной падения
-   (assert/ожидание спеки), не SyntaxError, не «модуль не найден», не 125–127.
-   Нецелевое падение не засчитывается — чини тест, а не выдавай за красный.
-3. Зелёный до реализации (exit 0 на `redSha`) — тест-пустышка: rework.
-4. После реализации прогони те же тесты на `candidateSha`: exit 0.
+## Protocol
+1. Pin `baseSha`; write test(s) that fail specifically on the target behavior
+   and commit them as `redSha`. Production code must not be touched in
+   `redSha`.
+2. Run the test on `redSha`: expect exit≠0 with the target failure reason
+   (assert/spec expectation), not SyntaxError, not "module not found", not
+   125–127. A non-target failure does not count — fix the test rather than
+   passing it off as red.
+3. Green before implementation (exit 0 on `redSha`) means a vacuous test:
+   rework.
+4. After implementation, run the same tests on `candidateSha`: exit 0.
 
-## Запреты
-- Не правь прод-код в коммите красного теста — адаптер отвергает весь diff.
-- Не подгоняй тест под уже написанную реализацию.
-- Не смешивай красный тест с рефакторингом и форматированием.
+## Prohibitions
+- Do not edit production code in the red-test commit — the adapter rejects the
+  entire diff.
+- Do not tune the test to an implementation already written.
+- Do not mix the red test with refactoring or formatting.
 
-## Свидетельство
+## Evidence
 `{"type":"test-first","redSha":<40hex>,"testDiff":<digest>,"redExitCode":<n>,
-"failureReasonDigest":<digest>,"touchesProdCode":false}` — PASS только при
-целевом красном и нетронутом прод-коде.
+"failureReasonDigest":<digest>,"touchesProdCode":false}` — PASS only with a
+targeted red and untouched production code.

@@ -1,20 +1,20 @@
-# falsify-first-oracle — станция опровержения
+# falsify-first-oracle — falsification station
 
-Роль: verifier (read-only). Модель: critic. Верификатор: falsification.
+Role: verifier (read-only). Model: critic. Verifier: falsification.
 
-## Цель
-Попытаться сломать гипотезу ДО её доказательства: систематический поиск
-контрпримеров по классам T1–T7 (см. station skill falsify-t1-t7).
+## Goal
+Try to break the hypothesis BEFORE it is proved: systematic counterexample
+search across classes T1–T7 (see station skill falsify-t1-t7).
 
-## Протокол
-1. Перебери классы опровержения по чек-листу, не по вдохновению.
-2. Каждый кандидат-контрпример — с минимальным воспроизведением и трассой.
-3. Выдержанная попытка сломать — свидетельство крепости, не слабости станции.
+## Protocol
+1. Walk the falsification classes by checklist, not by inspiration.
+2. Every candidate counterexample needs minimal reproduction and a trace.
+3. A survived break attempt is evidence of strength, not station weakness.
 
-## Запреты
-- Никаких правок; только наблюдение и перебор.
-- Не объявлять «контрпримеров нет» без фактического числа прогонов.
+## Prohibitions
+- No edits; observation and search only.
+- Do not declare "no counterexamples" without an actual run count.
 
-## Выход
-Артефакт `{"type":"falsification",...}`: digest трассы, число кейсов,
-counterexamples. PASS только при `counterexamples:0` при честном переборе.
+## Output
+Artifact `{"type":"falsification",...}`: trace digest, case count,
+counterexamples. PASS only with `counterexamples:0` after an honest search.

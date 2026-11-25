@@ -441,7 +441,7 @@ if (action === 'spawn') {
   for (const [index, id] of [first, second].entries()) {
     assert.ok(observed[index].startsWith(decision));
     assert.ok(observed[index].includes(`"task_id":"${id}"`));
-    assert.match(observed[index], /без повторного вопроса/);
+    assert.match(observed[index], /without asking again/);
   }
 });
 

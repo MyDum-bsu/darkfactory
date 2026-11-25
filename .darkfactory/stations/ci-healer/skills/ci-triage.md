@@ -1,21 +1,23 @@
-# ci-triage — классификация красного CI
+# ci-triage — red CI classification
 
-## Классы причин
-1. **Реальная регрессия**: падение воспроизводится локально и детерминированно
-   на кандидате, зелёное на базе. Лечится правкой кода.
-2. **Flaky**: падение плавает между прогонами одного SHA. Лечится точкой
-   недетерминизма (тайминг, порядок, seed, сеть в тесте) — не ретраем.
-3. **Среда**: падение не связано с diff (образ, лимит, внешний сервис).
-   Докажи независимость от diff на базе — иначе это класс 1.
-4. **Сам тест**: тест сломан, а не код. Красный коммит теста — с правкой
-   только тестовых файлов.
+## Cause classes
+1. **Real regression**: the failure reproduces locally and deterministically
+   on the candidate and is green on the base. Treated by a code fix.
+2. **Flaky**: the failure moves between runs of the same SHA. Treated at the
+   nondeterminism point (timing, ordering, seed, network in the test) — not by
+   retrying.
+3. **Environment**: the failure is unrelated to the diff (image, limit,
+   external service). Prove independence from the diff on the base — otherwise
+   it is class 1.
+4. **The test itself**: the test is broken, not the code. The red test commit
+   changes only test files.
 
-## Протокол
-1. Сначала локальное воспроизведение: та же команда, тот же SHA. Нет
-   воспроизведения — нет диагноза.
-2. Один класс — одна правка; «заодно поправил соседнее» — rework.
-3. Доказательство лечения — зелёный прогон ТЕХ ЖЕ проверок, не других.
+## Protocol
+1. Local reproduction first: same command, same SHA. No reproduction means no
+   diagnosis.
+2. One class — one fix; "fixed the neighboring thing too" is rework.
+3. Proof of healing is a green run of THE SAME checks, not different ones.
 
-## Запреты
-Ретрай до зелёного, отключение/ослабление проверки, расширение таймаутов
-«про запас» — это сокрытие красного, не лечение.
+## Prohibitions
+Retrying until green, disabling/weakening a check, or increasing timeouts
+"just in case" hides red rather than healing it.

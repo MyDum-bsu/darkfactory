@@ -470,9 +470,9 @@ test('integration: worker, critic, and arbiter prompts embed pinned read-only pr
     const arbiterPrompt = arbiterIntakePrompt('Spec text', 'Extra rules', undefined, slice);
 
     for (const text of [workerPrompt, criticBlock, arbiterPrompt]) {
-      assert.match(text, new RegExp(`Память проекта \\(read-only, срез digest ${slice.digest}\\)`));
+      assert.match(text, new RegExp(`Project memory \\(read-only, slice digest ${slice.digest}\\)`));
       assert.match(text, /Never bypass tamper gate/);
-      assert.match(text, /прямая запись воркером запрещена/);
+      assert.match(text, /direct writes by the worker are forbidden/);
     }
   } finally { await cleanup(); }
 });

@@ -1,22 +1,24 @@
-# feature-blueprint — план фичи до кода
+# feature-blueprint — feature plan before code
 
-## Цель
-До первой правки зафиксируй минимальный проверяемый план: что меняется, где
-граница интерфейса, как это будет доказано. Код без blueprint — rework.
+## Goal
+Before the first edit, record the minimum verifiable plan: what changes, where
+the interface boundary is, and how it will be proven. Code without a blueprint
+is rework.
 
-## Протокол
-1. Выпиши из карточки критерий приёмки и явный scope. Всё вне scope — запрет.
-2. Найди существующий модуль-хозяин изменения; новый файл/абстракцию создавай
-   только если существующая структура не вмещает контракт, и скажи почему.
-3. Разбей работу на шаги, каждый с проверяемым результатом («файл X экспортирует
-   Y; тест Z красный→зелёный»). Шаг без проверки — не шаг.
-4. Назови главный риск и способ его фальсифицировать самому себе.
+## Protocol
+1. Extract the acceptance criterion and explicit scope from the card. Anything
+   outside scope is forbidden.
+2. Find the existing module that owns the change; create a new file/abstraction
+   only if the current structure cannot hold the contract, and say why.
+3. Break the work into steps, each with a verifiable result ("file X exports
+   Y; test Z goes red→green"). A step without verification is not a step.
+4. Name the main risk and how you will falsify it yourself.
 
-## Запреты
-- Не начинай реализацию, пока шаги не проверяемы пошагово.
-- Не проектируй «на вырост»: только то, что требует карточка.
-- Не копируй чужие паттерны вслепую — сначала прочти соглашения репозитория.
+## Prohibitions
+- Do not start implementation until every step is independently verifiable.
+- Do not design "for growth": implement only what the card requires.
+- Do not copy other patterns blindly — read the repository conventions first.
 
-## Выход
-Артефакт станции-писателя: diff + перечень пройденных проверок (`failedChecks`),
-привязанный к каждому шагу blueprint.
+## Output
+Writer-station artifact: diff + list of completed checks (`failedChecks`),
+bound to each blueprint step.

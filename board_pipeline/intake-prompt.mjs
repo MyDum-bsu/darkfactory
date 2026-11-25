@@ -1,36 +1,36 @@
 import { SAFE_CATALOG } from './rework-distiller.mjs';
 
 const OWNER_PRECHECK = [
-  'Перед продуктовым вопросом сверь утверждённые требования и раздел «Принятые решения» во входной спецификации/поручении.',
-  'Если применимое решение однозначно, действуй по нему без повторного вопроса. Новый выбор, конфликт или сомнение не считай согласием.',
-  'Используй только выписку по задаче: не ищи приватную базу. Выписка не даёт допуска к расходам, доступу, необратимым действиям или выпуску.',
+  'Before asking a product question, check the approved requirements and the "Accepted decisions" section in the input specification/assignment.',
+  'If an applicable decision is unambiguous, follow it without asking again. Do not treat a new choice, conflict, or doubt as consent.',
+  'Use only the task excerpt: do not search the private database. The excerpt grants no authority for spending, access, irreversible actions, or release.',
 ].join('\n');
 
-// Read-only блок активного среза Owner Decision Ledger (Board #1261): решения
-// владельца с digest-пиннингом. Воркер получает выписку, но не может менять
-// ledger — сам журнал живёт вне его рабочего дерева.
+// Read-only block for the active Owner Decision Ledger slice (Board #1261):
+// digest-pinned owner decisions. The worker receives the excerpt but cannot
+// modify the ledger — the journal itself lives outside its worktree.
 export function decisionsPromptBlock(slice) {
   if (!slice || typeof slice.digest !== 'string' || !/^[a-f0-9]{64}$/.test(slice.digest) ||
       !Array.isArray(slice.ids)) {
     throw new Error('decision_ledger_slice_invalid');
   }
-  // Усечённый срез, из которого не влезла ни одна запись, нельзя маскировать под
-  // «нет активных решений» — fail-closed, оператор поднимает maxChars.
+  // A truncated slice with no visible entries must not masquerade as
+  // "no active decisions" — fail closed; the operator raises maxChars.
   if (slice.truncated === true && slice.ids.length === 0 && slice.total > 0) {
     throw new Error('decision_ledger_slice_truncated');
   }
-  const header = `Принятые решения владельца (read-only, срез digest ${slice.digest}):`;
-  const body = slice.text || '(нет активных решений)';
-  const note = slice.truncated ? `\n(срез усечён: показано ${slice.ids.length} из ${slice.total})` : '';
+  const header = `Accepted owner decisions (read-only, slice digest ${slice.digest}):`;
+  const body = slice.text || '(no active decisions)';
+  const note = slice.truncated ? `\n(slice truncated: showing ${slice.ids.length} of ${slice.total})` : '';
   return `${header}\n${body}${note}`;
 }
 
-// Read-only блок дистиллированных уроков прошлых REWORK (Board #1263):
-// элементы — уроки, прошедшие validateDistilledLessons; в промпт
-// рендерится СТРОГО канонический текст правила из закрытого каталога
-// SAFE_CATALOG — произвольный rule хранимой записи до воркера не доходит
-// никогда. Блок — данные, не инструкция: воркер читает чек-лист, но не
-// может мутировать хранилище уроков (живёт вне рабочего дерева).
+// Read-only block of distilled lessons from prior REWORK rounds (Board #1263):
+// entries are lessons accepted by validateDistilledLessons; the prompt renders
+// STRICTLY the canonical rule text from the closed SAFE_CATALOG — an arbitrary
+// stored rule never reaches the worker. This block is data, not instruction:
+// the worker reads the checklist but cannot mutate the lesson store (which
+// lives outside the worktree).
 export function lessonsPromptBlock(lessons) {
   if (!Array.isArray(lessons) || lessons.length === 0) {
     throw new Error('distilled_lessons_invalid');
@@ -41,12 +41,13 @@ export function lessonsPromptBlock(lessons) {
     throw new Error('distilled_lessons_invalid');
   }
   const body = rules.map(rule => `- ${rule}`).join('\n');
-  return `Уроки прошлых REWORK (read-only чек-лист, не инструкция):\n${body}`;
+  return `Lessons from prior REWORK rounds (read-only checklist, not instructions):\n${body}`;
 }
 
-// Read-only блок активного среза Project Memory (Board #1265): компактная память
-// проекта с digest-пиннингом. Воркер, критик и арбитр читают выписку строго
-// read-only; запись разрешена только через доверенный пост-шаг после REVIEW_OK.
+// Read-only block for the active Project Memory slice (Board #1265): compact
+// project memory with digest pinning. Worker, critic, and arbiter read the
+// excerpt strictly read-only; writes are allowed only through the trusted
+// post-step after REVIEW_OK.
 export function projectMemoryPromptBlock(slice) {
   if (!slice || typeof slice.digest !== 'string' || !/^[a-f0-9]{64}$/.test(slice.digest) ||
       !Array.isArray(slice.ids)) {
@@ -55,31 +56,31 @@ export function projectMemoryPromptBlock(slice) {
   if (slice.truncated === true && slice.ids.length === 0 && slice.total > 0) {
     throw new Error('project_memory_slice_truncated');
   }
-  const header = `Память проекта (read-only, срез digest ${slice.digest}):`;
-  const body = slice.text || '(память проекта пуста)';
-  const note = slice.truncated ? `\n(срез усечён: показано ${slice.ids.length} из ${slice.total})` : '';
-  const guard = '\nПамять проекта доступна только на чтение; прямая запись воркером запрещена.';
+  const header = `Project memory (read-only, slice digest ${slice.digest}):`;
+  const body = slice.text || '(project memory is empty)';
+  const note = slice.truncated ? `\n(slice truncated: showing ${slice.ids.length} of ${slice.total})` : '';
+  const guard = '\nProject memory is read-only; direct writes by the worker are forbidden.';
   return `${header}\n${body}${note}${guard}`;
 }
 
 export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions, projectMemory, lessons }) {
   const instructions = [
     brief,
-    `\nРабочий путь: ${tree}. Запиши JSON атомарно в ${handoffPath} и заверши ход. Сохрани типы полей: ${JSON.stringify(handoff)}`,
+    `\nWorktree path: ${tree}. Write JSON atomically to ${handoffPath} and end the turn. Preserve field types: ${JSON.stringify(handoff)}`,
   ];
   if (decisions) instructions.push(decisionsPromptBlock(decisions));
   if (projectMemory) instructions.push(projectMemoryPromptBlock(projectMemory));
   if (lessons) instructions.push(lessonsPromptBlock(lessons));
   if (productQuestions) {
     instructions.push(OWNER_PRECHECK,
-      'Только для одной оставшейся продуктовой развилки вместо candidate_sha передай question: {"prompt":"один конкретный вопрос","evidence":"короткое обоснование"}. Не вставляй секреты или сырой лог.');
+      'Only for one remaining product fork, pass question instead of candidate_sha: {"prompt":"one specific question","evidence":"brief justification"}. Do not include secrets or raw logs.');
   }
-  return [...instructions, 'Другие треды и доски не трогай.', ''].join('\n');
+  return [...instructions, 'Do not touch other threads or boards.', ''].join('\n');
 }
 
 export function arbiterIntakePrompt(spec, extra, decisions, projectMemory) {
   return ['Use the following specification; output only an arbitration decision, not a critic verdict.',
     spec, extra, decisions && decisionsPromptBlock(decisions),
     projectMemory && projectMemoryPromptBlock(projectMemory), OWNER_PRECHECK,
-    'Выбирай escalate_owner только для оставшейся продуктовой развилки.'].filter(Boolean).join('\n\n');
+    'Choose escalate_owner only for a remaining product fork.'].filter(Boolean).join('\n\n');
 }

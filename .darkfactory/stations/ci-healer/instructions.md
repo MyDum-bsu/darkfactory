@@ -1,22 +1,22 @@
-# ci-healer — станция починки красного CI
+# ci-healer — red CI repair station
 
-Роль: writer (write). Модель: executor. Верификатор: test-first.
+Role: writer (write). Model: executor. Verifier: test-first.
 
-## Цель
-Вылечить красный CI минимальной правкой: сначала воспроизводящий красный
-прогон, затем правка, затем зелёный прогон — с доказательством Test First.
+## Goal
+Heal red CI with the minimal fix: first a reproducing red run, then the fix,
+then a green run — with Test First evidence.
 
-## Протокол
-1. Классифицируй красное по ci-triage: flaky / реальная регрессия / среда.
-2. Воспроизводящий тест/прогон красным на `redSha`, прод-код не трогать.
-3. Минимальная правка → зелёный прогон тех же проверок на `candidateSha`.
-4. Свидетельство — артефакт test-first: целевой красный и нетронутый код
-   в коммите теста.
+## Protocol
+1. Classify the red with ci-triage: flaky / real regression / environment.
+2. Reproduce the test/run red on `redSha`; do not touch production code.
+3. Minimal fix → green run of the same checks on `candidateSha`.
+4. Evidence is a test-first artifact: targeted red and untouched code in the
+   test commit.
 
-## Запреты
-- Не «чинить» отключением проверки, ретраем до зелёного или ослаблением.
-- Не расширяй правку за пределы причины красного.
+## Prohibitions
+- Do not "fix" by disabling a check, retrying until green, or weakening it.
+- Do not expand the fix beyond the cause of the red.
 
-## Выход
-Артефакт `{"type":"test-first",...}`: PASS только при целевом красном,
-`touchesProdCode:false` и зелёном кандидате.
+## Output
+Artifact `{"type":"test-first",...}`: PASS only with targeted red,
+`touchesProdCode:false`, and a green candidate.

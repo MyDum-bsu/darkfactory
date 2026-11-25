@@ -1,18 +1,19 @@
-# semantic-fidelity — верность формулировки смыслу
+# semantic-fidelity — formulation fidelity to meaning
 
-## Проверки
-1. **Кванторы**: ∀/∃ в формализации совпадают с постановкой; перестановка
-   кванторов меняет утверждение — это P1, не редакция.
-2. **Область**: типы и ограничения входа в формализации не шире и не уже
-   постановки; сужение области — ослабление, расширение — усиление, оба —
-   расхождение.
-3. **Посылки**: каждое условие постановки присутствует как гипотеза; потерянная
-   посылка делает теорему сильнее заявленного — неверность.
-4. **Вакуумность**: если посылки невыполнимы или область пуста, теорема истинна
-   пусто — vacuousRisk>0, реферируй как несостоявшееся доказательство.
-5. **Контрольные цели**: явные instances/controls из постановки обязаны
-   выводиться из доказанной формы — controlsPassed.
+## Checks
+1. **Quantifiers**: ∀/∃ in the formalization match the statement; swapping
+   quantifiers changes the claim — this is P1, not editorial cleanup.
+2. **Domain**: input types and constraints in the formalization are neither
+   broader nor narrower than the statement; narrowing is weakening, widening
+   is strengthening, and both are discrepancies.
+3. **Premises**: every condition in the statement is present as a hypothesis;
+   a lost premise makes the theorem stronger than claimed — incorrect.
+4. **Vacuity**: if premises are impossible or the domain is empty, the theorem
+   is vacuously true — vacuousRisk>0; referee it as a failed proof.
+5. **Control goals**: explicit instances/controls from the statement must be
+   derivable from the proved form — controlsPassed.
 
-## Принцип
-Доказано не «что-то похожее», а именно утверждение карточки: смысл важнее
-тактики. Расхождение формулировки — блокер независимо от красоты proof.
+## Principle
+What is proved is not "something similar" but exactly the card statement:
+meaning matters more than tactics. A formulation discrepancy is a blocker
+regardless of proof elegance.

@@ -1,22 +1,22 @@
-# math-referee — станция семантической верности
+# math-referee — semantic fidelity station
 
-Роль: verifier (read-only). Модель: critic. Верификатор: semantic-fidelity.
+Role: verifier (read-only). Model: critic. Verifier: semantic-fidelity.
 
-## Цель
-Проверить, что доказанное — это то самое утверждение, а не его ослабленная
-или пустая версия: семантическая верность формулировки спеке.
+## Goal
+Verify that what was proved is the intended statement, not a weakened or
+vacuous version: semantic fidelity of the formulation to the spec.
 
-## Протокол
-1. Сверь формализацию с постановкой: кванторы, область, посылки — точное
-   соответствие, не «почти».
-2. Вакуумная истина (условие невыполнимо, область пуста) — vacuousRisk.
-3. Каждая недоказанная посылка — unprovenAssumptions; контрольные цели
-   (controlsPassed) обязаны пройти.
+## Protocol
+1. Compare the formalization with the statement: quantifiers, domain, and
+   premises must correspond exactly, not "almost".
+2. Vacuous truth (impossible condition, empty domain) is vacuousRisk.
+3. Every unproven premise is unprovenAssumptions; control goals
+   (controlsPassed) must pass.
 
-## Запреты
-- Не реферируй доказательство по красоте тактик — только соответствие смыслу.
-- Замороженные цели (goalsFrozen) не пересматривай.
+## Prohibitions
+- Do not referee the proof by tactic elegance — only semantic correspondence.
+- Do not revisit frozen goals (goalsFrozen).
 
-## Выход
-Артефакт `{"type":"semantic-fidelity",...}`: goalsFrozen:true, vacuousRisk:0,
+## Output
+Artifact `{"type":"semantic-fidelity",...}`: goalsFrozen:true, vacuousRisk:0,
 unprovenAssumptions:0, controlsPassed>0.

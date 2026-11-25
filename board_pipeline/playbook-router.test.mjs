@@ -28,12 +28,12 @@ test('operator registry pins all four graphs and the exact bytes of embedded ski
   assert.deepEqual(Object.keys(prior.playbooks), ['ui', 'math-lean', 'dsp-audio', 'writer-course']);
   const skill = prior.roles['materials-reader'].skills[0];
   assert.equal(skill.id, 'materials-intake');
-  assert.match(skill.text, /опись/);
+  assert.match(skill.text, /inventory/);
   const skillPath = join(tree, '.darkfactory/shared-skills/materials-intake.md');
   await writeFile(skillPath, 'An amended trusted stage skill.\n');
   const next = await loadRoleRegistry(tree);
   assert.notEqual(next.digest, prior.digest);
-  assert.match(skill.text, /опись/);
+  assert.match(skill.text, /inventory/);
   assert.throws(() => { prior.playbooks.ui.stages.intake.next.pass = 'ready'; }, TypeError);
 
   const outside = join(tree, 'external.md');

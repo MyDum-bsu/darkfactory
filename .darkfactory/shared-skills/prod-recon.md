@@ -1,22 +1,25 @@
-# prod-recon — разведка работающей среды
+# prod-recon — live-environment reconnaissance
 
-## Цель
-Ответить на вопрос о проде/стенде по фактам: что реально развёрнуто, что в
-логах, что в данных. Только чтение — разведка ничего не меняет.
+## Goal
+Answer a question about production/staging from facts: what is actually
+deployed, what is in the logs, and what is in the data. Read-only —
+reconnaissance changes nothing.
 
-## Протокол
-1. Сначала зафиксируй идентичность цели: хост, версия/SHA развёрнутого кода,
-   время наблюдения. Вывод без привязки к версии — не вывод.
-2. Читай в порядке: статус процесса → последние логи (head и tail, не только
-   tail) → состояние БД/очереди read-only → конфиг. Каждый факт — с источником.
-3. Сравнивай наблюдаемое с ожидаемым по спеке: расхождение — главный выход.
-4. Отдели «наблюдаю» от «предполагаю»: гипотезы помечай явно.
+## Protocol
+1. First pin the target identity: host, version/SHA of deployed code, and
+   observation time. A conclusion not bound to a version is not a conclusion.
+2. Read in this order: process status → recent logs (head and tail, not only
+   tail) → database/queue state read-only → config. Every fact needs a source.
+3. Compare the observed state with the spec's expectation: the discrepancy is
+   the primary output.
+4. Separate "I observe" from "I infer": label hypotheses explicitly.
 
-## Запреты
-- Никаких правок, рестартов, миграций, flush — даже «безобидных».
-- Не выводи секреты/токены/PII в артефакт: маскируй значения, показывай форму.
-- Не доверяй одному источнику: лог «всё ок» без проверки данных — половина факта.
+## Prohibitions
+- No edits, restarts, migrations, or flushes — even "harmless" ones.
+- Do not emit secrets/tokens/PII into the artifact: mask values and show shape.
+- Do not trust one source: a log saying "all good" without checking data is
+  half a fact.
 
-## Выход
-Список наблюдений `{факт, источник, время}`, расхождения со спекой, явные
-незакрытые вопросы.
+## Output
+List of observations `{fact, source, time}`, discrepancies from the spec, and
+explicit unresolved questions.
