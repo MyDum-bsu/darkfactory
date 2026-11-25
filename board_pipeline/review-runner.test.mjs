@@ -166,6 +166,21 @@ test('transcript: responseModel и providerThinkingLevel сверяются, too
   assert.doesNotThrow(() => assertToolsAllowed(['read', 'grep', 'find', 'ls']));
 });
 
+test('transcript: нормальные rawStopReason провайдеров — завершённый ход', () => {
+  for (const rawStopReason of ['completed', 'stop', 'STOP', 'end_turn']) {
+    const parsed = parseReviewTranscript([msg({ rawStopReason }), settled].join('\n'));
+    assert.match(parsed.finalText, /REVIEW_OK/);
+  }
+});
+
+test('transcript: аномальные rawStopReason — отказ', () => {
+  for (const rawStopReason of ['cancelled', 'length', 'max_tokens', 'error', 'tool_calls', '', null]) {
+    assert.throws(() => parseReviewTranscript([
+      msg({ rawStopReason }), settled,
+    ].join('\n')), (e) => e.reason === 'review_incomplete_turn');
+  }
+});
+
 test('transcript: незавершённый/пустой финальный ход — отказ', () => {
   // Последний ход обязан stop/completed с непустым текстом.
   assert.throws(() => parseReviewTranscript([

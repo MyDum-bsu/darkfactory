@@ -38,6 +38,8 @@ const TRUNCATED_TRANSCRIPT = new Set([
   'review_transcript_empty', 'review_transcript_corrupt', 'review_incomplete_turn',
 ]);
 
+const VALID_RAW_STOP_REASONS = new Set(['completed', 'stop', 'STOP', 'end_turn']);
+
 // Незавершённый поток может быть уже дисквалифицирующим, а не оборванным:
 // явный error/auto_retry_end со сбросом либо assistant-сообщение с
 // провайдером/моделью/effort, противоречащими закреплённому критику. Такой
@@ -350,7 +352,7 @@ export function parseReviewTranscript(ndjson) {
   const last = seen.at(-1);
   const toolsAdded = tools.size ? [...tools] : null;
   if (hasError || !seenSettled || aborted !== false || last.stopReason !== 'stop' ||
-      (last.rawStopReason !== undefined && last.rawStopReason !== 'completed') ||
+      (last.rawStopReason !== undefined && !VALID_RAW_STOP_REASONS.has(last.rawStopReason)) ||
       !last.text.trim()) {
     throw new ReviewDenied('review_incomplete_turn');
   }
