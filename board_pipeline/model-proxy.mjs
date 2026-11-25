@@ -4,7 +4,7 @@ import { createServer, request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { once } from 'node:events';
 import { chmod, mkdtemp, rm } from 'node:fs/promises';
-import { isIP } from 'node:net';
+import { connect as netConnect, isIP } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -14,7 +14,10 @@ const IO_TIMEOUT_MS = 120_000;
 
 function proxyConfig(env) {
   const chosen = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
-  if (!chosen) throw new Error('model_proxy_missing');
+  if (!chosen) {
+    if (env.DF_MODEL_PROXY_DIRECT === '1') return { direct: true };
+    throw new Error('model_proxy_missing');
+  }
   let proxy;
   try { proxy = new URL(chosen); } catch { throw new Error('model_proxy_invalid'); }
   if (!['http:', 'https:'].includes(proxy.protocol) || !proxy.hostname || proxy.port === '44100' ||
@@ -45,6 +48,31 @@ function deny(socket, code, reason) {
 
 function connectUpstream(proxy, authority, client, pending, upstreamHead, track) {
   // Never forward client-controlled headers, including Proxy-Authorization.
+  if (proxy.direct) {
+    const colon = authority.lastIndexOf(':');
+    const host = authority.slice(0, colon);
+    const port = Number(authority.slice(colon + 1));
+    const tunnel = netConnect({ host, port });
+    pending.add(tunnel);
+    tunnel.once('close', () => pending.delete(tunnel));
+    client.once('close', () => tunnel.destroy());
+    tunnel.once('error', () => deny(client, 502, 'Model Proxy Unavailable'));
+    tunnel.setTimeout(IO_TIMEOUT_MS, () => tunnel.destroy(new Error('model_proxy_timeout')));
+    tunnel.once('connect', () => {
+      if (client.destroyed) { tunnel.destroy(); return; }
+      track(tunnel);
+      tunnel.once('error', () => client.destroy());
+      client.once('error', () => tunnel.destroy());
+      tunnel.once('close', () => client.end());
+      client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (upstreamHead.length) tunnel.write(upstreamHead);
+      client.pipe(tunnel).pipe(client);
+    });
+    return () => {
+      client.destroy();
+      tunnel.destroy();
+    };
+  }
   let connected;
   const upstream = proxy.request({ method: 'CONNECT', path: authority, hostname: proxy.hostname, port: proxy.port,
     headers: { ...proxy.headers, Host: authority }, agent: false });

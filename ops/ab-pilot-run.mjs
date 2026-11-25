@@ -13,8 +13,8 @@ const exec = promisify(execFile);
 const SOURCE = join(import.meta.dirname, '..');
 const BASE = '6872d3cbb23aa90908a8f530671816a3620ff972';
 const WORKER = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
-const CRITIC = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
-const ARBITER = { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' };
+const CRITIC = { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium', skills: ['logika'] };
+const ARBITER = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const trim = async (cmd, args, opts) => (await exec(cmd, args, opts)).stdout.trim();
 
@@ -85,12 +85,14 @@ async function writeSealedCase({ run, name, arm, project, parent, owner, url, tr
   const dir = join(run, 'operator');
   const brief = join(dir, 'brief.md'), reviewPrompt = join(dir, 'review.md');
   const reviewGate = join(dir, 'board-review.mjs'), routes = join(dir, 'routes.json');
+  const logikaSkill = join(dir, 'logika.md');
   const policyFile = join(dir, 'policy.json'), switchFile = join(run, 'switch', 'run');
   await mkdir(dir, { mode: 0o700 });
   await mkdir(join(run, 'switch'), { mode: 0o700 });
   await writeFile(switchFile, 'run\n', { mode: 0o600 });
   await writeFile(brief, CASES[name].brief + '\nWork only in the specified test copy. Do not access the environment, home files, external data, or other threads. Do not use network, push, PR, or Board. Only local commit and the specified envelope.\n', { mode: 0o600 });
   await writeFile(reviewPrompt, `Independent read-only review. ${CASES[name].brief}\nInspect the exact diff and synthetic tests. Block only proven contract mismatch or test weakening. Do not access the network, other threads, or operational data.`, { mode: 0o600 });
+  await writeFile(logikaSkill, '# Logika Review\nVerify contract invariants, edge cases, and test fidelity strictly against the diff.\n', { mode: 0o600 });
   await cp(join(SOURCE, 'ops/local/board-review.mjs'), reviewGate);
   await writeFile(routes, '{}\n', { mode: 0o600 });
   const label = { key: 'queue', value: `ab-${name}-${arm}` };
@@ -106,14 +108,14 @@ async function writeSealedCase({ run, name, arm, project, parent, owner, url, tr
   if (name === 'policy') checks.push({ image, cwd: '.', timeoutMs: 20_000,
     argv: ['node', '--test', 'board_pipeline/policy-key.test.mjs'] });
   const version = 'ab-1448';
-  const policy = { scope: 'isolated', boardUrl: url, channel: 'pilot', owner, label, version, waitMs: 140000,
+  const policy = { scope: 'isolated', boardUrl: url, channel: 'pilot', owner, label, version, waitMs: 240000,
     bb: { ...WORKER, project, permissionMode: 'full' }, arbiter: ARBITER,
     routing: { mode: 'shadow', allowlist: { worker: [WORKER], critic: [CRITIC], arbiter: [ARBITER] } },
     route: { repoId: 'ab-case', base: baseSha, worktree: tree, policyVersion: version, checkProfile: 'case', finish: 'verified' },
     profiles: { case: { branch: 'pilot', review: CRITIC, checks } },
-    brief, reviewPrompt, reviewGate, handoffDir: join(run, 'inbox'), abPilot };
+    brief, reviewPrompt, reviewGate, reviewSkillFiles: { logika: logikaSkill }, handoffDir: join(run, 'inbox'), abPilot };
   await writeFile(policyFile, JSON.stringify(policy), { mode: 0o600 });
-  const hashes = await Promise.all([policyFile, brief, reviewPrompt, reviewGate, routes].map(async path => sha(await readFile(path))));
+  const hashes = await Promise.all([policyFile, brief, reviewPrompt, reviewGate, routes, logikaSkill].map(async path => sha(await readFile(path))));
   return { policyFile, label, specDigest: hashes[2], policyDigest: sha(JSON.stringify(hashes)) };
 }
 
@@ -185,7 +187,7 @@ async function runCell(name, arm, root, parent, project) {
     if (!/^[1-9][0-9]*$/.test(taskId ?? '')) throw new Error('pilot_task_unconfirmed');
     const started = Date.now();
     const output = await exec(process.execPath, [join(SOURCE, 'board_pipeline/run-isolated.mjs'), '--execute',
-      '--policy', policyFile, '--state', join(run, 'state')], { env, timeout: 260_000, maxBuffer: 2 * 1024 * 1024 })
+      '--policy', policyFile, '--state', join(run, 'state')], { env, timeout: 360_000, maxBuffer: 2 * 1024 * 1024 })
       .then(r => ({ ...r, code: 0 }), e => ({ stdout: e.stdout ?? '', stderr: e.stderr ?? '', code: e.code ?? null }));
     const wall = Date.now() - started;
     await writeFile(join(run, 'runner.log'), output.stdout + '\n' + output.stderr, { mode: 0o600 });

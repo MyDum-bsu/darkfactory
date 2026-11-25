@@ -8,11 +8,13 @@ export const SOL_ARBITER = Object.freeze({ provider: 'openai', model: 'gpt-6.2-s
 export const PI_SOL_CRITIC = Object.freeze({ provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' });
 export const NEON_PI_ARBITER = Object.freeze({ provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' });
 
-// Зачисление host-agy keyring: непустой DF_AGY_KEYRING_ITEM. Строгая форма
-// пути и мост xdg-dbus-proxy проверяются самим транспортом — здесь только
-// факт enrolment для выбора дефолтного профиля.
+// Зачисление host-agy credential: непустой DF_AGY_KEYRING_ITEM (desktop) или
+// DF_AGY_OAUTH_TOKEN_FILE (headless cloud). Строгая форма пути, права и
+// мост проверяются самим транспортом — здесь только факт enrolment.
 export function agyKeyringEnrolled(env = process.env) {
-  return typeof env?.DF_AGY_KEYRING_ITEM === 'string' && env.DF_AGY_KEYRING_ITEM.trim() !== '';
+  const hasKeyring = typeof env?.DF_AGY_KEYRING_ITEM === 'string' && env.DF_AGY_KEYRING_ITEM.trim() !== '';
+  const hasTokenFile = typeof env?.DF_AGY_OAUTH_TOKEN_FILE === 'string' && env.DF_AGY_OAUTH_TOKEN_FILE.trim() !== '';
+  return hasKeyring || hasTokenFile;
 }
 
 // Дефолтные роли L2 (Board #1666 DF-OPS-1.5): Neon medium primary +

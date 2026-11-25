@@ -127,3 +127,16 @@ test('pilot closure stops even an enrolled model CONNECT before going upstream',
   });
   assert.equal(outbound, 1);
 });
+
+test('explicit DF_MODEL_PROXY_DIRECT=1 allows allowlisted direct mode while still rejecting unlisted hosts', async () => {
+  await withModelProxy({ allow: ['chatgpt.com:443'], env: { DF_MODEL_PROXY_DIRECT: '1' } }, async path => {
+    for (const denied of ['127.0.0.1:44100', '10.2.3.4:443', 'other.invalid:443', 'chatgpt.com:80']) {
+      assert.match(await exchange(path, tunnel(denied)), /^HTTP\/1\.1 403 /);
+    }
+    assert.match(await exchange(path, 'GET http://chatgpt.com/ HTTP/1.1\r\nHost: chatgpt.com\r\n\r\n'), /^HTTP\/1\.1 405 /);
+  });
+  await assert.rejects(
+    withModelProxy({ allow: ['chatgpt.com:443'], env: { DF_MODEL_PROXY_DIRECT: '0' } }, async () => assert.fail('unexpected')),
+    /model_proxy_missing/,
+  );
+});

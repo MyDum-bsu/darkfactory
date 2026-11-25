@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -149,4 +149,57 @@ test('pinAttemptTriad: явный Neon без keyring — fail-closed до spawn
       selected: { worker: BB, critic: PI_SOL, arbiter: NEON_PI_ARBITER } },
     reviewSetup: piSetup, env: {} }).critic.provider, 'openai');
   assert.equal(pinAttemptTriad({ routed: { outcome: 'rejected', reason: 'x' }, reviewSetup: piSetup, env: {} }).outcome, 'rejected');
+});
+
+test('headless DF_AGY_OAUTH_TOKEN_FILE enrolls Neon, enforces 0600, and revokes staged token on sealBootstrap', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'df-agy-token-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const binary = join(dir, 'agy');
+  const token = join(dir, 'antigravity-oauth-token');
+  const snapshot = join(dir, 'snapshot');
+  await writeFile(binary, '#!/bin/sh\n', { mode: 0o700 });
+  await writeFile(token, '{"access_token":"synthetic"}\n', { mode: 0o600 });
+  await mkdir(snapshot, { mode: 0o500 });
+  t.after(() => chmod(snapshot, 0o700).catch(() => {}));
+
+  const skillPath = await skillFiles(t);
+  const setup = await operatorReviewSetup(
+    policyOf(undefined, { reviewSkillFiles: { logika: skillPath } }),
+    { env: { DF_AGY_OAUTH_TOKEN_FILE: token } },
+  );
+  assert.equal(setup.neon, true);
+  assert.deepEqual(setup.critic, { ...NEON_CRITIC, skills: ['logika'] });
+
+  let stagedExistsBefore = false;
+  let stagedExistsAfter = true;
+  let dbusEnv = 'unset';
+  await hostAgyTransport({
+    snapshot,
+    publishSnapshot: async () => {},
+    prompt: 'synthetic',
+    env: { DF_AGY_BINARY: binary, DF_AGY_OAUTH_TOKEN_FILE: token, DF_MODEL_PROXY_DIRECT: '1' },
+    launch: async req => {
+      dbusEnv = req.env.DBUS_SESSION_BUS_ADDRESS;
+      const stagedPath = join(req.env.HOME, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
+      stagedExistsBefore = await lstat(stagedPath).then(() => true, () => false);
+      await req.sealBootstrap();
+      stagedExistsAfter = await lstat(stagedPath).then(() => true, () => false);
+      return { stdout: '{}', stderr: '', code: 0 };
+    },
+  });
+  assert.equal(dbusEnv, undefined);
+  assert.equal(stagedExistsBefore, true);
+  assert.equal(stagedExistsAfter, false);
+
+  await chmod(token, 0o644);
+  await assert.rejects(
+    hostAgyTransport({
+      snapshot,
+      publishSnapshot: async () => {},
+      prompt: 'synthetic',
+      env: { DF_AGY_BINARY: binary, DF_AGY_OAUTH_TOKEN_FILE: token, DF_MODEL_PROXY_DIRECT: '1' },
+      launch: async () => assert.fail('must not launch with group/world readable token'),
+    }),
+    err => err?.reason === 'agy_oauth_token_not_enrolled',
+  );
 });

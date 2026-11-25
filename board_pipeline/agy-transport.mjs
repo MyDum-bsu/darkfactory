@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { copyFile, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, realpath, rm, unlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,15 +14,16 @@ const BUS_ROOT = '/org/freedesktop/secrets';
 const BUS_SERVICE = 'org.freedesktop.secrets';
 const KEY_ITEM = /^\/org\/freedesktop\/secrets\/collection\/[a-zA-Z0-9_]+\/[a-zA-Z0-9_]+$/;
 const EGRESS = ['daily-cloudcode-pa.googleapis.com:443', 'cloudcode-pa.googleapis.com:443'];
-// Host Agy's account bootstrap also needs Google's user-info endpoint.
-const BOOTSTRAP = ['play.googleapis.com:443', 'www.googleapis.com:443'];
+// Host Agy's account bootstrap also needs Google's user-info and OAuth refresh endpoints.
+const BOOTSTRAP = ['play.googleapis.com:443', 'www.googleapis.com:443', 'oauth2.googleapis.com:443'];
 
-async function ownedFile(path, error) {
+async function ownedFile(path, error, { privateOnly = false } = {}) {
   if (!isAbsolute(path ?? '')) throw new ReviewDenied(error);
   try {
     const canonical = await realpath(path);
     const st = await lstat(canonical);
-    if (!st.isFile() || st.uid !== process.getuid() || st.mode & 0o022) throw new ReviewDenied(error);
+    const modeMask = privateOnly ? 0o077 : 0o022;
+    if (!st.isFile() || st.uid !== process.getuid() || st.mode & modeMask) throw new ReviewDenied(error);
     return canonical;
   } catch (cause) {
     if (cause instanceof ReviewDenied) throw cause;
@@ -103,8 +104,15 @@ export async function hostAgyTransport({ prompt, snapshot, publishSnapshot, time
   if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
   const binary = await ownedFile(env.DF_AGY_BINARY ?? join(homedir(), '.local', 'opt', 'antigravity-cli', 'agy'),
     'agy_binary_not_enrolled');
-  const scope = await ownedFile(env.DF_AGY_SCOPE_FILE ?? join(homedir(), '.config', 'antigravity', 'credential-user-scope'),
-    'agy_scope_not_enrolled');
+  const useTokenFile = !env.DF_AGY_KEYRING_ITEM &&
+    typeof env.DF_AGY_OAUTH_TOKEN_FILE === 'string' && env.DF_AGY_OAUTH_TOKEN_FILE.trim() !== '';
+  const tokenFile = useTokenFile
+    ? await ownedFile(env.DF_AGY_OAUTH_TOKEN_FILE, 'agy_oauth_token_not_enrolled', { privateOnly: true })
+    : null;
+  const scope = useTokenFile
+    ? null
+    : await ownedFile(env.DF_AGY_SCOPE_FILE ?? join(homedir(), '.config', 'antigravity', 'credential-user-scope'),
+      'agy_scope_not_enrolled');
   const scratch = await mkdtemp(join(tmpdir(), 'df-agy-'));
   // Отмена добивает группу процесса именно этого запуска: уникальный
   // scratch-путь находится в /proc по cmdline/environ — после execv
@@ -133,12 +141,23 @@ export async function hostAgyTransport({ prompt, snapshot, publishSnapshot, time
     const keyring = join(scratch, 'keyring.sock');
     await mkdir(runtime, { mode: 0o700 });
     await mkdir(join(config, 'antigravity'), { recursive: true, mode: 0o700 });
-    await copyFile(scope, join(config, 'antigravity', 'credential-user-scope'));
+    if (scope) await copyFile(scope, join(config, 'antigravity', 'credential-user-scope'));
+    let stagedToken = null;
+    if (tokenFile) {
+      const cliDir = join(home, '.gemini', 'antigravity-cli');
+      await mkdir(cliDir, { recursive: true, mode: 0o700 });
+      stagedToken = join(cliDir, 'antigravity-oauth-token');
+      await copyFile(tokenFile, stagedToken);
+      await chmod(stagedToken, 0o600);
+    }
     const boundary = await snapshotBoundary(cwd, scratch, home, runtime);
     const username = userInfo().username;
     const proxyEnv = env.DF_AGY_HTTPS_PROXY ? { HTTPS_PROXY: env.DF_AGY_HTTPS_PROXY } : env;
-    const result = await withAgyKeyring({ address: env.DBUS_SESSION_BUS_ADDRESS, path: keyring, item: env.DF_AGY_KEYRING_ITEM },
-      revokeKeyring => withModelProxy({ allow: EGRESS, bootstrap: BOOTSTRAP, env: proxyEnv,
+    const withCreds = useTokenFile
+      ? async fn => fn(async () => { if (stagedToken) await unlink(stagedToken).catch(() => {}); })
+      : fn => withAgyKeyring({ address: env.DBUS_SESSION_BUS_ADDRESS, path: keyring, item: env.DF_AGY_KEYRING_ITEM }, fn);
+    const result = await withCreds(
+      revokeCreds => withModelProxy({ allow: EGRESS, bootstrap: BOOTSTRAP, env: proxyEnv,
         hostClient: true, beforeConnect: beforeEffect },
         (proxy, sealModelBootstrap) => launch({ binary, cwd, prompt, timeoutMs, beforeEffect,
           publishSnapshot: async () => {
@@ -146,11 +165,11 @@ export async function hostAgyTransport({ prompt, snapshot, publishSnapshot, time
             await assertPackagedCaptures(cwd);
           },
           boundary: { ...boundary, proxyPort: Number(new URL(proxy).port) },
-          sealBootstrap: () => { sealModelBootstrap(); return revokeKeyring(); },
+          sealBootstrap: () => { sealModelBootstrap(); return revokeCreds(); },
           env: { PATH: '/usr/bin:/bin', HOME: home, XDG_CONFIG_HOME: config, XDG_RUNTIME_DIR: runtime,
             TMPDIR: boundary.tmp,
             USER: username, LOGNAME: username, LANG: 'C.UTF-8',
-            DBUS_SESSION_BUS_ADDRESS: `unix:path=${keyring}`,
+            ...(useTokenFile ? {} : { DBUS_SESSION_BUS_ADDRESS: `unix:path=${keyring}` }),
             HTTPS_PROXY: proxy, HTTP_PROXY: proxy, https_proxy: proxy, http_proxy: proxy,
             NO_PROXY: '', no_proxy: '' } })));
     const final = await lstat(cwd);

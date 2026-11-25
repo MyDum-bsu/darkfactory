@@ -473,7 +473,7 @@ export async function runLive({ root, cases = 'policy,docs', out = null, execImp
       const started = Date.now();
       const result = await execImpl(process.execPath, [
         runner, '--execute', '--case', pilotCase, '--arm', arm, '--root', evidenceRoot,
-      ], { timeout: 300_000, maxBuffer: 4 * 1024 * 1024 });
+      ], { timeout: 420_000, maxBuffer: 4 * 1024 * 1024 });
       runs.push({ case: pilotCase, arm, elapsedMs: Date.now() - started,
         outcome: JSON.parse(String(result.stdout).trim().split('\n').at(-1)) });
     }
