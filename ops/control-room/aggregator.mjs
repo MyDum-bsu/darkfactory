@@ -318,22 +318,24 @@ function compactTelemetryAttempt(entry) {
   if (!taskId) return null;
   const startedMs = timeValue(entry.started_at ?? entry.startedAt ?? entry.created_at ?? entry.createdAt);
   const endedMs = timeValue(entry.ended_at ?? entry.endedAt ?? entry.completed_at ?? entry.completedAt);
-  const phasesMs = entry.phases_ms !== null && typeof entry.phases_ms === 'object' && !Array.isArray(entry.phases_ms)
-    ? Object.fromEntries(Object.entries(entry.phases_ms)
-      .filter(([, value]) => value === null || Number.isFinite(value))
-      .map(([key, value]) => [key, value === null ? null : Number(value)]))
-    : {};
-  const rounds = entry.rounds !== null && typeof entry.rounds === 'object' && !Array.isArray(entry.rounds)
+  const objectValue = value => value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  const rawPhases = objectValue(entry.phases_ms) ?? objectValue(entry.phasesMs) ?? {};
+  const phasesMs = Object.fromEntries(Object.entries(rawPhases)
+    .filter(([, value]) => value === null || Number.isFinite(value))
+    .map(([key, value]) => [key, value === null ? null : Number(value)]));
+  const rawRounds = objectValue(entry.rounds);
+  const rounds = rawRounds
     ? {
-        total: finiteNumber(entry.rounds.total),
-        rework: finiteNumber(entry.rounds.rework),
-        pass: finiteNumber(entry.rounds.pass),
-        arbitration: finiteNumber(entry.rounds.arbitration),
-        open: finiteNumber(entry.rounds.open),
-        gates: entry.rounds.gates !== null && typeof entry.rounds.gates === 'object' && !Array.isArray(entry.rounds.gates)
-          ? { ...entry.rounds.gates } : {},
+        total: finiteNumber(rawRounds.total),
+        rework: finiteNumber(rawRounds.rework),
+        pass: finiteNumber(rawRounds.pass),
+        arbitration: finiteNumber(rawRounds.arbitration),
+        open: finiteNumber(rawRounds.open),
+        gates: objectValue(rawRounds.gates) ? { ...rawRounds.gates } : {},
       }
     : { total: null, rework: null, pass: null, arbitration: null, open: null, gates: {} };
+  const reworkRounds = finiteNumber(rounds.rework) ?? firstNumber(entry.rework_rounds, entry.reworkRounds);
+  if (rounds.rework === null) rounds.rework = reworkRounds;
   const roleCost = role => normalizeCost(entry.costs?.[role]);
   const roleCosts = [roleCost('worker'), roleCost('critic'), roleCost('arbiter')].filter(v => v !== null);
   const roleCostTotal = roleCosts.length ? roleCosts.reduce((a, b) => a + b, 0) : null;
@@ -350,10 +352,12 @@ function compactTelemetryAttempt(entry) {
     open: entry.open === true,
     startedAt: startedMs === null ? null : new Date(startedMs).toISOString(),
     endedAt: endedMs === null ? null : new Date(endedMs).toISOString(),
-    elapsedMs: finiteNumber(phasesMs.total) ??
+    elapsedMs: finiteNumber(phasesMs.total) ?? firstNumber(entry.elapsed_ms, entry.elapsedMs) ??
       (startedMs !== null && endedMs !== null && endedMs >= startedMs ? endedMs - startedMs : null),
     phasesMs,
     rounds,
+    reworkRounds,
+    reason: firstText(entry.reason),
     models: {
       worker: copyModel(entry.models?.worker),
       critic: copyModel(entry.models?.critic),

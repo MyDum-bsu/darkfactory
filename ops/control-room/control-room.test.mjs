@@ -380,6 +380,77 @@ test('aggregator telemetry: populates compact live summary from JSONL records', 
   }
 });
 
+test('aggregator telemetry: real provider attempts survive activeTrees compaction', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-active-'));
+  try {
+    const record = {
+      schema: 1,
+      kind: 'attempt_summary',
+      task_id: 'T-DOUBLE-COMPACT',
+      attempt_id: 'att-double-compact',
+      epoch: 1,
+      outcome: 'done',
+      open: false,
+      started_at: '2026-01-01T00:00:00.000Z',
+      ended_at: '2026-01-01T00:30:00.000Z',
+      phases_ms: {
+        worker: 600000,
+        l1_local: 60000,
+        tamper: 30000,
+        l2_critic: 120000,
+        arbiter: null,
+        total: 1800000,
+      },
+      rounds: {
+        total: 1,
+        rework: 0,
+        pass: 1,
+        arbitration: 0,
+        open: 0,
+        gates: { l1: 1, tamper: 1, l2: 1 },
+      },
+      models: {
+        worker: { provider: 'acp-devin', model: 'swe-2-high' },
+        critic: { provider: 'google', model: 'gemini-review' },
+        arbiter: null,
+      },
+      tokens: {
+        worker: { input: 1000, output: 200, cached: 300 },
+        critic: { input: 500, output: 100, cached: 50 },
+        arbiter: null,
+      },
+    };
+    await writeFile(join(dir, 'telemetry.jsonl'), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+
+    const telemetryProvider = createTelemetryProvider({ telemetryDir: dir });
+    const telemetry = await telemetryProvider();
+    assert.ok(telemetry, 'real telemetry provider loads the JSONL record');
+    assert.equal(telemetry.attempts.length, 1);
+    assert.equal(telemetry.attempts[0].phasesMs.worker, 600000);
+
+    const server = createControlRoomAggregator({ port: 0,
+      telemetryProvider,
+      modelsProvider: null,
+      finopsProvider: null });
+    const snap = await server.snapshot();
+    const tree = snap.activeTrees[0];
+    assert.ok(tree, 'telemetry-only active tree exists');
+    assert.equal(tree.taskId, 'T-DOUBLE-COMPACT');
+    assert.equal(tree.elapsedMs, 1800000);
+    assert.equal(tree.worker.elapsedMs, 600000);
+    const stage = kind => tree.stages.find(item => item.kind === kind);
+    assert.equal(stage('l1_local').status, 'pass');
+    assert.equal(stage('l1_local').elapsedMs, 60000);
+    assert.equal(stage('tamper').status, 'pass');
+    assert.equal(stage('tamper').elapsedMs, 30000);
+    assert.equal(stage('l2_critic').status, 'pass');
+    assert.equal(stage('l2_critic').elapsedMs, 120000);
+    assert.equal(stage('arbiter').status, 'skipped');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('aggregator telemetry: empty, missing, and corrupt-only directories degrade to null', async () => {
   const missing = join(tmpdir(), 'cr-telemetry-missing-definitely');
   assert.equal(await createTelemetryProvider({ telemetryDir: missing })(), null);
