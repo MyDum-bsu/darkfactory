@@ -46,19 +46,21 @@ function deny(socket, code, reason) {
   if (!socket.destroyed) socket.end(`HTTP/1.1 ${code} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
 }
 
-function connectUpstream(proxy, authority, client, pending, upstreamHead, track) {
+export function connectUpstream(proxy, authority, client, pending, upstreamHead, track, dial = netConnect) {
   // Never forward client-controlled headers, including Proxy-Authorization.
   if (proxy.direct) {
     const colon = authority.lastIndexOf(':');
     const host = authority.slice(0, colon);
     const port = Number(authority.slice(colon + 1));
-    const tunnel = netConnect({ host, port });
+    const tunnel = dial({ host, port });
     pending.add(tunnel);
     tunnel.once('close', () => pending.delete(tunnel));
     client.once('close', () => tunnel.destroy());
-    tunnel.once('error', () => deny(client, 502, 'Model Proxy Unavailable'));
+    const onPreConnectError = () => deny(client, 502, 'Model Proxy Unavailable');
+    tunnel.once('error', onPreConnectError);
     tunnel.setTimeout(IO_TIMEOUT_MS, () => tunnel.destroy(new Error('model_proxy_timeout')));
     tunnel.once('connect', () => {
+      tunnel.off('error', onPreConnectError);
       if (client.destroyed) { tunnel.destroy(); return; }
       track(tunnel);
       tunnel.once('error', () => client.destroy());
@@ -79,9 +81,11 @@ function connectUpstream(proxy, authority, client, pending, upstreamHead, track)
   pending.add(upstream);
   upstream.once('close', () => pending.delete(upstream));
   client.once('close', () => upstream.destroy());
-  upstream.once('error', () => deny(client, 502, 'Model Proxy Unavailable'));
+  const onPreConnectError = () => deny(client, 502, 'Model Proxy Unavailable');
+  upstream.once('error', onPreConnectError);
   upstream.setTimeout(IO_TIMEOUT_MS, () => upstream.destroy(new Error('model_proxy_timeout')));
   upstream.once('connect', (response, tunnel, head) => {
+    upstream.off('error', onPreConnectError);
     if (response.statusCode !== 200 || client.destroyed) {
       tunnel.destroy();
       deny(client, 502, 'Model Proxy Refused');

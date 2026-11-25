@@ -44,6 +44,19 @@ async function readBb(run, threadId, policy, taskId, role, workspace) {
     provider: thread.providerId, model: requested[0]?.data?.execution?.model ?? null, role, usage, cost_usd: cost, complete, native };
 }
 
+const hex64 = value => /^[a-f0-9]{64}$/.test(value ?? '');
+const sandboxTransport = value => value === 'docker-ro-v1' || value === 'landlock-ro-v1';
+const validActual = actual => actual !== null && typeof actual === 'object' &&
+  ['provider', 'model', 'reasoningLevel'].every(key => typeof actual[key] === 'string' && actual[key].length > 0);
+
+function matchesSandboxStageWitness(row, stage, history, accepted) {
+  return row !== null && typeof row === 'object' && stage === row.stage && row.stage === history?.stage &&
+    row.verdict === 'PASS' && history?.verdict === 'PASS' && row.artifactDigest === history?.digest &&
+    hex64(row.artifactDigest) && hex64(row.snapshotDigest) && hex64(row.challenge) && hex64(row.transcript_sha256) &&
+    row.mode === 'read-only' && sandboxTransport(row.transport) && row.threadId === `sandbox:${row.transport}` &&
+    row.worktreeFingerprint?.head === accepted?.sha && validActual(row.actual);
+}
+
 async function stagesCovered(run, policy, stages, accepted, threads) {
   const native = new Map(threads.filter(row => row.role === 'stage').map(row => [row.id, row.native]));
   const registry = await loadRoleRegistry(policy.abPilot.catalog);
@@ -54,16 +67,21 @@ async function stagesCovered(run, policy, stages, accepted, threads) {
   const receipts = await readLines(join(run, 'state/ab-stage-receipts.jsonl'));
   const traces = await readLines(join(run, 'state/ab-foreman.jsonl'));
   const trace = traces[0];
-  return traces.length === 1 && trace.status === 'ready_for_native_acceptance' &&
+  const confirmed = traces.length === 1 && trace.status === 'ready_for_native_acceptance' &&
     trace.candidate === accepted?.sha && trace.subject === accepted?.subject_digest &&
-    Array.isArray(trace.history) && planned.length === stages.length && stages.length === receipts.length &&
-    receipts.length === trace.history.length && planned.every((stage, i) => {
-      const row = receipts[i];
-      return stage === stages[i].stage && stage === row.stage && row.threadId === stages[i].threadId &&
-        row.verdict === 'PASS' && trace.history[i].stage === stage && trace.history[i].verdict === 'PASS' &&
-        row.artifactDigest === trace.history[i].digest && /^[a-f0-9]{64}$/.test(row.artifactDigest ?? '') &&
-        matchesNativeStageWitness(row, native.get(row.threadId));
-    });
+    Array.isArray(trace.history) && receipts.length === trace.history.length;
+  if (!confirmed) return false;
+  if (stages.length === 0) {
+    return planned.length === receipts.length && planned.every((stage, i) =>
+      matchesSandboxStageWitness(receipts[i], stage, trace.history[i], accepted));
+  }
+  return planned.length === stages.length && stages.length === receipts.length && planned.every((stage, i) => {
+    const row = receipts[i];
+    return stage === stages[i].stage && stage === row.stage && row.threadId === stages[i].threadId &&
+      row.verdict === 'PASS' && trace.history[i].stage === stage && trace.history[i].verdict === 'PASS' &&
+      row.artifactDigest === trace.history[i].digest && hex64(row.artifactDigest) &&
+      matchesNativeStageWitness(row, native.get(row.threadId));
+  });
 }
 
 async function readCell(root, name, arm) {

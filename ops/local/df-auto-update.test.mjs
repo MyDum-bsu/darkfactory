@@ -194,6 +194,26 @@ test('one tool failure does not stop remaining updates; atomic state report is v
   assert.equal((await stat(env.stateFile)).mode & 0o777, 0o600);
 });
 
+test('busy flip after npm install defers bb-hub restart at the final gate', async t => {
+  const env = await fixture(t);
+  let busy = false;
+  const harness = fakeHarness(env, {
+    processList: () => busy ? '123 /usr/local/bin/agy worker' : '',
+  });
+  const originalRunner = harness.runner;
+  harness.runner = async (command, args = []) => {
+    const result = await originalRunner(command, args);
+    if (command === 'npm' && args[0] === 'install' && args[2] === 'bb-app@latest') busy = true;
+    return result;
+  };
+  const report = await runAutoUpdate(options(env, 'hub'), harness);
+  const bbApp = report.components.find(component => component.name === 'bb-app');
+  assert.equal(bbApp.status, 'updated');
+  assert.equal(bbApp.restart, 'deferred_busy');
+  assert.match(bbApp.note, /active work detected after install/);
+  assert.ok(!harness.calls.some(([command, args]) => command === 'systemctl' && args.includes('restart')));
+});
+
 test('forced run still does not restart bb-hub while agents are active', async t => {
   const env = await fixture(t);
   const harness = fakeHarness(env, { processList: '123 /usr/local/bin/agy worker' });

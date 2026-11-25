@@ -202,10 +202,24 @@ async function npmPackageComponent(ctx, spec) {
       await mustRun(ctx, 'npm', ['ls', '-g', packageName, '--prefix', prefix], { timeoutMs: 30_000 });
     }
   }
-  if (spec.restartService && ctx.role === 'hub' && before !== after && !ctx.activeBusy) {
-    await mustRun(ctx, 'systemctl', ['--user', 'restart', spec.restartService], { timeoutMs: 30_000 });
+  const extra = { latest };
+  if (spec.restartService && ctx.role === 'hub' && before !== after) {
+    let busyNow = ctx.activeBusy;
+    if (typeof ctx.checkActiveBusy === 'function') {
+      try {
+        busyNow = Boolean(await ctx.checkActiveBusy() ?? ctx.activeBusy);
+      } catch {
+        busyNow = true;
+      }
+    }
+    if (busyNow) {
+      extra.restart = 'deferred_busy';
+      extra.note = 'restart deferred: active work detected after install';
+    } else {
+      await mustRun(ctx, 'systemctl', ['--user', 'restart', spec.restartService], { timeoutMs: 30_000 });
+    }
   }
-  return finished(result, before !== after ? 'updated' : 'already_current', before, after, { latest });
+  return finished(result, before !== after ? 'updated' : 'already_current', before, after, extra);
 }
 
 async function gitRepoComponent(ctx) {
@@ -325,17 +339,7 @@ async function writeStateAtomic(file, report) {
   await rename(tmp, file);
 }
 
-export async function runAutoUpdate(options = {}, deps = {}) {
-  const normalized = normalizeOptions(options, deps);
-  const home = defaultHome(deps);
-  const ctx = {
-    ...normalized,
-    home,
-    runner: deps.runner ?? defaultRunner,
-    pathExists: deps.pathExists ?? defaultPathExists,
-    commandExists: deps.commandExists ?? (command => defaultCommandExists(command, deps.env ?? process.env)),
-    nowMs: deps.nowMs ?? (() => Date.now()),
-  };
+async function scanBusyProcesses(ctx, deps) {
   let processText = '';
   let processScanFailed = false;
   if (deps.processList !== undefined) {
@@ -355,6 +359,22 @@ export async function runAutoUpdate(options = {}, deps = {}) {
   }
   const busyProcesses = findBusyProcesses(processText);
   if (processScanFailed) busyProcesses.unshift('process_scan_unavailable');
+  return busyProcesses;
+}
+
+export async function runAutoUpdate(options = {}, deps = {}) {
+  const normalized = normalizeOptions(options, deps);
+  const home = defaultHome(deps);
+  const ctx = {
+    ...normalized,
+    home,
+    runner: deps.runner ?? defaultRunner,
+    pathExists: deps.pathExists ?? defaultPathExists,
+    commandExists: deps.commandExists ?? (command => defaultCommandExists(command, deps.env ?? process.env)),
+    nowMs: deps.nowMs ?? (() => Date.now()),
+  };
+  ctx.checkActiveBusy = deps.checkActiveBusy ?? (async () => (await scanBusyProcesses(ctx, deps)).length > 0);
+  const busyProcesses = await scanBusyProcesses(ctx, deps);
   ctx.activeBusy = busyProcesses.length > 0;
 
   const startedAt = new Date(ctx.nowMs()).toISOString();

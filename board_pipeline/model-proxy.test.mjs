@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { createServer } from 'node:http';
 import { lstat, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { withModelProxy } from './model-proxy.mjs';
+import { connectUpstream, withModelProxy } from './model-proxy.mjs';
 
 function exchange(path, text) {
   return new Promise((resolve, reject) => {
@@ -129,6 +129,58 @@ test('pilot closure stops even an enrolled model CONNECT before going upstream',
     assert.match(await exchange(path, tunnel('chatgpt.com:443')), /^HTTP\/1\.1 403 /);
   });
   assert.equal(outbound, 1);
+});
+
+class FakeSocket extends EventEmitter {
+  constructor() {
+    super();
+    this.output = '';
+    this.destroyed = false;
+  }
+
+  write(data) {
+    this.output += data.toString();
+    return true;
+  }
+
+  end(data) {
+    if (data) this.write(data);
+    return this;
+  }
+
+  destroy() {
+    if (!this.destroyed) {
+      this.destroyed = true;
+      queueMicrotask(() => this.emit('close'));
+    }
+    return this;
+  }
+
+  setTimeout() {
+    return this;
+  }
+
+  pipe(target) {
+    return target;
+  }
+}
+
+test('direct mode keeps the pre-connect 502 handler but removes it after CONNECT succeeds', () => {
+  const preClient = new FakeSocket();
+  const preTunnel = new FakeSocket();
+  connectUpstream({ direct: true }, 'chatgpt.com:443', preClient, new Set(), Buffer.alloc(0), () => {}, () => preTunnel);
+  preTunnel.emit('error', new Error('dial failed'));
+  assert.match(preClient.output, /^HTTP\/1\.1 502 Model Proxy Unavailable/);
+
+  const client = new FakeSocket();
+  const tunnel = new FakeSocket();
+  connectUpstream({ direct: true }, 'chatgpt.com:443', client, new Set(), Buffer.alloc(0), () => {}, () => tunnel);
+  tunnel.emit('connect');
+  assert.equal(client.output, 'HTTP/1.1 200 Connection Established\r\n\r\n');
+  assert.equal(tunnel.listenerCount('error'), 1);
+  tunnel.emit('error', new Error('established tunnel failed'));
+  assert.equal(client.output, 'HTTP/1.1 200 Connection Established\r\n\r\n');
+  assert.equal(client.destroyed, true);
 });
 
 test('explicit DF_MODEL_PROXY_DIRECT=1 allows allowlisted direct mode while still rejecting unlisted hosts', async () => {

@@ -48,10 +48,15 @@ const main = () => {
     console.log(`OK manual-bb; implementation acp-devin/${profiles.implementation.model}; ZCode Start GLM-5.3 Flash/max; review Pi/Sol 6.2/medium`);
 
     const env = { ...process.env, XDG_CONFIG_HOME: join(runtime, 'config') };
-    delete env.BOARD_TOKEN;
-    delete env.BOARD_URL;
+    const boardUrl = process.env.BOARD_TOKEN ?
+      process.env.BOARD_URL || 'http://127.0.0.1:44100/api/board' :
+      'http://127.0.0.1:44100/api/board';
+    if (!process.env.BOARD_TOKEN) {
+      delete env.BOARD_TOKEN;
+      delete env.BOARD_URL;
+    }
     const board = execFileSync(join(runtime, 'node_modules/.bin/vb'), [
-      '--url', 'http://127.0.0.1:44100/api/board', 'channels', 'list', '--json',
+      '--url', boardUrl, 'channels', 'list', '--json',
     ], { env, encoding: 'utf8', timeout: 9000, stdio: ['ignore', 'pipe', 'pipe'] });
     verify(Array.isArray(JSON.parse(board).channels), 'Expected channels from the existing local Board');
     execFileSync('bb', ['thread', 'spawn', '--help'], { timeout: 6000, stdio: 'ignore' });
