@@ -76,6 +76,34 @@ test('--stdin-json denies red-team shell payload before execution', async () => 
   assert.equal(denial.severity, 'CRITICAL');
 });
 
+test('--stdin-json denies shell argv wrapper evasion after POSIX quoting', async () => {
+  for (const payload of [
+    { toolCall: { name: 'exec', args: { argv: ['bash', '-c', 'rm -rf /'] } } },
+    { toolCall: { name: 'shell', args: { argv: ['sh', '-c', 'rm -rf /'] } } },
+  ]) {
+    const result = await runHook(['--stdin-json'], JSON.stringify(payload));
+    assert.equal(result.code, 2, result.stdout);
+    const denial = JSON.parse(result.stdout);
+    assert.equal(denial.decision, 'deny');
+    assert.equal(denial.severity, 'CRITICAL');
+  }
+});
+
+test('--stdin-json fails closed on malformed toolCall shapes', async () => {
+  for (const payload of [
+    { toolCall: {} },
+    { toolCall: [] },
+    { toolCall: { name: '', args: { command: 'rm -rf /' } } },
+    { toolCall: { name: 123, args: { command: 'rm -rf /' } } },
+  ]) {
+    const result = await runHook(['--stdin-json'], JSON.stringify(payload));
+    assert.equal(result.code, 2, JSON.stringify(payload));
+    const denial = JSON.parse(result.stdout);
+    assert.equal(denial.decision, 'deny');
+    assert.equal(denial.severity, 'CRITICAL');
+  }
+});
+
 test('--stdin-json fails closed on malformed JSON, missing command, and oversized input', async () => {
   for (const input of ['not-json', JSON.stringify({ toolCall: { name: 'shell', args: {} } })]) {
     const result = await runHook(['--stdin-json'], input);

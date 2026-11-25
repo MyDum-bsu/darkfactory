@@ -43,6 +43,10 @@ export function inspectCommand(command, options = {}) {
   }
 }
 
+function shellQuoteArg(value) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 function commandFromValue(value) {
   if (typeof value === 'string') return value;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -50,7 +54,7 @@ function commandFromValue(value) {
     if (typeof value[key] === 'string') return value[key];
   }
   if (Array.isArray(value.argv) && value.argv.every(part => typeof part === 'string')) {
-    return value.argv.join(' ');
+    return value.argv.map(shellQuoteArg).join(' ');
   }
   return null;
 }
@@ -61,8 +65,11 @@ export function extractHookCommand(payload) {
   }
   if (typeof payload.command === 'string') return { command: payload.command, applies: true };
   const toolCall = payload.toolCall ?? payload.tool_call ?? null;
-  if (!toolCall || typeof toolCall !== 'object') return { command: null, applies: true };
-  const name = typeof toolCall.name === 'string' ? toolCall.name : '';
+  if (!toolCall || typeof toolCall !== 'object' || Array.isArray(toolCall) ||
+      typeof toolCall.name !== 'string' || !toolCall.name.trim()) {
+    return { command: null, applies: true };
+  }
+  const name = toolCall.name;
   const applies = SHELL_TOOLS.has(name) || SHELL_TOOLS.has(name.toLowerCase());
   return { command: applies ? commandFromValue(toolCall.args) : null, applies };
 }
