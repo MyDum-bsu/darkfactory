@@ -921,11 +921,11 @@ test('df-herd: https: схема принимается парсером и не
   assert.equal(stderr.includes('unsupported URL scheme'), false);
 });
 
-test('web app: вкладки incl Board Explorer, safe URL validation и mobile CSS присутствуют', async () => {
+test('web app: 4 вкладки, safe URL validation и mobile CSS присутствуют', async () => {
   const app = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
   const html = await readFile(join(MODULE_DIR, 'web', 'index.html'), 'utf8');
   const css = await readFile(join(MODULE_DIR, 'web', 'styles.css'), 'utf8');
-  for (const label of ['Operations', 'Board', 'Models &amp; Routing', 'Resources &amp; FinOps', 'Workspace Map']) {
+  for (const label of ['Operations', 'Models &amp; Routing', 'Resources &amp; FinOps', 'Workspace Map']) {
     assert.ok(html.includes(label), label);
   }
   assert.equal(app.includes('new URL(value)'), true);
@@ -935,8 +935,16 @@ test('web app: вкладки incl Board Explorer, safe URL validation и mobile
   assert.equal(app.includes('navigator.clipboard?.writeText'), true);
   assert.equal(app.includes('fallbackCopyText'), true);
   assert.equal(app.includes('copyCommandChip'), true);
+});
+
+test('web app V2-8: Board Explorer tab и app.js syntax check', async () => {
+  const app = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
+  const html = await readFile(join(MODULE_DIR, 'web', 'index.html'), 'utf8');
+  assert.ok(html.includes('Board'));
   assert.equal(html.includes('data-tab="board"'), true);
   assert.equal(html.includes('id="board-explorer"'), true);
+  assert.equal(app.includes('renderBoardExplorer'), true);
+  assert.equal(app.includes('renderAgentTrees'), true);
   assert.equal(app.includes('textContent'), true);
   await execFileAsync(process.execPath, ['--check', join(MODULE_DIR, 'web', 'app.js')]);
 });
