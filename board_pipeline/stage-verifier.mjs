@@ -8,6 +8,10 @@ const positive = value => count(value) && value > 0;
 const digest = value => typeof value === 'string' && HEX.test(value);
 const sha40 = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 
+export const STAGE_VERDICT_INSTRUCTION =
+  'Output ONLY the single plain-text line <challenge> PASS (or <challenge> REWORK / <challenge> BLOCKED): ' +
+  'the challenge value, one space, then the verdict. Use no markdown backticks, no bold, no punctuation, and no other text.';
+
 // These are contracts for observations made by trusted adapters, not commands
 // or a substitute for L1/L2/L3. For example, a Lean adapter must run the check.
 const CHECKS = Object.freeze({

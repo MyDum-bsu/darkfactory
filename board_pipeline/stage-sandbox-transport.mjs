@@ -21,6 +21,7 @@ import { isAbsolute, join, relative } from 'node:path';
 import { promisify } from 'node:util';
 import { isDeepStrictEqual } from 'node:util';
 import { unpackExact } from './runtime.mjs';
+import { STAGE_VERDICT_INSTRUCTION } from './stage-verifier.mjs';
 import { withModelProxy } from './model-proxy.mjs';
 import { assertToolsAllowed, parseReviewTranscript, ReviewDenied, REVIEW_IMAGE,
   runInReadOnlySandbox, runnerReviewSpec, snapshotDigest, worktreeFingerprint } from './review-runner.mjs';
@@ -154,15 +155,38 @@ async function sandboxedPiConfig(file, src) {
 
 // Вердикт stage: ровно одна строка "<challenge> PASS|REWORK|BLOCKED" из
 // финального ответа модели. Чужой challenge — не доказательство.
+function parseVerdictLine(line) {
+  const source = line.trim();
+  const core = body => {
+    const match = /^([a-f0-9]{64}) (PASS|REWORK|BLOCKED)(\.?)$/.exec(body);
+    return match === null ? null :
+      { challenge: match[1], verdict: match[2], trailingDot: match[3] === '.' };
+  };
+  const plain = core(source);
+  if (plain !== null) return plain;
+  for (const mark of ['`', '**']) {
+    if (!source.startsWith(mark)) continue;
+    let body = null;
+    let outerDot = false;
+    if (source.endsWith(mark)) body = source.slice(mark.length, -mark.length);
+    else if (source.endsWith(`${mark}.`)) {
+      body = source.slice(mark.length, -(mark.length + 1));
+      outerDot = true;
+    }
+    if (body === null) continue;
+    const wrapped = core(body);
+    if (wrapped !== null && !(wrapped.trailingDot && outerDot)) return wrapped;
+  }
+  return null;
+}
+
 export function stageVerdictLine(text, challenge) {
   // Ровно одна строка вердикта во всём ответе: две подходящие строки
   // (даже с одним challenge) — неоднозначность, отказ до аттестации.
-  const lines = String(text ?? '')
-    .match(/^\s*[a-f0-9]{64} (?:PASS|REWORK|BLOCKED)\s*$/gm) ?? [];
+  const lines = String(text ?? '').split('\n').map(parseVerdictLine).filter(Boolean);
   if (lines.length !== 1) throw new StageDenied('stage_verdict_unconfirmed');
-  const match = /^\s*([a-f0-9]{64}) (PASS|REWORK|BLOCKED)\s*$/.exec(lines[0]);
-  if (match[1] !== challenge) throw new StageDenied('stage_verdict_unconfirmed');
-  return match[2];
+  if (lines[0].challenge !== challenge) throw new StageDenied('stage_verdict_unconfirmed');
+  return lines[0].verdict;
 }
 
 // Ожидание внутреннего вызова с учётом AbortSignal: при обрыве сначала
@@ -329,10 +353,10 @@ export function createStageSandboxTransport({
       const instruction = [
         'Изолированный этап измерения. Read-only: никаких записей, сети, команд и инструментов изменения.',
         'Дерево кандидата смонтировано read-only в /candidate — читай файлы напрямую.',
-        'Ответь ровно одной финальной строкой: <challenge> PASS|REWORK|BLOCKED.',
-        `Challenge: ${challenge}`,
-        '',
         prompt,
+        '',
+        `Challenge: ${challenge}`,
+        STAGE_VERDICT_INSTRUCTION,
       ].join('\n');
       const argv = ['/bin/sh', '-c',
         'mkdir -p /tmp/.pi/agent /tmp/session; ' +
@@ -445,6 +469,8 @@ export function createStageSandboxTransport({
       const instruction = [
         prompt,
         'Файлы кандидата доступны read-only в candidate/ — прочитай их инструментами чтения (read_file, grep_search, find_by_name, list_dir).',
+        `Challenge: ${challenge}`,
+        STAGE_VERDICT_INSTRUCTION,
       ].join('\n\n');
       let live;
       try {

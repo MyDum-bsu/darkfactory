@@ -187,7 +187,7 @@ async function runCell(name, arm, root, parent, project) {
     if (!/^[1-9][0-9]*$/.test(taskId ?? '')) throw new Error('pilot_task_unconfirmed');
     const started = Date.now();
     const output = await exec(process.execPath, [join(SOURCE, 'board_pipeline/run-isolated.mjs'), '--execute',
-      '--policy', policyFile, '--state', join(run, 'state')], { env, timeout: 360_000, maxBuffer: 2 * 1024 * 1024 })
+      '--policy', policyFile, '--state', join(run, 'state')], { env, timeout: 480_000, maxBuffer: 2 * 1024 * 1024 })
       .then(r => ({ ...r, code: 0 }), e => ({ stdout: e.stdout ?? '', stderr: e.stderr ?? '', code: e.code ?? null }));
     const wall = Date.now() - started;
     await writeFile(join(run, 'runner.log'), output.stdout + '\n' + output.stderr, { mode: 0o600 });

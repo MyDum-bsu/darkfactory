@@ -107,6 +107,11 @@ test('docker-ro-v1: аттестованный witness, конфигурация
   assert.ok(run.argv.slice(0, 2).join(' ').includes('/bin/sh -c'));
   assert.ok(run.argv.includes('read,grep,find,ls'));
   assert.ok(run.mounts.some(m => m.dst === '/pi-guard/pi-guard.cjs'));
+  const instruction = run.argv.at(-1);
+  assert.match(instruction, /Output ONLY the single plain-text line/);
+  assert.match(instruction, /no markdown backticks, no bold, no punctuation/);
+  assert.ok(instruction.indexOf('Output ONLY') > instruction.indexOf('Challenge:'),
+    'однозначная verdict-инструкция завершает stage prompt');
   const guard = await readFile(new URL('./pi-guard.cjs', import.meta.url), 'utf8');
   assert.match(guard, /44100/, 'pi-guard жёстко запрещает порт 44100');
 });
@@ -198,6 +203,44 @@ test('недостоверный verdict и mismatch модели — fail-close
   await assert.rejects(bad(`${'e'.repeat(64)} PASS`).observe(request(sol)), /stage_verdict_unconfirmed/);
   await assert.rejects(bad('no verdict here').observe(request(sol)), /stage_verdict_unconfirmed/);
   assert.equal(stageVerdictLine(` ${challenge} REWORK`, challenge), 'REWORK');
+});
+
+test('stageVerdictLine: markdown-обёртка и точка допускаются без ослабления уникальности и challenge', () => {
+  const accepted = [
+    [`${challenge} PASS`, 'PASS'],
+    [`  ${challenge} REWORK  `, 'REWORK'],
+    [`\`${challenge} BLOCKED\``, 'BLOCKED'],
+    [`**${challenge} PASS**`, 'PASS'],
+    [`${challenge} REWORK.`, 'REWORK'],
+    [`\`${challenge} BLOCKED.\``, 'BLOCKED'],
+    [`**${challenge} PASS.**`, 'PASS'],
+    [`**${challenge} PASS**.`, 'PASS'],
+    [`preface\n\`${challenge} REWORK\`\nepilogue`, 'REWORK'],
+    [`\`${challenge} BLOCKED\`\r\n`, 'BLOCKED'],
+  ];
+  for (const [text, verdict] of accepted) {
+    assert.equal(stageVerdictLine(text, challenge), verdict);
+    assert.equal(stageVerdictLine(text, challenge), verdict, 'парсер детерминирован при повторном вызове');
+  }
+  for (const empty of ['', null, undefined]) {
+    assert.throws(() => stageVerdictLine(empty, challenge), /stage_verdict_unconfirmed/);
+  }
+
+  const foreign = 'e'.repeat(64);
+  const rejected = [
+    `${challenge} PASS\n${challenge} PASS`,
+    `${challenge} PASS\n\`${challenge} PASS\``,
+    `${foreign} PASS`,
+    `**${foreign} REWORK**`,
+    `the verdict is ${challenge} PASS`,
+    `${challenge} PASS because tests passed`,
+    `**${challenge} PASS`,
+    `\`${challenge} PASS**`,
+    `***${challenge} PASS***`,
+    `${challenge} PASS..`,
+    `\`${challenge} PASS.\`.`,
+  ];
+  for (const text of rejected) assert.throws(() => stageVerdictLine(text, challenge), /stage_verdict_unconfirmed/);
 });
 
 test('реальная сетевая изоляция: connect к :44100 внутри rootless read-only контейнера', async t => {
