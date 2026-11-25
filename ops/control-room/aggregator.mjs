@@ -19,7 +19,7 @@
 
 import { execFile } from 'node:child_process';
 import { createReadStream } from 'node:fs';
-import { mkdir, readFile, readdir, stat, unlink } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, stat, unlink } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { homedir } from 'node:os';
@@ -35,6 +35,8 @@ import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
 import { createNetHealthMonitor } from './net-health.mjs';
 import { createFinopsProvider } from './finops.mjs';
 import { loadModelRegistry, registrySnapshot } from '../../board_pipeline/model-registry.mjs';
+import { collectTelemetry } from '../../board_pipeline/telemetry-collector.mjs';
+import { aggregateScorecard } from '../../board_pipeline/model-scorecard.mjs';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -257,6 +259,81 @@ export function createBranchDriftProvider(repos, {
   };
 }
 
+export const DEFAULT_TELEMETRY_DIR = join(
+  process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'),
+  'darkfactory', 'telemetry');
+export const TELEMETRY_MAX_BYTES = 1024 * 1024;
+export const TELEMETRY_MAX_FILES = 32;
+
+async function readBoundedText(path, maxBytes) {
+  const chunks = [];
+  let total = 0;
+  const stream = createReadStream(path, { encoding: 'utf8', end: maxBytes - 1 });
+  for await (const chunk of stream) {
+    total += Buffer.byteLength(chunk);
+    if (total > maxBytes) break;
+    chunks.push(chunk);
+  }
+  return chunks.join('');
+}
+
+// Safe read-only telemetry provider. It reads only regular *.jsonl files in
+// one directory, caps both file count and bytes, ignores corrupt JSONL rows,
+// and returns null when no valid run record exists. Missing directories and
+// filesystem races are observation gaps, never server failures.
+export function createTelemetryProvider({
+  telemetryDir = process.env.DF_TELEMETRY_DIR ?? DEFAULT_TELEMETRY_DIR,
+  maxBytes = TELEMETRY_MAX_BYTES,
+  maxFiles = TELEMETRY_MAX_FILES,
+  now = () => Date.now(),
+} = {}) {
+  return async () => {
+    try {
+      if (typeof telemetryDir !== 'string' || !telemetryDir) return null;
+      const dirStat = await lstat(telemetryDir).catch(() => null);
+      if (!dirStat?.isDirectory() || dirStat.isSymbolicLink()) return null;
+      const entries = await readdir(telemetryDir, { withFileTypes: true })
+        .catch(() => []);
+      const names = entries
+        .filter(entry => entry.isFile() && entry.name.endsWith('.jsonl'))
+        .map(entry => entry.name)
+        .sort()
+        .slice(0, maxFiles);
+      if (!names.length) return null;
+
+      const lines = [];
+      let remaining = maxBytes;
+      let latestMtimeMs = 0;
+      for (const name of names) {
+        if (remaining <= 0) break;
+        const path = join(telemetryDir, name);
+        const fileStat = await lstat(path).catch(() => null);
+        if (!fileStat?.isFile() || fileStat.isSymbolicLink()) continue;
+        latestMtimeMs = Math.max(latestMtimeMs, fileStat.mtimeMs);
+        const text = await readBoundedText(path, Math.min(remaining, maxBytes)).catch(() => '');
+        remaining -= Math.min(maxBytes, Buffer.byteLength(text));
+        for (const line of text.split(/\r?\n/)) if (line.trim()) lines.push(line);
+      }
+
+      const collected = await collectTelemetry({ telemetryLines: lines, clock: now });
+      if (!collected.sources.telemetry_runs) return null;
+      const scorecard = aggregateScorecard(lines, { seed: [] });
+      return {
+        runs: collected.sources.telemetry_runs,
+        firstRoundPassRate: collected.portfolio.first_round_pass_rate,
+        avgReworkRounds: collected.portfolio.avg_rework_rounds,
+        medianWallClockMs: collected.portfolio.median_wall_clock_ms,
+        models: scorecard.cells,
+        updatedAt: latestMtimeMs
+          ? new Date(latestMtimeMs).toISOString()
+          : collected.generated_at,
+      };
+    } catch {
+      return null;
+    }
+  };
+}
+
 // RO-список BB-тредов через CLI (bb thread list --json).
 export async function loadBbThreadsFromCli({ execImpl } = {}) {
   const exec = execImpl ?? (async (args) =>
@@ -320,13 +397,15 @@ export function createControlRoomAggregator({
   bbThreadsProvider = async () => [],
   branchDriftProvider = null,
   netHealth = null,
-  telemetryProvider = async () => null,
+  telemetryProvider = null,
+  telemetryDir = process.env.DF_TELEMETRY_DIR ?? DEFAULT_TELEMETRY_DIR,
   modelsProvider = createModelsProvider(),
   finopsProvider = createFinopsProvider(),
   inspectProvider = async () => ({ text: '', artifacts: [] }),
   webDir = WEB_DIR,
   now = () => Date.now(),
 } = {}) {
+  const readTelemetry = telemetryProvider ?? createTelemetryProvider({ telemetryDir, now });
   const ring = [];           // ограниченный журнал событий (≤ ringLimit)
   const attempts = new Map(); // key → последнее состояние попытки
   const sseClients = new Set();
@@ -448,7 +527,7 @@ export function createControlRoomAggregator({
     const [board, threads, telemetry] = await Promise.all([
       readBoardTasks(boardTasksProvider),
       bbThreadsProvider().catch(() => []),
-      telemetryProvider().catch(() => null)]);
+      readTelemetry().catch(() => null)]);
     const tasks = board.tasks;
     const net = netHealth ? await netHealth.snapshot().catch(() => null) : null;
     const drift = branchDriftProvider
@@ -647,7 +726,8 @@ async function cli(argv) {
     'models-catalog': { type: 'string' },
     'routing-policy': { type: 'string' },
     'resources-budget': { type: 'string' },
-    'worker-usage': { type: 'string' } } });
+    'worker-usage': { type: 'string' },
+    'telemetry-dir': { type: 'string' } } });
   const port = values.port !== undefined ? Number(values.port)
     : Number(process.env.DF_CONTROL_ROOM_PORT ?? DEFAULT_PORT);
   const socketPath = values.socket !== undefined ? values.socket
@@ -682,6 +762,7 @@ async function cli(argv) {
     modelsProvider: createModelsProvider({
       catalogPath: values['models-catalog'],
       policyPath: values['routing-policy'] }),
+    telemetryDir: values['telemetry-dir'],
     finopsProvider: createFinopsProvider({
       budgetPath: values['resources-budget'],
       workerUsagePath: values['worker-usage'],

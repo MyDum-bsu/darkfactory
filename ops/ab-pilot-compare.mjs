@@ -103,7 +103,8 @@ async function readCell(root, name, arm) {
     ...(attempt.tokens?.arbiter ? [attempt.tokens.arbiter] : []), ...bb.filter(item => item.role === 'stage').map(item => item.usage)];
   const fragment = sumUsages(modelUsages);
   // A truncated turn or aggregate L2 receipt cannot prove complete coverage of a cell.
-  const allStages = arm === 'linear' ? stages.length === 0 : first && await stagesCovered(run, policy, stages, accepted, bb);
+  const witnessedStages = arm === 'linear' ? stages.length === 0 : await stagesCovered(run, policy, stages, accepted, bb);
+  const allStages = arm === 'linear' ? witnessedStages : first && witnessedStages;
   const completeRoles = first && attempt.rounds.arbitration === 0 && allStages && bb.length > 0 && bb.every(row => row.complete);
   const coverage = completeRoles &&
     modelUsages.every(usage => usage && usage.input !== null && usage.output !== null && usage.cached !== null);
@@ -112,6 +113,7 @@ async function readCell(root, name, arm) {
   const completeCost = completeRoles && costs.every(value => value !== null);
   const envelope = { case: name, arm, closed, first_round_pass: first, elapsed_ms: outcome.elapsed_ms,
     rework: attempt.rounds.rework, attempted_rounds: attempt.rounds.total, stage_threads: stages.length,
+    stage_witness_coverage: arm === 'foreman' ? (witnessedStages ? 1 : 0) : null,
     tokens: coverage ? fragment : null, known_tokens: fragment,
     cost_usd: completeCost ? costs.reduce((sum, value) => sum + value, 0) : null };
   const pinned = canonicalDigest({ base: outcome.baseSha, checks: policy.profiles.case.checks,
