@@ -29,6 +29,15 @@ async function enrollLinear(t, waitMs) {
   });
 }
 
+test('A/B pilot accepts the full enclosed wait range through 360000 ms', async t => {
+  for (const waitMs of [5000, 360000]) {
+    const enrolled = await enrollLinear(t, waitMs);
+    assert.equal(enrolled.arm, 'linear');
+    assert.equal(enrolled.case, 'policy');
+    await enrolled.assertOpen();
+  }
+});
+
 test('A/B pilot accepts the full enclosed wait range through 600000 ms', async t => {
   for (const waitMs of [5000, 360001, 540000, 600000]) {
     const enrolled = await enrollLinear(t, waitMs);
