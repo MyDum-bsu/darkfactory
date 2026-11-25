@@ -204,6 +204,126 @@ test('aggregator: snapshot колонки по состояниям Board', asyn
     });
 });
 
+test('aggregator V2-8: activeTrees hierarchy, boardExplorer groups and repoSlots warning', async () => {
+  const fixedNow = Date.parse('2026-01-01T01:00:00.000Z');
+  const telemetryProvider = async () => ({ attempts: [{
+    task_id: 'T9', attempt_id: 'att-9', epoch: 1, outcome: 'done', repo_id: 'repo-gamma',
+    channel: 'darkfactory', title: 'Telemetry done',
+    started_at: '2026-01-01T00:00:00.000Z', ended_at: '2026-01-01T00:30:00.000Z',
+    phases_ms: { spawn: 1000, worker: 600000, l1_local: 60000, tamper: 30000,
+      l3_visual: null, l2_critic: 120000, arbiter: null, total: 1800000 },
+    rounds: { total: 2, rework: 1, pass: 1, arbitration: 1, open: 0,
+      gates: { l1: 1, tamper: 1, l2: 1, arbiter: 1 } },
+    models: { worker: { provider: 'acp-devin', model: 'swe-2-high' },
+      critic: { provider: 'google', model: 'gemini-review' },
+      arbiter: { provider: 'openai', model: 'sol-arbiter' } },
+    tokens: { worker: { input: 1000, output: 200, cached: 300 }, critic: null, arbiter: null },
+    costs: { worker: 1.2, critic: 0.3 },
+  }] });
+  const tasks = [
+    { task_id: 'T1', state: 'claimed', title: 'Active tree', channel: 'darkfactory',
+      labels: { repo_id: 'repo-alpha', priority: 'P1' }, priority: 'P1',
+      updatedAt: '2026-01-01T00:59:00.000Z' },
+    { task_id: 'T2', state: 'claimed', title: 'Second writer', channel: 'darkfactory',
+      labels: { repo_id: 'repo-alpha', priority: 'P2' } },
+    { task_id: 'T3', state: 'ready', title: 'Idea', channel: 'ideas',
+      labels: { repo_id: 'repo-beta', priority: 'P3' }, receiptSha: 'a'.repeat(40) },
+    { task_id: 'T4', state: 'waiting', title: 'Waiting', channel: 'darkfactory/friction',
+      labels: { repo_id: 'repo-beta' } },
+    { task_id: 'T5', state: 'blocked', title: 'Blocked', channel: 'ideas',
+      labels: { repo_id: 'repo-beta' } },
+    { task_id: 'T6', state: 'completed', title: 'Done', channel: 'optimization/core',
+      labels: { repo_id: 'repo-gamma' }, receiptSha: 'b'.repeat(40) },
+    { task_id: 'T9', state: 'completed', title: 'Telemetry done', channel: 'darkfactory',
+      labels: { repo_id: 'repo-gamma' } },
+  ];
+  const server = createControlRoomAggregator({ port: 0, now: () => fixedNow,
+    boardTasksProvider: async () => tasks, telemetryProvider });
+  server.ingest({ kind: 'phase', phase: 'working', task_id: 'T1', attempt_id: 'att-1', epoch: 1,
+    ts: '2026-01-01T00:00:00.000Z', channel: 'darkfactory', model: 'acp-devin/swe-2-high', tokens: 1234,
+    detail: { threadId: 'thr-worker', branch: 'feat/t1', contextPct: 47, cacheStatus: 'hit' } });
+  server.ingest({ kind: 'stage.started', phase: 'stages', task_id: 'T1', attempt_id: 'att-1', epoch: 1,
+    ts: '2026-01-01T00:05:00.000Z', detail: { stage: 'l1_local' } });
+  server.ingest({ kind: 'stage.completed', phase: 'stages', task_id: 'T1', attempt_id: 'att-1', epoch: 1,
+    ts: '2026-01-01T00:10:00.000Z', detail: { stage: 'l1_local', verdict: 'PASS' } });
+  server.ingest({ kind: 'stage.completed', phase: 'stages', task_id: 'T1', attempt_id: 'att-1', epoch: 1,
+    ts: '2026-01-01T00:12:00.000Z', detail: { stage: 'tamper', verdict: 'PASS' } });
+  server.ingest({ kind: 'stage.completed', phase: 'stages', task_id: 'T1', attempt_id: 'att-1', epoch: 1,
+    ts: '2026-01-01T00:13:00.000Z', detail: { stage: 'scope_fence', verdict: 'PASS' } });
+  server.ingest({ kind: 'stage.started', phase: 'stages', task_id: 'T1', attempt_id: 'att-1', epoch: 1,
+    ts: '2026-01-01T00:15:00.000Z', model: 'google/gemini-review', detail: { stage: 'l2_critic' } });
+
+  const snap = await server.snapshot();
+  const tree = snap.activeTrees.find(item => item.taskId === 'T1');
+  assert.ok(tree, 'T1 tree exists');
+  assert.equal(tree.title, 'Active tree');
+  assert.equal(tree.channel, 'darkfactory');
+  assert.equal(tree.repoId, 'repo-alpha');
+  assert.equal(tree.status, 'running');
+  assert.equal(tree.elapsedMs, 3600000);
+  assert.equal(tree.worker.threadId, 'thr-worker');
+  assert.equal(tree.worker.provider, 'acp-devin');
+  assert.equal(tree.worker.model, 'swe-2-high');
+  assert.equal(tree.worker.branch, 'feat/t1');
+  assert.equal(tree.worker.contextPct, 47);
+  assert.equal(tree.worker.cacheStatus, 'hit');
+  assert.equal(tree.worker.tokens, 1234);
+  assert.deepEqual(tree.stages.map(stage => stage.kind),
+    ['l1_local', 'tamper', 'scope_fence', 'l2_critic', 'arbiter']);
+  assert.equal(tree.stages[0].status, 'pass');
+  assert.equal(tree.stages[0].elapsedMs, 300000);
+  assert.equal(tree.stages[1].status, 'pass');
+  assert.equal(tree.stages[2].status, 'pass');
+  assert.equal(tree.stages[3].status, 'running');
+  assert.equal(tree.stages[3].model, 'gemini-review');
+  assert.equal(tree.stages[4].status, 'pending');
+
+  const telemetryTree = snap.activeTrees.find(item => item.taskId === 'T9');
+  assert.ok(telemetryTree, 'telemetry tree exists');
+  assert.equal(telemetryTree.status, 'done');
+  assert.equal(telemetryTree.rounds, 2);
+  assert.equal(telemetryTree.reworkRounds, 1);
+  assert.equal(telemetryTree.estCostUsd, 1.5);
+  assert.equal(telemetryTree.burnRatePerHr, 3);
+  assert.equal(telemetryTree.worker.model, 'swe-2-high');
+  assert.deepEqual(telemetryTree.worker.tokens, { input: 1000, output: 200, cached: 300 });
+  assert.equal(telemetryTree.stages.find(stage => stage.kind === 'l2_critic').elapsedMs, 120000);
+  assert.equal(telemetryTree.stages.find(stage => stage.kind === 'arbiter').status, 'skipped');
+
+  assert.equal(snap.repoSlots.defaultMaxPerRepo, 1);
+  assert.equal(snap.repoSlots.activeByRepo['repo-alpha'], 2);
+  assert.equal(snap.repoSlots.multiWriterWarnings.length, 1);
+  assert.ok(snap.repoSlots.multiWriterWarnings[0].includes('repo-alpha'));
+
+  const df = snap.boardExplorer.channels.find(channel => channel.name === 'darkfactory');
+  const ideas = snap.boardExplorer.channels.find(channel => channel.name === 'ideas');
+  const friction = snap.boardExplorer.channels.find(channel => channel.name === 'darkfactory/friction');
+  const optimization = snap.boardExplorer.channels.find(channel => channel.name === 'optimization/core');
+  assert.ok(df && ideas && friction && optimization);
+  assert.deepEqual(df.counts, { ready: 0, claimed: 2, waiting: 0, blocked: 0, completed: 1 });
+  assert.deepEqual(ideas.counts, { ready: 1, claimed: 0, waiting: 0, blocked: 1, completed: 0 });
+  assert.equal(friction.counts.waiting, 1);
+  assert.equal(optimization.counts.completed, 1);
+  const readyIdea = ideas.tasks.find(task => task.id === 'T3');
+  assert.equal(readyIdea.priority, 'P3');
+  assert.equal(readyIdea.repoId, 'repo-beta');
+  assert.equal(readyIdea.receiptSha, 'a'.repeat(40));
+  assert.equal(df.tasks.find(task => task.id === 'T1').updatedAt, '2026-01-01T00:59:00.000Z');
+});
+
+test('aggregator V2-8: additive snapshot preserves existing keys', async () => {
+  const server = createControlRoomAggregator({ port: 0 });
+  const snap = await server.snapshot();
+  for (const key of ['ts', 'reconcile', 'running', 'queued', 'needsOwner', 'recentlyCompleted',
+    'boardStatus', 'health', 'sessions', 'shiva', 'branchDrift', 'netHealth', 'telemetry',
+    'models', 'finops', 'eventsTail', 'attemptsTracked']) {
+    assert.ok(Object.hasOwn(snap, key), key);
+  }
+  for (const key of ['activeTrees', 'boardExplorer', 'repoSlots']) {
+    assert.ok(Object.hasOwn(snap, key), key);
+  }
+});
+
 test('aggregator: шива-счётчик помечает лида с двумя задачами как dirty', async () => {
   const threads = [
     { id: 't1', status: 'running', lead_session_id: 'L1', task_id: 'A' },
@@ -801,11 +921,11 @@ test('df-herd: https: схема принимается парсером и не
   assert.equal(stderr.includes('unsupported URL scheme'), false);
 });
 
-test('web app: 4 вкладки, safe URL validation и mobile CSS присутствуют', async () => {
+test('web app: вкладки incl Board Explorer, safe URL validation и mobile CSS присутствуют', async () => {
   const app = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
   const html = await readFile(join(MODULE_DIR, 'web', 'index.html'), 'utf8');
   const css = await readFile(join(MODULE_DIR, 'web', 'styles.css'), 'utf8');
-  for (const label of ['Operations', 'Models &amp; Routing', 'Resources &amp; FinOps', 'Workspace Map']) {
+  for (const label of ['Operations', 'Board', 'Models &amp; Routing', 'Resources &amp; FinOps', 'Workspace Map']) {
     assert.ok(html.includes(label), label);
   }
   assert.equal(app.includes('new URL(value)'), true);
@@ -815,6 +935,10 @@ test('web app: 4 вкладки, safe URL validation и mobile CSS присут�
   assert.equal(app.includes('navigator.clipboard?.writeText'), true);
   assert.equal(app.includes('fallbackCopyText'), true);
   assert.equal(app.includes('copyCommandChip'), true);
+  assert.equal(html.includes('data-tab="board"'), true);
+  assert.equal(html.includes('id="board-explorer"'), true);
+  assert.equal(app.includes('textContent'), true);
+  await execFileAsync(process.execPath, ['--check', join(MODULE_DIR, 'web', 'app.js')]);
 });
 
 

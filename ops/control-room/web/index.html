@@ -24,6 +24,7 @@
 
 <nav id="tabs" aria-label="Control Room sections">
   <button type="button" class="tab active" data-tab="ops">Operations</button>
+  <button type="button" class="tab" data-tab="board">Board</button>
   <button type="button" class="tab" data-tab="models">Models &amp; Routing</button>
   <button type="button" class="tab" data-tab="finops">Resources &amp; FinOps</button>
   <button type="button" class="tab" data-tab="workspace">Workspace Map</button>
@@ -32,23 +33,55 @@
 <div id="drift-panel" class="hidden"></div>
 <div id="state-banner" class="hidden"></div>
 
-<main id="board" class="tab-page">
-  <section class="col" id="col-running">
-    <h2>RUNNING NOW <span class="count" id="count-running">0</span></h2>
-    <div class="cards" id="running"></div>
+<main id="board" class="tab-page ops-page">
+  <section id="ops-summary" class="ops-ribbon" aria-label="Сводка операций"></section>
+  <section class="tree-section" aria-labelledby="agent-tree-title">
+    <div class="section-head">
+      <h2 id="agent-tree-title">AGENT EXECUTION TREE</h2>
+      <span class="section-note">read-only · live events + telemetry</span>
+    </div>
+    <div id="agent-trees" class="agent-trees"></div>
   </section>
-  <section class="col" id="col-queued">
-    <h2>QUEUED / WAITING <span class="count" id="count-queued">0</span></h2>
-    <div class="cards" id="queued"></div>
-  </section>
-  <section class="col" id="col-owner">
-    <h2>NEEDS OWNER <span class="count" id="count-owner">0</span></h2>
-    <div class="cards" id="needs-owner"></div>
-    <h2 class="mt">RECENTLY COMPLETED <span class="count" id="count-done">0</span></h2>
-    <div class="cards" id="done"></div>
-    <button id="toggle-done" class="link hidden" type="button"></button>
-  </section>
+  <div class="ops-columns">
+    <section class="col" id="col-running">
+      <h2>RUNNING NOW <span class="count" id="count-running">0</span></h2>
+      <div class="cards" id="running"></div>
+    </section>
+    <section class="col" id="col-queued">
+      <h2>QUEUED / WAITING <span class="count" id="count-queued">0</span></h2>
+      <div class="cards" id="queued"></div>
+    </section>
+    <section class="col" id="col-owner">
+      <h2>NEEDS OWNER <span class="count" id="count-owner">0</span></h2>
+      <div class="cards" id="needs-owner"></div>
+      <h2 class="mt">RECENTLY COMPLETED <span class="count" id="count-done">0</span></h2>
+      <div class="cards" id="done"></div>
+      <button id="toggle-done" class="link hidden" type="button"></button>
+    </section>
+  </div>
 </main>
+
+<section id="board-page" class="tab-page hidden" aria-label="Board Explorer">
+  <div class="board-toolbar">
+    <label class="board-filter-label">Канал
+      <select id="board-channel-filter">
+        <option value="all">Все</option>
+      </select>
+    </label>
+    <div class="state-filter" id="board-state-filter" aria-label="Состояние">
+      <button type="button" class="state-pill active" data-state="all">Все</button>
+      <button type="button" class="state-pill" data-state="ready">ready</button>
+      <button type="button" class="state-pill" data-state="claimed">claimed</button>
+      <button type="button" class="state-pill" data-state="waiting">waiting</button>
+      <button type="button" class="state-pill" data-state="blocked">blocked</button>
+      <button type="button" class="state-pill" data-state="completed">completed</button>
+    </div>
+    <label class="board-search-label">Поиск
+      <input id="board-search" type="search" placeholder="id, title, repo, label…" autocomplete="off">
+    </label>
+  </div>
+  <div id="board-explorer" class="board-explorer"></div>
+</section>
 
 <section id="models-page" class="tab-page hidden" aria-label="Models and routing">
   <div id="models-summary" class="summary-grid"></div>
@@ -77,7 +110,15 @@
   <div id="projects"></div>
 </footer>
 
-<aside id="inspect" class="hidden">
+<aside id="board-task-drawer" class="hidden drawer" aria-label="Task details">
+  <div class="inspect-head">
+    <span id="board-task-title">task</span>
+    <button id="board-task-close" type="button">×</button>
+  </div>
+  <div id="board-task-body" class="drawer-body"></div>
+</aside>
+
+<aside id="inspect" class="hidden drawer">
   <div class="inspect-head">
     <span id="inspect-title">inspect</span>
     <button id="inspect-close" type="button">×</button>

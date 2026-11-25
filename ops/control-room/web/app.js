@@ -4,7 +4,8 @@
 'use strict';
 
 const $ = id => document.getElementById(id);
-const state = { snapshot: null, showAllDone: false, driftOpen: false, cleanOnly: true, tab: 'ops' };
+const state = { snapshot: null, showAllDone: false, driftOpen: false, cleanOnly: true, tab: 'ops',
+  boardChannel: 'all', boardState: 'all', boardSearch: '' };
 
 const el = (tag, cls, text) => {
   const node = document.createElement(tag);
@@ -30,6 +31,263 @@ const fmtMs = ms => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
+
+const moneyUsd = n => n == null ? '—' : `$${Number(n).toFixed(3)}`;
+const pct = n => n == null ? '—' : `${Math.round(Number(n))}%`;
+const shortSha = value => typeof value === 'string' && value ? value.slice(0, 12) : '—';
+const statusClass = status => status === 'pass' || status === 'done' || status === 'completed' ? 'ok'
+  : status === 'running' || status === 'rework' || status === 'claimed' || status === 'ready' ? 'accent'
+  : status === 'hold' || status === 'blocked' || status === 'waiting' || status === 'pending' ? 'warn'
+  : status === 'fail' || status === 'failed' ? 'bad' : '';
+
+function pill(text, cls) {
+  return el('span', `pill${cls ? ` ${cls}` : ''}`, text ?? '—');
+}
+
+function tokenText(tokens) {
+  if (tokens == null) return '—';
+  if (Number.isFinite(tokens)) return String(tokens);
+  if (typeof tokens === 'object') {
+    const total = Number.isFinite(tokens.total) ? tokens.total
+      : (tokens.input ?? 0) + (tokens.output ?? 0);
+    const cached = Number.isFinite(tokens.cached) && tokens.cached ? ` · cache ${tokens.cached}` : '';
+    return `${total || '—'} tok${cached}`;
+  }
+  return String(tokens);
+}
+
+function opsMetric(label, value, sub, cls) {
+  const node = el('div', `ops-metric${cls ? ` ${cls}` : ''}`);
+  node.append(el('div', 'ops-label', label));
+  node.append(el('div', 'ops-value', value));
+  node.append(el('div', 'ops-sub', sub ?? 'read-only'));
+  return node;
+}
+
+function renderOpsSummary(snap) {
+  const box = $('ops-summary');
+  box.replaceChildren();
+  const trees = Array.isArray(snap.activeTrees) ? snap.activeTrees : [];
+  const active = trees.filter(tree => ['running', 'rework'].includes(tree.status));
+  const rounds = trees.reduce((sum, tree) => sum + (Number.isFinite(tree.rounds) ? tree.rounds : 0), 0);
+  const reviews = trees.reduce((sum, tree) => sum + (tree.stages ?? []).filter(stage =>
+    ['l2_critic', 'arbiter'].includes(stage.kind) && stage.status === 'running').length, 0);
+  const burn = active.reduce((sum, tree) => sum + (Number.isFinite(tree.burnRatePerHr) ? tree.burnRatePerHr : 0), 0);
+  const credits = snap.finops?.totals?.remainingCreditsEur;
+  const slots = snap.repoSlots ?? { activeByRepo: {}, multiWriterWarnings: [] };
+  const slotCount = Object.values(slots.activeByRepo ?? {}).reduce((a, b) => a + b, 0);
+  const warnings = slots.multiWriterWarnings?.length ?? 0;
+  box.append(
+    opsMetric('Активные задачи', String(active.length), `всего деревьев ${trees.length}`, active.length ? 'ok' : null),
+    opsMetric('Раунды', String(rounds), `rework ${trees.reduce((sum, tree) => sum + (tree.reworkRounds ?? 0), 0)}`),
+    opsMetric('Ревью в работе', String(reviews), 'L2 critic + arbiter', reviews ? 'warn' : null),
+    opsMetric('Burn rate', burn ? `$${burn.toFixed(2)}/h` : '—', 'оценка активных воркеров', burn ? 'warn' : null),
+    opsMetric('GCP credits', credits == null ? '—' : eur(credits), 'остаток по FinOps', credits ? 'ok' : null),
+    opsMetric('Изоляция repo slots', `${slotCount}/repo ≤ 1`, warnings ? `${warnings} конфликт(а)` : 'по одному писателю', warnings ? 'bad' : 'ok'),
+  );
+}
+
+function stageTitle(kind) {
+  return { l1_local: 'L1 Docker', tamper: 'Tamper', scope_fence: 'Scope Fence',
+    l2_critic: 'L2 Critic', arbiter: 'Arbiter' }[kind] ?? kind;
+}
+
+function stageNode(stage) {
+  const node = el('li', `stage-node status-${stage.status ?? 'pending'}`);
+  const top = el('div', 'stage-top');
+  top.append(el('span', 'stage-name', stageTitle(stage.kind)));
+  top.append(pill(stage.status ?? 'pending', statusClass(stage.status)));
+  node.append(top);
+  const meta = el('div', 'stage-meta');
+  if (stage.model) meta.append(el('span', null, stage.model));
+  if (stage.round != null) meta.append(el('span', null, `round ${stage.round}`));
+  if (stage.elapsedMs != null) meta.append(el('span', null, fmtMs(stage.elapsedMs)));
+  if (stage.reason) meta.append(el('span', null, stage.reason));
+  if (!meta.childNodes.length) meta.append(el('span', null, 'ожидание'));
+  node.append(meta);
+  return node;
+}
+
+function workerNode(worker) {
+  const node = el('div', 'worker-node');
+  const title = el('div', 'worker-title');
+  title.append(el('span', null, 'Worker'));
+  title.append(pill(worker?.phase ?? 'unknown', statusClass(worker?.phase)));
+  node.append(title);
+  node.append(el('div', 'worker-subtitle',
+    [worker?.provider, worker?.model].filter(Boolean).join(' / ') || 'модель не сообщена'));
+  const meta = el('div', 'tree-meta');
+  if (worker?.threadId) meta.append(pill(worker.threadId, 'violet'));
+  if (worker?.branch) meta.append(pill(worker.branch, 'accent'));
+  if (worker?.elapsedMs != null) meta.append(pill(`⏱ ${fmtMs(worker.elapsedMs)}`));
+  if (worker?.cacheStatus) meta.append(pill(`cache ${worker.cacheStatus}`, 'ok'));
+  meta.append(pill(tokenText(worker?.tokens)));
+  node.append(meta);
+  const line = el('div', 'context-line');
+  const bar = el('div', 'context-bar');
+  const fill = el('div');
+  const value = Number.isFinite(worker?.contextPct) ? Math.max(0, Math.min(100, worker.contextPct)) : 0;
+  fill.style.width = `${value}%`;
+  bar.append(fill);
+  line.append(bar, el('span', null, `ctx ${pct(worker?.contextPct)}`));
+  node.append(line);
+  return node;
+}
+
+function treeCard(tree) {
+  const node = el('article', `tree-card status-${tree.status ?? 'running'}`);
+  const head = el('div', 'tree-head');
+  head.append(el('span', 'tree-id', `#${tree.taskId}`));
+  head.append(el('span', 'tree-title', tree.title || '(без названия)'));
+  head.append(pill(tree.status ?? 'running', statusClass(tree.status)));
+  node.append(head);
+  const meta = el('div', 'tree-meta');
+  meta.append(pill(tree.channel ?? 'unassigned', 'accent'));
+  if (tree.repoId) meta.append(pill(`repo ${tree.repoId}`, 'violet'));
+  node.append(meta);
+  const kpis = el('div', 'tree-kpis');
+  for (const [label, value] of [
+    ['elapsed', fmtMs(tree.elapsedMs)],
+    ['rounds', tree.rounds ?? '—'],
+    ['rework', tree.reworkRounds ?? '—'],
+    ['cost / burn', `${moneyUsd(tree.estCostUsd)} · ${tree.burnRatePerHr == null ? '—' : `$${tree.burnRatePerHr.toFixed(2)}/h`}`],
+  ]) {
+    const kpi = el('div', 'tree-kpi');
+    kpi.append(el('span', null, label));
+    kpi.append(el('b', null, String(value)));
+    kpis.append(kpi);
+  }
+  node.append(kpis);
+  node.append(workerNode(tree.worker ?? {}));
+  const stages = el('ol', 'stage-list');
+  for (const stage of tree.stages ?? []) stages.append(stageNode(stage));
+  node.append(stages);
+  node.addEventListener('click', () => openInspect(tree.taskId));
+  return node;
+}
+
+function renderAgentTrees(snap) {
+  const box = $('agent-trees');
+  box.replaceChildren();
+  const trees = Array.isArray(snap.activeTrees) ? snap.activeTrees : [];
+  for (const tree of trees) box.append(treeCard(tree));
+  if (!trees.length) box.append(el('div', 'empty', 'Нет активных деревьев исполнения'));
+}
+
+function boardTaskMatches(task, query) {
+  if (!query) return true;
+  const labels = Object.entries(task.labels ?? {}).map(([key, value]) => `${key}=${value}`).join(' ');
+  return [task.id, task.title, task.repoId, task.channel, task.state, task.priority, labels]
+    .filter(Boolean).join(' ').toLowerCase().includes(query);
+}
+
+function channelFilterOptions(channels) {
+  const names = channels.map(channel => channel.name);
+  const options = ['all', ...names];
+  if (names.some(name => name === 'optimization' || name.startsWith('optimization/'))) {
+    options.splice(1, 0, 'optimization/*');
+  }
+  return [...new Set(options)];
+}
+
+function channelMatchesFilter(name, filter) {
+  if (filter === 'all') return true;
+  if (filter.endsWith('/*')) return name === filter.slice(0, -2) || name.startsWith(filter.slice(0, -1));
+  return name === filter;
+}
+
+function updateBoardChannelOptions(channels) {
+  const select = $('board-channel-filter');
+  const selected = state.boardChannel;
+  const options = channelFilterOptions(channels);
+  select.replaceChildren();
+  for (const value of options) {
+    const option = el('option', null, value === 'all' ? 'Все' : value);
+    option.value = value;
+    select.append(option);
+  }
+  select.value = options.includes(selected) ? selected : 'all';
+  state.boardChannel = select.value;
+}
+
+function openBoardTask(task) {
+  const drawer = $('board-task-drawer');
+  drawer.classList.remove('hidden');
+  $('board-task-title').textContent = `#${task.id} · ${task.title || '(без названия)'}`;
+  const body = $('board-task-body');
+  body.replaceChildren();
+  const rows = [
+    ['id', task.id], ['channel', task.channel], ['state', task.state],
+    ['priority', task.priority ?? '—'], ['repo_id', task.repoId ?? '—'],
+    ['updatedAt', task.updatedAt ?? '—'], ['title', task.title || '(без названия)'],
+  ];
+  for (const [key, value] of rows) {
+    const row = el('div', 'detail-row');
+    row.append(el('div', 'detail-key', key));
+    row.append(el('div', 'detail-value', String(value ?? '—')));
+    body.append(row);
+  }
+  const shaRow = el('div', 'detail-row');
+  shaRow.append(el('div', 'detail-key', 'receipt SHA'));
+  shaRow.append(el('div', 'detail-value detail-sha', task.receiptSha ?? '—'));
+  body.append(shaRow);
+  const labels = el('div', 'detail-labels');
+  labels.textContent = Object.entries(task.labels ?? {}).map(([key, value]) => `${key}: ${value}`).join('\n') || 'labels: —';
+  body.append(labels);
+}
+
+function boardTaskCard(task) {
+  const node = el('button', 'board-task-card');
+  node.type = 'button';
+  const top = el('div', 'board-task-top');
+  top.append(el('span', 'board-task-id', `#${task.id}`));
+  top.append(el('span', 'board-task-title', task.title || '(без названия)'));
+  top.append(pill(task.state, statusClass(task.state)));
+  node.append(top);
+  const meta = el('div', 'board-task-meta');
+  if (task.priority) meta.append(pill(`P ${task.priority}`, 'warn'));
+  if (task.repoId) meta.append(pill(task.repoId, 'violet'));
+  if (task.receiptSha) meta.append(pill(`sha ${shortSha(task.receiptSha)}`, 'ok'));
+  node.append(meta);
+  node.append(el('div', 'board-task-updated', `updated ${task.updatedAt ?? '—'}`));
+  node.addEventListener('click', () => openBoardTask(task));
+  return node;
+}
+
+function renderBoardExplorer(snap) {
+  const explorer = snap.boardExplorer ?? { channels: [] };
+  const channels = Array.isArray(explorer.channels) ? explorer.channels : [];
+  updateBoardChannelOptions(channels);
+  for (const button of document.querySelectorAll('#board-state-filter .state-pill')) {
+    button.classList.toggle('active', button.dataset.state === state.boardState);
+  }
+  const box = $('board-explorer');
+  box.replaceChildren();
+  const query = state.boardSearch.trim().toLowerCase();
+  let shown = 0;
+  for (const channel of channels) {
+    if (!channelMatchesFilter(channel.name, state.boardChannel)) continue;
+    const tasks = (channel.tasks ?? []).filter(task =>
+      (state.boardState === 'all' || task.state === state.boardState) && boardTaskMatches(task, query));
+    if (!tasks.length) continue;
+    shown += tasks.length;
+    const section = el('section', 'channel-section');
+    const head = el('div', 'channel-head');
+    head.append(el('span', 'channel-name', channel.name));
+    const counts = el('span', 'channel-counts');
+    for (const stateName of ['ready', 'claimed', 'waiting', 'blocked', 'completed']) {
+      counts.append(pill(`${stateName} ${channel.counts?.[stateName] ?? 0}`, statusClass(stateName)));
+    }
+    head.append(counts);
+    section.append(head);
+    const listNode = el('div', 'channel-tasks');
+    for (const task of tasks) listNode.append(boardTaskCard(task));
+    section.append(listNode);
+    box.append(section);
+  }
+  if (!shown) box.append(el('div', 'empty', 'По фильтру задач нет'));
+}
+
 function chip(id, text, cls) {
   const node = $(id);
   node.textContent = text;
@@ -40,7 +298,10 @@ function chip(id, text, cls) {
 function renderStatus(snap) {
   const host = snap.netHealth?.host ?? {};
   const running = snap.running?.length ?? 0;
-  chip('chip-slots', `слоты ${running}`, running ? 'ok' : null);
+  const activeByRepo = Object.values(snap.repoSlots?.activeByRepo ?? {}).reduce((a, b) => a + b, 0);
+  const slotWarnings = snap.repoSlots?.multiWriterWarnings?.length ?? 0;
+  chip('chip-slots', `слоты ${activeByRepo || running}/repo≤1`,
+    slotWarnings ? 'bad' : (activeByRepo || running) ? 'ok' : null);
   chip('chip-killswitch', snap.killSwitch ? 'KILL-SWITCH' : 'kill-switch: off',
     snap.killSwitch ? 'bad' : null);
   chip('chip-disk', `disk ${fmtBytes(host.disk?.freeBytes)}`,
@@ -431,7 +692,7 @@ function setTab(tab) {
   for (const button of document.querySelectorAll('#tabs .tab')) {
     button.classList.toggle('active', button.dataset.tab === tab);
   }
-  const pages = { ops: 'board', models: 'models-page', finops: 'finops-page', workspace: 'workspace-page' };
+  const pages = { ops: 'board', board: 'board-page', models: 'models-page', finops: 'finops-page', workspace: 'workspace-page' };
   for (const [name, id] of Object.entries(pages)) $(id).classList.toggle('hidden', name !== tab);
   $('projects-footer').classList.toggle('hidden', tab !== 'ops');
 }
@@ -458,7 +719,10 @@ function render(snap) {
   state.snapshot = snap;
   renderStatus(snap);
   renderDriftPanel(snap);
+  renderOpsSummary(snap);
+  renderAgentTrees(snap);
   renderBoard(snap);
+  renderBoardExplorer(snap);
   renderProjects(snap);
   renderModels(snap);
   renderFinops(snap);
@@ -505,13 +769,31 @@ $('chip-drift').addEventListener('click', () => {
   if (state.snapshot) renderDriftPanel(state.snapshot);
 });
 $('inspect-close').addEventListener('click', () => $('inspect').classList.add('hidden'));
+$('board-task-close').addEventListener('click', () => $('board-task-drawer').classList.add('hidden'));
+$('board-channel-filter').addEventListener('change', ev => {
+  state.boardChannel = ev.target.value;
+  if (state.snapshot) renderBoardExplorer(state.snapshot);
+});
+$('board-search').addEventListener('input', ev => {
+  state.boardSearch = ev.target.value;
+  if (state.snapshot) renderBoardExplorer(state.snapshot);
+});
+for (const button of document.querySelectorAll('#board-state-filter .state-pill')) {
+  button.addEventListener('click', () => {
+    state.boardState = button.dataset.state;
+    if (state.snapshot) renderBoardExplorer(state.snapshot);
+  });
+}
 $('toggle-clean').addEventListener('change', ev => { state.cleanOnly = ev.target.checked; });
 for (const button of document.querySelectorAll('#tabs .tab')) {
   button.addEventListener('click', () => setTab(button.dataset.tab));
 }
 
 document.addEventListener('keydown', ev => {
-  if (ev.key === 'Escape') $('inspect').classList.add('hidden');
+  if (ev.key === 'Escape') {
+    $('inspect').classList.add('hidden');
+    $('board-task-drawer').classList.add('hidden');
+  }
 });
 
 refresh();

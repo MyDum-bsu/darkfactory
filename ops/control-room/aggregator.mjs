@@ -36,6 +36,7 @@ import { createNetHealthMonitor } from './net-health.mjs';
 import { createFinopsProvider } from './finops.mjs';
 import { loadModelRegistry, registrySnapshot } from '../../board_pipeline/model-registry.mjs';
 import { collectTelemetry } from '../../board_pipeline/telemetry-collector.mjs';
+import { normalizeCost, normalizeUsage, parseTelemetryLines } from '../../board_pipeline/telemetry.mjs';
 import { aggregateScorecard } from '../../board_pipeline/model-scorecard.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -150,13 +151,23 @@ export function createBoardObserver({ boardUrl, token = null,
     if (!message || typeof message !== 'object') return null;
     const task = message.task ?? (message.state ? message : null);
     if (!task || typeof task.state !== 'string') return null;
+    const labels = message.labels ?? task.labels ?? {};
+    const result = task.result && typeof task.result === 'object' ? task.result : {};
+    const updatedAt = task.updatedAt ?? task.updated_at ?? message.updatedAt ??
+      message.updated_at ?? (typeof raw?.last === 'string' ? raw.last : raw?.last?.ts ?? raw?.last?.updatedAt);
+    const receiptSha = task.receiptSha ?? task.receipt_sha ?? result.sha ?? result.candidate_sha ??
+      result.receiptSha ?? result.receipt_sha ?? labels.receipt_sha ?? labels.receiptSha;
     return {
       task_id: task.task_id ?? message.id ?? task.id,
       state: task.state,
       title: task.title ?? String(message.text ?? '').split('\n')[0] ?? '',
-      labels: message.labels ?? task.labels ?? {},
+      labels,
       epoch: task.epoch ?? null,
       channel: message.channel ?? null,
+      ...(task.priority !== undefined || labels.priority !== undefined
+        ? { priority: task.priority ?? labels.priority } : {}),
+      ...(updatedAt !== undefined ? { updatedAt } : {}),
+      ...(receiptSha !== undefined ? { receiptSha } : {}),
       ...(task.blocked && typeof task.blocked === 'object' ? { blocked: task.blocked } : {}),
       ...(task.executor ? { executor: task.executor } : {}),
       ...(task.question ? { question: task.question } : {}),
@@ -265,6 +276,99 @@ export const DEFAULT_TELEMETRY_DIR = join(
 export const TELEMETRY_MAX_BYTES = 1024 * 1024;
 export const TELEMETRY_MAX_FILES = 32;
 
+
+const textValue = value => typeof value === 'string' && value.trim()
+  ? sanitizeTerminalText(value.trim()) : null;
+const finiteNumber = value => typeof value === 'number' && Number.isFinite(value) ? value : null;
+const timeValue = value => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+};
+const firstText = (...values) => values.map(textValue).find(value => value !== null) ?? null;
+const firstNumber = (...values) => values.map(finiteNumber).find(value => value !== null) ?? null;
+
+function copyUsage(raw) {
+  const usage = normalizeUsage(raw);
+  return usage ? { input: usage.input, output: usage.output, cached: usage.cached } : null;
+}
+
+function copyModel(raw) {
+  if (typeof raw === 'string' && raw.trim()) {
+    const value = sanitizeTerminalText(raw.trim());
+    const slash = value.indexOf('/');
+    return slash > 0 && slash < value.length - 1
+      ? { provider: value.slice(0, slash), model: value.slice(slash + 1) }
+      : { provider: null, model: value };
+  }
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+    const provider = textValue(raw.provider);
+    const model = textValue(raw.model ?? raw.id ?? raw.model_id);
+    if (provider || model) return { provider, model };
+  }
+  return { provider: null, model: null };
+}
+
+function compactTelemetryAttempt(entry) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const taskId = firstText(entry.task_id, entry.taskId, entry.id);
+  if (!taskId) return null;
+  const startedMs = timeValue(entry.started_at ?? entry.startedAt ?? entry.created_at ?? entry.createdAt);
+  const endedMs = timeValue(entry.ended_at ?? entry.endedAt ?? entry.completed_at ?? entry.completedAt);
+  const phasesMs = entry.phases_ms !== null && typeof entry.phases_ms === 'object' && !Array.isArray(entry.phases_ms)
+    ? Object.fromEntries(Object.entries(entry.phases_ms)
+      .filter(([, value]) => value === null || Number.isFinite(value))
+      .map(([key, value]) => [key, value === null ? null : Number(value)]))
+    : {};
+  const rounds = entry.rounds !== null && typeof entry.rounds === 'object' && !Array.isArray(entry.rounds)
+    ? {
+        total: finiteNumber(entry.rounds.total),
+        rework: finiteNumber(entry.rounds.rework),
+        pass: finiteNumber(entry.rounds.pass),
+        arbitration: finiteNumber(entry.rounds.arbitration),
+        open: finiteNumber(entry.rounds.open),
+        gates: entry.rounds.gates !== null && typeof entry.rounds.gates === 'object' && !Array.isArray(entry.rounds.gates)
+          ? { ...entry.rounds.gates } : {},
+      }
+    : { total: null, rework: null, pass: null, arbitration: null, open: null, gates: {} };
+  const roleCost = role => normalizeCost(entry.costs?.[role]);
+  const roleCosts = [roleCost('worker'), roleCost('critic'), roleCost('arbiter')].filter(v => v !== null);
+  const roleCostTotal = roleCosts.length ? roleCosts.reduce((a, b) => a + b, 0) : null;
+  const labels = entry.labels !== null && typeof entry.labels === 'object' && !Array.isArray(entry.labels)
+    ? entry.labels : {};
+  return {
+    taskId,
+    attemptId: firstText(entry.attempt_id, entry.attemptId),
+    epoch: Number.isSafeInteger(entry.epoch) ? entry.epoch : null,
+    channel: firstText(entry.channel, entry.project, labels.channel),
+    title: firstText(entry.title),
+    repoId: firstText(entry.repo_id, entry.repoId, labels.repo_id, labels.project),
+    outcome: firstText(entry.outcome),
+    open: entry.open === true,
+    startedAt: startedMs === null ? null : new Date(startedMs).toISOString(),
+    endedAt: endedMs === null ? null : new Date(endedMs).toISOString(),
+    elapsedMs: finiteNumber(phasesMs.total) ??
+      (startedMs !== null && endedMs !== null && endedMs >= startedMs ? endedMs - startedMs : null),
+    phasesMs,
+    rounds,
+    models: {
+      worker: copyModel(entry.models?.worker),
+      critic: copyModel(entry.models?.critic),
+      arbiter: copyModel(entry.models?.arbiter),
+    },
+    tokens: {
+      worker: copyUsage(entry.tokens?.worker),
+      critic: copyUsage(entry.tokens?.critic),
+      arbiter: copyUsage(entry.tokens?.arbiter),
+    },
+    costUsd: normalizeCost(entry) ?? roleCostTotal,
+    threadId: firstText(entry.thread_id, entry.bb_thread_id, entry.threadId, entry.bbThreadId),
+  };
+}
+
 async function readBoundedText(path, maxBytes) {
   const chunks = [];
   let total = 0;
@@ -318,8 +422,10 @@ export function createTelemetryProvider({
       const collected = await collectTelemetry({ telemetryLines: lines, clock: now });
       if (!collected.sources.telemetry_runs) return null;
       const scorecard = aggregateScorecard(lines, { seed: [] });
+      const parsed = parseTelemetryLines(lines);
       return {
         runs: collected.sources.telemetry_runs,
+        attempts: parsed.entries.map(compactTelemetryAttempt).filter(Boolean).slice(-128),
         firstRoundPassRate: collected.portfolio.first_round_pass_rate,
         avgReworkRounds: collected.portfolio.avg_rework_rounds,
         medianWallClockMs: collected.portfolio.median_wall_clock_ms,
@@ -383,6 +489,350 @@ export function createModelsProvider({ catalogPath, policyPath, configDir, now, 
       return { ok: false, error: sanitizeTerminalText(error.message) };
     }
   };
+}
+
+
+const BOARD_EXPLORER_STATES = ['ready', 'claimed', 'waiting', 'blocked', 'completed'];
+
+function canonicalBoardState(raw) {
+  const state = String(raw ?? '').trim().toLowerCase();
+  if (state === 'ready') return 'ready';
+  if (state === 'claimed' || state === 'working') return 'claimed';
+  if (state === 'blocked' || state === 'awaiting_answer' || state === 'hold') return 'blocked';
+  if (state === 'completed' || state === 'done') return 'completed';
+  return 'waiting';
+}
+
+function taskRepoId(task) {
+  const labels = task?.labels !== null && typeof task?.labels === 'object' ? task.labels : {};
+  return firstText(task?.repoId, task?.repo_id, labels.repo_id, labels.repoId, labels.project);
+}
+
+function receiptShaOf(task) {
+  const result = task?.result !== null && typeof task?.result === 'object' ? task.result : {};
+  const labels = task?.labels !== null && typeof task?.labels === 'object' ? task.labels : {};
+  return firstText(task?.receiptSha, task?.receipt_sha, result.sha, result.candidate_sha,
+    result.receipt_sha, result.receiptSha, labels.receipt_sha, labels.receiptSha, labels.sha);
+}
+
+function normalizeBoardExplorerTask(task) {
+  const labels = task?.labels !== null && typeof task?.labels === 'object' && !Array.isArray(task.labels)
+    ? task.labels : {};
+  return {
+    id: String(task?.task_id ?? task?.id ?? ''),
+    channel: firstText(task?.channel, labels.channel) ?? 'unassigned',
+    state: canonicalBoardState(task?.state),
+    priority: firstText(task?.priority, labels.priority),
+    repoId: taskRepoId(task),
+    title: firstText(task?.title) ?? '',
+    labels,
+    updatedAt: firstText(task?.updatedAt, task?.updated_at, task?.last, task?.lastActivityAt),
+    receiptSha: receiptShaOf(task),
+  };
+}
+
+export function buildBoardExplorer(tasks = []) {
+  const grouped = new Map();
+  for (const raw of Array.isArray(tasks) ? tasks : []) {
+    const task = normalizeBoardExplorerTask(raw);
+    if (!task.id) continue;
+    if (!grouped.has(task.channel)) {
+      grouped.set(task.channel, { name: task.channel,
+        counts: Object.fromEntries(BOARD_EXPLORER_STATES.map(state => [state, 0])), tasks: [] });
+    }
+    const channel = grouped.get(task.channel);
+    channel.counts[task.state] += 1;
+    channel.tasks.push(task);
+  }
+  const channels = [...grouped.values()].sort((a, b) => a.name.localeCompare(b.name));
+  for (const channel of channels) {
+    channel.tasks.sort((a, b) => {
+      const aTime = timeValue(a.updatedAt);
+      const bTime = timeValue(b.updatedAt);
+      if (aTime !== null && bTime !== null && aTime !== bTime) return bTime - aTime;
+      return a.id.localeCompare(b.id, undefined, { numeric: true });
+    });
+  }
+  return { channels };
+}
+
+const TREE_STAGE_ORDER = ['l1_local', 'tamper', 'scope_fence', 'l2_critic', 'arbiter'];
+const ACTIVE_TREE_STATES = new Set(['claimed', 'working', 'blocked', 'awaiting_answer', 'hold',
+  'completed', 'done']);
+
+function canonicalStageKind(raw) {
+  const value = String(raw ?? '').toLowerCase();
+  if (!value) return null;
+  if (value.includes('scope')) return 'scope_fence';
+  if (value.includes('tamper')) return 'tamper';
+  if (value.includes('arbiter') || value.includes('arbitr')) return 'arbiter';
+  if (value.includes('l2') || value.includes('critic') || value.includes('review')) return 'l2_critic';
+  if (value.includes('l1') || value.includes('local') || value.includes('docker')) return 'l1_local';
+  return null;
+}
+
+function eventTime(event, fallback = 0) {
+  return timeValue(event?.ts) ?? (Number.isSafeInteger(event?.seq) ? event.seq : fallback);
+}
+
+function latestEvent(events) {
+  return events.length ? events[events.length - 1] : null;
+}
+
+function eventModelParts(raw) {
+  const model = copyModel(raw);
+  return model;
+}
+
+function stageVerdictStatus(value) {
+  const verdict = String(value ?? '').trim().toLowerCase();
+  if (!verdict) return null;
+  if (['pass', 'passed', 'ok', 'success', 'done', 'completed'].includes(verdict)) return 'pass';
+  if (['skip', 'skipped', 'not_applicable', 'disabled'].includes(verdict)) return 'skipped';
+  if (['fail', 'failed', 'rework', 'blocked', 'hold', 'error'].includes(verdict)) return 'fail';
+  if (['running', 'started', 'pending'].includes(verdict)) return verdict;
+  return null;
+}
+
+function buildStageNodes(events, telemetry, nowMs) {
+  const nodes = new Map(TREE_STAGE_ORDER.map(kind => [kind, {
+    kind, status: 'pending', model: null, round: null, elapsedMs: null, reason: null,
+  }]));
+  const telemetryPhases = telemetry?.phasesMs ?? {};
+  const telemetryHasAttempt = telemetry !== null && telemetry !== undefined;
+  for (const kind of ['l1_local', 'tamper', 'l2_critic', 'arbiter']) {
+    if (!Object.hasOwn(telemetryPhases, kind)) continue;
+    const node = nodes.get(kind);
+    const elapsed = finiteNumber(telemetryPhases[kind]);
+    if (elapsed !== null) {
+      node.status = 'pass';
+      node.elapsedMs = elapsed;
+    } else if (telemetryHasAttempt) {
+      node.status = 'skipped';
+    }
+  }
+  const gateRound = (node, keys) => {
+    const gates = telemetry?.rounds?.gates ?? {};
+    for (const key of keys) {
+      const value = finiteNumber(gates[key]);
+      if (value !== null) node.round = value;
+    }
+  };
+  gateRound(nodes.get('l1_local'), ['l1', 'l1_local', 'local']);
+  gateRound(nodes.get('tamper'), ['tamper']);
+  gateRound(nodes.get('scope_fence'), ['scope', 'scope_fence']);
+  gateRound(nodes.get('l2_critic'), ['l2', 'l2_critic', 'critic']);
+  gateRound(nodes.get('arbiter'), ['arbiter', 'arbitration']);
+  if (!nodes.get('arbiter').round) {
+    nodes.get('arbiter').round = finiteNumber(telemetry?.rounds?.arbitration);
+  }
+  const criticModel = telemetry?.models?.critic?.model ?? null;
+  const arbiterModel = telemetry?.models?.arbiter?.model ?? null;
+  if (criticModel) nodes.get('l2_critic').model = criticModel;
+  if (arbiterModel) nodes.get('arbiter').model = arbiterModel;
+
+  const started = new Map();
+  for (const event of events) {
+    const detail = event?.detail !== null && typeof event?.detail === 'object' ? event.detail : {};
+    const kind = [detail.stage, detail.kind, event.role, event.phase, event.kind]
+      .map(canonicalStageKind).find(value => value !== null) ?? null;
+    if (!kind) continue;
+    const node = nodes.get(kind);
+    const at = eventTime(event);
+    const eventKind = String(event.kind ?? '').toLowerCase();
+    const explicit = stageVerdictStatus(detail.status ?? detail.verdict ?? detail.outcome ?? event.reason);
+    if (event.model) {
+      const model = eventModelParts(event.model).model;
+      if (model) node.model = model;
+    }
+    if (Number.isFinite(event.round)) node.round = event.round;
+    if (event.reason) node.reason = textValue(event.reason);
+    if (detail.reason) node.reason = textValue(detail.reason);
+    if (eventKind.includes('started') || eventKind.includes('start')) {
+      started.set(kind, at);
+      node.status = 'running';
+      node.elapsedMs = Math.max(0, nowMs - at);
+    } else if (eventKind.includes('completed') || eventKind.includes('finished') || explicit) {
+      node.status = explicit ?? (eventKind.includes('completed') ? 'pass' : 'running');
+      const began = started.get(kind);
+      if (began !== undefined && at >= began) node.elapsedMs = at - began;
+      if (detail.verdict) node.reason = textValue(detail.verdict);
+    } else if (event.phase === kind || eventKind === kind) {
+      node.status = explicit ?? 'running';
+      node.elapsedMs = Math.max(0, nowMs - at);
+    }
+  }
+  return TREE_STAGE_ORDER.map(kind => nodes.get(kind));
+}
+
+function threadMatchesTask(thread, taskId, threadId) {
+  if (!thread || typeof thread !== 'object') return false;
+  if (threadId && [thread.id, thread.threadId, thread.thread_id].some(id => String(id ?? '') === String(threadId))) return true;
+  return [thread.task_id, thread.taskId, thread.card_id, thread.cardId].some(id => String(id ?? '') === String(taskId));
+}
+
+function treeStatus(boardState, telemetry, last, reworkRounds) {
+  const phase = String(last?.phase ?? '').toLowerCase();
+  const outcome = String(telemetry?.outcome ?? '').toLowerCase();
+  const board = String(boardState ?? '').toLowerCase();
+  if (['completed', 'done'].includes(board) || ['completed', 'done'].includes(phase) ||
+      ['completed', 'done', 'verified', 'deployed'].includes(outcome)) return 'done';
+  if (['blocked', 'awaiting_answer', 'hold'].includes(board) ||
+      ['hold', 'uncertain', 'lease_lost', 'awaiting_answer', 'blocked', 'blocking'].includes(phase) ||
+      ['hold', 'blocked', 'uncertain', 'lease_lost'].includes(outcome)) return 'hold';
+  if (String(last?.kind ?? '').toLowerCase() === 'rework' || reworkRounds > 0) return 'rework';
+  return 'running';
+}
+
+function buildTreeForTask(taskId, { boardTask, events, telemetry, threads, nowMs }) {
+  const last = latestEvent(events);
+  const first = events[0] ?? null;
+  const labels = boardTask?.labels !== null && typeof boardTask?.labels === 'object' ? boardTask.labels : {};
+  const detail = last?.detail !== null && typeof last?.detail === 'object' ? last.detail : {};
+  const detailValue = (...keys) => {
+    for (const event of [...events].reverse()) {
+      const item = event?.detail !== null && typeof event?.detail === 'object' ? event.detail : {};
+      for (const key of keys) {
+        if (item[key] !== undefined && item[key] !== null) return item[key];
+      }
+    }
+    return null;
+  };
+  const startedMs = timeValue(telemetry?.startedAt) ?? timeValue(first?.ts);
+  const terminal = ['done', 'hold'].includes(treeStatus(boardTask?.state, telemetry, last,
+    finiteNumber(telemetry?.rounds?.rework) ?? events.filter(e => String(e.kind ?? '').toLowerCase() === 'rework').length));
+  const endedMs = terminal
+    ? timeValue(telemetry?.endedAt) ?? timeValue(last?.ts) ?? startedMs
+    : nowMs;
+  const elapsedMs = finiteNumber(telemetry?.elapsedMs) ??
+    (startedMs !== null && endedMs !== null ? Math.max(0, endedMs - startedMs) : null);
+  const reworkRounds = finiteNumber(telemetry?.rounds?.rework) ??
+    events.filter(e => String(e.kind ?? '').toLowerCase() === 'rework').length;
+  const eventRounds = events.map(e => finiteNumber(e.round)).filter(v => v !== null);
+  const rounds = finiteNumber(telemetry?.rounds?.total) ??
+    (eventRounds.length ? Math.max(...eventRounds) : null) ??
+    (events.length ? reworkRounds + 1 : null);
+  const estCostUsd = finiteNumber(telemetry?.costUsd);
+  const burnRatePerHr = estCostUsd !== null && elapsedMs !== null && elapsedMs > 0
+    ? Number((estCostUsd / (elapsedMs / 3_600_000)).toFixed(4)) : null;
+  const threadId = firstText(detailValue('threadId', 'thread_id'), last?.bb_thread_id,
+    telemetry?.threadId, boardTask?.thread_id, boardTask?.bb_thread_id);
+  const thread = (Array.isArray(threads) ? threads : []).find(item => threadMatchesTask(item, taskId, threadId)) ?? null;
+  const telemetryWorker = telemetry?.models?.worker ?? { provider: null, model: null };
+  const workerEvent = [...events].reverse().find(event =>
+    event?.role === 'worker' || event?.phase === 'working' ||
+    (event?.model && !canonicalStageKind(event?.detail?.stage ?? event?.role))) ?? last;
+  const parsedEventModel = copyModel(workerEvent?.model);
+  const provider = firstText(telemetryWorker.provider, parsedEventModel.provider,
+    thread?.provider, thread?.providerId, thread?.provider_id);
+  const model = firstText(telemetryWorker.model, parsedEventModel.model,
+    thread?.model, thread?.modelId, thread?.model_id, boardTask?.executor?.model);
+  const eventTokens = [...events].reverse().map(event => finiteNumber(event?.tokens))
+    .find(value => value !== null) ?? null;
+  const workerTokens = copyUsage(telemetry?.tokens?.worker) ??
+    copyUsage(thread?.usage) ?? eventTokens;
+  const contextPct = firstNumber(detailValue('contextPct', 'context_pct', 'contextPercent',
+    'context_usage_pct'), thread?.contextPct, thread?.context_pct, thread?.context?.pct,
+    thread?.context?.percent, thread?.context?.usagePct);
+  const workerElapsedMs = finiteNumber(telemetry?.phasesMs?.worker) ?? elapsedMs;
+  const usageCache = workerTokens !== null && typeof workerTokens === 'object'
+    ? finiteNumber(workerTokens.cached) : null;
+  const cacheStatus = firstText(detailValue('cacheStatus', 'cache_status'),
+    thread?.cacheStatus, thread?.cache_status) ??
+    (usageCache !== null ? (usageCache > 0 ? 'hit' : 'miss') : null);
+  const status = treeStatus(boardTask?.state, telemetry, last, reworkRounds);
+  return {
+    taskId: String(taskId),
+    title: firstText(boardTask?.title, telemetry?.title) ?? '',
+    channel: firstText(last?.channel, telemetry?.channel, boardTask?.channel, labels.channel) ?? 'unassigned',
+    repoId: firstText(telemetry?.repoId, taskRepoId(boardTask ?? {}), detailValue('repoId', 'repo_id')),
+    status,
+    elapsedMs,
+    rounds,
+    reworkRounds,
+    estCostUsd,
+    burnRatePerHr,
+    worker: {
+      threadId,
+      provider,
+      model,
+      branch: firstText(detailValue('branch', 'worktreeBranch'), thread?.branch, thread?.currentBranch,
+        thread?.gitBranch, labels.branch),
+      phase: firstText(last?.phase, boardTask?.state) ?? null,
+      elapsedMs: workerElapsedMs,
+      contextPct,
+      cacheStatus,
+      tokens: workerTokens,
+    },
+    stages: buildStageNodes(events, telemetry, nowMs),
+  };
+}
+
+export function buildActiveTrees({ events = [], tasks = [], telemetryAttempts = [], threads = [],
+  now = () => Date.now(), limit = 100 } = {}) {
+  const nowValue = now();
+  const nowMs = timeValue(nowValue) ?? (nowValue instanceof Date ? nowValue.getTime() : Date.now());
+  const boardById = new Map();
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    const id = task?.task_id ?? task?.id;
+    if (id !== undefined && id !== null) boardById.set(String(id), task);
+  }
+  const telemetryByTask = new Map();
+  for (const raw of Array.isArray(telemetryAttempts) ? telemetryAttempts : []) {
+    const compact = compactTelemetryAttempt(raw);
+    if (!compact) continue;
+    const previous = telemetryByTask.get(compact.taskId);
+    const currentTs = timeValue(compact.endedAt) ?? timeValue(compact.startedAt) ?? 0;
+    const previousTs = previous ? (timeValue(previous.endedAt) ?? timeValue(previous.startedAt) ?? 0) : -1;
+    if (!previous || currentTs >= previousTs) telemetryByTask.set(compact.taskId, compact);
+  }
+  const groups = new Map();
+  for (const event of Array.isArray(events) ? events : []) {
+    if (event?.task_id === undefined || event?.task_id === null) continue;
+    const taskId = String(event.task_id);
+    const key = [taskId, event.attempt_id ?? '', event.epoch ?? ''].join('|');
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(event);
+  }
+  const latestGroupByTask = new Map();
+  for (const group of groups.values()) {
+    group.sort((a, b) => eventTime(a) - eventTime(b));
+    const taskId = String(group[0].task_id);
+    const currentMax = eventTime(group[group.length - 1]);
+    const previous = latestGroupByTask.get(taskId);
+    const previousMax = previous ? eventTime(previous[previous.length - 1]) : -Infinity;
+    if (!previous || currentMax >= previousMax) latestGroupByTask.set(taskId, group);
+  }
+  const ids = new Set([...latestGroupByTask.keys(), ...telemetryByTask.keys()]);
+  for (const [taskId, task] of boardById) {
+    if (ACTIVE_TREE_STATES.has(String(task?.state ?? '').toLowerCase())) ids.add(taskId);
+  }
+  const trees = [...ids].map(taskId => buildTreeForTask(taskId, {
+    boardTask: boardById.get(taskId) ?? null,
+    events: latestGroupByTask.get(taskId) ?? [],
+    telemetry: telemetryByTask.get(taskId) ?? null,
+    threads,
+    nowMs,
+  }));
+  const rank = { running: 0, rework: 1, hold: 2, done: 3 };
+  trees.sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9) ||
+    String(a.taskId).localeCompare(String(b.taskId), undefined, { numeric: true }));
+  return trees.slice(0, limit);
+}
+
+export function buildRepoSlots(trees = []) {
+  const activeByRepo = {};
+  for (const tree of Array.isArray(trees) ? trees : []) {
+    if (!['running', 'rework'].includes(tree?.status)) continue;
+    const repoId = textValue(tree.repoId);
+    if (!repoId) continue;
+    activeByRepo[repoId] = (activeByRepo[repoId] ?? 0) + 1;
+  }
+  const multiWriterWarnings = Object.entries(activeByRepo)
+    .filter(([, count]) => count > 1)
+    .map(([repoId, count]) =>
+      `repo_id ${repoId} has ${count} active writers (default max 1); parallelize across repos instead`);
+  return { defaultMaxPerRepo: 1, activeByRepo, multiWriterWarnings };
 }
 
 // --- агрегатор -----------------------------------------------------------------
@@ -543,6 +993,10 @@ export function createControlRoomAggregator({
       : null;
     const sessions = sessionHygiene(threads, tasks, attempts);
     const shiva = shivaCounter(threads, tasks);
+    const activeTrees = buildActiveTrees({ events: ring, tasks,
+      telemetryAttempts: telemetry?.attempts ?? [], threads, now });
+    const boardExplorer = buildBoardExplorer(tasks);
+    const repoSlots = buildRepoSlots(activeTrees);
     const reconciled = reconcileNeeded;
     reconcileNeeded = false;
     return {
@@ -553,6 +1007,9 @@ export function createControlRoomAggregator({
       health: { board: board.boardStatus },
       sessions: { active: sessions.active, archivedCount: sessions.archived.length },
       shiva,
+      activeTrees,
+      boardExplorer,
+      repoSlots,
       branchDrift: drift,
       netHealth: net,
       telemetry,
