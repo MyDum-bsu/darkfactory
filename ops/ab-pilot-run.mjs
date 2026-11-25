@@ -40,7 +40,7 @@ async function writeCatalog(catalog, name) {
   await mkdir(join(catalog, '.darkfactory'), { recursive: true, mode: 0o700 });
   await cp(join(SOURCE, '.darkfactory/shared-skills'), join(catalog, '.darkfactory/shared-skills'), { recursive: true });
   const role = (kind, model, verifier, skills) => ({ kind, model, verifier, skills,
-    mode: kind === 'writer' ? 'write' : 'read-only', phaseBudgetMs: 120000,
+    mode: kind === 'writer' ? 'write' : 'read-only', phaseBudgetMs: 240000,
     reasoning: kind === 'verifier' ? 'medium' : 'inherit', tools: kind === 'writer' ? ['snapshot-read', 'worktree-edit'] : ['snapshot-read'] });
   const roles = {
     implementation: role('writer', 'executor', 'change-set', name === 'policy'
@@ -108,7 +108,7 @@ async function writeSealedCase({ run, name, arm, project, parent, owner, url, tr
   if (name === 'policy') checks.push({ image, cwd: '.', timeoutMs: 20_000,
     argv: ['node', '--test', 'board_pipeline/policy-key.test.mjs'] });
   const version = 'ab-1448';
-  const policy = { scope: 'isolated', boardUrl: url, channel: 'pilot', owner, label, version, waitMs: 360000,
+  const policy = { scope: 'isolated', boardUrl: url, channel: 'pilot', owner, label, version, waitMs: 540000,
     bb: { ...WORKER, project, permissionMode: 'full' }, arbiter: ARBITER,
     routing: { mode: 'shadow', allowlist: { worker: [WORKER], critic: [CRITIC], arbiter: [ARBITER] } },
     route: { repoId: 'ab-case', base: baseSha, worktree: tree, policyVersion: version, checkProfile: 'case', finish: 'verified' },
@@ -187,7 +187,7 @@ async function runCell(name, arm, root, parent, project) {
     if (!/^[1-9][0-9]*$/.test(taskId ?? '')) throw new Error('pilot_task_unconfirmed');
     const started = Date.now();
     const output = await exec(process.execPath, [join(SOURCE, 'board_pipeline/run-isolated.mjs'), '--execute',
-      '--policy', policyFile, '--state', join(run, 'state')], { env, timeout: 480_000, maxBuffer: 2 * 1024 * 1024 })
+      '--policy', policyFile, '--state', join(run, 'state')], { env, timeout: 600_000, maxBuffer: 2 * 1024 * 1024 })
       .then(r => ({ ...r, code: 0 }), e => ({ stdout: e.stdout ?? '', stderr: e.stderr ?? '', code: e.code ?? null }));
     const wall = Date.now() - started;
     await writeFile(join(run, 'runner.log'), output.stdout + '\n' + output.stderr, { mode: 0o600 });

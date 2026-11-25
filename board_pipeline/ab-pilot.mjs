@@ -30,7 +30,7 @@ export async function enrollAbPilot(config, { policy, tree, root, inbox, daemon,
       policy.scope !== 'isolated' || policy.channel !== 'pilot' || policy.route.finish !== 'verified' ||
       policy.route.taskId !== undefined || policy.questionGate !== undefined || policy.release !== undefined ||
       policy.decisionLedger !== undefined || policy.projectMemory !== undefined ||
-      !Number.isSafeInteger(policy.waitMs) || policy.waitMs < 5000 || policy.waitMs > 360000 ||
+      !Number.isSafeInteger(policy.waitMs) || policy.waitMs < 5000 || policy.waitMs > 600000 ||
       !policy.label?.key || !isId(/^ab-[a-z0-9-]+$/, policy.label.value)) throw new Error('ab_pilot_scope_denied');
   const roots = [tree, root, inbox];
   const switchOpen = await createPilotSwitch(config.switch, { permitDirectory: dir => separate(dir, roots) });

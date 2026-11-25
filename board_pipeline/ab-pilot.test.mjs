@@ -29,8 +29,8 @@ async function enrollLinear(t, waitMs) {
   });
 }
 
-test('A/B pilot accepts the full enclosed wait range through 360000 ms', async t => {
-  for (const waitMs of [5000, 360000]) {
+test('A/B pilot accepts the full enclosed wait range through 600000 ms', async t => {
+  for (const waitMs of [5000, 360001, 540000, 600000]) {
     const enrolled = await enrollLinear(t, waitMs);
     assert.equal(enrolled.arm, 'linear');
     assert.equal(enrolled.case, 'policy');
@@ -39,7 +39,7 @@ test('A/B pilot accepts the full enclosed wait range through 360000 ms', async t
 });
 
 test('A/B pilot rejects wait values outside the enclosed range', async t => {
-  for (const waitMs of [4999, 360001, 360000.5, Number.NaN]) {
+  for (const waitMs of [4999, 600001, 600000.5, Number.NaN, null, undefined, Number.POSITIVE_INFINITY]) {
     await assert.rejects(enrollLinear(t, waitMs), /ab_pilot_scope_denied/);
   }
 });
