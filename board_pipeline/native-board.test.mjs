@@ -97,11 +97,13 @@ function contractTask(handle, labels, over = {}) {
 test('claimReady takes the oldest admitted ready card and returns its contract labels', async t => {
   const { handle, ported, seen } = await claimedBoard(t);
   const plain = await contractTask(handle, { queue: 'vs1', finish: 'verified' });
-  const admitted = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const admitted = await contractTask(handle, { ...CONTRACT, queue: 'vs1' },
+    { text: 'Card-specific claimReady specification' });
   const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
   const picked = await port.claimReady(FILTER);
   assert.equal(picked.taskId, admitted.task.id);
   assert.equal(picked.labels.spec_digest, CONTRACT.spec_digest);
+  assert.equal(picked.text, 'Card-specific claimReady specification');
   assert.notEqual(picked.taskId, plain.task.id);
   assert.equal(seen.claim, 1, 'ровно один native claim — только допущенная карточка');
   const held = await port.verifyHeld(picked.taskId, picked.epoch);

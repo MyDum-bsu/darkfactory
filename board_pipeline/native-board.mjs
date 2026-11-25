@@ -226,7 +226,8 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
           const fresh = await rootOf(listed.id);
           if (fresh.task.state !== 'ready' || !admits(trusted, fresh)) continue;
           const claim = await acquire(listed.id, token, fresh);
-          return { taskId: listed.id, ...claim, labels: fresh.labels };
+          return { taskId: listed.id, ...claim, labels: fresh.labels,
+            ...(typeof fresh.text === 'string' ? { text: fresh.text } : {}) };
         }
         // Сервер сообщает курсор следующей страницы; без сдвига или без карточек очередь кончилась.
         if (!page.cursor || page.cursor === after || !page.tasks?.length) return null;

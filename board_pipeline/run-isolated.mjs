@@ -77,6 +77,22 @@ async function readOperatorInputs(paths) {
   return { inputs, digest };
 }
 
+const sha256Utf8 = value => createHash('sha256').update(Buffer.from(value, 'utf8')).digest('hex');
+
+export function queueModeSpecInputs({ route, attempt, operatorBrief, reviewSpec }) {
+  const unchanged = { workerBrief: operatorBrief, reviewSpec, specText: null, block: null };
+  if (route?.taskId !== undefined || typeof attempt?.specText !== 'string' || !attempt?.spec_digest) {
+    return unchanged;
+  }
+  if (sha256Utf8(attempt.specText) === attempt.spec_digest) {
+    const block = `Task specification (verified spec_digest ${attempt.spec_digest}):\n${attempt.specText}`;
+    return { workerBrief: `${operatorBrief}\n\n${block}`, reviewSpec: `${reviewSpec}\n\n${block}`,
+      specText: attempt.specText, block };
+  }
+  if (sha256Utf8(operatorBrief) === attempt.spec_digest) return unchanged;
+  throw new Error('card_spec_digest_mismatch');
+}
+
 async function ownerAnswerSource(cfg, principal, tree, inbox) {
   if (cfg === undefined) return undefined;
   if (cfg?.exclusiveBoardOwner !== true || !isAbsolute(cfg.inbox ?? '') ||
@@ -256,7 +272,7 @@ async function execute() {
   const pinned = await readOperatorInputs(files);
   if (!pinned.inputs.get(policyFile).equals(policyBytes)) throw new Error('Operator policy changed during load');
   const reviewSpec = pinned.inputs.get(reviewPrompt).toString('utf8');
-  const reviewText = [reviewSpec, ...reviewSetup.skills.map((skill, i) => {
+  const reviewText = spec => [spec, ...reviewSetup.skills.map((skill, i) => {
     const body = pinned.inputs.get(reviewSetup.skillPaths[i]).toString('utf8');
     if (!body.trim()) throw new Error(`Empty operator review skill: ${skill}`);
     return `Operator-selected review skill (${skill}):\n${body}`;
@@ -477,9 +493,10 @@ async function execute() {
         worker_thread_id: '<фактический BB_THREAD_ID>', candidate_sha: '<полный Git SHA>' };
       const lessonRules = await currentLessons().catch(() => []);
       const operatorBrief = pinned.inputs.get(brief).toString('utf8');
+      const specInputs = queueModeSpecInputs({ route, attempt, operatorBrief, reviewSpec });
       const writer = ab?.writer;
-      const roleBrief = writer ? [operatorBrief, 'Навыки роли реализации (read-only):',
-        ...writer.skills.map(skill => skill.text)].join('\n\n') : operatorBrief;
+      const roleBrief = writer ? [specInputs.workerBrief, 'Навыки роли реализации (read-only):',
+        ...writer.skills.map(skill => skill.text)].join('\n\n') : specInputs.workerBrief;
       const prompt = workerIntakePrompt({ brief: roleBrief, tree,
         handoffPath: handoffPath(attempt), handoff, productQuestions: Boolean(ownerAnswers),
         decisions: await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`) ?? undefined,
@@ -679,7 +696,11 @@ async function execute() {
     const beforeEffect = beforeAttemptEffect(attempt.task_id, attempt.epoch);
     const decisionSlice = await pinnedDecisions(`${attempt.task_id}:${attempt.epoch}`);
     const memorySlice = await activeProjectMemory(`${attempt.task_id}:${attempt.attempt_id}:${attempt.epoch}`);
-    const criticPrompt = [reviewText, decisionSlice && decisionsPromptBlock(decisionSlice),
+    const specInputs = queueModeSpecInputs({ route, attempt,
+      operatorBrief: pinned.inputs.get(brief).toString('utf8'), reviewSpec });
+    const acceptanceAttempt = { ...attempt };
+    delete acceptanceAttempt.specText;
+    const criticPrompt = [reviewText(specInputs.reviewSpec), decisionSlice && decisionsPromptBlock(decisionSlice),
       memorySlice && projectMemoryPromptBlock(memorySlice)].filter(Boolean).join('\n\n');
     // Фактический критик L2 и арбитр — закреплённая триада попытки
     // (#1263), иначе проверенный дефолт. Спек нормализуется к провайдеру,
@@ -850,7 +871,7 @@ async function execute() {
       const runLocal = offlineProfileRunner(root, { beforeEffect });
       const runVisual = offlineVisualRunner(root, { beforeEffect });
       let diff, localEvidence, visualEvidence = null;
-      const result = await acceptHeld({ attempt, submission, policy, journal: root, ports: {
+      const result = await acceptHeld({ attempt: acceptanceAttempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', inspect),
         local: telemetry.port('l1_local', async (binding, trusted) => {
           enterPhase('l1_l3');
@@ -894,7 +915,7 @@ async function execute() {
             // Доверенные артефакты под verifier каждой стадии: 'inventory'
             // и 'change-set' измеряются фактически, прочие — fail-closed.
             const readArtifact = foremanArtifacts({ candidate: handoff.candidate_sha, diff, localEvidence,
-              brief: pinned.inputs.get(brief), review: reviewSpec, git: rawGit,
+              brief: specInputs.workerBrief, review: specInputs.reviewSpec, git: rawGit,
               visual: visualEvidence, journal: root });
             // Общий (без abPilot) foreman-контур: живая загрузка реестра и
             // сверка digest на каждом входе — тот же fail-closed, что у ab.
@@ -997,8 +1018,10 @@ async function execute() {
   const arbitrate = async (req) => {
     const beforeEffect = beforeAttemptEffect(req.task_id, req.epoch);
     await beforeEffect?.();
+    const specInputs = queueModeSpecInputs({ route, attempt: req,
+      operatorBrief: pinned.inputs.get(brief).toString('utf8'), reviewSpec });
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
-      prompt: arbiterIntakePrompt(reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
+      prompt: arbiterIntakePrompt(specInputs.reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
         await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined,
         await activeProjectMemory(`${req.task_id}:${req.attempt_id}:${req.epoch}`)) });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));

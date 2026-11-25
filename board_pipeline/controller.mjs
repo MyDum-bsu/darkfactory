@@ -127,6 +127,7 @@ function attemptOf(record, route) {
     if (record.contract.has_ui !== undefined) attempt.has_ui = record.contract.has_ui;
     if (record.contract.category !== undefined) attempt.category = record.contract.category;
     if (record.contract.labels !== undefined) attempt.labels = record.contract.labels;
+    if (typeof record.contract.specText === 'string') attempt.specText = record.contract.specText;
   }
   return attempt;
 }
@@ -319,6 +320,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         }
         claim = picked;
         contract = contractOf(picked.labels);
+        if (typeof picked.text === 'string') contract.specText = picked.text;
       }
       if (!Number.isSafeInteger(claim.epoch) || claim.epoch < 1) throw new Error('No native claim epoch');
       await save({ phase: 'launching', taskId: claim.taskId ?? route.taskId, epoch: claim.epoch,
@@ -640,7 +642,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           subjectDigest,
           dodViolation: workerSelector.hasDodViolation?.(allFindings) === true,
           verifyHeld: (id, ep) => board.verifyHeld(id, ep),
-          arbitrate: workerSelector.arbitrate,
+          arbitrate: typeof workerSelector.arbitrate === 'function'
+            ? request => workerSelector.arbitrate({ ...request,
+                ...(attempt.spec_digest !== undefined ? { spec_digest: attempt.spec_digest } : {}),
+                ...(attempt.specText !== undefined ? { specText: attempt.specText } : {}) })
+            : workerSelector.arbitrate,
         });
         if (ruling.decision === 'lease_lost') {
           await save({ phase: 'lease_lost', reason: ruling.reason, roundsHistory });

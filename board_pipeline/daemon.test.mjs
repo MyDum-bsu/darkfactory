@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFileSync, spawn as spawnProcess } from 'node:child_process';
-import { generateKeyPairSync } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -396,10 +396,12 @@ test('run-isolated --daemon: pinned intake and separate telemetry for two cards'
   const decision = 'Принятые решения: ручная выгрузка — CSV.';
   await writeFile(cfg.brief, decision);
 
-  const labels = { queue: 'daemon-it', repo_id: 'repo-daemon-it', profile_id: 'pilot',
-    finish: 'verified', spec_digest: 'a'.repeat(64), policy_digest: 'b'.repeat(64) };
-  const first = (await handle.tasks.create('pilot', { text: 'Fixture 1', labels })).task.id;
-  const second = (await handle.tasks.create('pilot', { text: 'Fixture 2', labels })).task.id;
+  const sha256 = text => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+  const labels = text => ({ queue: 'daemon-it', repo_id: 'repo-daemon-it', profile_id: 'pilot',
+    finish: 'verified', spec_digest: sha256(text), policy_digest: 'b'.repeat(64) });
+  const specs = ['Fixture 1 card specification', 'Fixture 2 card specification'];
+  const first = (await handle.tasks.create('pilot', { text: specs[0], labels: labels(specs[0]) })).task.id;
+  const second = (await handle.tasks.create('pilot', { text: specs[1], labels: labels(specs[1]) })).task.id;
   const bin = join(fx.base, 'bin');
   await mkdir(bin, { mode: 0o700 });
   const prompts = join(fx.base, 'prompts.jsonl');
@@ -441,6 +443,9 @@ if (action === 'spawn') {
   for (const [index, id] of [first, second].entries()) {
     assert.ok(observed[index].startsWith(decision));
     assert.ok(observed[index].includes(`"task_id":"${id}"`));
+    assert.ok(observed[index].includes(
+      `Task specification (verified spec_digest ${sha256(specs[index])}):\n${specs[index]}`));
+    assert.ok(!observed[index].includes(specs[1 - index]));
     assert.match(observed[index], /without asking again/);
   }
 });
