@@ -902,20 +902,21 @@ test('selectEscalationReviewer: ни один вариант не сохраня
   assert.equal(unknown.outcome, 'rejected');
 });
 
-// ── Routing Policy v2 rev.2: полный запрет acp-zcode-start ─────────────────
+// ── Owner Decision #18: acp-zcode-start допускается при наличии квоты ──────
 test('retiredProviderViolation: acp-zcode-start отклоняется в любом списке', () => {
   assert.equal(retiredProviderViolation(PRIMARY_WORKER), null);
   assert.equal(retiredProviderViolation({ provider: 'pi', model: 'opencode-go/deepseek-v4' }), null);
   assert.equal(retiredProviderViolation({
-    provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }),
-    'zcode_provider_retired');
+    provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }), null);
+  assert.equal(retiredProviderViolation('zcode'), null);
+  assert.equal(retiredProviderViolation('acp-zcode-start/builtin:zai-start-plan\\GLM-5.3-Flash'), null);
 });
 
 test('явный plan с acp-zcode-start: резерв пропускается, первичный — отказ', async () => {
   const refused = { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
   const zcode = { provider: 'acp-zcode-start',
     model: 'builtin:zai-start-plan\\GLM-5.3-Flash', effort: 'max' };
-  // Резерв zcode — пропуск с явной причиной, маршрут продолжается.
+  // Доступный резерв zcode запускается по обычному порядку fallback.
   const { calls, spawn } = spawnLog([{ threadId: 'thr_ds9' }]);
   const sel = await attemptSpawnWithFallback({
     attempt: ATTEMPT, spawn, inspectWorktree: cleanTree,
@@ -923,26 +924,40 @@ test('явный plan с acp-zcode-start: резерв пропускается,
     probe: async w => w.provider === 'acp-devin' ? refused : QUOTA_OK,
   });
   assert.equal(sel.outcome, 'spawned');
-  assert.equal(sel.worker.provider, 'pi');
-  const retired = sel.attemptedWorkers.find(w => w.provider === 'acp-zcode-start');
-  assert.equal(retired.verdict, 'skipped');
-  assert.equal(retired.reason, 'zcode_provider_retired');
-  // Первичный zcode — отказ маршрута до spawn.
-  const x = spawnLog([{ threadId: 'thr_never' }]);
-  const rej = await attemptSpawnWithFallback({
+  assert.equal(sel.worker, zcode);
+  assert.equal(sel.fallbackReason, 'confirmed_refusal:acp-devin');
+  assert.deepEqual(calls, [zcode]);
+  const spawned = sel.attemptedWorkers.find(w => w.provider === 'acp-zcode-start');
+  assert.equal(spawned.verdict, 'spawned');
+  // Первичный zcode при доступной квоте тоже запускается.
+  const x = spawnLog([{ threadId: 'thr_zcode1' }]);
+  const ok = await attemptSpawnWithFallback({
     attempt: ATTEMPT, spawn: x.spawn, plan: [zcode, NARROW_RESERVE_PI],
     probe: async () => QUOTA_OK, inspectWorktree: cleanTree,
   });
-  assert.equal(rej.outcome, 'rejected');
-  assert.equal(rej.reason, 'zcode_provider_retired');
-  assert.equal(x.calls.length, 0);
+  assert.equal(ok.outcome, 'spawned');
+  assert.equal(ok.worker, zcode);
+  assert.equal(ok.fallbackReason, null);
+  assert.deepEqual(x.calls, [zcode]);
+  // Подтверждённый отказ/исчерпание квоты zcode переводит маршрут на резерв.
+  const y = spawnLog([{ threadId: 'thr_afterzcode' }]);
+  const fallback = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn: y.spawn, plan: [zcode, NARROW_RESERVE_PI],
+    probe: async w => w.provider === 'acp-zcode-start' ? refused : QUOTA_OK,
+    inspectWorktree: cleanTree,
+  });
+  assert.equal(fallback.outcome, 'spawned');
+  assert.equal(fallback.worker.provider, 'pi');
+  assert.equal(fallback.fallbackReason, 'confirmed_refusal:acp-zcode-start');
 });
 
 test('allowlist.worker с acp-zcode-start — отказ политики', () => {
-  assert.throws(() => normalizeRoutingPolicy({
-    routing: { allowlist: { worker: [
-      { provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }] } },
-  }), e => e instanceof ReviewDenied && e.reason === 'zcode_provider_retired');
+  const zcode = { provider: 'acp-zcode-start',
+    model: 'builtin:zai-start-plan\\GLM-5.3-Flash' };
+  const normalized = normalizeRoutingPolicy({
+    routing: { allowlist: { worker: [zcode] } },
+  });
+  assert.deepEqual(normalized.allowlist.worker, [zcode]);
 });
 
 // ── Rev.2: строгий DeepSeek-only — аттестованное семейство, не префикс ─────
@@ -1014,12 +1029,13 @@ test('selectEscalationReviewer: worker и critic одного семейства
 
 test('retiredProviderViolation рекурсивен: pi/acp-zcode-start в allowlist и plan', async () => {
   const nested = { provider: 'pi', model: 'acp-zcode-start/builtin:zai-start-plan\\GLM-5.3-Flash' };
-  assert.equal(retiredProviderViolation(nested), 'zcode_provider_retired');
-  // normalizeRoutingPolicy: вложенный zcode через харнесс — тот же отказ.
-  assert.throws(() => normalizeRoutingPolicy({
+  assert.equal(retiredProviderViolation(nested), null);
+  // normalizeRoutingPolicy: вложенный zcode через харнесс допускается.
+  const normalized = normalizeRoutingPolicy({
     routing: { allowlist: { worker: [nested] } },
-  }), e => e instanceof ReviewDenied && e.reason === 'zcode_provider_retired');
-  // Явный plan: вложенный zcode-резерв пропускается с той же причиной.
+  });
+  assert.deepEqual(normalized.allowlist.worker, [nested]);
+  // Явный plan: доступный вложенный zcode-резерв запускается.
   const refused = { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
   const { calls, spawn } = spawnLog([{ threadId: 'thr_ds10' }]);
   const sel = await attemptSpawnWithFallback({
@@ -1028,18 +1044,18 @@ test('retiredProviderViolation рекурсивен: pi/acp-zcode-start в allow
     probe: async w => w.provider === 'acp-devin' ? refused : QUOTA_OK,
   });
   assert.equal(sel.outcome, 'spawned');
+  assert.equal(sel.worker, nested);
   assert.equal(sel.worker.provider, 'pi');
-  assert.equal(sel.worker.model, 'opencode-go/deepseek-v4.1-flash');
-  const retired = sel.attemptedWorkers.find(w => w.model === nested.model);
-  assert.equal(retired.verdict, 'skipped');
-  assert.equal(retired.reason, 'zcode_provider_retired');
-  assert.equal(calls.length, 1);
+  assert.equal(sel.worker.model, nested.model);
+  const spawned = sel.attemptedWorkers.find(w => w.model === nested.model);
+  assert.equal(spawned.verdict, 'spawned');
+  assert.deepEqual(calls, [nested]);
 });
 
 test('строковые id в plan: zcode и не-DeepSeek opencode-go отклоняются', async () => {
   const refused = { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
   const ZCODE_STR = 'acp-zcode-start/builtin:zai-start-plan\\GLM-5.3-Flash';
-  // Строковый zcode-резерв — пропуск с zcode_provider_retired.
+  // Строковый zcode-резерв при доступной квоте запускается.
   const { calls, spawn } = spawnLog([{ threadId: 'thr_ds11' }]);
   const sel = await attemptSpawnWithFallback({
     attempt: ATTEMPT, spawn, inspectWorktree: cleanTree,
@@ -1047,19 +1063,19 @@ test('строковые id в plan: zcode и не-DeepSeek opencode-go откл
     probe: async w => (w === PRIMARY_WORKER ? refused : QUOTA_OK),
   });
   assert.equal(sel.outcome, 'spawned');
-  assert.equal(calls.length, 1);
-  const retired = sel.attemptedWorkers.find(w => w.id === ZCODE_STR);
-  assert.equal(retired.verdict, 'skipped');
-  assert.equal(retired.reason, 'zcode_provider_retired');
-  // Строковый zcode-первичный — отказ маршрута до spawn.
-  const x = spawnLog([{ threadId: 'thr_never' }]);
-  const rej = await attemptSpawnWithFallback({
+  assert.equal(sel.worker, ZCODE_STR);
+  assert.deepEqual(calls, [ZCODE_STR]);
+  const spawned = sel.attemptedWorkers.find(w => w.verdict === 'spawned');
+  assert.equal(spawned.family, 'glm');
+  // Строковый zcode-первичный — обычный запуск маршрута.
+  const x = spawnLog([{ threadId: 'thr_zcode2' }]);
+  const primary = await attemptSpawnWithFallback({
     attempt: ATTEMPT, spawn: x.spawn, plan: [ZCODE_STR],
     probe: async () => QUOTA_OK, inspectWorktree: cleanTree,
   });
-  assert.equal(rej.outcome, 'rejected');
-  assert.equal(rej.reason, 'zcode_provider_retired');
-  assert.equal(x.calls.length, 0);
+  assert.equal(primary.outcome, 'spawned');
+  assert.equal(primary.worker, ZCODE_STR);
+  assert.deepEqual(x.calls, [ZCODE_STR]);
   // Строковый не-DeepSeek opencode-go — первичный отказ и пропуск резерва.
   const y = spawnLog([{ threadId: 'thr_never2' }]);
   const rej2 = await attemptSpawnWithFallback({
@@ -1087,8 +1103,8 @@ test('строковые id в plan: zcode и не-DeepSeek opencode-go откл
   });
   assert.equal(sel3.outcome, 'spawned');
   // И прямые вызовы предикатов со строками.
-  assert.equal(retiredProviderViolation(ZCODE_STR), 'zcode_provider_retired');
-  assert.equal(retiredProviderViolation('pi/acp-zcode-start/x'), 'zcode_provider_retired');
+  assert.equal(retiredProviderViolation(ZCODE_STR), null);
+  assert.equal(retiredProviderViolation('pi/acp-zcode-start/x'), null);
   assert.equal(opencodeGoPolicyViolation('opencode-go/glm-5'), 'opencode_go_non_deepseek_disallowed');
   assert.equal(opencodeGoPolicyViolation('pi/opencode-go/qwen3'), 'opencode_go_non_deepseek_disallowed');
   assert.equal(opencodeGoPolicyViolation('opencode-go/deepseek-v4'), null);

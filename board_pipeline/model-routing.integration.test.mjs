@@ -348,12 +348,30 @@ test('Opus 5.5 escalation: все три условия → anthropic; инач�
 test('acp-zcode-start выведен из обращения: allowlist и план его отклоняют', async () => {
   const zcode = { provider: 'acp-zcode-start',
     model: 'builtin:zai-start-plan\\GLM-5.3-Flash', effort: 'max' };
-  // В allowlist.worker — явный отказ политики.
-  assert.throws(() => normalizeRoutingPolicy(policy('active', {
-    worker: [DEVIN, zcode], critic: [NEON], arbiter: [SOL] })),
-    e => e instanceof ReviewDenied && e.reason === 'zcode_provider_retired');
-  // В явном плане попытки — резерв пропускается с той же причиной, маршрут
-  // идёт по DeepSeek/Neon.
+  // Owner Decision #18: zcode допускается в allowlist.worker.
+  const normalized = normalizeRoutingPolicy(policy('active', {
+    worker: [DEVIN, zcode], critic: [NEON], arbiter: [SOL] }));
+  assert.deepEqual(normalized.allowlist.worker, [DEVIN, zcode]);
+  // При доказанном скоркарде и доступной квоте active-роутинг может выбрать zcode.
+  const zcPolicy = policy('active', {
+    worker: [DEVIN, zcode], critic: [NEON], arbiter: [SOL] });
+  const zcScorecard = aggregateScorecard(journal(zcode, 6), { seed: [] });
+  const available = routeRole({
+    role: 'worker', size: 'S', domain: 'backend', policy: zcPolicy,
+    scorecard: zcScorecard, base: DEVIN, others: { critic: NEON, arbiter: SOL },
+    availability: spec => modelKey(spec) === modelKey(zcode) ? 'available' : 'unavailable',
+  });
+  assert.equal(available.outcome, 'routed');
+  assert.deepEqual(available.selected, zcode);
+  // Исчерпанная квота zcode остаётся обычным пропуском кандидата, не hard-ban.
+  const exhausted = routeRole({
+    role: 'worker', size: 'S', domain: 'backend', policy: zcPolicy,
+    scorecard: zcScorecard, base: DEVIN, others: { critic: NEON, arbiter: SOL },
+    availability: spec => modelKey(spec) === modelKey(zcode) ? 'quota_exhausted' : 'available',
+  });
+  assert.equal(exhausted.outcome, 'rejected');
+  assert.equal(exhausted.skipped[0].reason, 'quota_exhausted');
+  // В явном плане попытки доступный zcode-резерв запускается после отказа первичного.
   const selection = await attemptSpawnWithFallback({
     attempt: { task_id: '9', epoch: 1, attempt_id: 'a1', base_sha: 'a'.repeat(40) },
     plan: [PRIMARY_WORKER, zcode, { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' }],
@@ -364,10 +382,9 @@ test('acp-zcode-start выведен из обращения: allowlist и пл�
     inspectWorktree: async () => ({ clean: true, head: 'a'.repeat(40) }),
   });
   assert.equal(selection.outcome, 'spawned');
-  assert.equal(selection.worker.provider, 'pi');
-  const retired = selection.attemptedWorkers.find(w => w.provider === 'acp-zcode-start');
-  assert.equal(retired.verdict, 'skipped');
-  assert.equal(retired.reason, 'zcode_provider_retired');
+  assert.equal(selection.worker, zcode);
+  const spawned = selection.attemptedWorkers.find(w => w.provider === 'acp-zcode-start');
+  assert.equal(spawned.verdict, 'spawned');
 });
 
 // ── Board #1263: активация routeTriad в active-режиме с безопасным откатом ──

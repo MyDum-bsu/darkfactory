@@ -633,13 +633,21 @@ test('run: матрица моделей — жёсткая блокировка
   for (const spec of [
     'openai/gpt-6.1-terra',
     { provider: 'pi', model: 'openai/gpt-6.1-terra' },
-    'zcode', 'pi/acp-zcode-start/m', 'acp-zcode-start',
-    'glm', 'glm-5.3-flash', 'pi/opencode-go/glm-5',
-    'builtin:zai-start-plan\\glm-5.3-flash',
     { provider: 'openai', model: 'GPT-6.1-TERRA' },
   ]) {
-    assert.ok(modelViolation(spec), JSON.stringify(spec));
+    assert.equal(modelViolation(spec), 'model_gpt_6_1_terra_disallowed', JSON.stringify(spec));
   }
+  // Owner Decision #18: zcode/acp-zcode-start/glm больше не hard-ban.
+  for (const spec of [
+    'zcode', 'pi/acp-zcode-start/m', 'acp-zcode-start',
+    'glm', 'glm-5.3-flash',
+    'builtin:zai-start-plan\\glm-5.3-flash',
+    { provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash' },
+  ]) {
+    assert.equal(modelViolation(spec), null, JSON.stringify(spec));
+  }
+  // Независимый запрет opencode-go на не-DeepSeek модели сохраняется.
+  assert.equal(modelViolation('pi/opencode-go/glm-5'), 'opencode_go_non_deepseek_disallowed');
   assert.equal(forbiddenModelViolation({ provider: 'acp-devin', model: 'swe-2-high' }), null);
   assert.equal(modelViolation({ provider: 'openai', model: 'gpt-6.2-sol' }), null);
 });
@@ -704,9 +712,14 @@ test('run: запрещённая модель в CLI, критике, арби�
     const f6 = await withPolicy(dir, badRouteArb);
     await assert.rejects(() => runPlan(runValues(f6, 's')),
       /disallowed:route\.arbiter/);
-    const badArbiter = { ...policySpec(wt), arbiter: { provider: 'pi', model: 'acp-zcode-start/x' } };
-    const f2 = await withPolicy(dir, badArbiter);
-    await assert.rejects(() => runPlan(runValues(f2, 's')), /zcode.*:arbiter/);
+    const state = join(dir, 'state');
+    await mkdir(state);
+    await chmod(state, 0o700);
+    const allowedArbiter = { ...policySpec(wt), arbiter: { provider: 'acp-zcode-start',
+      model: 'builtin:zai-start-plan\\GLM-5.3-Flash' } };
+    const f2 = await withPolicy(dir, allowedArbiter);
+    const zcodePlan = await runPlan(runValues(f2, state));
+    assert.equal(zcodePlan.policy, f2);
     // Кандидат в routing.allowlist.critic с активным роутингом — тот же запрет.
     const routed = { ...policySpec(wt),
       routing: { mode: 'active', allowlist: {

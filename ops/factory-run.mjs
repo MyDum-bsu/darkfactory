@@ -4,11 +4,12 @@
 // Матрица моделей обязательна и явна: без --provider/--model — отказ; при
 // переданной политике они обязаны совпадать с policy.bb.provider/model.
 // Запрещённые провайдеры/модели блокируются в любом сегменте пути
-// (включая вложенные 'pi/...'): gpt-6.1-terra, zcode/acp-zcode-start,
-// glm / glm-* — и в статических спеках, и в кандидатах routing.allowlist
-// (активный роутинг мог бы закрепить их скоркардом). Дополнительно
-// действуют opencodeGoPolicyViolation и retiredProviderViolation из
-// board_pipeline/worker-selector.mjs.
+// (включая вложенные 'pi/...'): gpt-6.1-terra — и в статических спеках,
+// и в кандидатах routing.allowlist (активный роутинг мог бы закрепить
+// их скоркардом). По Owner Decision #18 zcode/acp-zcode-start и glm
+// допускаются при наличии квоты; текстового запрета для них здесь нет.
+// Дополнительно действуют opencodeGoPolicyViolation и
+// retiredProviderViolation из board_pipeline/worker-selector.mjs.
 //
 //   node ops/factory-run.mjs --provider P --model M \
 //     --policy FILE --state DIR [--worktree DIR] [--memory-dir DIR] \
@@ -47,8 +48,6 @@ export function forbiddenModelViolation(spec) {
   for (const id of ids) {
     for (const seg of id.toLowerCase().split(/[/\\]/)) {
       if (seg === 'gpt-6.1-terra') return 'model_gpt_6_1_terra_disallowed';
-      if (seg.includes('zcode')) return 'zcode_provider_disallowed';
-      if (seg === 'glm' || seg.startsWith('glm-')) return 'model_glm_disallowed';
     }
   }
   return null;

@@ -79,31 +79,12 @@ export function opencodeGoPolicyViolation(spec) {
     ? null : 'opencode_go_non_deepseek_disallowed';
 }
 
-// Полный запрет выбывшего провайдера: acp-zcode-start отклоняется в любом
-// списке кандидатов (явный plan, allowlist политики), не только в дефолтном
-// плане. Проверка рекурсивна: харнесс 'pi' с вложенной моделью вида
-// 'acp-zcode-start/...' (в любой вложенности) тоже отклоняется.
-// Причина — 'zcode_provider_retired'.
+// Owner Decision #18: acp-zcode-start/zcode и glm допускаются при наличии
+// квоты — выбывших провайдеров в действующей политике нет. Сигнатура
+// сохраняется для обратной совместимости вызовов (stage-sandbox-transport
+// и маршрутизатор): отсутствие нарушения обозначается null, как прежде.
 export function retiredProviderViolation(spec) {
-  const retired = id => typeof id === 'string' && id.toLowerCase() === 'acp-zcode-start';
-  // Строковый id 'provider/model': каждый сегмент проверяется — вложенный
-  // 'pi/acp-zcode-start/...' отклоняется так же, как и верхний провайдер.
-  const scanId = id => {
-    const i = id.indexOf('/');
-    return i < 0 ? retired(id) : retired(id.slice(0, i)) || scanId(id.slice(i + 1));
-  };
-  if (typeof spec === 'string') return scanId(spec) ? 'zcode_provider_retired' : null;
-  const scan = entry => {
-    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
-    if (retired(entry.provider)) return true;
-    if (typeof entry.model === 'string' && entry.model.includes('/')) {
-      const i = entry.model.indexOf('/');
-      if (retired(entry.model.slice(0, i))) return true;
-      return scan({ provider: entry.model.slice(0, i), model: entry.model.slice(i + 1) });
-    }
-    return false;
-  };
-  return scan(spec) ? 'zcode_provider_retired' : null;
+  return null;
 }
 
 // Упорядоченный план исполнителей маршрута: первичный acp-devin/swe-2-1-medium,
@@ -808,8 +789,9 @@ export function routeTriad({ size, domain, policy, scorecard,
     mode: steps.worker.mode, selected, steps };
 }
 
-// Допуск кандидата по политике #1247: 0 zcode, DeepSeek-only в opencode-go,
-// а при непустом allowlist роли — строго внутри него.
+// Допуск кандидата по политике #1247 с поправкой Owner Decision #18:
+// zcode допустим при квоте, DeepSeek-only в opencode-go сохраняется, а при
+// непустом allowlist роли выбор остаётся строго внутри него.
 const admissible = (spec, list) =>
   retiredProviderViolation(spec) === null && opencodeGoPolicyViolation(spec) === null &&
   (list.length === 0 || inAllowlist(spec, list));
