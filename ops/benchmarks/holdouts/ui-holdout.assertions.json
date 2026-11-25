@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "case": "ui-holdout",
+  "hidden": true,
+  "assertions": [
+    { "id": "minimum-items", "kind": "dom-count", "selector": "[data-run-item]", "minimum": 11 },
+    { "id": "collapsible-items", "kind": "dom-count", "selector": "[data-run-item] [aria-expanded]", "minimum": 11 },
+    { "id": "state-queued", "kind": "state-present", "state": "queued" },
+    { "id": "state-running", "kind": "state-present", "state": "running" },
+    { "id": "state-blocked", "kind": "state-present", "state": "blocked" },
+    { "id": "state-complete", "kind": "state-present", "state": "complete" },
+    { "id": "keyboard-toggle", "kind": "keyboard", "key": "Enter", "target": "[data-run-item] button" },
+    { "id": "aria-controlled-region", "kind": "aria", "attribute": "aria-controls" },
+    { "id": "styled-button", "kind": "computed-style", "selector": "button", "property": "border-radius" },
+    { "id": "focus-visible", "kind": "stylesheet", "requiredText": ":focus-visible" },
+    { "id": "no-native-select", "kind": "dom-absent", "selector": "select:not([data-styled])" },
+    { "id": "no-external-network", "kind": "static", "forbiddenPatterns": ["https://", "http://", "@import"] }
+  ]
+}

@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
 import { get } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -16,7 +16,7 @@ import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
   escapeHtml, SECURITY_HEADERS } from './origin-guard.mjs';
 import { createNetHealthMonitor } from './net-health.mjs';
 import { createControlRoomAggregator, createBoardObserver,
-  createBranchDriftProvider, createModelsProvider, RING_LIMIT } from './aggregator.mjs';
+  createBranchDriftProvider, createModelsProvider, createTelemetryProvider, RING_LIMIT } from './aggregator.mjs';
 import { createFinopsProvider } from './finops.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -217,6 +217,93 @@ test('aggregator: шива-счётчик помечает лида с двум�
       assert.equal(dirty.lead, 'L1');
       assert.deepEqual(new Set(dirty.taskIds), new Set(['A', 'B']));
     });
+});
+
+test('aggregator telemetry: populates compact live summary from JSONL records', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-'));
+  try {
+    const run = (task, outcome, rework, total, pass) => JSON.stringify({
+      schema: 1, kind: 'attempt_summary', task_id: task, attempt_id: `att-${task}`,
+      outcome, open: false,
+      started_at: '2026-01-01T00:00:00.000Z', ended_at: '2026-01-01T00:00:10.000Z',
+      phases_ms: { spawn: 1, worker: 2, l1_local: 1, tamper: 0, l3_visual: null,
+        l2_critic: 1, arbiter: null, total },
+      rounds: { total: rework + 1, rework, pass, arbitration: 0, open: 0, gates: {} },
+      models: { worker: { provider: 'acp-devin', model: 'swe-2-high' } },
+      labels: { domain: 'backend', size: 'S' },
+    });
+    const original = [
+      run('T1', 'done', 0, 1000, 1),
+      run('T2', 'done', 2, 3000, 1),
+      '{"corrupt"',
+    ].join('\n') + '\n';
+    await writeFile(join(dir, 'telemetry.jsonl'), original, { mode: 0o600 });
+    await writeFile(join(dir, 'notes.txt'), '{"ignored":true}\n');
+
+    await withServer({ telemetryDir: dir }, async (server, base) => {
+      const snap = JSON.parse((await httpGet(`${base}/api/snapshot`)).body);
+      assert.equal(snap.telemetry.runs, 2);
+      assert.equal(snap.telemetry.firstRoundPassRate, 0.5);
+      assert.equal(snap.telemetry.avgReworkRounds, 1);
+      assert.equal(snap.telemetry.medianWallClockMs, 2000);
+      assert.ok(snap.telemetry.updatedAt);
+      const cells = Object.values(snap.telemetry.models);
+      assert.equal(cells.length, 1);
+      assert.equal(cells[0].model.model, 'swe-2-high');
+      assert.equal(cells[0].observations, 2);
+    });
+
+    assert.equal(await readFile(join(dir, 'telemetry.jsonl'), 'utf8'), original);
+    assert.deepEqual((await readdir(dir)).sort(), ['notes.txt', 'telemetry.jsonl']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('aggregator telemetry: empty, missing, and corrupt-only directories degrade to null', async () => {
+  const missing = join(tmpdir(), 'cr-telemetry-missing-definitely');
+  assert.equal(await createTelemetryProvider({ telemetryDir: missing })(), null);
+
+  const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-empty-'));
+  try {
+    assert.equal(await createTelemetryProvider({ telemetryDir: dir })(), null);
+    await writeFile(join(dir, 'telemetry.jsonl'), 'not json\n{"wrong":true}\n');
+    assert.equal(await createTelemetryProvider({ telemetryDir: dir })(), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('aggregator telemetry: DF_TELEMETRY_DIR selects the default read-only source', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-env-'));
+  const previous = process.env.DF_TELEMETRY_DIR;
+  try {
+    await writeFile(join(dir, 'telemetry.jsonl'), JSON.stringify({
+      schema: 1, kind: 'attempt_summary', task_id: 'ENV', attempt_id: 'env-1',
+      outcome: 'done', open: false,
+      phases_ms: { total: 10 }, rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0, gates: {} },
+      models: { worker: { provider: 'acp-devin', model: 'swe-2-high' } },
+    }) + '\n');
+    process.env.DF_TELEMETRY_DIR = dir;
+    const telemetry = await createTelemetryProvider()();
+    assert.equal(telemetry.runs, 1);
+    assert.equal(telemetry.firstRoundPassRate, 1);
+  } finally {
+    if (previous === undefined) delete process.env.DF_TELEMETRY_DIR;
+    else process.env.DF_TELEMETRY_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('aggregator telemetry: file reads are bounded without crashing on large corrupt input', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-large-'));
+  try {
+    await writeFile(join(dir, 'telemetry.jsonl'), `${'x'.repeat(20000)}\n`);
+    const provider = createTelemetryProvider({ telemetryDir: dir, maxBytes: 128 });
+    assert.equal(await provider(), null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('aggregator: branch-drift индикатор в снапшоте', async () => {
