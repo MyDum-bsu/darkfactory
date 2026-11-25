@@ -444,6 +444,195 @@ export function createTelemetryProvider({
   };
 }
 
+// --- fleet telemetry -----------------------------------------------------------
+
+export const FLEET_STALE_MS = 900_000;
+export const FLEET_MAX_FILE_BYTES = 64 * 1024;
+const FLEET_NUMERIC_FIELDS = ['uptimeSec', 'cpuCores', 'load1m', 'memTotalMb',
+  'memUsedMb', 'memPct', 'diskTotalGb', 'diskUsedGb', 'diskPct'];
+
+const nowMilliseconds = now => {
+  const value = typeof now === 'function' ? now() : now;
+  if (value instanceof Date) return value.getTime();
+  return timeValue(value) ?? Date.now();
+};
+
+const roundMetric = value => Number(value.toFixed(4));
+
+// Normalize one collector record. Records with missing, non-finite, negative,
+// or semantically impossible core fields are observation noise and are dropped
+// by the caller; a partial host object must never become a confident metric.
+export function normalizeFleetHost(raw, nowMs = Date.now()) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const host = textValue(raw.host);
+  if (!host || typeof raw.ts !== 'string' || !raw.ts.trim()) return null;
+  const tsMs = timeValue(raw.ts);
+  if (tsMs === null) return null;
+  const metrics = {};
+  for (const field of FLEET_NUMERIC_FIELDS) {
+    const value = finiteNumber(raw[field]);
+    if (value === null || value < 0) return null;
+    metrics[field] = value;
+  }
+  if (!Number.isSafeInteger(metrics.cpuCores) || metrics.cpuCores <= 0 ||
+      metrics.memTotalMb <= 0 || metrics.diskTotalGb <= 0) return null;
+  if (metrics.memPct > 100 || metrics.diskPct > 100) return null;
+  if (metrics.memUsedMb > metrics.memTotalMb || metrics.diskUsedGb > metrics.diskTotalGb) return null;
+
+  const ageMs = nowMs - tsMs;
+  const ageSec = Math.floor(ageMs / 1000);
+  const stale = ageMs > FLEET_STALE_MS;
+  const loadThreshold = metrics.cpuCores * 1.5;
+  const alerts = [];
+  if (metrics.memPct >= 85) alerts.push(`memory usage ${metrics.memPct}% >= 85%`);
+  if (metrics.diskPct >= 85) alerts.push(`disk usage ${metrics.diskPct}% >= 85%`);
+  if (metrics.load1m >= loadThreshold) {
+    alerts.push(`load1m ${metrics.load1m} >= ${roundMetric(loadThreshold)} (cpuCores * 1.5)`);
+  }
+  if (stale) alerts.push(`host telemetry stale: age ${ageSec}s > 900s`);
+
+  return {
+    host,
+    ts: textValue(raw.ts) ?? new Date(tsMs).toISOString(),
+    ageSec,
+    stale,
+    uptimeSec: metrics.uptimeSec,
+    cpuCores: metrics.cpuCores,
+    load1m: metrics.load1m,
+    memTotalMb: metrics.memTotalMb,
+    memUsedMb: metrics.memUsedMb,
+    memPct: metrics.memPct,
+    diskTotalGb: metrics.diskTotalGb,
+    diskUsedGb: metrics.diskUsedGb,
+    diskPct: metrics.diskPct,
+    alerts,
+  };
+}
+
+// Read bounded regular *.json files only. Missing directories, symlinks,
+// malformed JSON, oversized files, and filesystem races all degrade to skipped
+// records because fleet telemetry is observational, never a control-plane input.
+export async function readFleetTelemetryFiles(fleetDir, {
+  maxFileBytes = FLEET_MAX_FILE_BYTES } = {}) {
+  if (typeof fleetDir !== 'string' || !fleetDir) return [];
+  const dirStat = await lstat(fleetDir).catch(() => null);
+  if (!dirStat?.isDirectory() || dirStat.isSymbolicLink()) return [];
+  const entries = await readdir(fleetDir, { withFileTypes: true }).catch(() => []);
+  const names = entries
+    .filter(entry => entry.isFile() && entry.name.endsWith('.json'))
+    .map(entry => entry.name)
+    .sort();
+  const records = [];
+  for (const name of names) {
+    const path = join(fleetDir, name);
+    const fileStat = await lstat(path).catch(() => null);
+    if (!fileStat?.isFile() || fileStat.isSymbolicLink() || fileStat.size > maxFileBytes) continue;
+    try {
+      records.push(JSON.parse(await readFile(path, 'utf8')));
+    } catch { /* malformed host snapshot is ignored */ }
+  }
+  return records;
+}
+
+export function createFleetHostsProvider({ fleetDir = null, now = () => Date.now(),
+  maxFileBytes = FLEET_MAX_FILE_BYTES } = {}) {
+  return async () => {
+    const nowMs = nowMilliseconds(now);
+    const records = await readFleetTelemetryFiles(fleetDir, { maxFileBytes });
+    return records
+      .map(record => normalizeFleetHost(record, nowMs))
+      .filter(Boolean)
+      .sort((a, b) => a.host.localeCompare(b.host));
+  };
+}
+
+function hostFleetAnomalies(host) {
+  const anomalies = [];
+  const push = (kind, message, metric, threshold) => anomalies.push({
+    kind, severity: 'warn', host: host.host, message, metric, threshold });
+  if (host.memPct >= 85) {
+    push('memory_pressure', `${host.host}: memory usage ${host.memPct}% >= 85%`, host.memPct, 85);
+  }
+  if (host.diskPct >= 85) {
+    push('disk_pressure', `${host.host}: disk usage ${host.diskPct}% >= 85%`, host.diskPct, 85);
+  }
+  const loadThreshold = roundMetric(host.cpuCores * 1.5);
+  if (host.load1m >= host.cpuCores * 1.5) {
+    push('load_pressure', `${host.host}: load1m ${host.load1m} >= ${loadThreshold}`,
+      host.load1m, loadThreshold);
+  }
+  if (host.stale) {
+    push('host_stale', `${host.host}: telemetry age ${host.ageSec}s exceeds 900s`,
+      host.ageSec, 900);
+  }
+  return anomalies;
+}
+
+function liveFactoryBurnRate(activeTrees, telemetry) {
+  const direct = firstNumber(telemetry?.burnRatePerHrUsd, telemetry?.hourlyBurnUsd,
+    telemetry?.liveFactory?.burnRatePerHrUsd, telemetry?.liveFactoryBurnRatePerHrUsd);
+  if (direct !== null && direct >= 0) return roundMetric(direct);
+  const liveTrees = (Array.isArray(activeTrees) ? activeTrees : [])
+    .filter(tree => ['running', 'rework'].includes(tree?.status));
+  return roundMetric(liveTrees.reduce((sum, tree) =>
+    sum + (finiteNumber(tree?.burnRatePerHr) ?? 0), 0));
+}
+
+function recentReworkStats(telemetry) {
+  const attempts = Array.isArray(telemetry?.attempts) ? telemetry.attempts : [];
+  const runCount = finiteNumber(telemetry?.runs) ?? attempts.length;
+  if (runCount < 3) return null;
+  const direct = firstNumber(telemetry?.reworkRatio, telemetry?.reworkRate,
+    telemetry?.rework_rate, telemetry?.recentReworkRatio);
+  if (direct !== null && direct >= 0 && direct <= 1) return { ratio: direct, runCount };
+  let evaluatedRuns = 0;
+  let reworkedRuns = 0;
+  for (const attempt of attempts.slice(-32)) {
+    const rework = finiteNumber(attempt?.rounds?.rework);
+    if (rework === null) continue;
+    evaluatedRuns += 1;
+    if (rework > 0) reworkedRuns += 1;
+  }
+  if (evaluatedRuns < 3) return null;
+  return { ratio: reworkedRuns / evaluatedRuns, runCount: evaluatedRuns };
+}
+
+// Pure fleet/cost anomaly composition, kept separate from filesystem reads so
+// boundary values and repeated invocation are deterministic under test.
+export function buildFleetTelemetry({ hosts = [], telemetry = null, activeTrees = [] } = {}) {
+  const normalizedHosts = (Array.isArray(hosts) ? hosts : [])
+    .filter(host => host !== null && typeof host === 'object')
+    .sort((a, b) => String(a.host ?? '').localeCompare(String(b.host ?? '')));
+  const anomalies = normalizedHosts.flatMap(hostFleetAnomalies);
+
+  const hourlyBurnUsd = liveFactoryBurnRate(activeTrees, telemetry);
+  if (hourlyBurnUsd !== null && hourlyBurnUsd > 2.0) {
+    anomalies.push({ kind: 'burn_rate_high', severity: 'bad', host: null,
+      message: `factory burn rate $${hourlyBurnUsd}/h exceeds $2/h`,
+      metric: hourlyBurnUsd, threshold: 2.0 });
+  }
+
+  const rework = recentReworkStats(telemetry);
+  if (rework && rework.ratio > 0.5) {
+    const ratio = roundMetric(rework.ratio);
+    anomalies.push({ kind: 'high_rework_rate', severity: 'warn', host: null,
+      message: `recent telemetry rework ratio ${ratio} exceeds 0.5 across ${rework.runCount} runs`,
+      metric: ratio, threshold: 0.5 });
+  }
+
+  return {
+    hosts: normalizedHosts,
+    anomalies,
+    summary: {
+      hostCount: normalizedHosts.length,
+      healthyCount: normalizedHosts.filter(host => Array.isArray(host.alerts) && host.alerts.length === 0).length,
+      alertCount: anomalies.length,
+      hourlyBurnUsd,
+      projectedDailyUsd: hourlyBurnUsd === null ? null : roundMetric(hourlyBurnUsd * 24),
+    },
+  };
+}
+
 // RO-список BB-тредов через CLI (bb thread list --json).
 export async function loadBbThreadsFromCli({ execImpl } = {}) {
   const exec = execImpl ?? (async (args) =>
@@ -845,7 +1034,9 @@ export function createControlRoomAggregator({
   port = DEFAULT_PORT,
   host = '127.0.0.1',
   socketPath = null,
+  stateDir = null,
   stateDirs = [],
+  fleetDir,
   ringLimit = RING_LIMIT,
   boardTasksProvider = async () => [],
   bbThreadsProvider = async () => [],
@@ -860,6 +1051,10 @@ export function createControlRoomAggregator({
   now = () => Date.now(),
 } = {}) {
   const readTelemetry = telemetryProvider ?? createTelemetryProvider({ telemetryDir, now });
+  const effectiveStateDir = stateDir ?? stateDirs[0] ?? null;
+  const effectiveFleetDir = fleetDir !== undefined ? fleetDir
+    : effectiveStateDir ? join(effectiveStateDir, 'fleet') : null;
+  const readFleetHosts = createFleetHostsProvider({ fleetDir: effectiveFleetDir, now });
   const ring = [];           // ограниченный журнал событий (≤ ringLimit)
   const attempts = new Map(); // key → последнее состояние попытки
   const sseClients = new Set();
@@ -978,10 +1173,11 @@ export function createControlRoomAggregator({
   };
 
   async function snapshot() {
-    const [board, threads, telemetry] = await Promise.all([
+    const [board, threads, telemetry, fleetHosts] = await Promise.all([
       readBoardTasks(boardTasksProvider),
       bbThreadsProvider().catch(() => []),
-      readTelemetry().catch(() => null)]);
+      readTelemetry().catch(() => null),
+      readFleetHosts().catch(() => [])]);
     const tasks = board.tasks;
     const net = netHealth ? await netHealth.snapshot().catch(() => null) : null;
     const drift = branchDriftProvider
@@ -999,6 +1195,7 @@ export function createControlRoomAggregator({
     const shiva = shivaCounter(threads, tasks);
     const activeTrees = buildActiveTrees({ events: ring, tasks,
       telemetryAttempts: telemetry?.attempts ?? [], threads, now });
+    const fleetTelemetry = buildFleetTelemetry({ hosts: fleetHosts, telemetry, activeTrees });
     const boardExplorer = buildBoardExplorer(tasks);
     const repoSlots = buildRepoSlots(activeTrees);
     const reconciled = reconcileNeeded;
@@ -1017,6 +1214,7 @@ export function createControlRoomAggregator({
       branchDrift: drift,
       netHealth: net,
       telemetry,
+      fleetTelemetry,
       models,
       finops,
       eventsTail: ring.slice(-50),
@@ -1188,7 +1386,8 @@ async function cli(argv) {
     'routing-policy': { type: 'string' },
     'resources-budget': { type: 'string' },
     'worker-usage': { type: 'string' },
-    'telemetry-dir': { type: 'string' } } });
+    'telemetry-dir': { type: 'string' },
+    'fleet-dir': { type: 'string' } } });
   const port = values.port !== undefined ? Number(values.port)
     : Number(process.env.DF_CONTROL_ROOM_PORT ?? DEFAULT_PORT);
   const socketPath = values.socket !== undefined ? values.socket
@@ -1214,8 +1413,9 @@ async function cli(argv) {
     ? createBranchDriftProvider(driftRepos,
       { ttlMs: Number(values['drift-ttl'] ?? 20_000) })
     : null;
+  const stateDirs = values['state-dir'] ?? [];
   const aggregator = createControlRoomAggregator({
-    port, socketPath, stateDirs: values['state-dir'] ?? [],
+    port, socketPath, stateDir: stateDirs[0] ?? null, stateDirs,
     netHealth,
     boardTasksProvider: observeBoard.fetchTasks,
     bbThreadsProvider: () => loadBbThreadsFromCli(),
@@ -1224,6 +1424,7 @@ async function cli(argv) {
       catalogPath: values['models-catalog'],
       policyPath: values['routing-policy'] }),
     telemetryDir: values['telemetry-dir'],
+    fleetDir: values['fleet-dir'],
     finopsProvider: createFinopsProvider({
       budgetPath: values['resources-budget'],
       workerUsagePath: values['worker-usage'],

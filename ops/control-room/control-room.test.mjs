@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, readFile, readdir } from 'node:fs/promises';
 import { get } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -16,7 +16,8 @@ import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
   escapeHtml, SECURITY_HEADERS } from './origin-guard.mjs';
 import { createNetHealthMonitor } from './net-health.mjs';
 import { createControlRoomAggregator, createBoardObserver,
-  createBranchDriftProvider, createModelsProvider, createTelemetryProvider, RING_LIMIT } from './aggregator.mjs';
+  createBranchDriftProvider, createModelsProvider, createTelemetryProvider,
+  buildFleetTelemetry, normalizeFleetHost, RING_LIMIT } from './aggregator.mjs';
 import { createFinopsProvider } from './finops.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -1066,4 +1067,179 @@ test('df-herd: width contract 80/120 на всех вкладках, ANSI зак
         }
       }
     });
+});
+
+// --- DF-OBS-FLEET: fleet telemetry and cost anomaly monitor ---------------------
+
+test('aggregator fleetTelemetry: reads real host snapshots and emits resource/cost anomalies', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-fleet-'));
+  try {
+    const fleetDir = join(dir, 'fleet');
+    await mkdir(fleetDir);
+    const fixedNow = Date.parse('2026-01-01T01:00:00.000Z');
+    const healthy = {
+      host: 'a-healthy', ts: '2026-01-01T00:59:00Z', uptimeSec: 3600,
+      cpuCores: 4, load1m: 1.2, memTotalMb: 1024, memUsedMb: 384,
+      memPct: 37.5, diskTotalGb: 100, diskUsedGb: 40, diskPct: 40,
+    };
+    const pressured = {
+      host: 'b-pressured', ts: '2026-01-01T00:30:00Z', uptimeSec: 7200,
+      cpuCores: 4, load1m: 7, memTotalMb: 1000, memUsedMb: 900,
+      memPct: 90, diskTotalGb: 100, diskUsedGb: 92, diskPct: 92,
+    };
+    await writeFile(join(fleetDir, 'b-pressured.json'), JSON.stringify(pressured));
+    await writeFile(join(fleetDir, 'a-healthy.json'), JSON.stringify(healthy));
+    await writeFile(join(fleetDir, 'malformed.json'), '{"host":');
+    await writeFile(join(fleetDir, 'invalid.json'), JSON.stringify({
+      ...healthy, host: 'c-invalid', memPct: '90' }));
+
+    const telemetryAttempt = (id, total, rework) => ({
+      task_id: id, attempt_id: `att-${id}`, epoch: 1, open: true,
+      startedAt: '2026-01-01T00:00:00.000Z', elapsedMs: 3_600_000,
+      costUsd: 0.8,
+      rounds: { total, rework, pass: total - rework, arbitration: 0, open: 0, gates: {} },
+    });
+    const telemetryProvider = async () => ({
+      runs: 3,
+      attempts: [
+        telemetryAttempt('FLEET-T1', 3, 2),
+        telemetryAttempt('FLEET-T2', 3, 2),
+        telemetryAttempt('FLEET-T3', 1, 0),
+      ],
+    });
+    const server = createControlRoomAggregator({ port: 0, stateDir: dir,
+      now: () => fixedNow, telemetryProvider,
+      modelsProvider: null, finopsProvider: null });
+    const snap = await server.snapshot();
+    const fleet = snap.fleetTelemetry;
+
+    assert.deepEqual(fleet.hosts.map(host => host.host), ['a-healthy', 'b-pressured']);
+    assert.equal(fleet.hosts[0].ageSec, 60);
+    assert.equal(fleet.hosts[0].stale, false);
+    assert.deepEqual(fleet.hosts[0].alerts, []);
+    assert.equal(fleet.hosts[1].ageSec, 1800);
+    assert.equal(fleet.hosts[1].stale, true);
+    assert.equal(fleet.hosts[1].alerts.length, 4);
+    assert.ok(fleet.hosts[1].alerts.some(alert => alert.includes('memory usage')));
+    assert.ok(fleet.hosts[1].alerts.some(alert => alert.includes('disk usage')));
+    assert.ok(fleet.hosts[1].alerts.some(alert => alert.includes('load1m')));
+    assert.ok(fleet.hosts[1].alerts.some(alert => alert.includes('stale')));
+    assert.equal(fleet.hosts.some(host => host.host === 'c-invalid'), false);
+
+    const kinds = fleet.anomalies.map(anomaly => anomaly.kind).sort();
+    assert.deepEqual(kinds, ['burn_rate_high', 'disk_pressure', 'high_rework_rate',
+      'host_stale', 'load_pressure', 'memory_pressure'].sort());
+    const memory = fleet.anomalies.find(anomaly => anomaly.kind === 'memory_pressure');
+    assert.equal(memory.host, 'b-pressured');
+    assert.equal(memory.metric, 90);
+    assert.equal(memory.threshold, 85);
+    const disk = fleet.anomalies.find(anomaly => anomaly.kind === 'disk_pressure');
+    assert.equal(disk.metric, 92);
+    assert.equal(disk.threshold, 85);
+    const stale = fleet.anomalies.find(anomaly => anomaly.kind === 'host_stale');
+    assert.equal(stale.metric, 1800);
+    assert.equal(stale.threshold, 900);
+    const burn = fleet.anomalies.find(anomaly => anomaly.kind === 'burn_rate_high');
+    assert.equal(burn.host, null);
+    assert.equal(burn.metric, 2.4);
+    assert.equal(burn.threshold, 2.0);
+    const rework = fleet.anomalies.find(anomaly => anomaly.kind === 'high_rework_rate');
+    assert.equal(rework.metric, 0.6667);
+    assert.equal(rework.threshold, 0.5);
+
+    assert.deepEqual(fleet.summary, {
+      hostCount: 2,
+      healthyCount: 1,
+      alertCount: 6,
+      hourlyBurnUsd: 2.4,
+      projectedDailyUsd: 57.6,
+    });
+    assert.deepEqual((await server.snapshot()).fleetTelemetry, fleet,
+      'repeated reads are deterministic and read-only');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('aggregator fleetTelemetry: missing fleet directory degrades to empty snapshot', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-fleet-missing-'));
+  try {
+    const server = createControlRoomAggregator({ port: 0,
+      fleetDir: join(dir, 'missing'), telemetryProvider: async () => null,
+      modelsProvider: null, finopsProvider: null });
+    const snap = await server.snapshot();
+    assert.deepEqual(snap.fleetTelemetry.hosts, []);
+    assert.deepEqual(snap.fleetTelemetry.anomalies, []);
+    assert.deepEqual(snap.fleetTelemetry.summary, {
+      hostCount: 0,
+      healthyCount: 0,
+      alertCount: 0,
+      hourlyBurnUsd: 0,
+      projectedDailyUsd: 0,
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('normalizeFleetHost: staleness and alert thresholds are boundary-exact', () => {
+  const now = Date.parse('2026-01-01T01:00:00.000Z');
+  const base = {
+    host: 'boundary', ts: '2026-01-01T00:45:00Z', uptimeSec: 1,
+    cpuCores: 4, load1m: 5.9, memTotalMb: 100, memUsedMb: 84,
+    memPct: 84, diskTotalGb: 100, diskUsedGb: 84, diskPct: 84,
+  };
+  const exactStalenessBoundary = normalizeFleetHost(base, now);
+  assert.equal(exactStalenessBoundary.ageSec, 900);
+  assert.equal(exactStalenessBoundary.stale, false);
+  assert.deepEqual(exactStalenessBoundary.alerts, []);
+
+  const oneMsStale = normalizeFleetHost({ ...base, ts: '2026-01-01T00:44:59.999Z' }, now);
+  assert.equal(oneMsStale.stale, true);
+  assert.ok(oneMsStale.alerts.some(alert => alert.includes('stale')));
+
+  const atAlertThresholds = normalizeFleetHost({
+    ...base, ts: '2026-01-01T00:59:59Z', load1m: 6,
+    memUsedMb: 85, memPct: 85, diskUsedGb: 85, diskPct: 85,
+  }, now);
+  assert.equal(atAlertThresholds.stale, false);
+  assert.equal(atAlertThresholds.alerts.length, 3);
+  assert.ok(atAlertThresholds.alerts.some(alert => alert.includes('memory usage')));
+  assert.ok(atAlertThresholds.alerts.some(alert => alert.includes('disk usage')));
+  assert.ok(atAlertThresholds.alerts.some(alert => alert.includes('load1m')));
+
+  assert.equal(normalizeFleetHost(null, now), null);
+  assert.equal(normalizeFleetHost({ ...base, memPct: null }, now), null);
+  assert.equal(normalizeFleetHost({ ...base, memPct: 101 }, now), null);
+  assert.equal(normalizeFleetHost({ ...base, cpuCores: 0 }, now), null);
+  assert.deepEqual(normalizeFleetHost(base, now), normalizeFleetHost(base, now));
+});
+
+test('buildFleetTelemetry: cost and rework anomaly thresholds are strict', () => {
+  const attempt = (id, rework) => ({ task_id: id,
+    rounds: { total: rework + 1, rework, pass: 1, arbitration: 0, open: 0, gates: {} } });
+  const exactBoundaries = buildFleetTelemetry({
+    hosts: [],
+    activeTrees: [{ status: 'running', burnRatePerHr: 2.0 }],
+    telemetry: { runs: 4, attempts: [
+      attempt('R1', 1), attempt('R2', 1), attempt('R3', 0), attempt('R4', 0)] },
+  });
+  assert.equal(exactBoundaries.summary.hourlyBurnUsd, 2.0);
+  assert.equal(exactBoundaries.anomalies.some(a => a.kind === 'burn_rate_high'), false,
+    'burn rate must exceed, not merely equal, 2.0');
+  assert.equal(exactBoundaries.anomalies.some(a => a.kind === 'high_rework_rate'), false,
+    'rework ratio must exceed, not merely equal, 0.5');
+
+  const insufficientSample = buildFleetTelemetry({
+    hosts: [], activeTrees: [],
+    telemetry: { runs: 2, attempts: [attempt('R1', 1), attempt('R2', 1)] },
+  });
+  assert.equal(insufficientSample.anomalies.some(a => a.kind === 'high_rework_rate'), false);
+
+  const overThreshold = buildFleetTelemetry({
+    hosts: [], activeTrees: [{ status: 'running', burnRatePerHr: 2.0001 }],
+    telemetry: { runs: 3, attempts: [attempt('R1', 1), attempt('R2', 1), attempt('R3', 0)] },
+  });
+  assert.equal(overThreshold.anomalies.find(a => a.kind === 'burn_rate_high').metric, 2.0001);
+  assert.equal(overThreshold.anomalies.find(a => a.kind === 'high_rework_rate').metric, 0.6667);
 });
