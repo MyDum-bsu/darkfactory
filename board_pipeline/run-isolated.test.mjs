@@ -60,6 +60,23 @@ test('legacy static-brief queue cards keep the existing unprefixed behavior', ()
   assert.equal(result.reviewSpec, 'Static review policy');
 });
 
+test('sealed pilot cards pinned to the review spec keep static inputs unchanged', () => {
+  const operatorBrief = 'Static operator brief';
+  const reviewSpec = 'Sealed A/B pilot review policy';
+  const result = queueModeSpecInputs({ route: {},
+    attempt: { spec_digest: sha256(reviewSpec), specText: 'Isolated #1448 policy' },
+    operatorBrief, reviewSpec });
+  assert.equal(result.workerBrief, operatorBrief);
+  assert.equal(result.reviewSpec, reviewSpec);
+  assert.equal(result.specText, null);
+  assert.equal(result.block, null);
+
+  assert.throws(() => queueModeSpecInputs({ route: {},
+      attempt: { spec_digest: sha256('unrelated digest'), specText: 'Isolated #1448 policy' },
+      operatorBrief, reviewSpec }),
+    /card_spec_digest_mismatch/);
+});
+
 test('queue mode without card spec text preserves existing static behavior', () => {
   const result = queueModeSpecInputs({ route: {},
     attempt: { spec_digest: 'f'.repeat(64) },

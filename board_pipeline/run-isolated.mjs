@@ -89,7 +89,8 @@ export function queueModeSpecInputs({ route, attempt, operatorBrief, reviewSpec 
     return { workerBrief: `${operatorBrief}\n\n${block}`, reviewSpec: `${reviewSpec}\n\n${block}`,
       specText: attempt.specText, block };
   }
-  if (sha256Utf8(operatorBrief) === attempt.spec_digest) return unchanged;
+  if (sha256Utf8(operatorBrief) === attempt.spec_digest ||
+      sha256Utf8(reviewSpec) === attempt.spec_digest) return unchanged;
   throw new Error('card_spec_digest_mismatch');
 }
 
