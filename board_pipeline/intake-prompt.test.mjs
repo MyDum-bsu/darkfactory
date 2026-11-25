@@ -166,3 +166,55 @@ test('projectMemoryPromptBlock is fail-closed on unpinned or zero-shown truncate
   const partial = projectMemoryPromptBlock({ ...memorySlice, truncated: true, total: 4 });
   assert.match(partial, /slice truncated: showing 1 of 4/);
 });
+
+test('worker prompt without executor keeps the legacy byte shape', () => {
+  const legacy = workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice,
+    projectMemory: memorySlice, lessons });
+  assert.ok(legacy.startsWith(spec));
+  assert.ok(legacy.endsWith('\n'));
+  assert.equal(legacy, workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice,
+    projectMemory: memorySlice, lessons }));
+});
+
+test('executor-aware worker prompt embeds the complete legacy contract verbatim', () => {
+  const legacy = workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice,
+    projectMemory: memorySlice, lessons });
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice,
+    projectMemory: memorySlice, lessons,
+    executor: { provider: 'acp-devin', model: 'swe-2-1-medium' },
+    allowedPaths: ['board_pipeline/intake-prompt.mjs'] });
+  assert.ok(prompt.includes(legacy));
+  assert.match(prompt, /# Context/);
+  assert.match(prompt, /# Scope Fence/);
+  assert.match(prompt, /board_pipeline\/intake-prompt\.mjs/);
+  for (const required of ['Accepted owner decisions (read-only', 'Project memory (read-only',
+    'Lessons from prior REWORK rounds', 'Before asking a product question',
+    'Write JSON atomically', 'Do not touch other threads or boards.']) {
+    assert.ok(prompt.includes(required), required);
+  }
+});
+
+test('worker prompt family adaptation follows the executor model', () => {
+  const cases = [
+    [{ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' }, '[file content begin]'],
+    [{ provider: 'acp-antigravity-acp', model: 'gemini-4-neon' }, 'Based on the specification and context provided above'],
+    [{ provider: 'openai', model: 'gpt-6.2-sol' }, '<structured_output_contract>'],
+    [{ provider: 'agy', model: 'claude-opus-5.5' }, 'Hard constraints are enforced by sandbox/gates'],
+    [{ provider: 'unknown', model: 'unknown' }, null],
+  ];
+  for (const [executor, marker] of cases) {
+    const prompt = workerIntakePrompt({ ...worker, productQuestions: false, executor });
+    if (marker !== null) assert.ok(prompt.includes(marker), marker);
+    assert.ok(prompt.includes(spec));
+    assert.ok(prompt.includes('Do not touch other threads or boards.'));
+  }
+});
+
+test('worker prompt scope fence is fail-closed on malformed allowed paths', () => {
+  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false,
+    executor: { provider: 'acp-devin', model: 'swe-2-1-medium' },
+    allowedPaths: ['../outside'] }), /scope_fence_path_invalid/);
+  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false,
+    executor: { provider: 'acp-devin', model: 'swe-2-1-medium' },
+    allowedPaths: [] }), /scope_fence_input_invalid/);
+});

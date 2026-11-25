@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { isApprovedWorker, queueModeSpecInputs } from './run-isolated.mjs';
+import { allowedPathsFromAttempt, allowedPathsFromLabels, isApprovedWorker, queueModeSpecInputs,
+  scopeFenceReworkResult } from './run-isolated.mjs';
 
 test('isApprovedWorker accepts SWE-2.1 implementation workers and legacy SWE-2 High', () => {
   for (const model of ['swe-2-1-medium', 'swe-2-1-high', 'swe-2-1-xhigh', 'swe-2-1-max']) {
@@ -83,4 +84,31 @@ test('queue mode without card spec text preserves existing static behavior', () 
     operatorBrief: 'Static operator brief', reviewSpec: 'Static review policy' });
   assert.equal(result.workerBrief, 'Static operator brief');
   assert.equal(result.reviewSpec, 'Static review policy');
+});
+
+test('allowedPathsFromLabels parses the card label and treats absence as unrestricted', () => {
+  assert.equal(allowedPathsFromLabels({}), null);
+  assert.equal(allowedPathsFromLabels(null), null);
+  assert.deepEqual(allowedPathsFromLabels({ allowed_paths: 'board_pipeline/,ops/control-room/' }),
+    ['board_pipeline/', 'ops/control-room/']);
+  assert.throws(() => allowedPathsFromLabels({ allowed_paths: '../x' }), /scope_fence_path_invalid/);
+  assert.throws(() => allowedPathsFromLabels({ allowed_paths: '' }), /scope_fence_path_invalid/);
+  assert.throws(() => allowedPathsFromLabels({ allowed_paths: 42 }), /allowed_paths_invalid/);
+});
+
+test('allowedPathsFromAttempt prefers pinned attempt data over live labels', () => {
+  assert.deepEqual(allowedPathsFromAttempt({ allowed_paths: 'a.mjs' }, { allowed_paths: 'b.mjs' }), ['a.mjs']);
+  assert.deepEqual(allowedPathsFromAttempt({ labels: { allowed_paths: 'a.mjs,b/' } }, null), ['a.mjs', 'b/']);
+  assert.deepEqual(allowedPathsFromAttempt({}, { allowed_paths: 'c.mjs' }), ['c.mjs']);
+  assert.equal(allowedPathsFromAttempt({}, {}), null);
+});
+
+test('scopeFenceReworkResult is typed deterministic worker feedback', () => {
+  const result = scopeFenceReworkResult(['outside.mjs'], ['board_pipeline/']);
+  assert.equal(result.outcome, 'rework');
+  assert.equal(result.reason, 'scope_fence_violation');
+  assert.deepEqual(result.feedback.violations, ['outside.mjs']);
+  assert.equal(result.feedback.findings[0].file, 'outside.mjs');
+  assert.match(result.feedback.findings[0].expected, /board_pipeline\//);
+  assert.deepEqual(result, scopeFenceReworkResult(['outside.mjs'], ['board_pipeline/']));
 });

@@ -1,4 +1,6 @@
 import { SAFE_CATALOG } from './rework-distiller.mjs';
+import { formatWorkerPrompt, resolveModelFamily } from './model-prompt-profiles.mjs';
+import { scopeFencePromptBlock } from './scope-fence.mjs';
 
 const OWNER_PRECHECK = [
   'Before asking a product question, check the approved requirements and the "Accepted decisions" section in the input specification/assignment.',
@@ -63,7 +65,8 @@ export function projectMemoryPromptBlock(slice) {
   return `${header}\n${body}${note}${guard}`;
 }
 
-export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions, projectMemory, lessons }) {
+export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions,
+  projectMemory, lessons, executor, allowedPaths }) {
   const instructions = [
     brief,
     `\nWorktree path: ${tree}. Write JSON atomically to ${handoffPath} and end the turn. Preserve field types: ${JSON.stringify(handoff)}`,
@@ -75,7 +78,15 @@ export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQ
     instructions.push(OWNER_PRECHECK,
       'Only for one remaining product fork, pass question instead of candidate_sha: {"prompt":"one specific question","evidence":"brief justification"}. Do not include secrets or raw logs.');
   }
-  return [...instructions, 'Do not touch other threads or boards.', ''].join('\n');
+  const basePrompt = [...instructions, 'Do not touch other threads or boards.', ''].join('\n');
+  if (executor === undefined || executor === null) return basePrompt;
+  return formatWorkerPrompt({
+    family: resolveModelFamily(executor),
+    basePrompt,
+    scopeFenceBlock: allowedPaths === undefined || allowedPaths === null
+      ? undefined
+      : scopeFencePromptBlock(allowedPaths),
+  });
 }
 
 export function arbiterIntakePrompt(spec, extra, decisions, projectMemory) {
