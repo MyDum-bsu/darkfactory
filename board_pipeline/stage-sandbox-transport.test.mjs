@@ -278,6 +278,26 @@ test('закреплённый reasoning: docker исполняет и атте�
   assert.equal(agyCalls, 0, 'неподдерживаемый спек не доходит до запуска');
 });
 
+test('docker reasoning: повышение допускается, понижение и неизвестные уровни отклоняются', async t => {
+  const { worktree, journal, piRoot, unpack } = await fixture(t);
+  const transportFor = reasoningLevel => createStageSandboxTransport({ worktree, journal, piRoot, unpack,
+    probeDocker: async () => true, worktreeFingerprintImpl: fp,
+    dockerSandbox: async () => ({ code: 0, stdout: 'T' }),
+    parsePi: () => ({ actual: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel },
+      toolsAdded: [], finalText: `${challenge} PASS` }) });
+
+  const upgraded = await transportFor('high').observe(request({ ...sol, reasoning: 'medium' }));
+  assert.equal(upgraded.verdict, 'PASS');
+  assert.equal(upgraded.witness.actual.reasoningLevel, 'high');
+
+  for (const reasoningLevel of ['low', 'off', 'bogus', undefined]) {
+    await assert.rejects(transportFor(reasoningLevel).observe(request({ ...sol, reasoning: 'medium' })),
+      /stage_reasoning_mismatch/);
+  }
+  await assert.rejects(transportFor('medium').observe(request({ ...sol, reasoning: 'bogus' })),
+    /stage_reasoning_mismatch/);
+});
+
 test('stageDockerSandbox пробрасывает signal в runInReadOnlySandbox через саму обёртку', async () => {
   const controller = new AbortController();
   let seen;

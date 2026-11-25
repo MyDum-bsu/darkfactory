@@ -36,6 +36,8 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
 export class StageDenied extends ReviewDenied {}
 
+const REASONING_RANK = Object.freeze({ off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5 });
+
 // Маршрут модели к доказуемому read-only контуру. Запрещённые политикой
 // идентификаторы и неизвестные спеки — stage_model_denied до любой пробы.
 export function stageTransportKind(model) {
@@ -389,7 +391,12 @@ export function createStageSandboxTransport({
       for (const key of ['provider', 'model']) {
         if (parsed.actual[key] !== spec[key]) throw new StageDenied(`stage_${key}_mismatch`);
       }
-      if (parsed.actual.reasoningLevel !== effort) throw new StageDenied('stage_reasoning_mismatch');
+      const effortRank = Object.hasOwn(REASONING_RANK, effort) ? REASONING_RANK[effort] : undefined;
+      const actualRank = Object.hasOwn(REASONING_RANK, parsed.actual.reasoningLevel) ?
+        REASONING_RANK[parsed.actual.reasoningLevel] : undefined;
+      if (effortRank === undefined || actualRank === undefined || actualRank < effortRank) {
+        throw new StageDenied('stage_reasoning_mismatch');
+      }
       assertToolsAllowed(parsed.toolsAdded);
       const verdict = stageVerdictLine(parsed.finalText, challenge);
       if (run.code !== 0) throw new StageDenied(`stage_runner_exit:${run.code ?? 'timeout'}`);
