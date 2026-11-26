@@ -174,6 +174,25 @@ function freshRuntimeId(kind) {
   fail('worker_runtime_kind_invalid');
 }
 
+// Секреты и привилегированные каналы контроллера никогда не наследуются
+// дочерним процессом воркера (defense-in-depth): воркеру нужен лишь его
+// собственный CLI/env, а не ssh-agent, токены Board или HMAC-ключ памяти.
+const CONTROLLER_SENSITIVE_ENV = new Set([
+  'SSH_AUTH_SOCK',
+  'BOARD_TOKEN',
+  'VB_TOKEN',
+  'DF_PROJECT_MEMORY_HMAC_KEY',
+  'DF_CONTROL_ROOM_WRITE_TOKEN',
+]);
+
+export function scrubbedWorkerChildEnv(env) {
+  const clean = {};
+  for (const [key, value] of Object.entries(env ?? {})) {
+    if (!CONTROLLER_SENSITIVE_ENV.has(key)) clean[key] = value;
+  }
+  return clean;
+}
+
 function terminalExitCode(terminal) {
   return Number.isSafeInteger(terminal?.exit_code) ? terminal.exit_code : undefined;
 }
@@ -325,7 +344,7 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
 
   function launchSubproc(session, built) {
     const child = spawnProcess(built.command, [...built.argv], {
-      cwd: session.worktree, env, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: session.worktree, env: scrubbedWorkerChildEnv(env), stdio: ['ignore', 'pipe', 'pipe'],
     });
     watchChild(session, child);
     return child;
@@ -361,13 +380,42 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     return kind === 'hc' ? spawnHc(input, prompt) : spawnSubproc(input, prompt);
   }
 
+  function hcProbeNotFound(error) {
+    const detail = `${error?.stderr ?? ''}\n${error?.stdout ?? ''}\n${error?.message ?? ''}`;
+    return detail.includes('"not_found"') || detail.includes('no terminal');
+  }
+
+  // Crash-resume под уже занятым именем: мёртвый терминал сначала убирается,
+  // иначе hc run создаст дубликат имени и observe/send/kill по имени станут
+  // неоднозначными. Живой терминал никогда не снимается — fail-closed, как
+  // worker_busy у subproc; неподтверждённый сбой probe пробрасывается, а не
+  // маскируется под чистое имя.
+  async function removeCrashedHcTerminal(runtimeId) {
+    let terminal;
+    try {
+      terminal = await hc(['get', '--json', '--', runtimeId]);
+    } catch (error) {
+      if (hcProbeNotFound(error)) return;
+      throw error;
+    }
+    if (terminal?.error?.kind === 'not_found') return;
+    if (hcState(terminal) !== 'exited') fail('worker_runtime_exists');
+    try {
+      await hc(['kill', '--json', '--', runtimeId], { timeout: 15_000 });
+    } catch { /* kill уже завершённого терминала идемпотентен — best-effort */ }
+    await hc(['rm', '--json', '--', runtimeId], { timeout: 15_000 });
+  }
+
   async function resumeWorker(rawInput) {
     const input = validateResumeInput(rawInput);
     const prompt = text(await promptFromFile(input.promptFile), 'worker_prompt_invalid');
     const built = buildResumeCommand(input.executor, { sessionId: input.sessionId, prompt,
       promptFile: input.promptFile, permissionMode: input.permissionMode,
       interactive: kind === 'hc' });
-    if (kind === 'hc') return runHc(input, built, { resumed: true });
+    if (kind === 'hc') {
+      if (input.runtimeId !== undefined) await removeCrashedHcTerminal(input.runtimeId);
+      return runHc(input, built, { resumed: true });
+    }
     const runtimeId = input.runtimeId ?? freshRuntimeId('subproc');
     return startSubprocSession(input, built, runtimeId, { replaceTerminal: true });
   }
