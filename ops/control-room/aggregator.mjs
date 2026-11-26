@@ -38,6 +38,7 @@ import { loadModelRegistry, registrySnapshot } from '../../board_pipeline/model-
 import { collectTelemetry } from '../../board_pipeline/telemetry-collector.mjs';
 import { normalizeCost, normalizeUsage, parseTelemetryLines } from '../../board_pipeline/telemetry.mjs';
 import { aggregateScorecard } from '../../board_pipeline/model-scorecard.mjs';
+import { buildAdaptiveGatesSummary } from '../../board_pipeline/adaptive-gates.mjs';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1198,6 +1199,7 @@ export function createControlRoomAggregator({
     const fleetTelemetry = buildFleetTelemetry({ hosts: fleetHosts, telemetry, activeTrees });
     const boardExplorer = buildBoardExplorer(tasks);
     const repoSlots = buildRepoSlots(activeTrees);
+    const adaptiveGates = buildAdaptiveGatesSummary({ attempts: telemetry?.attempts ?? [] });
     const reconciled = reconcileNeeded;
     reconcileNeeded = false;
     return {
@@ -1211,6 +1213,7 @@ export function createControlRoomAggregator({
       activeTrees,
       boardExplorer,
       repoSlots,
+      adaptiveGates,
       branchDrift: drift,
       netHealth: net,
       telemetry,

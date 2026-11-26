@@ -317,12 +317,35 @@ test('aggregator V2-8: additive snapshot preserves existing keys', async () => {
   const snap = await server.snapshot();
   for (const key of ['ts', 'reconcile', 'running', 'queued', 'needsOwner', 'recentlyCompleted',
     'boardStatus', 'health', 'sessions', 'shiva', 'branchDrift', 'netHealth', 'telemetry',
-    'models', 'finops', 'eventsTail', 'attemptsTracked']) {
+    'models', 'finops', 'eventsTail', 'attemptsTracked', 'adaptiveGates']) {
     assert.ok(Object.hasOwn(snap, key), key);
   }
   for (const key of ['activeTrees', 'boardExplorer', 'repoSlots']) {
     assert.ok(Object.hasOwn(snap, key), key);
   }
+});
+
+test('aggregator V2-9: adaptiveGates summary exposes thresholds and per-repo rollback stats', async () => {
+  const telemetryProvider = async () => ({ attempts: [
+    { task_id: 'AG1', repo_id: 'repo-adaptive', outcome: 'done', open: false },
+    { task_id: 'AG2', repo_id: 'repo-adaptive', outcome: 'rolled_back', open: false },
+    { task_id: 'AG3', repo_id: 'repo-adaptive', outcome: 'done', open: false },
+    { task_id: 'AG4', repo_id: 'repo-adaptive', outcome: 'done', open: false },
+    { task_id: 'AG5', repo_id: 'repo-adaptive', outcome: 'done', open: false },
+    { task_id: 'AG6', repo_id: 'repo-adaptive', outcome: 'done', open: true },
+  ] });
+  const server = createControlRoomAggregator({ port: 0, telemetryProvider,
+    modelsProvider: null, finopsProvider: null });
+  const snap = await server.snapshot();
+  assert.equal(snap.adaptiveGates.fastMaxMs, 90000);
+  assert.equal(snap.adaptiveGates.asyncMinMs, 120000);
+  assert.equal(snap.adaptiveGates.breakerTripRate, 0.1);
+  assert.equal(snap.adaptiveGates.breakerRecoverRate, 0.05);
+  const repo = snap.adaptiveGates.repos['repo-adaptive'];
+  assert.equal(repo.totalRuns, 5);
+  assert.equal(repo.rollbacks, 1);
+  assert.equal(repo.rollbackRate, 0.2);
+  assert.equal(repo.circuitBreakerOpen, true);
 });
 
 test('aggregator: шива-счётчик помечает лида с двумя задачами как dirty', async () => {
