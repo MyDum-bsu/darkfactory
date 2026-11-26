@@ -80,6 +80,15 @@ export function isAllowedHost(host, port, defaultPort = 80) {
   return (parsed.port ?? defaultPort) === port;
 }
 
+// Fetch Metadata: браузерные cross-site запросы к loopback отклоняются даже
+// без Origin (например, адресная строка/img/script probe). CLI/curl обычно не
+// шлют Sec-Fetch-Site, поэтому отсутствие заголовка остаётся допустимым.
+export function isAllowedFetchSite(secFetchSite) {
+  if (secFetchSite === undefined || secFetchSite === null || secFetchSite === '') return true;
+  const value = String(secFetchSite).trim().toLowerCase();
+  return value === 'same-origin' || value === 'none';
+}
+
 // Origin заголовок (CSRF-защита для будущих мутаций и для защиты от
 // drive-by форм): отсутствие Origin допустимо (curl/SSE), заданный —
 // обязан быть loopback на нашем порту.

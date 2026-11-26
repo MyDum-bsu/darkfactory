@@ -23,6 +23,7 @@ export function createNetHealthMonitor({
   fetchImpl,
   cloudStatePath = null,
   diskPath = '/',
+  meminfoPath = '/proc/meminfo',
   cloudStaleMs = CLOUD_STALE_MS,
   now = () => Date.now(),
 } = {}) {
@@ -95,8 +96,23 @@ export function createNetHealthMonitor({
     }
   };
 
+  const availableMemoryBytes = async () => {
+    if (process.platform === 'linux') {
+      try {
+        const meminfo = await readFile(meminfoPath, 'utf8');
+        const match = /^MemAvailable:\s*(\d+)\s+kB\s*$/m.exec(meminfo);
+        if (match) {
+          const availableKb = Number(match[1]);
+          if (Number.isFinite(availableKb) && availableKb >= 0) return availableKb * 1024;
+        }
+      } catch { /* fall back to os.freemem() below */ }
+    }
+    return freemem();
+  };
+
   const hostMetrics = async () => {
-    const mem = { freeBytes: freemem(), totalBytes: totalmem() };
+    const freeBytes = await availableMemoryBytes();
+    const mem = { freeBytes, availableBytes: freeBytes, totalBytes: totalmem() };
     try {
       const st = await statfs(diskPath, { bigint: true });
       return { mem, disk: { freeBytes: Number(st.bavail * st.bsize),

@@ -5,20 +5,22 @@
 
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, rm, writeFile, readFile, readdir } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, rm, writeFile, readFile, readdir, utimes } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
 import { get, request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
-import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
+import { isAllowedHost, isAllowedOrigin, isAllowedFetchSite, sanitizeTerminalText,
   escapeHtml, SECURITY_HEADERS } from './origin-guard.mjs';
 import { createNetHealthMonitor } from './net-health.mjs';
 import { createControlRoomAggregator, createBoardObserver,
   createBranchDriftProvider, createModelsProvider, createTelemetryProvider,
-  buildActiveTrees, buildFleetTelemetry, normalizeFleetHost, RING_LIMIT } from './aggregator.mjs';
-import { createFinopsProvider } from './finops.mjs';
+  buildActiveTrees, buildFleetTelemetry, normalizeFleetHost, readKillSwitchState,
+  readRequestBody, OWNER_WRITE_BODY_TIMEOUT_MS, RING_LIMIT } from './aggregator.mjs';
+import { buildSpendDynamics, createFinopsProvider } from './finops.mjs';
 import vm from 'node:vm';
 
 const execFileAsync = promisify(execFile);
@@ -1605,13 +1607,35 @@ test('df-herd: models tab печатает корректный синтакси
 // (в частности, append возвращает undefined — chaining запрещён).
 function loadWebApp(source, hookNames = ['renderProjects', 'renderStatus']) {
   const ids = new Map();
+  let documentRef = null;
   const makeElement = tag => {
     const classes = new Set();
     const node = {
       tagName: tag, children: [], childNodes: [], textContent: '', className: '',
-      dataset: {}, style: {}, listeners: {},
-      append(...kids) { for (const k of kids) { node.children.push(k); node.childNodes.push(k); } },
-      replaceChildren() { node.children = []; node.childNodes = []; },
+      dataset: {}, style: {}, listeners: {}, parentNode: null, value: '',
+      append(...kids) {
+        for (const k of kids) {
+          if (k && typeof k === 'object') k.parentNode = node;
+          node.children.push(k);
+          node.childNodes.push(k);
+        }
+      },
+      replaceChildren() {
+        for (const k of node.children) if (k && typeof k === 'object') k.parentNode = null;
+        node.children = [];
+        node.childNodes = [];
+      },
+      contains(other) {
+        for (let current = other; current; current = current.parentNode) {
+          if (current === node) return true;
+        }
+        return false;
+      },
+      focus() { if (documentRef) documentRef.activeElement = node; },
+      setSelectionRange(start, end) {
+        node.selectionStart = start;
+        node.selectionEnd = end;
+      },
       addEventListener(type, fn) { (node.listeners[type] ??= []).push(fn); },
       removeEventListener(type, fn) {
         node.listeners[type] = (node.listeners[type] ?? []).filter(entry => entry !== fn);
@@ -1631,6 +1655,7 @@ function loadWebApp(source, hookNames = ['renderProjects', 'renderStatus']) {
   };
   const sandbox = {
     document: {
+      activeElement: null,
       getElementById(id) {
         if (!ids.has(id)) ids.set(id, makeElement('div'));
         return ids.get(id);
@@ -1646,6 +1671,7 @@ function loadWebApp(source, hookNames = ['renderProjects', 'renderStatus']) {
     setTimeout, clearTimeout, URL, console, encodeURIComponent,
     navigator: {}, crypto: { randomUUID: () => 'uuid-fixed' },
   };
+  documentRef = sandbox.document;
   let hooks = null;
   sandbox.__capture = value => { hooks = value; };
   vm.createContext(sandbox);
@@ -1696,7 +1722,7 @@ test('app.js renderProjects: счётчики по phase+state — Worker/Stage/
   assert.equal(box.children[0].className, 'empty');
 });
 
-test('app.js renderStatus: kill-switch читается из snap.killSwitch или snap.pilot.killSwitch', async () => {
+test('app.js renderStatus: kill-switch null/unknown не маскируется под off', async () => {
   const source = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
   const { hooks, ids } = loadWebApp(source);
   const base = { netHealth: {}, running: [] };
@@ -1705,11 +1731,21 @@ test('app.js renderStatus: kill-switch читается из snap.killSwitch и�
   assert.equal(ids.get('chip-killswitch').classList.contains('bad'), true);
   hooks.renderStatus({ ...base, killSwitch: true });
   assert.equal(ids.get('chip-killswitch').textContent, 'KILL-SWITCH');
-  hooks.renderStatus({ ...base });
+  hooks.renderStatus({ ...base, killSwitch: false });
   assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: off');
   assert.equal(ids.get('chip-killswitch').classList.contains('bad'), false);
+  hooks.renderStatus({ ...base });
+  assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: unknown');
+  assert.equal(ids.get('chip-killswitch').classList.contains('dim'), true);
+  hooks.renderStatus({ ...base, killSwitch: null, pilot: { killSwitch: false } });
+  assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: unknown');
+  assert.equal(ids.get('chip-killswitch').classList.contains('dim'), true);
   hooks.renderStatus({ ...base, pilot: {} });
-  assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: off');
+  assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: unknown');
+  // legacy pilot.killSwitch является путём к файлу, а не булевым состоянием:
+  // строка пути не должна ложно включать красный KILL-SWITCH.
+  hooks.renderStatus({ ...base, pilot: { killSwitch: '/private/switch' } });
+  assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: unknown');
 });
 
 function deepText(node) {
@@ -2069,4 +2105,372 @@ test('owner write-api: ошибка port → 502, ответ не кэшируе
       const mutation = await httpRequest(`${base}/api/snapshot`, {}, 'POST');
       assert.equal(mutation.status, 405);
     });
+});
+
+// --- P0/P1 reliability/security regressions ---------------------------------
+
+test('origin-guard: Sec-Fetch-Site cross-site/same-site GET rejected, CLI absent allowed', async () => {
+  assert.equal(isAllowedFetchSite(undefined), true);
+  assert.equal(isAllowedFetchSite('same-origin'), true);
+  assert.equal(isAllowedFetchSite('none'), true);
+  assert.equal(isAllowedFetchSite('cross-site'), false);
+  assert.equal(isAllowedFetchSite('same-site'), false);
+
+  await withServer({}, async (server, base) => {
+    assert.equal((await httpGet(`${base}/api/health`)).status, 200);
+    assert.equal((await httpRequest(`${base}/api/health`,
+      { 'Sec-Fetch-Site': 'same-origin' })).status, 200);
+    for (const value of ['cross-site', 'same-site']) {
+      const res = await httpRequest(`${base}/api/health`, { 'Sec-Fetch-Site': value });
+      assert.equal(res.status, 403, value);
+      assert.equal(JSON.parse(res.body).error, 'forbidden_fetch_site');
+    }
+  });
+});
+
+test('aggregator events tail: rotated files newest-first, bounded tail chunks, older fallback', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-events-rotated-'));
+  try {
+    const event = seq => JSON.stringify({ kind: 'attempt.phase', seq, task_id: 'T',
+      phase: 'working', ts: new Date(Date.UTC(2026, 0, 1) + seq * 1000).toISOString() });
+    await writeFile(join(dir, 'events.1.ndjson'), `${event(1)}\n${event(2)}\n`);
+    await writeFile(join(dir, 'events.ndjson'), `${event(3)}\n${event(4)}\n`);
+
+    const newestOnly = createControlRoomAggregator({ port: 0, stateDirs: [dir], ringLimit: 2,
+      modelsProvider: null, finopsProvider: null });
+    await newestOnly.start();
+    try {
+      const snap = await newestOnly.snapshot();
+      assert.deepEqual(snap.eventsTail.map(e => e.seq), [3, 4],
+        'лимит уже набран в новейшем events.ndjson: старый rotated-файл не читается');
+    } finally {
+      await newestOnly.stop();
+    }
+
+    const withFallback = createControlRoomAggregator({ port: 0, stateDirs: [dir], ringLimit: 3,
+      modelsProvider: null, finopsProvider: null });
+    await withFallback.start();
+    try {
+      const snap = await withFallback.snapshot();
+      assert.deepEqual(snap.eventsTail.map(e => e.seq), [2, 3, 4],
+        'недостающий хвост добирается из следующего более старого rotation-поколения');
+    } finally {
+      await withFallback.stop();
+    }
+
+    // Хвост читается окнами, а не целиком: 1000 строк (>64 KiB) дают ровно
+    // запрошенный лимит последних событий без загрузки журнала в память.
+    const many = Array.from({ length: 1000 }, (_, i) => event(i + 1)).join('\n') + '\n';
+    await writeFile(join(dir, 'events.ndjson'), many);
+    const bounded = createControlRoomAggregator({ port: 0, stateDirs: [dir], ringLimit: 750,
+      modelsProvider: null, finopsProvider: null });
+    await bounded.start();
+    try {
+      assert.equal(bounded.ringSize, 750);
+      const snap = await bounded.snapshot();
+      assert.equal(snap.eventsTail.length, 50);
+      assert.equal(snap.eventsTail[0].seq, 951);
+      assert.equal(snap.eventsTail.at(-1).seq, 1000);
+    } finally {
+      await bounded.stop();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('aggregator SSE: client closed during initial snapshot is never registered', async () => {
+  let releaseBoard;
+  let started;
+  const startedPromise = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { releaseBoard = resolve; });
+  const server = createControlRoomAggregator({ port: 0,
+    boardTasksProvider: async () => { started(); await gate; return []; },
+    modelsProvider: null, finopsProvider: null, telemetryProvider: async () => null });
+  await server.start();
+  const req = get(`http://127.0.0.1:${server.port}/api/events`, res => res.resume());
+  req.on('error', () => {});
+  try {
+    await startedPromise;
+    req.destroy();
+    releaseBoard([]);
+    for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(server.clients, 0);
+  } finally {
+    req.destroy();
+    await server.stop();
+  }
+});
+
+function controlRoomTelemetryRecord(taskId, attemptId = `att-${taskId}`) {
+  return {
+    schema: 1, kind: 'attempt_summary', task_id: taskId, attempt_id: attemptId,
+    outcome: 'done', open: false,
+    started_at: '2026-01-01T00:00:00.000Z', ended_at: '2026-01-01T00:00:10.000Z',
+    phases_ms: { total: 1000, worker: 1000, l2_critic: null, arbiter: null },
+    rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0, gates: {} },
+    models: { worker: { provider: 'acp-devin', model: 'swe-2-high' } },
+    labels: { domain: 'backend', size: 'S' },
+  };
+}
+
+test('aggregator telemetry: newest files win maxFiles and unchanged parsed result is cached', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-cache-'));
+  try {
+    const oldPath = join(dir, 'telemetry.1.jsonl');
+    const newPath = join(dir, 'telemetry.jsonl');
+    await writeFile(oldPath, `${JSON.stringify(controlRoomTelemetryRecord('OLD'))}\n`);
+    await writeFile(newPath, `${JSON.stringify(controlRoomTelemetryRecord('NEW'))}\n`);
+    const newest = await createTelemetryProvider({ telemetryDir: dir, maxFiles: 1 })();
+    assert.equal(newest.runs, 1);
+    assert.equal(newest.attempts[0].taskId, 'NEW');
+
+    const provider = createTelemetryProvider({ telemetryDir: dir, maxFiles: 2 });
+    const first = await provider();
+    const second = await provider();
+    assert.equal(second, first, 'path+mtime+size key reuses the parsed telemetry result');
+    assert.equal(first.runs, 2);
+
+    const updatedAt = new Date('2026-01-02T00:00:00.000Z');
+    await writeFile(newPath, [
+      JSON.stringify(controlRoomTelemetryRecord('NEW')),
+      JSON.stringify(controlRoomTelemetryRecord('NEWER', 'att-newer')),
+    ].join('\n') + '\n');
+    await utimes(newPath, updatedAt, updatedAt);
+    const third = await provider();
+    assert.notEqual(third, first);
+    assert.equal(third.runs, 3);
+    assert.equal(third.attempts.at(-1).taskId, 'NEWER');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('aggregator snapshot: concurrent calls coalesce; optional TTL does not alter default semantics', async () => {
+  let calls = 0;
+  const boardTasksProvider = async () => {
+    calls += 1;
+    await new Promise(resolve => setTimeout(resolve, 15));
+    return [];
+  };
+  const plain = createControlRoomAggregator({ port: 0, boardTasksProvider,
+    modelsProvider: null, finopsProvider: null, telemetryProvider: async () => null });
+  await Promise.all([plain.snapshot(), plain.snapshot(), plain.snapshot()]);
+  assert.equal(calls, 1, 'parallel snapshots share one in-flight provider pass');
+  await plain.snapshot();
+  assert.equal(calls, 2, 'without opt-in TTL a later snapshot is recomputed deterministically');
+
+  let nowMs = 1_000;
+  let ttlCalls = 0;
+  const cached = createControlRoomAggregator({ port: 0,
+    boardTasksProvider: async () => { ttlCalls += 1; return []; },
+    modelsProvider: null, finopsProvider: null, telemetryProvider: async () => null,
+    now: () => nowMs, snapshotCacheTtlMs: 100 });
+  await cached.snapshot();
+  await cached.snapshot();
+  assert.equal(ttlCalls, 1, 'short TTL reuses a fresh snapshot when explicitly enabled');
+  nowMs += 101;
+  await cached.snapshot();
+  assert.equal(ttlCalls, 2, 'expired TTL snapshot is recomputed');
+});
+
+test('readRequestBody: overflow rejects immediately and destroys the request', async () => {
+  const req = new EventEmitter();
+  let destroyed = 0;
+  req.destroy = () => { destroyed += 1; };
+  const body = readRequestBody(req, 4);
+  const rejection = assert.rejects(body, /body_too_large/);
+  req.emit('data', Buffer.alloc(5));
+  await rejection;
+  assert.equal(destroyed, 1);
+});
+
+test('readRequestBody: ten-second read timeout rejects and destroys the request', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'], now: 0 });
+  const req = new EventEmitter();
+  let destroyed = 0;
+  req.destroy = () => { destroyed += 1; };
+  const body = readRequestBody(req, 16);
+  const rejection = assert.rejects(body, /body_read_timeout/);
+  t.mock.timers.tick(OWNER_WRITE_BODY_TIMEOUT_MS);
+  await rejection;
+  assert.equal(destroyed, 1);
+});
+
+test('owner write-api: concurrent duplicate idempotency keys await one in-flight action', async () => {
+  const calls = [];
+  const ownerActions = {
+    answer: async (taskId, payload) => {
+      calls.push([taskId, payload]);
+      await new Promise(resolve => setTimeout(resolve, 25));
+      return { recorded: true };
+    },
+    unblock: async () => ({}), cancel: async () => ({}),
+  };
+  await withServer({ ownerWriteToken: WRITE_TOKEN, ownerActions }, async (server, base) => {
+    const payload = { taskId: 'T1', answer: 'да', idempotencyKey: 'parallel-click' };
+    const responses = await Promise.all(Array.from({ length: 6 }, () =>
+      jsonPost(base, '/api/owner/answer', payload)));
+    assert.deepEqual(responses.map(res => res.status), Array(6).fill(200));
+    assert.equal(calls.length, 1, ' simultaneous duplicates must not execute portMethod twice');
+    const bodies = responses.map(res => JSON.parse(res.body));
+    assert.equal(bodies.filter(body => body.deduplicated === false).length, 1);
+    assert.equal(bodies.filter(body => body.deduplicated === true).length, 5);
+  });
+});
+
+test('aggregator killSwitch: null when unconfigured, false for run file, true for stop/missing', async () => {
+  assert.equal(await readKillSwitchState(null), null);
+  const unconfigured = createControlRoomAggregator({ port: 0,
+    modelsProvider: null, finopsProvider: null, telemetryProvider: async () => null });
+  assert.equal((await unconfigured.snapshot()).killSwitch, null);
+
+  const dir = await mkdtemp(join(tmpdir(), 'cr-kill-switch-'));
+  try {
+    const path = join(dir, 'daemon.switch');
+    await writeFile(path, 'run\n', { mode: 0o600 });
+    assert.equal(await readKillSwitchState(path), false);
+    const server = createControlRoomAggregator({ port: 0, killSwitchPath: path,
+      modelsProvider: null, finopsProvider: null, telemetryProvider: async () => null });
+    assert.equal((await server.snapshot()).killSwitch, false);
+    await writeFile(path, 'stop\n', { mode: 0o600 });
+    assert.equal(await readKillSwitchState(path), true);
+    assert.equal((await server.snapshot()).killSwitch, true);
+    await writeFile(path, 'run\n', { mode: 0o600 });
+    await chmod(path, 0o644);
+    assert.equal(await readKillSwitchState(path), true,
+      'ослабленные права — тот же closed state, что у daemon createPilotSwitch');
+    await rm(path, { force: true });
+    assert.equal(await readKillSwitchState(path), true);
+    assert.equal((await server.snapshot()).killSwitch, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('net-health: Linux MemAvailable is preferred for host RAM freeBytes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-meminfo-'));
+  try {
+    const meminfo = join(dir, 'meminfo');
+    await writeFile(meminfo, 'MemTotal:       1024000 kB\nMemFree:          10000 kB\nMemAvailable:    512000 kB\n');
+    const monitor = createNetHealthMonitor({ meminfoPath: meminfo, diskPath: dir });
+    const snap = await monitor.snapshot();
+    assert.equal(snap.host.mem.freeBytes, 512000 * 1024);
+    assert.equal(snap.host.mem.availableBytes, 512000 * 1024);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('finops publicEntry: arbitrary secret YAML keys are not exposed in public entries', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-finops-allowlist-'));
+  try {
+    const budget = join(dir, 'budget.yaml');
+    await writeFile(budget, `version: 1
+cloud_credits:
+  - id: credit
+    label: Safe credit
+    total_eur: 100
+    remaining_eur: 90
+    api_key: secret-credit-key
+    billing_account: secret-billing-account
+compute_vms:
+  - id: worker
+    machine_type: spot
+    hourly_cost_usd: 0.1
+    metered: true
+    api_key: secret-vm-key
+compute_quotas:
+  - id: quota
+    total_units: 10
+    used_units: 1
+    billing_account: secret-quota-account
+ai_subscriptions:
+  - id: sub
+    model: safe-model
+    api_key: secret-sub-key
+workspace_links: {}
+`);
+    const snap = await createFinopsProvider({ budgetPath: budget,
+      now: new Date('2026-11-24T12:00:00Z') })();
+    assert.equal(snap.ok, true);
+    const serialized = JSON.stringify({
+      cloudCredits: snap.cloudCredits,
+      computeVms: snap.computeVms,
+      computeQuotas: snap.computeQuotas,
+      aiSubscriptions: snap.aiSubscriptions,
+    });
+    assert.equal(serialized.includes('secret-'), false);
+    assert.equal(serialized.includes('api_key'), false);
+    assert.equal(serialized.includes('billing_account'), false);
+    assert.equal(snap.cloudCredits[0].label, 'Safe credit');
+    assert.equal(snap.computeVms[0].machineType, 'spot');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('finops spendDynamics: empty daily history falls back to month spend and projection totals', async () => {
+  const direct = buildSpendDynamics({ dailyHistory: [], todayEur: 0,
+    spentMonthCostEur: 9, projectedMonthCostEur: 27,
+    dayOfMonth: 3, daysInMonth: 30, monthlyTargetEur: 25 });
+  assert.equal(direct.avgDailyEur, 3);
+  assert.equal(direct.projectedMonthEur, 27);
+  assert.equal(direct.overTarget, true);
+
+  const dir = await mkdtemp(join(tmpdir(), 'cr-finops-spend-fallback-'));
+  try {
+    const budget = join(dir, 'budget.yaml');
+    const usage = join(dir, 'usage.json');
+    await writeFile(budget, `version: 1
+monthly_budget_eur: 25
+compute_vms:
+  - id: cloud-bb-worker
+    machine_type: spot
+    hourly_cost_usd: 0.1
+    metered: true
+workspace_links: {}
+`);
+    // 30h × $0.1 × 0.92 = €2.76 spent; projected month cost is non-zero even
+    // though no daily history array exists in the usage journal.
+    await writeFile(usage, JSON.stringify({ runningMinutesMonth: 1800, runningMinutesToday: 0 }));
+    const snap = await createFinopsProvider({ budgetPath: budget, workerUsagePath: usage,
+      now: new Date('2026-11-24T12:00:00Z') })();
+    assert.equal(snap.ok, true);
+    assert.equal(snap.totals.spentMonthCostEur, 2.76);
+    assert.equal(snap.spendDynamics.projectedMonthEur, snap.totals.projectedMonthCostEur);
+    assert.equal(snap.spendDynamics.projectedMonthEur > 0, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('app.js renderBoard: active owner input value, focus and selection survive snapshot rerender', async () => {
+  const source = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
+  const { hooks, ids, sandbox } = loadWebApp(source, ['renderBoard']);
+  const snap = { running: [], queued: [], recentlyCompleted: [],
+    needsOwner: [{ task_id: 'T-focus', state: 'blocked', title: 'Need owner' }],
+    ownerWriteEnabled: true };
+  hooks.renderBoard(snap);
+  const firstPanel = findByClass(ids.get('needs-owner'), 'owner-actions');
+  const firstInput = collectByTag(firstPanel, 'input').find(input => input.type === 'text');
+  firstInput.value = 'черновик ответа';
+  firstInput.setSelectionRange(2, 8);
+  firstInput.focus();
+  assert.equal(sandbox.document.activeElement, firstInput);
+
+  hooks.renderBoard(snap);
+  const secondPanel = findByClass(ids.get('needs-owner'), 'owner-actions');
+  const secondInput = collectByTag(secondPanel, 'input').find(input => input.type === 'text');
+  assert.notEqual(secondInput, firstInput, 'poll rebuilds the card DOM');
+  assert.equal(secondInput.value, 'черновик ответа');
+  assert.equal(sandbox.document.activeElement, secondInput);
+  assert.equal(secondInput.selectionStart, 2);
+  assert.equal(secondInput.selectionEnd, 8);
+});
+
+test('web index: model CLI hint uses df-models set <id> <status>', async () => {
+  const html = await readFile(join(MODULE_DIR, 'web', 'index.html'), 'utf8');
+  assert.equal(html.includes('df-models set &lt;id&gt; &lt;status&gt;'), true);
+  assert.equal(html.includes('df-models set &lt;role&gt; &lt;model&gt;'), false);
 });
