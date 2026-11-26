@@ -538,3 +538,40 @@ test('AUDIT-0c: comment-only node -e и удаление runner executable — g
       `${name}: ${JSON.stringify(stripped.violations)}`);
   }
 });
+
+test('AUDIT-0c regression: .fit()-метод и конфиг skip вне тестов — не test_skipped', async () => {
+  const res = await gate({
+    base: { 'src/model.js': 'export const x = 1;\n' },
+    candidate: {
+      'src/model.js': 'export const x = 1;\n' +
+        'export const r = model.fit(data);\n' +
+        'export const cfg = { skip' + ': true, retries: 2 };\n' +
+        'export const alt = { only' + ': true };\n',
+    },
+  });
+  assert.equal(res.ok, true, JSON.stringify(res.violations));
+  assert.deepEqual(res.violations, []);
+});
+
+test('AUDIT-0c regression: .fit()/.xit() методы в тестовом файле — не фокусировка', async () => {
+  const res = await gate({
+    base: { 'tests/ml.test.js': 'test("a", () => {});\n' },
+    candidate: {
+      'tests/ml.test.js': 'test("a", () => {});\n' +
+        'const r = model.fit(data);\n' +
+        'obj.xit(1, 2);\n' +
+        'pipe.fdescribe(run);\n',
+    },
+  });
+  assert.deepEqual(res.violations.filter((v) => v.kind === 'test_skipped'), [],
+    JSON.stringify(res.violations));
+  // Контроль: глобальный fit(...) в тестовом файле по-прежнему отклоняется.
+  const focus = await gate({
+    base: { 'tests/ml.test.js': 'test("a", () => {});\n' },
+    candidate: {
+      'tests/ml.test.js': 'test("a", () => {});\n' + 'f' + 'it("focus", () => {});\n',
+    },
+  });
+  assert.ok(focus.violations.some((v) => v.kind === 'test_skipped'),
+    JSON.stringify(focus.violations));
+});

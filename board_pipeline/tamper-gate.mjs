@@ -19,7 +19,9 @@ const isTest = name => typeof name === 'string' && TEST_FILE.test(name);
 // Граница слева не допускает '.': вызов RegExp.test() не является тест-кейсом.
 const TEST_DEF = /(?:^|[^\w$.])(?:it|test|describe)\s*\(|(?:^|[^\w$])def\s+test_/;
 // Маркеры отключения/фокусировки тестов на добавленной строке.
-const SKIP_MARK = /\b(?:xit|xtest|xdescribe|fit|fdescribe)\s*\(|\b(?:it|test|describe|context)\s*\.\s*(?:skip|only|todo)\s*\(|\.only\s*\(|\.todo\s*\(|\bt\s*\.\s*skip\s*\(|\bpytest\s*\.\s*skip\s*\(|\{[^{}]*\b(?:skip|only)\s*:\s*true\b[^{}]*\}|\b(?:skip|only)\s*:\s*true\b|@pytest\.mark\.(?:skip|skipif|xfail)|@?unittest\.skip|@[s]kip\b/;
+// xit/fit-семейство — только глобальные вызовы: граница слева не допускает
+// '.', иначе метод вида model.fit() ложно считается фокусировкой теста.
+const SKIP_MARK = /(?:^|[^\w$.])(?:xit|xtest|xdescribe|fit|fdescribe)\s*\(|\b(?:it|test|describe|context)\s*\.\s*(?:skip|only|todo)\s*\(|\.only\s*\(|\.todo\s*\(|\bt\s*\.\s*skip\s*\(|\bpytest\s*\.\s*skip\s*\(|\{[^{}]*\b(?:skip|only)\s*:\s*true\b[^{}]*\}|\b(?:skip|only)\s*:\s*true\b|@pytest\.mark\.(?:skip|skipif|xfail)|@?unittest\.skip|@[s]kip\b/;
 const STRONG_TEST_DEF = /(?:^|[^\w$.])(?:it|test|describe)\s*\(.*(?:=>|function\b|,)|(?:^|[^\w$])def\s+test_[A-Za-z0-9_]*\s*\(/;
 const JS_TEST_DEF_OPEN = /(?:^|[^\w$.])(?:it|test|describe)\s*\((.*)$/;
 const PY_TEST_DEF_OPEN = /(?:^|[^\w$])def\s+test_[A-Za-z0-9_]*\s*\(/;
@@ -241,7 +243,10 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       if (!allowTestDeletion && isTestDef(text)) {
         testDefTally(file).added.push({ line: newLine, text });
       }
-      if (SKIP_MARK.test(text)) {
+      // Skip/only-маркеры осмысленны только в тестовых hunks: в обычном коде
+      // '{ skip: true }' — конфиг, а '.fit()' — метод, а не маркер теста.
+      // Строка-комментарий не является действующим маркером (как и проверкой).
+      if (testHunk && SKIP_MARK.test(text) && !COMMENT_MARK.test(text)) {
         push('test_skipped', newLine, 'added test skip/only marker');
       }
       if (testHunk) {

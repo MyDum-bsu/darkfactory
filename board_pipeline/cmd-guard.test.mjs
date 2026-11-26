@@ -327,3 +327,34 @@ test('AUDIT-0c: benign regeneration deletes remain allowed', () => {
   expectAllow('rm -rf dist');
   expectAllow('rm -rf build/.cache');
 });
+
+test('AUDIT-0c regression: вложенные кавычки внутри подстановок не обрывают разбор', () => {
+  expectBlock('echo "$(rm -rf "/")"', 'critical');
+  expectBlock('echo "`rm -rf "/"`"', 'critical');
+  expectBlock('echo "$(echo "$(rm -rf "/")")"', 'critical');
+  expectBlock('echo $(rm -rf "/")', 'critical');
+  expectBlock('echo "$(rm -rf ~/)"', 'critical');
+  expectAllow('echo "\\$(rm -rf /)"');
+  expectAllow("echo '$(rm -rf \"/\")'");
+});
+
+test('AUDIT-0c regression: fd-дублирование 2>&1 не разбивает сегменты команды', () => {
+  expectBlock('2>&1 rm -rf /', 'critical');
+  expectBlock('2>& 1 rm -rf /', 'critical');
+  expectBlock('1>&2 rm -rf /', 'critical');
+  expectBlock('0<&1 rm -rf /', 'critical');
+  expectBlock('ls 2>&1; rm -rf /', 'critical');
+  expectBlock('true & rm -rf /', 'critical');
+  expectAllow('echo hi 2>&1');
+  expectAllow('echo hi 2>&1 | cat');
+  expectAllow('echo out 1>&2');
+});
+
+test('AUDIT-0c regression: оператор редиректа внутри слова не скрывает цель rm', () => {
+  expectBlock('rm -rf />&2', 'critical');
+  expectBlock('rm -rf />x', 'critical');
+  expectBlock('rm -rf / 2>&1', 'critical');
+  expectBlock('rm -rf ~>/dev/null', 'critical');
+  expectAllow('echo hi>/tmp/x');
+  expectAllow('echo hi 2>/dev/null');
+});

@@ -159,7 +159,31 @@ function lexCommands(line, state, depth) {
       }
       cur += c; inWord = true; continue;
     }
-    if (c === ';' || c === '\n' || c === '&') { pushSegment(); continue; }
+    if (c === ';' || c === '\n' || c === '&') {
+      // '&' в fd-дублировании '>&'/'<&' (2>&1, 0<&1) — часть оператора
+      // редиректа внутри слова, а не разделитель команд: иначе разбор
+      // '2>&1 rm -rf /' дробится на ['2>'] и ['1', 'rm', ...], пряча argv[0].
+      // '&>'/'&>>' (redirect both) сюда НЕ входят: в POSIX-sh это background +
+      // пустая команда с редиректом — консервативно остаётся разделителем.
+      if (c === '&' && (line[i - 1] === '>' || line[i - 1] === '<')) {
+        cur += c;
+        inWord = true;
+        continue;
+      }
+      pushSegment();
+      continue;
+    }
+    // '<'/'>' — операторы редиректа даже в середине слова: 'rm -rf />x' в
+    // shell — rm с целью '/' и редиректом '>x', а не целью '/>x'. Без границы
+    // слова цель склеивается с оператором и прячется от проверок путей.
+    // Цифры перед оператором — fd-префикс (2>), серия операторов не
+    // прерывается (>>, <<<); прочее слово завершается перед оператором.
+    if (c === '<' || c === '>') {
+      if (inWord && cur && !/^\d*[<>]*$/.test(cur)) pushWord();
+      cur += c;
+      inWord = true;
+      continue;
+    }
     if (/\s/.test(c)) { pushWord(); continue; }
     cur += c;
     inWord = true;
@@ -174,10 +198,28 @@ function lexCommands(line, state, depth) {
   return { segments };
 }
 
-function findQuoteClose(line, start, quote) {
+function findQuoteClose(line, start, quote, depth = 0) {
   // Кавычка внутри одинарных — литеральна; внутри двойных \" экранируется.
+  // $(...) и `...` внутри двойных кавычек разбираются как единая подстановка:
+  // кавычки внутри неё открывают собственный контекст и НЕ закрывают внешнюю
+  // строку (bash: echo "$(rm -rf "/")" — валидная вложенность).
+  if (depth > 64) throw new Error('nesting too deep');
   for (let i = start + 1; i < line.length; i++) {
-    if (quote === '"' && line[i] === '\\') { i++; continue; }
+    if (quote === '"') {
+      if (line[i] === '\\') { i++; continue; }
+      if (line[i] === '$' && line[i + 1] === '(') {
+        const close = findParenClose(line, i + 1, depth + 1);
+        if (close < 0) return -1;
+        i = close;
+        continue;
+      }
+      if (line[i] === '`') {
+        const close = findBacktickClose(line, i);
+        if (close < 0) return -1;
+        i = close;
+        continue;
+      }
+    }
     if (line[i] === quote) return i;
   }
   return -1;
@@ -190,12 +232,13 @@ function findBacktickClose(line, start) {
   return -1;
 }
 
-function findParenClose(line, start) {
+function findParenClose(line, start, nestDepth = 0) {
+  if (nestDepth > 64) throw new Error('nesting too deep');
   let depth = 0;
   for (let i = start; i < line.length; i++) {
     const c = line[i];
     if (c === "'" || c === '"') {
-      const close = findQuoteClose(line, i, c);
+      const close = findQuoteClose(line, i, c, nestDepth + 1);
       if (close < 0) return -1;
       i = close;
       continue;
@@ -221,8 +264,11 @@ function tokenize(words) {
       const op = redir[1] ?? redir[2];
       // Ведущий редирект съедает цель до определения argv[0]. После команды
       // цель herestring остаётся входным потоком (важно для xargs).
-      if (!redir[3] && (beforeCommand || op !== '<<<')) i++;
-      if (redir[3] && op === '<<<' && !beforeCommand) argv.push(redir[3]);
+      // Голый '&' после '>'/'<' — fd-дублирование с ОТДЕЛЬНОЙ целью (2>& 1 —
+      // валидный shell): цель — следующее слово, как у редиректа без неё.
+      const rest = redir[3] === '&' ? '' : redir[3];
+      if (!rest && (beforeCommand || op !== '<<<')) i++;
+      if (rest && op === '<<<' && !beforeCommand) argv.push(rest);
       continue;
     }
     argv.push(w);
