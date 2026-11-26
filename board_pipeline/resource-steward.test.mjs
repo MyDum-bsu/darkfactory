@@ -18,6 +18,18 @@ const bytesGiB = n => n * GiB;
 const DAY_MS = 86_400_000;
 
 const sandbox = async label => mkdtemp(join(tmpdir(), `rsteward-${label}-`));
+const pathWithBuildBudget = async fallback => {
+  let lastError;
+  for (const candidate of [...new Set(['/dev/shm', '/run', fallback])]) {
+    try {
+      await requireWorkspaceSpace(candidate, 'build');
+      return candidate;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+};
 // mtime в прошлом/будущем без ожидания реального времени
 const age = async (path, days) => {
   const ts = new Date(Date.now() - days * DAY_MS);
@@ -31,11 +43,12 @@ const thread = (id, over = {}) => ({
   ...over,
 });
 
-// --- Пороги 5 / 2 GiB и 1.5 GiB ---------------------------------------------
+// --- Пороги 8 / 2 GiB и 1.5 GiB ---------------------------------------------
 
 test('disk thresholds: exactly 5 GiB is ok, below is tier1, below 2 is alarm', () => {
-  assert.equal(evaluateDisk(bytesGiB(5n)), 'ok');
-  assert.equal(evaluateDisk(bytesGiB(5n) - 1n), 'tier1');
+  assert.equal(evaluateDisk(bytesGiB(8n)), 'ok');
+  assert.equal(evaluateDisk(bytesGiB(8n) - 1n), 'tier1');
+  assert.equal(evaluateDisk(bytesGiB(5n)), 'tier1');
   assert.equal(evaluateDisk(bytesGiB(2n)), 'tier1'); // ровно 2 — ещё не тревога
   assert.equal(evaluateDisk(bytesGiB(2n) - 1n), 'alarm');
   assert.equal(evaluateDisk(0n), 'alarm');
@@ -194,6 +207,30 @@ test('pruneCacheRoot never follows or deletes symlinks (real fs)', async () => {
   }
 });
 
+test('pruneCacheRoot rejects a symlinked cache root before realpath and preserves the target', async () => {
+  const root = await sandbox('rootlink');
+  try {
+    const target = join(root, 'target-cache');
+    const link = join(root, 'cache-link');
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, 'old-blob'), 'precious');
+    await age(join(target, 'old-blob'), 30);
+    await symlink(target, link, 'dir');
+    const events = [];
+    const result = await pruneCacheRoot({
+      root: link, cutoffMs: Date.now() - 7 * DAY_MS, journal: async e => events.push(e),
+      fsImpl: await import('node:fs/promises'),
+    });
+    assert.equal(result.deletedFiles, 0);
+    assert.equal(result.removedDirs, 0);
+    assert.equal(result.refused, 1);
+    assert.equal(await readFile(join(target, 'old-blob'), 'utf8'), 'precious');
+    assert.ok(events.some(e => e.event === 'cache_skip' && e.root === link && e.reason === 'symlink'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('pruneCacheRoot respects the entry cap and reports truncation', async () => {
   const root = await sandbox('cap');
   try {
@@ -256,6 +293,28 @@ test('only unambiguous idle threads are stoppable', () => {
   assert.equal(reasons.thr_aaa009, 'self');
 });
 
+test('portable hc and subproc worker sessions are inspected with the same idle safeguards', () => {
+  const hcIdle = 'df-3840-d0d63638ee';
+  const subprocIdle = 'subproc-d0d63638ee89';
+  const { stoppable, skipped } = selectIdleThreads([
+    thread(hcIdle),
+    thread(subprocIdle),
+    thread('thr_portablebb'),
+    thread('df-3840-abcdef0123', { status: 'active' }),
+    thread('subproc-abcdef012345', { queuedWork: 'turn' }),
+    thread('df-3840-ABCDEF0123'),
+    thread('subproc-xyz'),
+    { id: 'df-slot-4' },
+  ]);
+  assert.deepEqual(stoppable.map(t => t.id), [hcIdle, subprocIdle, 'thr_portablebb']);
+  const reasons = Object.fromEntries(skipped.map(s => [s.id, s.reason]));
+  assert.equal(reasons['df-3840-abcdef0123'], 'status:active');
+  assert.equal(reasons['subproc-abcdef012345'], 'queued_work');
+  assert.equal(skipped.some(s => s.id === 'df-3840-ABCDEF0123'), false);
+  assert.equal(skipped.some(s => s.id === 'subproc-xyz'), false);
+  assert.equal(skipped.some(s => s.id === 'df-slot-4'), false);
+});
+
 test('parseBbThreadList accepts array, {threads} and fails on {ok:false}', () => {
   assert.deepEqual(parseBbThreadList('[{"id":"thr_a"}]'), [{ id: 'thr_a' }]);
   assert.deepEqual(parseBbThreadList('{"threads":[{"id":"thr_b"}]}'), [{ id: 'thr_b' }]);
@@ -303,6 +362,47 @@ test('journal chmod restores 0600 on a pre-existing wider-open file', async () =
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('journal open rejects a symlinked journal path with O_NOFOLLOW', async () => {
+  const dir = await sandbox('jlink');
+  try {
+    const target = join(dir, 'target.jsonl');
+    const link = join(dir, 'journal.jsonl');
+    await writeFile(target, '');
+    await symlink(target, link);
+    await assert.rejects(openJournal(link), error => ['ELOOP', 'EINVAL'].includes(error?.code));
+    assert.equal(await readFile(target, 'utf8'), '');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('openJournal closes the descriptor if the permission hardening step fails', async () => {
+  let closes = 0;
+  const fd = {
+    chmod: async () => { throw new Error('chmod denied'); },
+    write: async () => {},
+    sync: async () => {},
+    close: async () => { closes++; },
+  };
+  await assert.rejects(openJournal('/tmp/steward-open-failure.jsonl', {
+    mkdir: async () => {},
+    open: async () => fd,
+  }), /chmod denied/);
+  assert.equal(closes, 1);
+});
+
+test('runSteward closes the journal in finally when a write fails', async () => {
+  let closes = 0;
+  const journalFactory = async () => Object.assign(
+    async () => { throw new Error('journal write failed'); },
+    { close: async () => { closes++; } },
+  );
+  await assert.rejects(runSteward({
+    mounts: ['/data'], journalPath: '/tmp/steward-journal-close-test.jsonl', journalFactory,
+  }), /journal write failed/);
+  assert.equal(closes, 1);
 });
 
 // --- Тревога и эскалация ---------------------------------------------------------
@@ -363,7 +463,7 @@ test('quiet tick: above 5 GiB and enough RAM — zero actions, zero LLM calls', 
     const bbCalls = [];
     const escalations = [];
     const summary = await runSteward({
-      mounts: ['/data'], statfsImpl: mountStat(bytesGiB(6n)), memInfoImpl: async () => bytesGiB(4n),
+      mounts: ['/data'], statfsImpl: mountStat(bytesGiB(9n)), memInfoImpl: async () => bytesGiB(4n),
       tmpRoot: join(root, 'tmp'), journalPath,
       execDocker: async args => { dockerCalls.push(args); return { code: 0, stdout: '', stderr: '' }; },
       execBb: async args => { bbCalls.push(args); return { code: 0, stdout: '[]', stderr: '' }; },
@@ -396,7 +496,7 @@ test('tier1 tick: docker prune, expired tmp and caches cleaned; no alarm above 2
     for (const [rel, ageDays] of [['tmp/df-old', 30], ['tmp/df-old/x', 30], ['tmp/df-new', 1], ['cachepip/old-blob', 30]]) {
       await age(join(root, rel), ageDays);
     }
-    const statfsImpl = async () => bytesGiB(4n); // до уборки < 5 GiB
+    const statfsImpl = async () => bytesGiB(4n); // до уборки < 8 GiB
     const dockerCalls = [];
     const summary = await runSteward({
       mounts: ['/data'], statfsImpl, memInfoImpl: async () => bytesGiB(8n),
@@ -412,7 +512,7 @@ test('tier1 tick: docker prune, expired tmp and caches cleaned; no alarm above 2
     assert.deepEqual(await readdir(join(root, 'tmp')).then(n => n.sort()), ['df-new']);
     assert.equal((await readdir(join(root, 'cachepip'))).length, 0);
     assert.equal(summary.alarm.raised, false);
-    // после уборки места стало больше, но ниже 5 — пост-измерение в журнале
+    // после уборки места стало больше, но ниже 8 — пост-измерение в журнале
     const events = (await readFile(journalPath, 'utf8')).trim().split('\n').map(JSON.parse);
     assert.ok(events.some(e => e.event === 'measurement_post' && e.level === 'tier1'));
   } finally {
@@ -738,18 +838,32 @@ test('parseArgv: flags, mounts and unknown flag rejection', () => {
 });
 
 test('escalation hook drains stderr (no pipe stall) and reports it in detail', async () => {
-  const dir = await sandbox('hook');
-  const hookPath = join(dir, 'hook.sh');
+  // 200 KB в stderr — больше буфера pipe: без дренирования хук завис бы.
+  const outcome = await escalateViaCommand('/bin/sh', 15_000, [
+    '-c', 'yes hook-diag | head -c 200000 >&2; exit 7',
+  ])({ reason: 'test' });
+  assert.equal(outcome.code, 7);
+  assert.ok(outcome.detail.includes('hook-diag'));
+  assert.ok(outcome.detail.length <= 500); // диагностика обрезана до хвоста
+});
+
+test('escalation hook spawn failure rejects with the underlying Error, not an error array', async () => {
+  const dir = await sandbox('hookmissing');
   try {
-    // 200 KB в stderr — больше буфера pipe: без дренирования хук завис бы.
-    await writeFile(hookPath, '#!/bin/sh\nyes hook-diag | head -c 200000 >&2\nexit 7\n', { mode: 0o700 });
-    const outcome = await escalateViaCommand(hookPath, 15_000)({ reason: 'test' });
-    assert.equal(outcome.code, 7);
-    assert.ok(outcome.detail.includes('hook-diag'));
-    assert.ok(outcome.detail.length <= 500); // диагностика обрезана до хвоста
+    await assert.rejects(
+      escalateViaCommand(join(dir, 'missing-hook'), 5_000)({ reason: 'test' }),
+      error => error instanceof Error && !Array.isArray(error) && /ENOENT|spawn/.test(error.message),
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('escalation hook may close stdin early without an unhandled EPIPE failure', async () => {
+  const outcome = await escalateViaCommand('/bin/sh', 5_000, ['-c', 'exit 0'])({
+    reason: 'test', payload: 'x'.repeat(1024 * 1024),
+  });
+  assert.equal(outcome.code, 0);
 });
 
 test('default mounts contain no operator-specific filesystem', () => {
@@ -760,11 +874,11 @@ test('CLI without --journal writes the journal under XDG_STATE_HOME (real spawn)
   const work = await sandbox('cli');
   const stateDir = join(work, 'state');
   try {
-    // Следим только за ФС песочницы с запасом, чтобы реальный CLI не начал уборку.
-    await requireWorkspaceSpace(work, 'build');
+    // Следим за ФС с гарантированным запасом, чтобы реальный CLI не начал уборку.
+    const measuredRoot = await pathWithBuildBudget(work);
     const child = spawn(process.execPath, [
       join(import.meta.dirname, 'resource-steward.mjs'),
-      '--no-docker', '--mount', work, '--bb', '/bin/false',
+      '--no-docker', '--mount', measuredRoot, '--bb', '/bin/false',
     ], { env: { ...process.env, XDG_STATE_HOME: stateDir }, stdio: 'ignore' });
     const [code] = await once(child, 'close');
     assert.equal(code, 0);
