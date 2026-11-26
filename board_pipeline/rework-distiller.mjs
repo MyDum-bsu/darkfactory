@@ -8,10 +8,12 @@
 // причиной 'lesson_weakens_security_gate'. Критичные кандидаты помечаются
 // requires_owner_approval и НЕ попадают в чек-лист автоматически.
 
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath, rename, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rename, rm, stat, unlink,
+  writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export const LESSONS_SCHEMA = 1;
 
@@ -394,34 +396,122 @@ export async function loadLessons(path, { allowedDir = null, outside = [] } = {}
   return lessons;
 }
 
+// Жив ли процесс: ESRCH — процесса нет (мёртвый лок); EPERM и прочие —
+// процесс существует, но принадлежит другому пользователю, лок живой.
+const pidAlive = pid => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== 'ESRCH';
+  }
+};
+
+export const LESSONS_STALE_LOCK_MS = 60_000;
+
+// Lockfile хранилища уроков — та же модель, что у project-memory/decision-
+// ledger: лок несёт JSON { pid, token, createdAt } и снимается рейпером
+// только когда он И просрочен, И владелец мёртв (либо pid не читается —
+// оборванная на создании запись). Перед unlink идентичность перепроверяется
+// по inode и точному контенту — чужой пересозданный лок не удаляется.
+async function clearStaleLessonsLock(lock, staleLockMs, now = Date.now()) {
+  let before;
+  try { before = await stat(lock); } catch { return false; }
+  if (!before.isFile()) return false;
+  let raw;
+  try { raw = await readFile(lock, 'utf8'); } catch { return false; }
+  let meta = null;
+  try { meta = JSON.parse(raw); } catch { /* legacy/пустой лок — судим по mtime */ }
+  let createdAtMs = NaN;
+  let pid = null;
+  if (meta !== null && typeof meta === 'object' && !Array.isArray(meta)) {
+    if (typeof meta.createdAt === 'string') createdAtMs = Date.parse(meta.createdAt);
+    if (Number.isSafeInteger(meta.pid) && meta.pid > 0) pid = meta.pid;
+  }
+  if (!Number.isFinite(createdAtMs)) createdAtMs = before.mtimeMs;
+  const expired = Number.isFinite(createdAtMs) && (now - createdAtMs) > staleLockMs;
+  if (!expired) return false;
+  if (pid !== null && pidAlive(pid)) return false;
+  let after;
+  try { after = await stat(lock); } catch { return false; }
+  if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) return false;
+  let rawAgain;
+  try { rawAgain = await readFile(lock, 'utf8'); } catch { return false; }
+  if (rawAgain !== raw) return false;
+  await rm(lock, { force: true }).catch(() => {});
+  return true;
+}
+
+// Эксклюзивная блокировка read-modify-write хранилища уроков: конкурентные
+// слоты не могут потерять чужие уроки гонкой «прочитали один снимок —
+// перезаписали друг друга».
+async function withLessonsLock(storePath, fn, { staleLockMs = LESSONS_STALE_LOCK_MS } = {}) {
+  const lock = `${storePath}.lock`;
+  const token = randomBytes(16).toString('hex');
+  let fd;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      fd = await open(lock, 'wx', 0o600);
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      await clearStaleLessonsLock(lock, staleLockMs);
+      await delay(50);
+    }
+  }
+  if (fd === undefined) throw new Error('lessons_store_locked');
+  try {
+    await fd.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }));
+    return await fn();
+  } finally {
+    try {
+      const handleStat = await fd.stat();
+      let pathStat = null;
+      try { pathStat = await stat(lock); } catch { /* лок уже отсутствует */ }
+      if (pathStat !== null && pathStat.isFile() &&
+          pathStat.dev === handleStat.dev && pathStat.ino === handleStat.ino) {
+        await unlink(lock).catch(() => {});
+      }
+    } catch { /* fd недействителен — остаток снимет stale-рейп */ }
+    await fd.close().catch(() => {});
+  }
+}
+
 // Слияние принятых уроков в хранилище: повтор id аккумулирует
 // occurrences и объединяет evidence_cards, а не плодит дубли. Запись
 // всего файла атомарна; число уроков ограничено maxLessons.
+// Весь цикл чтение-слияние-запись выполняется под эксклюзивным lockfile:
+// база слияния перечитывается ВНУТРИ блокировки и потому всегда свежая —
+// опция existing сохранена в сигнатуре для совместимости, но авторитетным
+// источником остаётся хранилище под локом.
 export async function appendLessons(path, accepted, { existing = null,
   maxLessons = DEFAULT_MAX_LESSONS, allowedDir = null, outside = [] } = {}) {
   // Та же граница, что и у чтения — ДО создания цели и любого .tmp:
   // симлинк/не-файл, расходящийся канонический путь, каталог вне
   // allowedDir или путь внутри outside (worktree) — отказ до записи.
   await assertLessonsPathAllowed(path, { allowedDir, outside });
-  const store = existing ?? await loadLessons(path, { allowedDir, outside });
-  const byId = new Map(store.map(lesson => [lesson.id, lesson]));
-  for (const lesson of Array.isArray(accepted) ? accepted : []) {
-    const prev = byId.get(lesson.id);
-    if (prev) {
-      prev.occurrences += lesson.occurrences;
-      prev.evidence_cards = [...new Set([...prev.evidence_cards, ...lesson.evidence_cards])];
-    } else if (byId.size < maxLessons) {
-      byId.set(lesson.id, { ...lesson, evidence_cards: [...lesson.evidence_cards] });
-    }
-  }
-  const merged = [...byId.values()].slice(0, maxLessons);
-  const body = merged.map(lesson =>
-    JSON.stringify({ schema: LESSONS_SCHEMA, lesson })).join('\n') + (merged.length ? '\n' : '');
+  // Каталог создаётся до захвата лока — lockfile живёт рядом с хранилищем.
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const tmp = join(dirname(path), `.lessons-${randomUUID()}.tmp`);
-  await writeFile(tmp, body, { mode: 0o600 });
-  await rename(tmp, path);
-  return merged;
+  return withLessonsLock(path, async () => {
+    const store = await loadLessons(path, { allowedDir, outside });
+    const byId = new Map(store.map(lesson => [lesson.id, lesson]));
+    for (const lesson of Array.isArray(accepted) ? accepted : []) {
+      const prev = byId.get(lesson.id);
+      if (prev) {
+        prev.occurrences += lesson.occurrences;
+        prev.evidence_cards = [...new Set([...prev.evidence_cards, ...lesson.evidence_cards])];
+      } else if (byId.size < maxLessons) {
+        byId.set(lesson.id, { ...lesson, evidence_cards: [...lesson.evidence_cards] });
+      }
+    }
+    const merged = [...byId.values()].slice(0, maxLessons);
+    const body = merged.map(lesson =>
+      JSON.stringify({ schema: LESSONS_SCHEMA, lesson })).join('\n') + (merged.length ? '\n' : '');
+    const tmp = join(dirname(path), `.lessons-${randomUUID()}.tmp`);
+    await writeFile(tmp, body, { mode: 0o600 });
+    await rename(tmp, path);
+    return merged;
+  });
 }
 
 // Персистентный pending-стóр уроков, ожидающих решения владельца: тот же
@@ -480,12 +570,20 @@ export async function approvePendingLesson({ pendingPath, lessonsPath, lessonId,
   // перезапись pending без одобренного: сбой между шагами оставляет урок в
   // обоих стóрах — повторный approve безопасен, потери урока нет.
   const merged = await appendLessons(lessonsPath, [approved], { allowedDir, outside, maxLessons });
-  const remaining = pending.filter(lesson => lesson.id !== lessonId);
   await assertLessonsPathAllowed(pendingPath, { allowedDir, outside });
-  const body = remaining.map(lesson =>
-    JSON.stringify({ schema: LESSONS_SCHEMA, lesson })).join('\n') + (remaining.length ? '\n' : '');
-  const tmp = join(dirname(pendingPath), `.pending-${randomUUID()}.tmp`);
-  await writeFile(tmp, body, { mode: 0o600 });
-  await rename(tmp, pendingPath);
+  await mkdir(dirname(pendingPath), { recursive: true, mode: 0o700 });
+  // Перезапись pending — тот же read-modify-write, что и appendLessons:
+  // база перечитывается под эксклюзивным локом, иначе конкурентный
+  // savePendingLessons теряется гонкой last-write-wins. Локи не вложены —
+  // appendLessons выше уже отпустил лок lessonsPath.
+  await withLessonsLock(pendingPath, async () => {
+    const current = await loadLessons(pendingPath, { allowedDir, outside });
+    const remaining = current.filter(lesson => lesson.id !== lessonId);
+    const body = remaining.map(lesson =>
+      JSON.stringify({ schema: LESSONS_SCHEMA, lesson })).join('\n') + (remaining.length ? '\n' : '');
+    const tmp = join(dirname(pendingPath), `.pending-${randomUUID()}.tmp`);
+    await writeFile(tmp, body, { mode: 0o600 });
+    await rename(tmp, pendingPath);
+  });
   return merged.find(lesson => lesson.id === lessonId) ?? approved;
 }
