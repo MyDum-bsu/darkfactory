@@ -1477,3 +1477,133 @@ test('a typed invalid handoff blocks as invalid instead of crashing verification
   assert.equal((await x.inspect()).state, 'blocked');
   assert.equal(x.effects.verify, 0);
 });
+
+test('crash-resume resets the turn watermark so the fresh terminal turn 1 is accepted', async t => {
+  const x = await lab(t);
+  x.cfg.bb.resume = async packet => ({ resumed: true, threadId: packet.attempt.bb_thread_id });
+  let mode = 'crashed';
+  x.cfg.submissions.read = async (attempt, after) => {
+    if (mode === 'crashed') return { turnSeq: 1, completed: false, state: 'exited', exitCode: 1 };
+    // Свежий возобновлённый терминал нумерует ходы заново с 1: без сброса
+    // watermark'а ход 1 masked бы старым after=1 и никогда не дошёл бы.
+    return { turnSeq: 1, completed: true, state: 'idle', submission: {
+      task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+      worker_thread_id: attempt.bb_thread_id, candidate_sha: 'c'.repeat(40) } };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  // Первый терминал падает на ходе 1 — контроллер возобновляет воркера.
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.equal(record.turnSeq, 0, 'watermark сброшен для свежего терминала');
+  assert.equal(record.crashResumes, 1);
+  assert.equal(record.receipt.kind, 'resume');
+  mode = 'fresh';
+  // Ход 1 свежего терминала принимается немедленно: verify и settle проходят.
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(x.effects.verify, 1);
+  assert.equal((await x.inspect()).result.sha, 'c'.repeat(40));
+});
+
+test('crash-resume reset does not swallow a later missing handoff as a legacy record', async t => {
+  const x = await lab(t);
+  x.cfg.bb.resume = async packet => ({ resumed: true, threadId: packet.attempt.bb_thread_id });
+  x.cfg.submissions.read = async (attempt, after) => ({
+    turnSeq: after + 1, completed: false, state: 'exited', exitCode: 1 });
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.cfg.state.load()).turnSeq, 0);
+  // Третий обрыв без resume: диагностика обязана различать свежий ход без
+  // handoff и повторный ход — crashResumes сохраняет это различие при after=0.
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_turn_finished_without_new_handoff');
+});
+
+test('recoverInterruptedChecking re-runs verify once when the live claim matches the epoch', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  await x.tick();
+  // Вытеснение Spot VM между записью checking и завершением verify(): кандидат
+  // зафиксирован, исход проверки неизвестен, но захват всё ещё наш на той же epoch.
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)] });
+  const out = await x.tick();
+  assert.equal(out.phase, 'done');
+  assert.equal(x.effects.verify, 1, 'verify() повторён ровно один раз');
+  assert.equal((await x.inspect()).state, 'completed');
+  assert.equal((await x.inspect()).result.sha, 'c'.repeat(40));
+  assert.equal((await x.cfg.state.load()).checkingRecovered, true);
+});
+
+test('recoverInterruptedChecking stays uncertain when epoch, state diverged or lookup fails', async t => {
+  for (const mutate of ['epoch', 'state', 'lookup_fails']) {
+    const x = await lab(t);
+    x.cfg.recoverInterruptedChecking = true;
+    await x.tick();
+    const record = await x.cfg.state.load();
+    const checking = { ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+      seenShas: ['c'.repeat(40)] };
+    if (mutate === 'epoch') checking.epoch = record.epoch + 1;
+    if (mutate === 'state') {
+      // Карточка уже заблокирована: live.state !== 'claimed' — повтор verify()
+      // был бы вторым эффектом поверх чужого результата.
+      await x.cfg.board.block(x.cfg.route.taskId, record.epoch, 'external block');
+    }
+    if (mutate === 'lookup_fails') {
+      const lookup = x.cfg.board.lookup.bind(x.cfg.board);
+      x.cfg.board.lookup = async (...args) => {
+        if (String(args[0]) === String(x.cfg.route.taskId)) throw new Error('board read lost');
+        return lookup(...args);
+      };
+    }
+    await x.cfg.state.save(checking);
+    const out = await x.tick();
+    assert.equal(out.phase, 'uncertain', mutate);
+    assert.equal(out.reason, 'interrupted_checking', mutate);
+    assert.equal(x.effects.verify, 0, `verify() не повторяется при ${mutate}`);
+  }
+});
+
+test('a repeated interruption of the same checking round is not recovered twice', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  await x.tick();
+  const record = await x.cfg.state.load();
+  // Маркер checkingRecovered уже стоит: повторное вытеснение того же раунда —
+  // строгий uncertain, а не бесконечный цикл перепроверки.
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)], checkingRecovered: true });
+  const out = await x.tick();
+  assert.equal(out.phase, 'uncertain');
+  assert.equal(out.reason, 'interrupted_checking');
+  assert.equal(x.effects.verify, 0);
+});
+
+test('without recoverInterruptedChecking an interrupted checking stays strictly uncertain', async t => {
+  const x = await lab(t);
+  await x.tick();
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)] });
+  const out = await x.tick();
+  assert.equal(out.phase, 'uncertain');
+  assert.equal(out.reason, 'interrupted_checking');
+  assert.equal(x.effects.verify, 0);
+});
+
+test('a terminal receipt on the interrupted checking record blocks recovery', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  await x.tick();
+  const record = await x.cfg.state.load();
+  // Терминальная квитанция результата означает завершённую обработку:
+  // повтор verify() был бы вторым внешним эффектом.
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)], receipt: { kind: 'block' } });
+  const out = await x.tick();
+  assert.equal(out.phase, 'uncertain');
+  assert.equal(out.reason, 'interrupted_checking');
+  assert.equal(x.effects.verify, 0);
+});

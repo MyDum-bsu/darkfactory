@@ -132,6 +132,14 @@ async function canonicalInput(path,
 const sha256File = async path =>
   createHash('sha256').update(await readFile(path)).digest('hex');
 
+// sha256 utf8-текста спеки — тот же отпечаток, что контроллер сверяет с
+// текстом карточки (sha256Utf8(specText) в run-isolated.mjs): при совпадении
+// текст спеки включается в промпт воркера как проверенный блок.
+export function computeSpecDigest(text) {
+  if (typeof text !== 'string') fail('spec_digest_invalid');
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
 // Путь хранилища из политики (та же форма, что у контроллера:
 // resolveLedgerPath принимает строку или { path }, resolveMemoryStoreDir —
 // строку или { storeDir|dir|path }). Явный null/''/нестроковое значение —
@@ -364,6 +372,14 @@ export async function buildEnqueuePlan(values, deps = {}) {
       if (specDigest !== briefDigest) fail('spec_digest_mismatch');
     }
     specDigest = briefDigest;
+  }
+  // --text — фактический текст карточки, который читает воркер: без явного
+  // --spec-digest дайджест закрепляет именно его (sha256 utf8), а не файл
+  // --brief. Иначе метка не сходилась бы с текстом карточки и run-isolated
+  // молча опускал бы спеку из промпта воркера (sha256(specText) !== spec_digest).
+  // Явный --spec-digest — осознанное закрепление оператора, как и раньше.
+  if (values.text !== undefined && values['spec-digest'] === undefined) {
+    specDigest = computeSpecDigest(values.text);
   }
   const title = values.text ?? (values.brief !== undefined ? briefText : values.title);
   if (typeof title !== 'string' || !title.trim()) fail('title_or_text_required');
