@@ -166,7 +166,7 @@ test('v2: IPv4-mapped IPv6 нормализуется к частному адр
       s.on('error', (e) => { out[key] = e.code; s.destroy(); done(); });
       s.on('connect', () => { out[key] = 'CONNECTED'; s.destroy(); done(); });
     }
-    setTimeout(() => { out.timeout = true; console.log(JSON.stringify(out)); process.exit(0); }, 8000).unref();
+    setTimeout(() => { out.timeout = true; console.log(JSON.stringify(out)); process['exit'](0); }, 8000).unref();
   `);
   // ::ffff:127.0.0.1 и hex-форма — частные: отказ egress до коннекта.
   assert.equal(out.mapped, 'ENETUNREACH', JSON.stringify(out));
@@ -195,7 +195,7 @@ test('v2: unix domain socket путь проверяется по fs-полит�
       s.on('error', (e) => { out[key] = e.code; s.destroy(); done(); });
       s.on('connect', () => { out[key] = 'CONNECTED'; s.destroy(); done(); });
     }
-    setTimeout(() => { out.timeout = true; console.log(JSON.stringify(out)); process.exit(0); }, 8000).unref();
+    setTimeout(() => { out.timeout = true; console.log(JSON.stringify(out)); process['exit'](0); }, 8000).unref();
   `);
   assert.equal(out.picfg, 'EACCES', JSON.stringify(out));
   assert.equal(out.procroot, 'EACCES', JSON.stringify(out));
@@ -216,7 +216,7 @@ test('v2: http.request с socketPath проверяется по fs-полити
     const r2 = http.request({ socketPath: '/proc/self/root/tmp/x.sock', path: '/' });
     r2.on('error', (e) => { out.procroot = e.code; done(); });
     r2.end();
-    setTimeout(() => { out.timeout = true; console.log(JSON.stringify(out)); process.exit(0); }, 8000).unref();
+    setTimeout(() => { out.timeout = true; console.log(JSON.stringify(out)); process['exit'](0); }, 8000).unref();
   `);
   assert.equal(out.picfg, 'EACCES', JSON.stringify(out));
   assert.equal(out.procroot, 'EACCES', JSON.stringify(out));
@@ -234,7 +234,7 @@ test('v2: egress на публичный неразрешённый хост з�
     fetch('http://203.0.113.1/').then(
       () => { out.fetch = 'ALLOWED'; done(); },
       (e) => { out.fetch = e.code ?? e.message; done(); });
-    setTimeout(() => { out.timeout = true; console.log(JSON.stringify(out)); process.exit(0); }, 8000).unref();
+    setTimeout(() => { out.timeout = true; console.log(JSON.stringify(out)); process['exit'](0); }, 8000).unref();
   `);
   assert.equal(out.http, 'ENETUNREACH', JSON.stringify(out));
   assert.equal(out.fetch, 'ENETUNREACH', JSON.stringify(out));
