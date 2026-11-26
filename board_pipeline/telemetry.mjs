@@ -130,6 +130,7 @@ export function roundGateOf(reason) {
   if (reason === 'local_checks_failed') return 'l1';
   if (reason === 'tamper_gate_failed') return 'tamper';
   if (reason === 'visual_gate_failed') return 'l3';
+  if (reason === 'scope_fence_violation') return 'scope_fence';
   if (typeof reason === 'string' && reason.startsWith('review_verdict:')) return 'l2';
   if (reason === 'arbiter_directed_rework') return 'arbiter';
   return null;
@@ -179,6 +180,13 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
   const tokens = { worker: null, critic: null, arbiter: null };
   const identity = { task_id: null, attempt_id: null, epoch: null, bb_thread_id: null };
   const roleModels = { worker: null, critic: null, arbiter: null };
+  // Метаданные субъекта попытки: repo_id и метки разреза (size/domain) —
+  // основа bucketing в adaptiveGates/model-scorecard; отсутствующее — null,
+  // не выдуманное значение.
+  const meta = { repo_id: null, size: null, domain: null };
+  // Суммарная стоимость попытки в USD: null, пока не записано ни одного
+  // валидного числа — отсутствие данных не превращается в выдуманный 0.
+  let costUsd = null;
 
   // Модели из доверенной политики: фактические переопределяются при spawn.
   for (const role of ROLES) {
@@ -207,6 +215,14 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
     if (Number.isSafeInteger(subject.epoch)) identity.epoch = subject.epoch;
     const threadId = subject.bb_thread_id ?? subject.thread_id;
     if (typeof threadId === 'string' && threadId) identity.bb_thread_id = threadId;
+    // repo_id и метки разреза: labels {size, domain} либо верхнеуровневые
+    // поля субъекта; принимаются только trimmed непустые строки.
+    const repoId = subject.repo_id ?? subject.repoId;
+    if (typeof repoId === 'string' && repoId.trim()) meta.repo_id = repoId.trim();
+    const size = subject.labels?.size ?? subject.size;
+    if (typeof size === 'string' && size.trim()) meta.size = size.trim();
+    const domain = subject.labels?.domain ?? subject.domain;
+    if (typeof domain === 'string' && domain.trim()) meta.domain = domain.trim();
     // На восстановленной попытке окна spawn нет; источник модели — WAL, не дефолт политики.
     model('worker', subject.executor);
   };
@@ -220,10 +236,12 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
     const at = now();
     if (at === null || start === null) return;
     if (startedAt === null || start < startedAt) startedAt = start;
-    const entry = phases.get(name) ?? { ms: 0, n: 0, fail: 0 };
+    const entry = phases.get(name) ?? { ms: 0, n: 0, fail: 0, lastOk: null };
     entry.ms += Math.max(0, at - start);
     entry.n += 1;
     if (!ok) entry.fail += 1;
+    // Последний исход фазы: перезапуск после сбоя перекрывает fail → ok.
+    entry.lastOk = Boolean(ok);
     phases.set(name, entry);
     events += 1;
   };
@@ -332,6 +350,20 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
       }, 'record_usage') ?? null;
     },
 
+    // Стоимость в USD: оба соглашения — recordCost(0.12) и
+    // recordCost('critic', { cost_usd: 0.12 }); числа вызовов суммируются.
+    // Невалидный/отсутствующий ввод fail-open игнорируется: без валидных
+    // чисел cost_usd в сводке отсутствует, никогда не выдуманный 0.
+    recordCost(roleOrCost, rawCost) {
+      return guarded(() => {
+        const raw = rawCost !== undefined ? rawCost : roleOrCost;
+        const value = normalizeCost(raw);
+        if (value === null) return null;
+        costUsd = (costUsd ?? 0) + value;
+        return value;
+      }, 'record_cost') ?? null;
+    },
+
     // Текущий снимок записи попытки: null там, где фаза/токены не измерены.
     summary() {
       return guarded(() => {
@@ -348,16 +380,40 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
         for (const [name, measured] of phases.entries()) {
           if (!TELEMETRY_PHASES.includes(name)) phasesMs[name] = measured.ms;
         }
+        // Статус последнего исхода каждой измеренной фазы: 'ok'/'fail'.
+        // Неизмеренные фазы опускаются — потребитель отличает passed-фазу
+        // от failed-фазы (например l2_critic с review_error против pass).
+        // Окно воркера без понятия отказа: 'ok', когда окно было закрыто.
+        const phasesStatus = {};
+        for (const phase of TELEMETRY_PHASES) {
+          if (phase === 'total') continue;
+          if (phase === 'worker') {
+            if (workerSeen) phasesStatus.worker = 'ok';
+            continue;
+          }
+          const measured = phases.get(phase);
+          if (measured) phasesStatus[phase] = measured.lastOk ? 'ok' : 'fail';
+        }
+        for (const [name, measured] of phases.entries()) {
+          if (!TELEMETRY_PHASES.includes(name)) phasesStatus[name] = measured.lastOk ? 'ok' : 'fail';
+        }
         return {
           task_id: identity.task_id,
           attempt_id: identity.attempt_id,
           epoch: identity.epoch,
           ...(identity.bb_thread_id !== null ? { bb_thread_id: identity.bb_thread_id } : {}),
+          ...(meta.repo_id !== null ? { repo_id: meta.repo_id } : {}),
+          ...(meta.size !== null || meta.domain !== null ? { labels: {
+            ...(meta.size !== null ? { size: meta.size } : {}),
+            ...(meta.domain !== null ? { domain: meta.domain } : {}),
+          } } : {}),
           phases_ms: phasesMs,
+          phases_status: phasesStatus,
           rounds: { ...rounds,
             ...(gateCounts.size ? { gates: Object.fromEntries([...gateCounts.entries()].sort()) } : {}) },
           models: { ...roleModels },
           tokens: { ...tokens },
+          ...(costUsd !== null ? { cost_usd: costUsd } : {}),
           partial: !spawnSeen && events > 0,
           notes_count: notes.length,
           ...(startedAt !== null ? { started_at: new Date(startedAt).toISOString() } : {}),
@@ -431,7 +487,7 @@ export function aggregateTelemetry(lines, { task = null, since = null, open = nu
   const aggregate = {
     attempts: 0, open_attempts: 0, outcomes: {}, corrupt: 0,
     phases_ms: {}, rounds: { total: 0, rework: 0, pass: 0, arbitration: 0, open: 0 },
-    tokens: {}, models: {}, first: null, last: null,
+    tokens: {}, models: {}, first: null, last: null, cost_usd: null,
   };
   const sinceTs = Number.isFinite(since) ? since : null;
   for (const line of lines) {
@@ -480,6 +536,10 @@ export function aggregateTelemetry(lines, { task = null, since = null, open = nu
         slot[name] = (slot[name] ?? 0) + 1;
         aggregate.models[role] = slot;
       }
+    }
+    // Стоимость: сумма finite cost_usd; ни одного числа — null, не 0.
+    if (Number.isFinite(entry.cost_usd)) {
+      aggregate.cost_usd = (aggregate.cost_usd ?? 0) + entry.cost_usd;
     }
     const started = Date.parse(entry.started_at ?? '');
     if (Number.isFinite(started)) {
