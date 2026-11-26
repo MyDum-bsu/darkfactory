@@ -189,6 +189,30 @@ test('enqueue: brief/policy файлы, симлинк и путь внутри 
   }
 });
 
+test('enqueue: --brief без --text даёт байт-в-байт текст карточки', async () => {
+  const dir = await tempdir();
+  try {
+    const brief = join(dir, 'brief.md');
+    const body = 'first line\nsecond line\n';
+    await writeFile(brief, body);
+    const plan = await buildEnqueuePlan({ ...baseValues(), title: undefined, text: undefined,
+      'spec-digest': undefined, brief });
+    assert.equal(plan.argv[5], body);
+    assert.equal(plan.argv[5].endsWith('\n'), true);
+    assert.equal(plan.labels.spec_digest, await sha256File(brief));
+    // Явный --text первичен; --brief остаётся источником spec_digest.
+    const explicit = await buildEnqueuePlan({ ...baseValues(), title: undefined,
+      text: 'explicit text', 'spec-digest': undefined, brief });
+    assert.equal(explicit.argv[5], 'explicit text');
+    // Даже legacy --title не подменяет тело, когда --text не задан:
+    // --brief — байтовый источник карточки, без потери финального newline.
+    const titled = await buildEnqueuePlan({ ...baseValues(), 'spec-digest': undefined, brief });
+    assert.equal(titled.argv[5], body);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 // --policy FILE: метка policy_digest — тот же отпечаток закреплённых входов,
 // что контроллер проверяет на seal (sha256 JSON-массива sha256 файлов).
 test('enqueue: --policy вычисляет закреплённый policy_digest контроллера', async () => {
@@ -1459,7 +1483,7 @@ test('run: --switch неканоническая строка и lstat-ошиб�
   }
 });
 
-test('enqueue: явный --vb через симлинк отклоняется, default vb — нет', async () => {
+test('enqueue: явный --vb разрешается до realpath, default vb — нет', async () => {
   const dir = await tempdir();
   try {
     const realVb = join(dir, 'vb-real');
@@ -1469,9 +1493,24 @@ test('enqueue: явный --vb через симлинк отклоняется,
     // Без --vb — команда по умолчанию 'vb', проверка пути не применяется.
     const plan = await buildEnqueuePlan({ ...baseValues() });
     assert.equal(plan.tool, 'vb');
-    // Явный --vb через симлинк — неканонический путь: отказ до вызова vb.
-    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), vb: linkVb }),
-      /non_canonical_or_symlink_path/);
+    // Явный --vb через симлинк разрешается до канонической цели: штатная
+    // установка vb использует symlink в ~/.local/bin.
+    const linked = await buildEnqueuePlan({ ...baseValues(), vb: linkVb });
+    assert.equal(linked.tool, realVb);
+    // Symlink внутри worktree наружу и symlink снаружи внутрь worktree
+    // отклоняются по обоим концам разрешения.
+    const wt = join(dir, 'wt');
+    await mkdir(wt);
+    const inward = join(wt, 'vb-link');
+    await symlink(realVb, inward);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), vb: inward, worktree: wt }),
+      /path_inside_worktree/);
+    const innerReal = join(wt, 'vb-real');
+    await writeFile(innerReal, '#!/bin/sh\n');
+    const outward = join(dir, 'vb-outward');
+    await symlink(innerReal, outward);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), vb: outward, worktree: wt }),
+      /path_inside_worktree/);
     // Канонический явный --vb вне worktree проходит.
     const ok = await buildEnqueuePlan({ ...baseValues(), vb: realVb });
     assert.equal(ok.tool, realVb);

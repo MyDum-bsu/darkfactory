@@ -17,10 +17,11 @@
 // [policyFile, brief, reviewPrompt, reviewGate, routes.json, ...skillPaths]
 // (board_pipeline/run-isolated.mjs readOperatorInputs); иначе метка
 // policy_digest не сойдётся с отпечатком и seal вернёт policy_digest_drift.
+import { isUtf8 } from 'node:buffer';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative } from 'node:path';
+import { dirname, isAbsolute, join, normalize, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
@@ -50,6 +51,31 @@ const within = (root, p) => {
   const rel = relative(root, p);
   return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
+
+async function executableInput(path, { worktrees = [], outside = [] } = {}) {
+  if (typeof path !== 'string' || !path) fail('path_required');
+  if (!isAbsolute(path)) fail('path_not_absolute');
+  if (normalize(path) !== path) fail('non_canonical_or_symlink_path');
+  const real = await realpath(path).catch(() => fail('path_missing'));
+  const st = await lstat(real);
+  if (!st.isFile()) fail('path_not_file');
+  const parts = path.split('/').filter(part => part !== '');
+  const prefixes = [];
+  for (let length = 1; length <= parts.length; length++) {
+    prefixes.push(`/${parts.slice(0, length).join('/')}`);
+  }
+  const witnesses = new Set([path, real]);
+  for (const prefix of prefixes) {
+    witnesses.add(await realpath(prefix).catch(() => fail('path_missing')));
+  }
+  for (const candidate of witnesses) {
+    if (worktrees.some(w => within(w, candidate)) ||
+        outside.some(d => within(d, candidate))) {
+      fail('path_inside_worktree');
+    }
+  }
+  return real;
+}
 
 async function canonicalInput(path,
     { worktrees = [], mustBe, storage = false, outside = [] } = {}) {
@@ -197,8 +223,6 @@ export async function buildEnqueuePlan(values, deps = {}) {
   // Формат нативной очереди (native-board.mjs): вне формата карточка не
   // допускается к захвату — отказ до её создания.
   if (!REPO_LABEL.test(values['repo-id'] ?? '')) fail('repo_id_invalid');
-  const title = values.title ?? values.text;
-  if (typeof title !== 'string' || !title.trim()) fail('title_or_text_required');
   if (!FINISH.has(values.finish)) fail('finish_invalid');
 
   const worktrees = values.worktree === undefined ? []
@@ -295,6 +319,7 @@ export async function buildEnqueuePlan(values, deps = {}) {
   const driftAllowed = drift?.driftDetected === true;
 
   let specDigest = values['spec-digest'];
+  let briefText;
   if (values.brief !== undefined) {
     const briefReal = await canonicalInput(values.brief, { worktrees, mustBe: 'file' });
     // --brief — тоже операторский файл: внутри handoffDir (inbox сдачи —
@@ -303,7 +328,10 @@ export async function buildEnqueuePlan(values, deps = {}) {
     if (handoff !== undefined && within(handoff, briefReal)) {
       fail('path_inside_worktree');
     }
-    const briefDigest = await sha256File(briefReal);
+    const briefBytes = await readFile(briefReal);
+    if (!isUtf8(briefBytes)) fail('brief_not_utf8');
+    briefText = briefBytes.toString('utf8');
+    const briefDigest = createHash('sha256').update(briefBytes).digest('hex');
     // Явный --spec-digest обязан совпадать с хэшем файла спеки — иначе
     // в Board ушла бы метка, не сходящаяся с приёмкой. Недопустимый или
     // несовпадающий дайджест отклоняется до вызова vb, а не
@@ -314,6 +342,9 @@ export async function buildEnqueuePlan(values, deps = {}) {
     }
     specDigest = briefDigest;
   }
+  const title = values.text ?? (values.brief !== undefined ? briefText : values.title);
+  if (typeof title !== 'string' || !title.trim()) fail('title_or_text_required');
+
   let policyDigest = values['policy-digest'];
   if (values.policy !== undefined) {
     const pinned = await pinnedPolicyDigest(policyFile, policyJson,
@@ -425,19 +456,13 @@ export async function buildEnqueuePlan(values, deps = {}) {
   const argv = ['--url', url, 'tasks', 'create', values.channel, title];
   for (const [key, value] of Object.entries(labels)) argv.push('--label', `${key}=${value}`);
   argv.push('--json');
-  // --vb без флага — команда по умолчанию 'vb'; явный путь исполняемого
-  // файла — тот же инвариант каноничности вне worktree, что и у прочих
-  // операторских входов: проверка до вызова vb.
+  // --vb без флага — команда по умолчанию 'vb'; явный исполняемый файл
+  // разрешается до realpath, а все префиксные и конечные witness-пути
+  // остаются вне worktree и handoffDir: проверка до вызова vb.
   let tool = 'vb';
   if (values.vb !== undefined) {
-    tool = await canonicalInput(values.vb, { worktrees, mustBe: 'file' });
-    // --vb — тоже явно заданный операторский файл: исполняемый файл
-    // внутри handoffDir (рабочего каталога сдачи) контроллер не допустил
-    // бы — отказ до вызова vb, иначе постановка запускала бы файл из
-    // inbox воркера вместо доверенного vb.
-    if (handoff !== undefined && within(handoff, tool)) {
-      fail('path_inside_worktree');
-    }
+    tool = await executableInput(values.vb,
+      { worktrees, outside: handoff === undefined ? [] : [handoff] });
   }
   return { tool, argv, labels,
     meta: { boardUrl: url, channel: values.channel, finish: values.finish, l1Profile,
