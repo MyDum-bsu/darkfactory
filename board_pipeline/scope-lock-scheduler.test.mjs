@@ -34,6 +34,33 @@ test('normalizeScopePaths rejects traversal, absolute and malformed paths fail-c
   assert.throws(() => normalizeScopePaths('a/./b'), /^Error: invalid_scope_path$/);
 });
 
+test('normalizeScopePaths validates every entry before honoring a wildcard', () => {
+  // regression: a wildcard must not launder traversal/absolute/empty entries
+  // into a legitimate unscoped lock — validation is fail-closed first
+  assert.throws(() => normalizeScopePaths(['../etc/passwd', '*']), /^Error: invalid_scope_path$/);
+  assert.throws(() => normalizeScopePaths(['*', '../etc/passwd']), /^Error: invalid_scope_path$/);
+  assert.throws(() => normalizeScopePaths(['/abs/path', '*']), /^Error: invalid_scope_path$/);
+  assert.throws(() => normalizeScopePaths(['*', '']), /^Error: invalid_scope_path$/);
+  assert.throws(() => normalizeScopePaths(['*', 42]), /^Error: invalid_scope_path$/);
+  assert.throws(() => normalizeScopePaths('../x, *'), /^Error: invalid_scope_path$/);
+  // clean wildcard-only inputs still mean unscoped
+  assert.equal(normalizeScopePaths(['*']), null);
+  assert.equal(normalizeScopePaths(['ops/x.mjs', '*']), null);
+});
+
+test('planSlotAssignments defers invalid_scope for traversal hidden behind a wildcard', () => {
+  const result = planSlotAssignments({
+    slots: ['df-auto'],
+    activeTasks: [],
+    readyTasks: [
+      { taskId: 'evil', repoId: 'repo-a', allowedPaths: ['../etc/passwd', '*'], priority: 10 },
+      { taskId: 'good', repoId: 'repo-a', allowedPaths: ['a.mjs'], priority: 9 },
+    ],
+  });
+  assert.deepEqual(result.deferred, [{ taskId: 'evil', reason: 'invalid_scope', conflictingTaskIds: [] }]);
+  assert.deepEqual(result.assignments.map(a => a.taskId), ['good']);
+});
+
 test('pathsOverlap detects exact file overlap', () => {
   assert.equal(pathsOverlap(['board_pipeline/daemon.mjs'], ['board_pipeline/daemon.mjs']), true);
   assert.equal(pathsOverlap(['a.mjs'], ['b.mjs']), false);
@@ -42,9 +69,24 @@ test('pathsOverlap detects exact file overlap', () => {
 test('pathsOverlap detects directory prefix overlap in both slash forms', () => {
   assert.equal(pathsOverlap(['ops/control-room'], ['ops/control-room/finops.mjs']), true);
   assert.equal(pathsOverlap(['ops/control-room/finops.mjs'], ['ops/control-room']), true);
-  // trailing slash normalized away — same result
-  assert.equal(pathsOverlap(normalizeScopePaths('ops/control-room/'), ['ops/control-room/finops.mjs']), true);
   assert.equal(pathsOverlap(['ops/control-room'], ['ops/control-room']), true);
+});
+
+test('pathsOverlap normalizes array inputs before comparison — no raw-form bypass', () => {
+  // regression: a trailing slash inside an array element must not fail open
+  assert.equal(pathsOverlap(['ops/control-room/'], ['ops/control-room/finops.mjs']), true);
+  assert.equal(pathsOverlap(['ops/control-room/finops.mjs'], ['ops/control-room/']), true);
+  // './' prefixes and backslashes inside array elements are normalized too
+  assert.equal(pathsOverlap(['./ops/control-room'], ['ops/control-room/finops.mjs']), true);
+  assert.equal(pathsOverlap(['ops\\control-room'], ['ops/control-room/finops.mjs']), true);
+  // a wildcard inside an array is unscoped — exclusive lock, overlaps everything
+  assert.equal(pathsOverlap(['*'], ['ops/control-room/finops.mjs']), true);
+  assert.equal(pathsOverlap(['ops/x.mjs'], ['*']), true);
+  // already-normalized input is idempotent
+  assert.equal(pathsOverlap(normalizeScopePaths('ops/control-room/'), ['ops/control-room/finops.mjs']), true);
+  // invalid entries inside arrays propagate the fail-closed error
+  assert.throws(() => pathsOverlap(['../x'], ['a.mjs']), /^Error: invalid_scope_path$/);
+  assert.throws(() => pathsOverlap(['a.mjs'], ['/abs']), /^Error: invalid_scope_path$/);
 });
 
 test('pathsOverlap does not overlap sibling prefixes (ops/foo vs ops/foobar)', () => {

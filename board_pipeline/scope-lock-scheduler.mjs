@@ -50,11 +50,16 @@ export function normalizeScopePaths(raw) {
   } else {
     throw invalidScope();
   }
+  // Validation precedes wildcard widening: every entry is normalized (and
+  // thereby validated fail-closed) before any '*' is honored, so a traversal
+  // or absolute path hiding next to a wildcard is rejected, never laundered
+  // into a legitimate unscoped lock.
+  if (entries.some(entry => typeof entry !== 'string' || entry === '')) throw invalidScope();
+  const normalized = entries.map(normalizeEntry);
   // A wildcard anywhere widens the scope to the whole repository; treating it
   // as unscoped is the safe direction (more locking, never less).
-  if (entries.some(entry => entry === '*')) return null;
-  if (entries.some(entry => typeof entry !== 'string' || entry === '')) throw invalidScope();
-  return [...new Set(entries.map(normalizeEntry))];
+  if (normalized.includes('*')) return null;
+  return [...new Set(normalized)];
 }
 
 // One path pair overlaps when they are equal or one is a directory prefix of
@@ -64,13 +69,16 @@ function pairOverlaps(a, b) {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
-// Decide whether two normalized scope path sets overlap. Null or empty on
-// either side means an unscoped task with an exclusive repo-wide lock, which
-// overlaps everything — fail-closed. Strings are accepted for convenience and
-// normalized first; invalid input propagates the normalization error.
+// Decide whether two scope path sets overlap. Null or empty on either side
+// means an unscoped task with an exclusive repo-wide lock, which overlaps
+// everything — fail-closed. String AND array inputs are always normalized
+// before comparison: trailing slashes, backslashes, './' prefixes and
+// wildcards inside arrays must not bypass the boundary check (fail-open), so
+// the comparison never sees a raw caller-supplied form. Invalid entries
+// propagate the normalization error.
 export function pathsOverlap(pathsA, pathsB) {
-  const a = typeof pathsA === 'string' ? normalizeScopePaths(pathsA) : pathsA;
-  const b = typeof pathsB === 'string' ? normalizeScopePaths(pathsB) : pathsB;
+  const a = (typeof pathsA === 'string' || Array.isArray(pathsA)) ? normalizeScopePaths(pathsA) : pathsA;
+  const b = (typeof pathsB === 'string' || Array.isArray(pathsB)) ? normalizeScopePaths(pathsB) : pathsB;
   if (a === null || a === undefined || a.length === 0) return true;
   if (b === null || b === undefined || b.length === 0) return true;
   for (const pathA of a) {
