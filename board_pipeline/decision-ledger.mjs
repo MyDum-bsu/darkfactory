@@ -5,7 +5,7 @@
 // контентного sha256 или ledger внутри worktree — ошибка, а не пустой срез.
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { appendFile, link, lstat, mkdir, open, readFile, readlink, realpath, rm,
+import { link, lstat, mkdir, open, readFile, readlink, realpath, rm,
   stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -25,6 +25,8 @@ const RECORDED_BY = /^[a-z0-9_.-]{1,64}$/i;
 const DIGEST = /^[a-f0-9]{64}$/;
 const MAX_RULE_CHARS = 1000;
 const MAX_LEDGER_BYTES = 8 * 1024 * 1024;
+// Жёсткий LRU-cap закреплённых срезов в кэше pinDecisions.
+const PIN_CACHE_CAP = 64;
 
 const inside = (root, p) => {
   const rel = relative(root, p);
@@ -109,6 +111,15 @@ async function assertLedgerOutside(ledgerPath, worktree) {
 }
 
 async function readEntries(ledgerPath) {
+  // Размер и тип проверяются ДО чтения: многогигабайтный или не-файл не
+  // загружается в память процесса.
+  let st;
+  try { st = await stat(ledgerPath); } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  if (!st.isFile()) throw new Error('decision_ledger_corrupt');
+  if (st.size > MAX_LEDGER_BYTES) throw new Error('decision_ledger_oversized');
   let text;
   try { text = await readFile(ledgerPath, 'utf8'); } catch (error) {
     if (error.code === 'ENOENT') return [];
@@ -192,10 +203,17 @@ const pidAlive = pid => {
 };
 
 // Восстановление после SIGKILL посреди записи: лок несёт JSON
-// { pid, createdAt }; лок старше staleLockMs или лок мёртвого pid снимается.
-// Нечитаемый/legacy-лок судится по mtime; свежий живой лок не трогается —
-// валидная конкурентная блокировка не ломается.
+// { pid, token, createdAt }. Мульти-слотовая гонка: истёкший лок ЖИВОГО pid
+// не снимается никогда — владелец может быть просто медленным, а рейп под ним
+// размыкает взаимное исключение. Лок снимается только когда он И просрочен
+// (старше staleLockMs), И владелец мёртв (либо pid не читается — legacy или
+// оборванная на создании запись, у которой живого владельца не существует).
+// Перед unlink идентичность лока перепроверяется по inode и точному контенту:
+// если конкурент успел снять и пересоздать лок, чужой валидный лок не трогаем.
 async function clearStaleLedgerLock(lock, staleLockMs, now = Date.now()) {
+  let before;
+  try { before = await stat(lock); } catch { return false; }
+  if (!before.isFile()) return false;
   let raw;
   try { raw = await readFile(lock, 'utf8'); } catch { return false; }
   let meta = null;
@@ -206,12 +224,16 @@ async function clearStaleLedgerLock(lock, staleLockMs, now = Date.now()) {
     if (typeof meta.createdAt === 'string') createdAtMs = Date.parse(meta.createdAt);
     if (Number.isSafeInteger(meta.pid) && meta.pid > 0) pid = meta.pid;
   }
-  if (!Number.isFinite(createdAtMs)) {
-    try { createdAtMs = (await stat(lock)).mtimeMs; } catch { return false; }
-  }
+  if (!Number.isFinite(createdAtMs)) createdAtMs = before.mtimeMs;
   const expired = Number.isFinite(createdAtMs) && (now - createdAtMs) > staleLockMs;
-  const dead = pid !== null && !pidAlive(pid);
-  if (!expired && !dead) return false;
+  if (!expired) return false;
+  if (pid !== null && pidAlive(pid)) return false;
+  let after;
+  try { after = await stat(lock); } catch { return false; }
+  if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) return false;
+  let rawAgain;
+  try { rawAgain = await readFile(lock, 'utf8'); } catch { return false; }
+  if (rawAgain !== raw) return false;
   await rm(lock, { force: true }).catch(() => {});
   return true;
 }
@@ -220,6 +242,9 @@ async function clearStaleLedgerLock(lock, staleLockMs, now = Date.now()) {
 // два supersedes одной цели) сериализуются, а не проходят оба по stale-снимку.
 async function withLedgerLock(ledgerPath, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } = {}) {
   const lock = `${ledgerPath}.lock`;
+  // Уникальный токен владения: рейпер сверяет контент перед снятием, а
+  // владелец не удалит чужой лок, пересозданный после гонки.
+  const token = randomBytes(16).toString('hex');
   let fd;
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
@@ -233,11 +258,21 @@ async function withLedgerLock(ledgerPath, fn, { staleLockMs = DEFAULT_STALE_LOCK
   }
   if (fd === undefined) throw new Error('decision_ledger_locked');
   try {
-    await fd.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+    await fd.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }));
     return await fn();
   } finally {
+    // Снятие лока только если файл по пути — тот же самый inode, что мы
+    // открыли: пересозданный конкурентом лок никогда не удаляется из-под него.
+    try {
+      const handleStat = await fd.stat();
+      let pathStat = null;
+      try { pathStat = await stat(lock); } catch { /* лок уже отсутствует */ }
+      if (pathStat !== null && pathStat.isFile() &&
+          pathStat.dev === handleStat.dev && pathStat.ino === handleStat.ino) {
+        await unlink(lock).catch(() => {});
+      }
+    } catch { /* fd недействителен — остаток снимет stale-рейп */ }
     await fd.close().catch(() => {});
-    await rm(lock, { force: true }).catch(() => {});
   }
 }
 
@@ -283,7 +318,17 @@ export async function recordDecision({ ledgerPath, scope, rule, sourceCard, reco
       source_card: card, timestamp: now.toISOString(), recorded_by: recordedBy,
       ...(supersedes !== undefined ? { supersedes } : {}) };
     record.sha256 = recordDigest(record);
-    await appendFile(target, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    // Долговечный fail-closed append: открытый дескриптор + запись +
+    // datasync перед закрытием — подтверждённая запись не теряется при
+    // падении машины сразу после ответа, а частичная запись обрывается на
+    // незавершённой строке и отклоняется при чтении.
+    const handle = await open(target, 'a', 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(record)}\n`);
+      await handle.datasync();
+    } finally {
+      await handle.close();
+    }
     return record;
   });
 }
@@ -336,36 +381,52 @@ export function pinDecisions(resolve_, { persistDir } = {}) {
   };
   return key => {
     let pin = pins.get(key);
-    if (pin === undefined) {
-      pin = (async () => {
-        const file = persistDir === undefined ? null : fileFor(key);
-        if (file !== null) {
-          const saved = await readPinned(file);
-          if (saved !== undefined) return saved;
-        }
-        const slice = (await resolve_()) ?? null;
-        if (file !== null && slice !== null) {
-          if (!isSliceContent(slice)) throw new Error('decision_ledger_slice_invalid');
-          // Атомарная публикация: полные байты во временном файле, link() делает
-          // появление pinPath мгновенным и failsafe-EEXIST — канон чужого pin.
-          const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
-          try {
-            await writeFile(tmp, JSON.stringify({ ...slice, pin_sha256: pinIntegrity(slice) }), { mode: 0o600 });
-            try {
-              await link(tmp, file);
-            } catch (error) {
-              if (error.code !== 'EEXIST') throw error;
-              const saved = await readPinned(file);
-              if (saved === undefined) throw new Error('decision_ledger_pin_invalid');
-              return saved;
-            }
-          } finally {
-            await unlink(tmp).catch(() => {});
-          }
-        }
-        return slice;
-      })();
+    if (pin !== undefined) {
+      // LRU-освежение: затронутый ключ переставляется в конец порядка вставки.
+      pins.delete(key);
       pins.set(key, pin);
+      return pin;
+    }
+    pin = (async () => {
+      const file = persistDir === undefined ? null : fileFor(key);
+      if (file !== null) {
+        const saved = await readPinned(file);
+        if (saved !== undefined) return saved;
+      }
+      const slice = (await resolve_()) ?? null;
+      if (file !== null && slice !== null) {
+        if (!isSliceContent(slice)) throw new Error('decision_ledger_slice_invalid');
+        // Атомарная публикация: полные байты во временном файле, link() делает
+        // появление pinPath мгновенным и failsafe-EEXIST — канон чужого pin.
+        const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+        try {
+          await writeFile(tmp, JSON.stringify({ ...slice, pin_sha256: pinIntegrity(slice) }), { mode: 0o600 });
+          try {
+            await link(tmp, file);
+          } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+            const saved = await readPinned(file);
+            if (saved === undefined) throw new Error('decision_ledger_pin_invalid');
+            return saved;
+          }
+        } finally {
+          await unlink(tmp).catch(() => {});
+        }
+      }
+      return slice;
+    })();
+    pins.set(key, pin);
+    // Отклонённый pin не закрепляется в кэше: повторный вызов того же ключа
+    // честно перезапускает resolve, а не возвращает навсегда битый Promise.
+    pin.catch(() => {
+      if (pins.get(key) === pin) pins.delete(key);
+    });
+    // Жёсткий LRU-cap: не больше PIN_CACHE_CAP ключей на фабрику — память
+    // процесса не растёт без ограничений от числа попыток.
+    while (pins.size > PIN_CACHE_CAP) {
+      const oldest = pins.keys().next().value;
+      if (oldest === undefined || oldest === key) break;
+      pins.delete(oldest);
     }
     return pin;
   };

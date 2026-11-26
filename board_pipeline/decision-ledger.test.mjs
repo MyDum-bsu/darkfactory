@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
-import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, symlink,
+import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, symlink, utimes,
   writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -438,12 +438,15 @@ async function spawnDeadPid() {
   });
 }
 
-test('stale lock recovery: dead-pid lock is reclaimed and recordDecision succeeds', async () => {
+test('stale lock recovery: expired dead-pid lock is reclaimed and recordDecision succeeds', async () => {
   const { tree, ledger, cleanup } = await sandbox();
   try {
     const deadPid = await spawnDeadPid();
     const lockPath = `${ledger}.lock`;
-    await writeFile(lockPath, JSON.stringify({ pid: deadPid, createdAt: new Date().toISOString() }));
+    // Лок снимается только когда он И просрочен, И владелец мёртв.
+    await writeFile(lockPath, JSON.stringify({
+      pid: deadPid, token: 'dead-token', createdAt: new Date(Date.now() - 120_000).toISOString(),
+    }));
     const rec = await recordDecision({ ledgerPath: ledger, scope: 'global',
       rule: 'written after dead-pid lock recovery', worktree: tree, ...base('lead') });
     assert.equal(rec.status, 'active');
@@ -452,17 +455,59 @@ test('stale lock recovery: dead-pid lock is reclaimed and recordDecision succeed
   } finally { await cleanup(); }
 });
 
-test('stale lock recovery: expired lock of a live pid is reclaimed after staleLockMs', async () => {
+test('fresh dead-pid lock is NOT reclaimed: expiry is required alongside owner death', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const deadPid = await spawnDeadPid();
+    const lockPath = `${ledger}.lock`;
+    // Мёртвый pid, но лок свежий — оба условия обязательны, рейпа нет.
+    await writeFile(lockPath, JSON.stringify({
+      pid: deadPid, token: 'fresh-dead-token', createdAt: new Date().toISOString(),
+    }));
+    await assert.rejects(() => recordDecision({ ledgerPath: ledger, scope: 'global',
+      rule: 'must never land', worktree: tree, ...base('lead') }), /decision_ledger_locked/);
+    const meta = JSON.parse(await readFile(lockPath, 'utf8'));
+    assert.equal(meta.pid, deadPid);
+    await rm(lockPath, { force: true });
+  } finally { await cleanup(); }
+});
+
+test('multi-slot TOCTOU: expired lock of a LIVE pid is never reclaimed', async () => {
   const { tree, ledger, cleanup } = await sandbox();
   try {
     const lockPath = `${ledger}.lock`;
-    // pid жив (наш собственный процесс), но лок старше staleLockMs — снимается.
+    // pid жив (наш собственный процесс) и лок старше staleLockMs — владелец
+    // может быть просто медленным; рейп под живым pid размыкал бы exclusion.
     await writeFile(lockPath, JSON.stringify({
       pid: process.pid,
+      token: 'live-token',
       createdAt: new Date(Date.now() - 120_000).toISOString(),
     }));
+    await assert.rejects(() => recordDecision({ ledgerPath: ledger, scope: 'global',
+      rule: 'must never land', worktree: tree, ...base('lead') }), /decision_ledger_locked/);
+    // Живой лок не тронут восстановлением — контент с токеном на месте.
+    const meta = JSON.parse(await readFile(lockPath, 'utf8'));
+    assert.equal(meta.pid, process.pid);
+    assert.equal(meta.token, 'live-token');
+    await rm(lockPath, { force: true });
+    // После ручного снятия запись снова работает — журнал не испорчен.
     const rec = await recordDecision({ ledgerPath: ledger, scope: 'global',
-      rule: 'written after expired lock recovery', worktree: tree, ...base('lead') });
+      rule: 'lands after manual unlock', worktree: tree, ...base('lead') });
+    assert.equal(rec.status, 'active');
+  } finally { await cleanup(); }
+});
+
+test('corrupt legacy lock without a pid is reclaimed by mtime expiry once stale', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const lockPath = `${ledger}.lock`;
+    // Оборванная на создании запись (crash между open и writeFile) не несёт
+    // pid: живого владельца не существует, лок судится по mtime и снимается.
+    await writeFile(lockPath, '###');
+    const past = new Date(Date.now() - 120_000);
+    await utimes(lockPath, past, past);
+    const rec = await recordDecision({ ledgerPath: ledger, scope: 'global',
+      rule: 'written after legacy lock recovery', worktree: tree, ...base('lead') });
     assert.equal(rec.status, 'active');
     await assert.rejects(() => readFile(lockPath), /ENOENT/);
   } finally { await cleanup(); }
@@ -522,4 +567,43 @@ test('formatDecisionsMarkdown renders a concise table of active decisions for in
     const md3 = formatDecisionsMarkdown(slice.items.map(i => ({ ...i, sourceCard: '1261' })));
     assert.match(md3, /\| global \| Board is the single queue \| 1261 \|/);
   } finally { await cleanup(); }
+});
+
+test('pinDecisions evicts rejected pins: a later call retries resolve instead of pinning the failure', async () => {
+  let calls = 0;
+  const pinned = pinDecisions(async () => {
+    calls += 1;
+    if (calls === 1) throw new Error('transient ledger read failure');
+    return { text: 't', digest: 'd'.repeat(64), ids: [], truncated: false, total: 0 };
+  });
+  await assert.rejects(() => pinned('9:1'), /transient ledger read failure/);
+  const retry = await pinned('9:1');
+  assert.equal(calls, 2);
+  assert.equal(retry.digest, 'd'.repeat(64));
+  // Успешный результат закрепляется — третий вызов не перечитывает.
+  assert.equal(await pinned('9:1'), retry);
+  assert.equal(calls, 2);
+});
+
+test('pinDecisions LRU cap: at most 64 pinned keys per factory, oldest evicted first', async () => {
+  let calls = 0;
+  const mk = keyCalls => pinDecisions(async () => {
+    keyCalls.n = (keyCalls.n ?? 0) + 1;
+    return { text: 't', digest: 'd'.repeat(64), ids: [], truncated: false, total: 0 };
+  });
+  const counter = { n: 0 };
+  const pinned = mk(counter);
+  // 64 ключа помещаются в кэш; 65-й вытесняет самый старый ('lru:0').
+  for (let i = 0; i < 64; i++) await pinned(`lru:${i}`);
+  assert.equal(counter.n, 64);
+  // Повтор свежего ключа — кэш, новых resolve нет.
+  await pinned('lru:63');
+  assert.equal(counter.n, 64);
+  await pinned('lru:overflow');
+  assert.equal(counter.n, 65);
+  // 'lru:0' вытеснен — обращение перезапускает resolve; 'lru:1' ещё в кэше.
+  await pinned('lru:1');
+  assert.equal(counter.n, 65);
+  await pinned('lru:0');
+  assert.equal(counter.n, 66);
 });

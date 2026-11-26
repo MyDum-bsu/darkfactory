@@ -2,6 +2,7 @@
 // их принятия (дедуп, лимиты, запрет самоослабления гейтов безопасности).
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -430,6 +431,69 @@ test('approvePendingLesson fail-closed: ослабляющий гейты уро
     // Ослабляющий урок остался в pending — не принят и не потерян молча.
     const still = await loadPendingLessons(pendingPath, { allowedDir: dir });
     assert.deepEqual(still.map(l => l.id), [evil.id]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('concurrent appendLessons from competing slots never lose lesson updates', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'lessons-race-'));
+  try {
+    const path = join(dir, 'lessons.jsonl');
+    // 8 конкурентных append, каждый со своим уникальным уроком: без
+    // эксклюзивной блокировки чтение-слияние-запись перезаписывает чужие
+    // уроки (last-write-wins), с блокировкой все 8 сохраняются.
+    const lesson = i => ({
+      id: `lesson-c-aaaaaa0${i}`, category: 'c', pattern: 'p', rule: `rule number ${i}`,
+      evidence_cards: [String(i)], occurrences: 1, risk_level: 'low',
+    });
+    await Promise.all(Array.from({ length: 8 }, (_, i) => appendLessons(path, [lesson(i)])));
+    const loaded = await loadLessons(path);
+    assert.equal(loaded.length, 8);
+    assert.deepEqual(loaded.map(l => l.id).sort(),
+      Array.from({ length: 8 }, (_, i) => `lesson-c-aaaaaa0${i}`).sort());
+    // Аккумуляция occurrences тоже не теряется под гонкой.
+    await Promise.all(Array.from({ length: 4 }, () => appendLessons(path, [{
+      ...lesson(0), evidence_cards: ['merge'], occurrences: 1,
+    }])));
+    const after = await loadLessons(path);
+    const merged = after.find(l => l.id === 'lesson-c-aaaaaa00');
+    assert.equal(merged.occurrences, 5);
+    assert.deepEqual(merged.evidence_cards.sort(), ['0', 'merge']);
+    // Lockfile снят владельцем — мусора рядом с хранилищем нет.
+    await assert.rejects(() => stat(`${path}.lock`), /ENOENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('appendLessons honours a live foreign lock and a stale dead lock recovers', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'lessons-lock-'));
+  try {
+    const path = join(dir, 'lessons.jsonl');
+    const lesson = {
+      id: 'lesson-c-aaaaaa01', category: 'c', pattern: 'p', rule: 'rule one',
+      evidence_cards: ['1'], occurrences: 2, risk_level: 'low',
+    };
+    // Просроченный лок мёртвого владельца снимается — запись проходит.
+    const deadPid = await new Promise(resolve => {
+      const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+      child.on('exit', () => resolve(child.pid));
+      child.on('error', () => resolve(2 ** 22 + 12345));
+    });
+    await writeFile(`${path}.lock`, JSON.stringify({
+      pid: deadPid, token: 'dead', createdAt: new Date(Date.now() - 120_000).toISOString(),
+    }));
+    await appendLessons(path, [lesson]);
+    assert.equal((await loadLessons(path)).length, 1);
+    // Живой свежий лок конкурента — отказ по истечении попыток, урок не записан.
+    await writeFile(`${path}.lock`, JSON.stringify({
+      pid: process.pid, token: 'live', createdAt: new Date().toISOString(),
+    }));
+    await assert.rejects(() => appendLessons(path, [{ ...lesson, id: 'lesson-c-bbbbbb02' }]),
+      /lessons_store_locked/);
+    assert.equal((await loadLessons(path)).length, 1);
+    await rm(`${path}.lock`, { force: true });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
