@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { createServer } from 'node:http';
+import { lstat, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { connect } from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { withModelProxy } from './model-proxy.mjs';
+import { connectUpstream, DEFAULT_IO_TIMEOUT_MS, withModelProxy } from './model-proxy.mjs';
 
 function exchange(path, text) {
   return new Promise((resolve, reject) => {
@@ -126,4 +129,142 @@ test('pilot closure stops even an enrolled model CONNECT before going upstream',
     assert.match(await exchange(path, tunnel('chatgpt.com:443')), /^HTTP\/1\.1 403 /);
   });
   assert.equal(outbound, 1);
+});
+
+class FakeSocket extends EventEmitter {
+  constructor() {
+    super();
+    this.output = '';
+    this.destroyed = false;
+  }
+
+  write(data) {
+    this.output += data.toString();
+    return true;
+  }
+
+  end(data) {
+    if (data) this.write(data);
+    return this;
+  }
+
+  destroy() {
+    if (!this.destroyed) {
+      this.destroyed = true;
+      queueMicrotask(() => this.emit('close'));
+    }
+    return this;
+  }
+
+  setTimeout() {
+    return this;
+  }
+
+  pipe(target) {
+    return target;
+  }
+}
+
+test('direct mode keeps the pre-connect 502 handler but removes it after CONNECT succeeds', () => {
+  const preClient = new FakeSocket();
+  const preTunnel = new FakeSocket();
+  connectUpstream({ direct: true }, 'chatgpt.com:443', preClient, new Set(), Buffer.alloc(0), () => {}, () => preTunnel);
+  preTunnel.emit('error', new Error('dial failed'));
+  assert.match(preClient.output, /^HTTP\/1\.1 502 Model Proxy Unavailable/);
+
+  const client = new FakeSocket();
+  const tunnel = new FakeSocket();
+  connectUpstream({ direct: true }, 'chatgpt.com:443', client, new Set(), Buffer.alloc(0), () => {}, () => tunnel);
+  tunnel.emit('connect');
+  assert.equal(client.output, 'HTTP/1.1 200 Connection Established\r\n\r\n');
+  assert.equal(tunnel.listenerCount('error'), 1);
+  tunnel.emit('error', new Error('established tunnel failed'));
+  assert.equal(client.output, 'HTTP/1.1 200 Connection Established\r\n\r\n');
+  assert.equal(client.destroyed, true);
+});
+
+test('model proxy io timeout defaults to at least 300s and accepts a validated override', () => {
+  class TimeoutSocket extends FakeSocket {
+    setTimeout(ms) {
+      this.timeoutMs = ms;
+      return this;
+    }
+  }
+  const direct = (timeout, override) => {
+    const client = new FakeSocket();
+    const tunnel = new TimeoutSocket();
+    connectUpstream({ direct: true }, 'chatgpt.com:443', client, new Set(), Buffer.alloc(0), () => {},
+      () => tunnel, override);
+    assert.equal(tunnel.timeoutMs, timeout);
+  };
+  direct(DEFAULT_IO_TIMEOUT_MS, undefined);
+  direct(456_000, 456_000);
+  assert.equal(DEFAULT_IO_TIMEOUT_MS >= 300_000, true);
+  assert.throws(() => connectUpstream({ direct: true }, 'chatgpt.com:443', new FakeSocket(), new Set(),
+    Buffer.alloc(0), () => {}, () => new FakeSocket(), 0), /model_proxy_timeout_invalid/);
+});
+
+test('model proxy rejects non-positive or non-integer ioTimeoutMs options before opening sockets', async () => {
+  for (const ioTimeoutMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '300000']) {
+    await assert.rejects(withModelProxy({
+      allow: ['chatgpt.com:443'], env: { DF_MODEL_PROXY_DIRECT: '1' }, ioTimeoutMs,
+    }, async () => assert.fail('unexpected listener')), /model_proxy_timeout_invalid/);
+  }
+});
+
+test('connect handler error boundary returns 502 cleanly without an unhandled rejection', async () => {
+  await withModelProxy({
+    allow: ['chatgpt.com:443'], env: { DF_MODEL_PROXY_DIRECT: '1' },
+    connectUpstreamImpl: () => { throw new Error('upstream exploded'); },
+  }, async path => {
+    assert.match(await exchange(path, tunnel('chatgpt.com:443')), /^HTTP\/1\.1 502 Model Proxy Unavailable/);
+    assert.match(await exchange(path, tunnel('chatgpt.com:443')), /^HTTP\/1\.1 502 Model Proxy Unavailable/);
+  });
+});
+
+test('explicit DF_MODEL_PROXY_DIRECT=1 allows allowlisted direct mode while still rejecting unlisted hosts', async () => {
+  await withModelProxy({ allow: ['chatgpt.com:443'], env: { DF_MODEL_PROXY_DIRECT: '1' } }, async path => {
+    for (const denied of ['127.0.0.1:44100', '10.2.3.4:443', 'other.invalid:443', 'chatgpt.com:80']) {
+      assert.match(await exchange(path, tunnel(denied)), /^HTTP\/1\.1 403 /);
+    }
+    assert.match(await exchange(path, 'GET http://chatgpt.com/ HTTP/1.1\r\nHost: chatgpt.com\r\n\r\n'), /^HTTP\/1\.1 405 /);
+  });
+  await assert.rejects(
+    withModelProxy({ allow: ['chatgpt.com:443'], env: { DF_MODEL_PROXY_DIRECT: '0' } }, async () => assert.fail('unexpected')),
+    /model_proxy_missing/,
+  );
+});
+
+test('deep TMPDIR uses a short private unix socket path and removes it on close', async t => {
+  const originalTmpdir = process.env.TMPDIR;
+  const base = await mkdtemp(join(tmpdir(), 'df-long-tmpdir-test-'));
+  const deep = join(base, ...Array.from({ length: 6 }, (_, i) => `nested-${i}-${'x'.repeat(20)}`));
+  await mkdir(deep, { recursive: true, mode: 0o700 });
+  process.env.TMPDIR = deep;
+  t.after(async () => {
+    if (originalTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmpdir;
+    await rm(base, { recursive: true, force: true });
+  });
+
+  const upstream = createServer();
+  upstream.on('connect', (_, socket) => {
+    socket.end('HTTP/1.1 200 Connection Established\r\n\r\nlong path response');
+  });
+  upstream.listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+  t.after(() => new Promise(resolve => upstream.close(resolve)));
+
+  let endpoint;
+  await withModelProxy({ allow: ['chatgpt.com:443'], env: { HTTPS_PROXY: `http://127.0.0.1:${upstream.address().port}` } },
+    async path => {
+      endpoint = path;
+      assert.match(path, /^\/tmp\/df-mp-.+\/m\.sock$/);
+      assert.ok(Buffer.byteLength(path, 'utf8') <= 88);
+      assert.equal((await lstat(dirname(path))).mode & 0o077, 0);
+      assert.equal((await readdir(deep)).length, 1);
+      assert.match(await exchange(path, tunnel('chatgpt.com:443')), /long path response$/);
+    });
+  assert.deepEqual(await readdir(deep), []);
+  await assert.rejects(lstat(dirname(endpoint)), { code: 'ENOENT' });
 });

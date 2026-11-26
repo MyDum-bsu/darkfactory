@@ -67,32 +67,32 @@ const PATTERNS = Object.freeze([
     category: 'assert_under_optimize',
     match: /\bassert\b[\s\S]{0,160}(-\s?o\b|optimiz|production|-o\b)/i,
     alt: /(-\s?o\b|optimiz|production)[\s\S]{0,160}\bassert\b/i,
-    rule: 'Не используй assert для проверок, обязательных в релизе: под флагом оптимизации (-O, production) assert-ы стираются — проверяй явным if/throw.',
+    rule: 'Do not use assert for checks required in release: optimization flags (-O, production) erase asserts — check explicitly with if/throw.',
     risk_level: 'medium',
   },
   {
     category: 'host_path_leak',
     match: /(^|\s)\/(home|users)\/[a-z0-9._-]+/i,
-    rule: 'В коде и тестах нет путей вида /home/<user>/... — только параметры, env и пути, вычисляемые от корня.',
+    rule: 'Code and tests must not contain paths like /home/<user>/... — use only parameters, env, and paths computed from the root.',
     risk_level: 'medium',
   },
   {
     category: 'non_atomic_write',
     match: /(не\s)?атомарн|atomic|tmp.*rename|rename.*tmp|temporar/,
     context: /запис|write|файл|handoff|конверт/,
-    rule: 'Файлы пиши атомарно: временный файл в том же каталоге + rename; частичная запись недопустима.',
+    rule: 'Write files atomically: temporary file in the same directory + rename; partial writes are inadmissible.',
     risk_level: 'medium',
   },
   {
     category: 'missed_edge_case',
     match: /edge.?case|граничн|пуст(ой|ого|ую|ым|ом)|empty|boundary|overflow|null|undefined|none\b/,
-    rule: 'Перед сдачей проверь граничные случаи: пустой и минимальный вход, границы диапазона, null/undefined, повторный вызов.',
+    rule: 'Before handoff, check edge cases: empty and minimal input, range boundaries, null/undefined, repeated invocation.',
     risk_level: 'low',
   },
   {
     category: 'missing_evidence',
     match: /нет\s+(доказ|evidence|квитанц)|missing\s+(evidence|receipt)|без\s+квитанц/,
-    rule: 'Каждая сдача несёт квитанцию и доказательство проверки — утверждение без evidence не считается.',
+    rule: 'Every handoff carries a receipt and verification evidence — a claim without evidence does not count.',
     risk_level: 'low',
   },
 ]);
@@ -212,8 +212,8 @@ export function distillReworkLessons(roundsHistory, { cardId = 'unknown',
   }
   for (const [signature, entry] of seen) {
     if (entry.count < 2) continue;
-    const rule = 'Проверь до сдачи именно то замечание, что уже повторялось в этой попытке: ' +
-      `«${signature.slice(0, 80)}» — повторный блокер не допускается.`;
+    const rule = 'Before handoff, check the exact finding that already repeated in this attempt: ' +
+      `"${signature.slice(0, 80)}" — a repeated blocker is not allowed.`;
     candidates.push({
       id: lessonId('repeated_finding', rule),
       category: 'repeated_finding',
@@ -232,18 +232,23 @@ export function distillReworkLessons(roundsHistory, { cardId = 'unknown',
 
 // Fail-closed гейт принятия уроков. candidates — выдача дистиллятора;
 // existing — уроки, уже лежащие в хранилище. Возврат:
-// { accepted, pending, rejected } — pending несёт кандидатов с
+// { accepted, pending, rejected, accumulated } — pending несёт кандидатов с
 // requires_owner_approval === true (в чек-лист не попадают сами),
 // rejected — { id, reason } по каждому отказу.
 // Порядок проверок детерминирован: форма → безопасность → owner-флаг →
 // дедуп → лимиты. Любой кандидат, ослабляющий ревью/тесты/изоляцию/
 // push/release/триаду, отклоняется с 'lesson_weakens_security_gate'.
+// С allowAccumulate повтор уже хранящегося канонического урока (тот же id
+// и тот же rule) не отклоняется, а уходит в accumulated — appendLessons
+// смержит occurrences и evidence_cards вместо мёртвого lesson_duplicate.
+// Без флага (default false) поведение дедупа не меняется.
 export function validateDistilledLessons(candidates, { existing = [],
   maxRuleChars = DEFAULT_MAX_RULE_CHARS, maxLessons = DEFAULT_MAX_LESSONS,
-  maxTotalChars = DEFAULT_MAX_TOTAL_CHARS } = {}) {
+  maxTotalChars = DEFAULT_MAX_TOTAL_CHARS, allowAccumulate = false } = {}) {
   const accepted = [];
   const pending = [];
   const rejected = [];
+  const accumulated = [];
   const known = new Map();
   for (const lesson of Array.isArray(existing) ? existing : []) {
     if (lesson !== null && typeof lesson === 'object' && typeof lesson.id === 'string') {
@@ -279,6 +284,13 @@ export function validateDistilledLessons(candidates, { existing = [],
       continue;
     }
     if (known.has(candidate.id) || known.has(`rule:${candidate.rule}`)) {
+      // Аккумуляция — только точный повтор того же урока (id И rule
+      // совпали): чужой урок с тем же текстом правила остаётся дублем.
+      const prior = known.get(candidate.id);
+      if (allowAccumulate && prior !== undefined && prior.rule === candidate.rule) {
+        accumulated.push(candidate);
+        continue;
+      }
       rejected.push({ id, reason: 'lesson_duplicate' });
       continue;
     }
@@ -291,7 +303,7 @@ export function validateDistilledLessons(candidates, { existing = [],
     totalChars += candidate.rule.length;
     accepted.push(candidate);
   }
-  return { accepted, pending, rejected };
+  return { accepted, pending, rejected, accumulated };
 }
 
 // path находится строго внутри root (как у изоляции run-isolated).
@@ -410,4 +422,70 @@ export async function appendLessons(path, accepted, { existing = null,
   await writeFile(tmp, body, { mode: 0o600 });
   await rename(tmp, path);
   return merged;
+}
+
+// Персистентный pending-стóр уроков, ожидающих решения владельца: тот же
+// JSONL-формат и те же fail-closed границы пути (symlink/allowedDir/outside),
+// что у основного хранилища. Раньше pending-кандидаты просто терялись после
+// validateDistilledLessons — теперь они накапливаются до явного approve.
+// Ослабляющий гейты урок fail-closed не попадает даже в pending-стóр.
+
+// Валидация кандидата для pending-стóра: форма + запрет самоослабления.
+function assertPendingLessonStorable(lesson) {
+  if (!validLesson(lesson)) throw new Error('lesson_invalid');
+  if (weakensSecurityGate(lesson.rule) ||
+      weakensSecurityGate(lesson.pattern) ||
+      weakensSecurityGate(lesson.category)) {
+    throw new Error('lesson_weakens_security_gate');
+  }
+}
+
+export async function savePendingLessons(pendingPath, lessons, { allowedDir = null,
+  outside = [], maxLessons = DEFAULT_MAX_LESSONS } = {}) {
+  const list = Array.isArray(lessons) ? lessons : [];
+  for (const lesson of list) assertPendingLessonStorable(lesson);
+  // Аккумуляция повторов по id та же, что в основном хранилище:
+  // occurrences суммируются, evidence_cards объединяются без дублей.
+  return appendLessons(pendingPath, list, { allowedDir, outside, maxLessons });
+}
+
+export async function loadPendingLessons(pendingPath, { allowedDir = null, outside = [] } = {}) {
+  return loadLessons(pendingPath, { allowedDir, outside });
+}
+
+// Одобрение владельцем: урок уходит из pending-стóра в основное хранилище
+// уроков с отметкой approved_by/approved_at. Fail-closed даже на approve:
+// ослабляющий гейты безопасности урок не может быть принят никогда —
+// решение владельца не отменяет запрет самоослабления.
+export async function approvePendingLesson({ pendingPath, lessonsPath, lessonId, approvedBy,
+  options = {} }) {
+  if (typeof lessonId !== 'string' || !lessonId) throw new Error('pending_lesson_id_invalid');
+  if (typeof approvedBy !== 'string' || !approvedBy.trim()) {
+    throw new Error('pending_lesson_approver_invalid');
+  }
+  const { allowedDir = null, outside = [], maxLessons = DEFAULT_MAX_LESSONS, now = new Date() } = options;
+  const pending = await loadPendingLessons(pendingPath, { allowedDir, outside });
+  const target = pending.find(lesson => lesson.id === lessonId);
+  if (target === undefined) throw new Error('pending_lesson_not_found');
+  // Повторная fail-closed проверка на момент approve: стóр могли подменить
+  // между distillation и решением владельца — безопасность не делегируется.
+  assertPendingLessonStorable(target);
+  const approved = {
+    ...target,
+    requires_owner_approval: false,
+    approved_by: approvedBy.trim(),
+    approved_at: now.toISOString(),
+  };
+  // Сначала append в основное хранилище (идемпотентный merge по id), затем
+  // перезапись pending без одобренного: сбой между шагами оставляет урок в
+  // обоих стóрах — повторный approve безопасен, потери урока нет.
+  const merged = await appendLessons(lessonsPath, [approved], { allowedDir, outside, maxLessons });
+  const remaining = pending.filter(lesson => lesson.id !== lessonId);
+  await assertLessonsPathAllowed(pendingPath, { allowedDir, outside });
+  const body = remaining.map(lesson =>
+    JSON.stringify({ schema: LESSONS_SCHEMA, lesson })).join('\n') + (remaining.length ? '\n' : '');
+  const tmp = join(dirname(pendingPath), `.pending-${randomUUID()}.tmp`);
+  await writeFile(tmp, body, { mode: 0o600 });
+  await rename(tmp, pendingPath);
+  return merged.find(lesson => lesson.id === lessonId) ?? approved;
 }

@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { execFile, execFileSync, spawn as spawnProcess } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { createServer, request as httpRequest } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
@@ -30,6 +30,12 @@ import { loadSdk } from './sdk.mjs';
 import { worktreeInspector } from './runtime.mjs';
 import { tamperGate } from './tamper-gate.mjs';
 import { createTelemetryRecorder } from './telemetry.mjs';
+import { loadRoleRegistry } from './role-registry.mjs';
+import { assertTriadStageCompatible, runPlaybook } from './playbook-router.mjs';
+import { stageTransportKind } from './stage-sandbox-transport.mjs';
+import { foremanArtifacts, foremanDiff } from './ab-pilot.mjs';
+import { PLAYBOOK_TRIAD, stageObservation } from './playbook-test-fixture.mjs';
+import { createBbStageObserver } from './bb-stage-adapter.mjs';
 import * as ws from './worker-selector.mjs';
 
 const exec = promisify(execFile);
@@ -114,7 +120,7 @@ async function enrollPilotFixture({ root, handle, url, channel, owner, pilotScop
 // Полный лабораторный стенд: живая Board, git worktree, слот-бронь, порты со
 // счётчиками и хранилище записи попытки — всё как в run-isolated, но под тестом.
 async function lab(t, { finish = 'verified', lease = 900, mutants, questions = false,
-  pilot = false, pilotScope = {}, hasUi = false } = {}) {
+  pilot = false, pilotScope = {}, hasUi = false, reviewVerdict = 'REVIEW_OK' } = {}) {
   const { url, dir } = await startBoard(boardCli(), t);
   const channel = pilot ? 'fixture-pilot' : 'pilot';
   process.env.BOARD_URL = url;
@@ -212,6 +218,7 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
   // Сценарий sha->result подменяет исход, но порт Board остаётся реальным.
   let scripted = {};
   let unsafePorts = {};
+  let beforeReview;
   const verify = async (attempt, submission) => {
     effects.verifyCalls++;
     const hit = scripted[submission.candidate_sha];
@@ -225,9 +232,13 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
         return { sha: binding.candidate_sha, ok: true,
           evidence: [{ file: 'checks-vs1.log', sha256: 'f'.repeat(64), exit: 0 }] }; },
       tamper: tamperGate,
-      review: async binding => { await port.guardTask?.(attempt.task_id, attempt.epoch); effects.reviewCalls++;
+      review: async binding => {
+        await port.guardTask?.(attempt.task_id, attempt.epoch);
+        await beforeReview?.(binding, attempt);
+        effects.reviewCalls++;
         return { task: binding.task_id, sha: binding.candidate_sha,
-          actual: REVIEW, verdict: 'REVIEW_OK', checkpoint: 'feed80ab' }; },
+          actual: REVIEW, verdict: reviewVerdict, checkpoint: 'feed80ab',
+          ...(reviewVerdict === 'REVIEW_BLOCKED' ? { excerpt: 'check.mjs: required case does not pass' } : {}) }; },
       ...(typeof unsafePorts === 'function' ? unsafePorts(journal) : unsafePorts),
     } });
   };
@@ -255,6 +266,7 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
     pushTurn: entry => { turns.push(entry); },
     setScript: map => { scripted = map; },
     setUnsafePorts: p => { unsafePorts = p; },
+    setBeforeReview: fn => { beforeReview = fn; },
     releaseSlot,
     tick: () => tick(cfg),
     workerSelector: over => { cfg.workerSelector = { ...ws, critic: REVIEW,
@@ -265,6 +277,304 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
       ...over }; },
   };
 }
+
+async function enrollBetaPlaybook(x, registry, playbook, {
+  observeStage = stageObservation, currentRegistry = () => registry, chooseTriad = triad => triad,
+} = {}) {
+  const stopDir = join(x.root, 'beta-switch');
+  await mkdir(stopDir, { mode: 0o700 });
+  const stop = join(stopDir, 'switch');
+  await writeFile(stop, 'run\n', { mode: 0o600 });
+  const assertOpen = await createPilotSwitch(stop);
+  const pinPath = join(x.stateDir, 'beta-pin.json');
+  await writeFile(pinPath, JSON.stringify({ task_id: x.taskId, playbook, registry_digest: registry.digest }),
+    { mode: 0o600, flag: 'wx' });
+  const readPin = async () => JSON.parse(await readFile(pinPath, 'utf8'));
+  const wal = join(x.stateDir, 'beta-attempt.json');
+  x.cfg.state = {
+    async load() {
+      try { return JSON.parse(await readFile(wal, 'utf8')); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    },
+    save: value => saveState(wal, value),
+  };
+  x.workerSelector({ pinTriad: async () => ({ plan: [PLAYBOOK_TRIAD.worker],
+    critic: PLAYBOOK_TRIAD.critic, arbiter: PLAYBOOK_TRIAD.arbiter }) });
+  x.setBeforeReview(async (handoff, attempt) => {
+    const policy = { profiles: { pilot: { task: x.taskId, worker: handoff.worker_thread_id,
+      worktree: x.tree, branch: 'pilot', base: x.base } } };
+    const inspect = worktreeInspector(policy);
+    const pin = await readPin();
+    if (pin.task_id !== handoff.task_id) throw new Error('beta_pin_task_mismatch');
+    const subject = { ...handoff, ...pin, attempt_id: attempt.attempt_id, epoch: attempt.epoch,
+      triad: chooseTriad(attempt.triad) };
+    const result = await runPlaybook({ registry: await currentRegistry(), playbook, attempt: subject }, {
+      async assertKernel(binding) {
+        await assertOpen();
+        const saved = await x.cfg.state.load();
+        const readback = await readPin();
+        if (readback.task_id !== saved.taskId) throw new Error('beta_pin_task_mismatch');
+        const live = await x.port.verifyHeld(saved.taskId, saved.epoch);
+        const tree = await inspect(handoff);
+        await assertOpen();
+        return { ...handoff, ...readback, task_id: saved.taskId, attempt_id: saved.attemptId, epoch: saved.epoch,
+          triad: saved.triad, held: live.epoch === binding.epoch && Date.parse(live.until) > Date.now(),
+          switchOpen: true, clean: tree.clean && tree.head === binding.candidate_sha, baseAncestor: tree.baseAncestor };
+      },
+      observeStage,
+    });
+    if (result.status !== 'ready_for_native_acceptance') throw new Error('beta_role_playbook_hold');
+  });
+  return stop;
+}
+
+test('VS-5 beta: four role DAGs on native Board and exact Git subject before independent acceptance', { timeout: 60_000 }, async t => {
+  const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+  const packs = {
+    ui: ['materials-reader', 'ui-builder', 'ux-visual-critic'],
+    'math-lean': ['materials-reader', 'conjecturer', 'falsify-first-oracle', 'lean-prover', 'literature-radar'],
+    'dsp-audio': ['materials-reader', 'dsp-experimenter', 'pipeline-freezer', 'blind-panel'],
+    'writer-course': ['materials-reader', 'course-designer', 'technical-writer', 'sparring-critic'],
+  };
+  for (const [pack, expected] of Object.entries(packs)) {
+    const x = await lab(t, { hasUi: pack === 'ui' });
+    if (pack === 'ui') {
+      x.setUnsafePorts({
+        visual: async binding => ({ ok: true, status: 'pass', sha: binding.candidate_sha,
+          artifacts: [{ name: 'page.png', sha256: 'a'.repeat(64), bytes: 5 }],
+          evidence: { file: 'visual.log', sha256: 'e'.repeat(64), exit: 0 } }),
+      });
+    }
+    const roles = [];
+    const subjects = new Set();
+    let previousArtifact = null;
+    await enrollBetaPlaybook(x, registry, pack, { observeStage: request => {
+      assert.equal(request.binding.task_id, x.taskId);
+      assert.equal(request.binding.candidate_sha, x.candidate);
+      assert.equal(request.binding.worktree, x.tree);
+      assert.equal(x.effects.completeCalls, 0);
+      assert.equal(x.effects.reviewCalls, 0, 'beta may not substitute for the independent gate');
+      assert.ok(request.skills.every(skill => skill.text.trim() && /^[a-f0-9]{64}$/.test(skill.digest)));
+      roles.push(request.role);
+      subjects.add(request.binding.subject_digest);
+      assert.equal(request.inputArtifactDigest, previousArtifact);
+      const receipt = stageObservation(request);
+      previousArtifact = receipt.artifactDigest;
+      return receipt;
+    } });
+    assert.equal((await x.tick()).phase, 'working');
+    x.submit(x.candidate, 10);
+    const final = await x.tick();
+    assert.equal(final.phase, 'done', `${pack}: ${final.reason}`);
+    const { state, result } = await x.port.lookup(x.taskId);
+    assert.equal(state, 'completed');
+    assert.equal(result.sha, x.candidate);
+    assert.deepEqual([...subjects], [result.subject_digest]);
+    assert.deepEqual(roles, expected);
+    assert.equal(x.effects.spawnCalls, 1);
+    assert.equal(x.effects.reviewCalls, 1);
+    assert.equal(x.effects.completeCalls, 1);
+  }
+});
+
+test('VS-5 beta: losing the switch during an observation prevents L2 and native completion', { timeout: 30_000 }, async t => {
+  const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+  const x = await lab(t);
+  let stageCalls = 0;
+  const stop = await enrollBetaPlaybook(x, registry, 'math-lean', { observeStage: async request => {
+    stageCalls++;
+    await writeFile(stop, 'stop\n');
+    return stageObservation(request);
+  } });
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'hold');
+  assert.notEqual((await x.card()).state, 'completed');
+  assert.equal(x.effects.reviewCalls, 0);
+  assert.equal(x.effects.completeCalls, 0);
+  assert.equal(stageCalls, 1);
+});
+
+test('VS-5 beta: stale catalog, substituted triad and missing receipt cannot reach native L2', { timeout: 45_000 }, async t => {
+  const checkout = fileURLToPath(new URL('..', import.meta.url));
+  const registry = await loadRoleRegistry(checkout);
+  const faults = { catalog: 'playbook_pin_mismatch', triad: 'playbook_kernel_unconfirmed', missing: 'playbook_receipt_unbound' };
+  for (const [fault, reason] of Object.entries(faults)) {
+    const x = await lab(t);
+    let calls = 0;
+    let reloaded = registry;
+    await enrollBetaPlaybook(x, registry, 'writer-course', {
+      currentRegistry: () => reloaded,
+      chooseTriad: triad => fault === 'triad' ? { ...triad,
+        // Подменённый worker обязан оставаться RO-совместимым (deepseek по
+        // аттестованной таблице): иначе сработает более ранняя граница
+        // foreman_triad_transport_incompatible, а не проверяемый kernel-гейт.
+        worker: { provider: 'pi', model: 'opencode-go/deepseek-v4' } } : triad,
+      observeStage() { calls++; return undefined; },
+    });
+    assert.equal((await x.tick()).phase, 'working');
+    if (fault === 'catalog') {
+      await cp(join(checkout, '.darkfactory'), join(x.root, '.darkfactory'), { recursive: true });
+      await writeFile(join(x.root, '.darkfactory/shared-skills/materials-intake.md'), 'Changed after enrollment.\n');
+      reloaded = await loadRoleRegistry(x.root);
+      assert.notEqual(reloaded.digest, registry.digest);
+    }
+    x.submit(x.candidate, 10);
+    const result = await x.tick();
+    assert.equal(result.phase, 'hold');
+    assert.equal(result.reason, `review_error:${reason}`);
+    assert.equal(x.effects.reviewCalls, 0);
+    assert.equal(x.effects.completeCalls, 0);
+    assert.equal(calls, fault === 'missing' ? 1 : 0);
+    assert.equal((await x.card()).state, 'blocked');
+  }
+});
+
+test('VS-5 beta: green role DAG does not override the independent L2 verdict', { timeout: 30_000 }, async t => {
+  const x = await lab(t, { reviewVerdict: 'REVIEW_BLOCKED' });
+  const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+  let calls = 0;
+  await enrollBetaPlaybook(x, registry, 'writer-course', {
+    observeStage(request) { calls++; return stageObservation(request); },
+  });
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(x.candidate, 10);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.card()).state, 'claimed');
+  assert.equal(calls, 4);
+  assert.equal(x.effects.reviewCalls, 1);
+  assert.equal(x.effects.feedbackCalls, 1);
+  assert.equal(x.effects.completeCalls, 0);
+});
+
+test('V2-1: Foreman RO stage transport → L2 → native complete на одном candidate_sha, fail-closed без аттестации',
+  { timeout: 60_000 }, async t => {
+    const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+    const sandboxObserver = async (x, transport) => {
+      const stageDir = join(x.root, `ro-stage-${transport.kind ?? 'x'}`);
+      const journal = join(x.root, `ro-journal-${transport.kind ?? 'x'}`);
+      await mkdir(stageDir, { mode: 0o700 });
+      await mkdir(journal, { mode: 0o700 });
+      return createBbStageObserver({ project: 'proj_stage', workspace: stageDir, journal,
+        deadline: Date.now() + 120_000 }, {
+        assertCurrent: async () => {},
+        // Первая стадия всех четырёх плейбуков — inventory: артефакт идёт
+        // продукционным foremanArtifacts (реальный git ls-tree + доказанный
+        // diff), а не заглушкой. Прочие verifier без доверенного адаптера —
+        // тестовая фикстура.
+        readArtifact: async req => req.verifier === 'inventory'
+          ? await foremanArtifacts({ candidate: x.candidate,
+              diff: await foremanDiff({ git: (...args) => git(x.tree, ...args), base: x.base,
+                candidate: x.candidate }),
+              localEvidence: { ok: true, sha: x.candidate,
+                evidence: [{ exit: 0, sha256: 'f'.repeat(64) }] },
+              brief: Buffer.from('Frozen task'), review: 'Frozen check',
+              git: (...args) => git(x.tree, ...args) })(req)
+          : { artifact: stageObservation(req).artifact, material: 'facts' },
+        record: async () => {},
+        recordWitness: async row => transport.witnesses.push(row),
+        sandboxTransport: transport,
+        execBb: async () => { transport.orphans++; throw new Error('host bb spawn запрещён в RO-пути'); },
+      });
+    };
+    const roTransport = x => ({
+      kind: 'attested', witnesses: [], orphans: 0,
+      // Фикстура не подменяет допуск: модель стадии обязана реально пройти
+      // stageTransportKind, Landlock-контур — ровно на 'medium'.
+      async assertReadOnly(model) {
+        if (stageTransportKind(model) === 'landlock-ro-v1' &&
+            (model.reasoning ?? 'medium') !== 'medium') return false;
+        return true;
+      },
+      async observe(req) {
+        stageTransportKind(req.model);
+        assert.equal(req.binding.candidate_sha, x.candidate);
+        assert.equal(req.binding.worktree, x.tree);
+        assert.match(req.prompt, /Изолированный этап измерения/);
+        const transcript = `stage-transcript:${req.challenge}`;
+        return { verdict: 'PASS', transcript_file: null, witness: {
+          mode: 'read-only', transport: 'docker-ro-v1', snapshotDigest: 'c'.repeat(64),
+          worktreeFingerprint: { head: x.candidate }, challenge: req.challenge, verdict: 'PASS',
+          artifactDigest: req.artifactDigest,
+          transcript_sha256: createHash('sha256').update(transcript).digest('hex'),
+          checkpoint: 'feed80ab',
+          actual: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' } } };
+      },
+    });
+    // Зелёный проход: role DAG через аттестованный RO-транспорт с witness,
+    // затем независимый L2 и нативное закрытие на том же candidate_sha.
+    const x = await lab(t);
+    const transport = roTransport(x);
+    const observer = await sandboxObserver(x, transport);
+    await enrollBetaPlaybook(x, registry, 'writer-course', { observeStage: observer });
+    assert.equal((await x.tick()).phase, 'working');
+    x.submit(x.candidate, 10);
+    const final = await x.tick();
+    assert.equal(final.phase, 'done', final.reason);
+    const { state, result } = await x.port.lookup(x.taskId);
+    assert.equal(state, 'completed');
+    assert.equal(result.sha, x.candidate);
+    assert.equal(x.effects.completeCalls, 1);
+    assert.equal(x.effects.reviewCalls, 1);
+    assert.equal(transport.orphans, 0, 'ноль осиротевших host-процессов');
+    assert.equal(transport.witnesses.length, 4);
+    for (const w of transport.witnesses) {
+      assert.equal(w.mode, 'read-only');
+      assert.equal(w.transport, 'docker-ro-v1');
+      assert.match(w.challenge, /^[a-f0-9]{64}$/);
+      assert.match(w.transcript_sha256, /^[a-f0-9]{64}$/);
+      assert.equal(w.threadId, 'sandbox:docker-ro-v1');
+    }
+    // Неаттестованный транспорт — fail-closed: ни стадий, ни L2, ни complete.
+    const y = await lab(t);
+    const denied = { kind: 'denied', witnesses: [], orphans: 0,
+      async assertReadOnly() { return false; },
+      async observe() { assert.fail('неаттестованный транспорт не вызывается'); } };
+    const deniedObserver = await sandboxObserver(y, denied);
+    await enrollBetaPlaybook(y, registry, 'writer-course', { observeStage: deniedObserver });
+    assert.equal((await y.tick()).phase, 'working');
+    y.submit(y.candidate, 10);
+    const held = await y.tick();
+    assert.equal(held.phase, 'hold');
+    assert.match(held.reason, /stage_read_only_transport_not_enrolled/);
+    assert.equal(y.effects.reviewCalls, 0);
+    assert.equal(y.effects.completeCalls, 0);
+    assert.equal(denied.orphans, 0);
+  });
+
+test('V2-1: триада, несовместимая с RO-транспортом плейбука, отклоняется до spawn писателя',
+  { timeout: 30_000 }, async t => {
+    const registry = await loadRoleRegistry(fileURLToPath(new URL('..', import.meta.url)));
+    // Devin в executor-слоте не проходит stageTransportKind: playbook
+    // 'writer-course' содержит writer-стадию (technical-writer → executor).
+    const incompatible = { worker: { provider: 'acp-devin', model: 'swe-2-high' },
+      critic: PLAYBOOK_TRIAD.critic, arbiter: PLAYBOOK_TRIAD.arbiter };
+    const pinForemanTriad = async triad => {
+      try {
+        assertTriadStageCompatible({ registry, playbook: 'writer-course', triad });
+      } catch (cause) {
+        return { outcome: 'rejected', reason: cause instanceof Error
+          ? cause.message : 'foreman_triad_transport_incompatible' };
+      }
+      return { plan: [triad.worker], critic: triad.critic, arbiter: triad.arbiter };
+    };
+    const x = await lab(t);
+    x.workerSelector({ pinTriad: () => pinForemanTriad(incompatible) });
+    const held = await x.tick();
+    assert.equal(held.phase, 'hold');
+    assert.equal(held.reason, 'foreman_triad_transport_incompatible');
+    assert.equal(x.effects.spawnCalls, 0, 'писатель не запускался на несовместимой триаде');
+    assert.equal(x.effects.reviewCalls, 0);
+    assert.equal(x.effects.completeCalls, 0);
+    assert.equal((await x.card()).state, 'blocked');
+    // Контрольный проход: совместимая триада той же формы пин не отклоняет.
+    assert.deepEqual(await pinForemanTriad(PLAYBOOK_TRIAD),
+      { plan: [PLAYBOOK_TRIAD.worker], critic: PLAYBOOK_TRIAD.critic, arbiter: PLAYBOOK_TRIAD.arbiter });
+    // Neon high под Landlock (medium-only) — та же fail-closed граница.
+    assert.deepEqual(await pinForemanTriad({ ...PLAYBOOK_TRIAD,
+      arbiter: { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' } }),
+      { outcome: 'rejected', reason: 'foreman_triad_transport_incompatible' });
+  });
 
 // ---------------------------------------------------------------------------
 // Трасса 1A: потерянный ack после реального эффекта spawn — однозначное

@@ -1,0 +1,62 @@
+# Канонический пример политики ролей x сценариев Darkfactory.
+# Пользовательская копия: $XDG_CONFIG_HOME/darkfactory/routing-policy.yaml
+# disabled и quota_paused исключаются механически; reviewer никогда не делит
+# семейство с coder, arbiter — с coder/reviewer, независимо от правок конфига.
+version: 1
+mode: balanced
+
+roles:
+  lead:
+    required_capabilities: [code, reasoning]
+    must_differ_family_from: []
+  coder_default:
+    required_capabilities: [code]
+    must_differ_family_from: []
+  coder_heavy:
+    required_capabilities: [code, reasoning]
+    must_differ_family_from: []
+  reviewer:
+    required_capabilities: [code, review]
+    must_differ_family_from: [coder]
+  arbiter:
+    required_capabilities: [code, reasoning]
+    must_differ_family_from: [coder, reviewer]
+  ux_critic:
+    required_capabilities: [vision]
+    must_differ_family_from: []
+
+modes:
+  economy:
+    # paid_api запрещён всегда; subscription допущен только для явно
+    # перечисленных ниже кандидатов.
+    cost_tiers: [free, subscription]
+    status_priority: [promo_free, active, standby]
+    candidates:
+      lead: [swe-2-1-medium, swe-2-1-high, swe-2-high]
+      coder_default: [swe-2-1-medium, swe-2-1-high, swe-2-high]
+      coder_heavy: [swe-2-1-high, swe-2-1-xhigh, swe-2-high]
+      reviewer: [gemini-4-neon, deepseek-v4.1-flash, claude-opus-5.5]
+      arbiter: [deepseek-v4.1-flash, gemini-4-neon, claude-opus-5.5]
+      ux_critic: [gemini-4-neon]
+
+  balanced:
+    cost_tiers: [free, subscription]
+    status_priority: [promo_free, active, standby]
+    candidates:
+      lead: [swe-2-1-high, swe-2-1-medium, gemini-4-neon]
+      coder_default: [swe-2-1-medium, swe-2-1-high, deepseek-v4.1-flash, gemini-4-neon, swe-2-high]
+      coder_heavy: [swe-2-1-xhigh, swe-2-1-high, swe-2-1-max, deepseek-v4.1-flash, gemini-4-neon]
+      reviewer: [gemini-4-neon, claude-opus-5.5, deepseek-v4.1-flash, gpt-6.2-sol]
+      arbiter: [deepseek-v4.1-flash, gpt-6.2-sol, claude-opus-5.5, gemini-4-neon]
+      ux_critic: [gemini-4-neon]
+
+  sprint:
+    cost_tiers: [free, subscription, paid_api]
+    status_priority: [promo_free, active, standby]
+    candidates:
+      lead: [swe-2-1-xhigh, swe-2-1-high, gemini-4-neon]
+      coder_default: [swe-2-1-high, swe-2-1-xhigh, deepseek-v4.1-flash, gemini-4-neon]
+      coder_heavy: [swe-2-1-max, swe-2-1-xhigh, deepseek-v4.1-flash, gemini-4-neon]
+      reviewer: [gemini-4-neon, claude-opus-5.5, gpt-6.2-sol, deepseek-v4.1-flash]
+      arbiter: [gpt-6.2-sol, deepseek-v4.1-flash, claude-opus-5.5, gemini-4-neon]
+      ux_critic: [gemini-4-neon]

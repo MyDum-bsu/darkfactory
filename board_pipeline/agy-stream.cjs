@@ -6,7 +6,20 @@ const { lstat, readFile, writeFile } = require('node:fs/promises');
 const { join } = require('node:path');
 const { isDeepStrictEqual, promisify } = require('node:util');
 const { checkSnapshotTool, isSnapshotTool } = require('./agy-tools.cjs');
+const { createStreamLoopGuard } = require('./loop-detector.cjs');
 const MODEL = 'gemini-4-neon';
+const MIN_AGY_VERSION = [1, 5, 14];
+const ATTESTED_AGY_VERSIONS = new Set(['1.5.14', '1.5.15', '1.5.16']);
+function isSupportedAgyVersion(raw) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(String(raw ?? '').trim());
+  if (!match) return false;
+  const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
+  for (let i = 0; i < 3; i += 1) {
+    if (parts[i] > MIN_AGY_VERSION[i]) return true;
+    if (parts[i] < MIN_AGY_VERSION[i]) return false;
+  }
+  return true;
+}
 const EFFORT = 'medium';
 const LIMIT = 2 * 1024 * 1024;
 const STEP_FIELDS = new Set(['conversation_id', 'step_index', 'state', 'step_type',
@@ -55,8 +68,16 @@ function trackSnapshotReads(cwd, enabled) {
   };
 }
 
-function monitorAgy(cwd, { snapshotTools = false } = {}) {
+function monitorAgy(cwd, { snapshotTools = false, loopMode } = {}) {
   const reader = trackSnapshotReads(cwd, snapshotTools);
+  // Микро-уровень защиты от зацикливания модели (V2-3, MIT-порт
+  // loop-gate): rolling 32-словные n-граммы по content-каналу стрима.
+  // DF_LOOP_GATE_MODE: observe (дефолт, метрика loopGuard без прерывания),
+  // abort (немедленный 'loop_detected'), off. Невалидное значение —
+  // fail-open в observe, стрим не ломается о мисконфиг.
+  const mode = loopMode ?? (['observe', 'abort', 'off'].includes(process.env.DF_LOOP_GATE_MODE)
+    ? process.env.DF_LOOP_GATE_MODE : 'observe');
+  const loopGuard = createStreamLoopGuard({ mode });
   let conversation;
   let result;
   let usage = null;
@@ -98,6 +119,10 @@ function monitorAgy(cwd, { snapshotTools = false } = {}) {
             throw error('agy_stream_extra_turn');
           }
           if (step.step_type === 'agent_response' && step.state === 'DONE') answered = true;
+          if (step.step_type === 'agent_response' && typeof step.text_delta === 'string') {
+            const loop = loopGuard.push('content', step.text_delta);
+            if (loop.looped && loopGuard.mode === 'abort') throw error('loop_detected');
+          }
           break;
         }
         case 'result': {
@@ -121,7 +146,8 @@ function monitorAgy(cwd, { snapshotTools = false } = {}) {
     finish() {
       if (!result) throw error('agy_incomplete_turn');
       return { text: result, ...reader.finish(), actual: { provider: 'google', model: MODEL, reasoningLevel: EFFORT },
-        evidence: { model: 'agy_stream_init', effort: 'agy_cli_request' }, usage };
+        evidence: { model: 'agy_stream_init', effort: 'agy_cli_request' }, usage,
+        loopGuard: loopGuard.finish() };
     },
   };
 }
@@ -206,7 +232,7 @@ async function runAgy({ binary, cwd, env, prompt, timeoutMs, sealBootstrap, befo
   try {
     version = await promisify(execFile)(binary, ['--version'], { cwd, env, timeout: 5000, maxBuffer: 4096 });
   } catch { throw error('agy_version_unattested'); }
-  if (version.stdout.trim() !== '1.5.14') throw error('agy_version_unattested');
+  if (!isSupportedAgyVersion(version.stdout)) throw error('agy_version_unattested');
   await beforeEffect?.();
   const args = ['--print', '', '--model', MODEL, '--effort', EFFORT,
     '--mode', 'plan', '--disable-slash-commands', '--settings', settings(cwd, Boolean(boundary)),
@@ -241,4 +267,4 @@ async function runAgy({ binary, cwd, env, prompt, timeoutMs, sealBootstrap, befo
   }
 }
 
-module.exports = { parseAgyStream, runAgy, superviseAgy };
+module.exports = { parseAgyStream, runAgy, superviseAgy, ATTESTED_AGY_VERSIONS, isSupportedAgyVersion };

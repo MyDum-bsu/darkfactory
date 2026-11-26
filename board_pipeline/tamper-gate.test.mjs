@@ -408,3 +408,170 @@ test('ослабление операнда после && против один�
   assert.equal(res.ok, false);
   assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
 });
+
+test('AUDIT-0c: не-test prose it (see below) не считается удалением теста', async () => {
+  const res = await gate({
+    base: { 'docs/guide.md': 'it (see below)\n' },
+    candidate: { 'docs/guide.md': 'see below\n' },
+  });
+  assert.equal(res.ok, true, JSON.stringify(res.violations));
+  assert.equal(res.violations.some((v) => v.kind === 'test_deleted'), false);
+
+  const underTestsDir = await gate({
+    base: { 'tests/README.md': 'it (see below)\n' },
+    candidate: { 'tests/README.md': 'see below\n' },
+  });
+  assert.equal(underTestsDir.violations.some((v) => v.kind === 'test_deleted'), false,
+    JSON.stringify(underTestsDir.violations));
+
+  const commentedOut = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {});\n// test("old", () => {});\n' },
+    candidate: { 'tests/app.test.js': 'test("a", () => {});\n' },
+  });
+  assert.equal(commentedOut.violations.some((v) => v.kind === 'test_deleted'), false,
+    JSON.stringify(commentedOut.violations));
+});
+
+test('AUDIT-0c: переименование title, async callback и перемещение кейса не test_deleted', async () => {
+  const rename = await gate({
+    base: { 'tests/app.test.js': 'test("old title", () => {});\n' },
+    candidate: { 'tests/app.test.js': 'test("new title", () => {});\n' },
+  });
+  assert.equal(rename.violations.some((v) => v.kind === 'test_deleted'), false,
+    JSON.stringify(rename.violations));
+
+  const asyncEdit = await gate({
+    base: { 'tests/app.test.js': 'test("case", () => {});\n' },
+    candidate: { 'tests/app.test.js': 'test("case", async () => {});\n' },
+  });
+  assert.equal(asyncEdit.violations.some((v) => v.kind === 'test_deleted'), false,
+    JSON.stringify(asyncEdit.violations));
+
+  const moved = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {});\ntest("b", () => {});\n' },
+    candidate: { 'tests/app.test.js': 'test("b", () => {});\ntest("a", () => {});\n' },
+  });
+  assert.equal(moved.violations.some((v) => v.kind === 'test_deleted'), false,
+    JSON.stringify(moved.violations));
+});
+
+test('AUDIT-0c: фактическое net deletion тестов по-прежнему отклоняется', async () => {
+  const res = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {});\ntest("b", () => {});\n' },
+    candidate: { 'tests/app.test.js': 'test("a", () => {});\n' },
+  });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.kind === 'test_deleted'), JSON.stringify(res.violations));
+});
+
+test('AUDIT-0c: расширенные skip/only маркеры отклоняются', async () => {
+  for (const [name, file, line] of [
+    ['xit', 'tests/xit.test.js', 'x' + 'it("off", () => {});\n'],
+    ['xtest', 'tests/xtest.test.js', 'x' + 'test("off", () => {});\n'],
+    ['xdescribe', 'tests/xdescribe.test.js', 'x' + 'describe("off", () => {});\n'],
+    ['fit', 'tests/fit.test.js', 'f' + 'it("focus", () => {});\n'],
+    ['fdescribe', 'tests/fdescribe.test.js', 'f' + 'describe("focus", () => {});\n'],
+    ['skip option', 'tests/option.test.js', 'test("off", { skip' + ': true }, () => {});\n'],
+    ['only option', 'tests/only.test.js', 'test("focus", { only' + ': true }, () => {});\n'],
+    ['test.todo', 'tests/todo.test.js', 'test.' + 'todo("later");\n'],
+    ['t.skip', 'tests/tskip.test.js', 'test("off", (t) => {\n  t.' + 'skip();\n});\n'],
+    ['pytest.skip', 'tests/py_test.py', 'def test_off():\n    pytest.' + 'skip("off")\n'],
+  ]) {
+    const res = await gate({
+      base: { 'tests/base.test.js': 'test("base", () => {});\n' },
+      candidate: {
+        'tests/base.test.js': 'test("base", () => {});\n',
+        [file]: line,
+      },
+    });
+    assert.equal(res.ok, false, name);
+    assert.ok(res.violations.some((v) => v.kind === 'test_skipped'),
+      `${name}: ${JSON.stringify(res.violations)}`);
+  }
+});
+
+test('AUDIT-0c: || true внутри assertion — assertion_weakened', async () => {
+  const res = await gate({
+    base: { 'tests/app.test.js': 'assert(value >= 10);\n' },
+    candidate: { 'tests/app.test.js': 'assert(value >= 10 |' + '| true);\n' },
+  });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'),
+    JSON.stringify(res.violations));
+});
+
+test('AUDIT-0c: block-comment suppression и early return в test hunk отклоняются', async () => {
+  const commented = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {\n  assert(x === 1);\n});\n' },
+    candidate: { 'tests/app.test.js': '/' + '*\ntest("a", () => {\n  assert(x === 1);\n});\n*/\n' },
+  });
+  assert.ok(commented.violations.some((v) => v.kind === 'assertion_weakened'),
+    JSON.stringify(commented.violations));
+
+  const earlyReturn = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {\n  assert(x === 1);\n});\n' },
+    candidate: { 'tests/app.test.js': 'test("a", () => {\n  ret' + 'urn;\n  assert(x === 1);\n});\n' },
+  });
+  assert.ok(earlyReturn.violations.some((v) => v.kind === 'assertion_weakened'),
+    JSON.stringify(earlyReturn.violations));
+});
+
+test('AUDIT-0c: comment-only node -e и удаление runner executable — gate_bypass', async () => {
+  const commentOnly = await gate({
+    base: { 'package.json': '{"scripts":{"test":"node --test"}}\n' },
+    candidate: { 'package.json': '{"scripts":{"test":"node -e \'/* test */\'"}}\n' },
+  });
+  assert.equal(commentOnly.ok, false);
+  assert.ok(commentOnly.violations.some((v) => v.kind === 'gate_bypass'),
+    JSON.stringify(commentOnly.violations));
+
+  for (const [name, script] of [
+    ['runner name inside eval string', 'node -e \'console.log(\\\"jest\\\")\''],
+    ['bare eval identifier', 'node -e \'jest\''],
+  ]) {
+    const stripped = await gate({
+      base: { 'package.json': '{"scripts":{"test":"jest --coverage"}}\n' },
+      candidate: { 'package.json': `{"scripts":{"test":"${script}"}}\n` },
+    });
+    assert.equal(stripped.ok, false, name);
+    assert.ok(stripped.violations.some((v) => v.kind === 'gate_bypass'),
+      `${name}: ${JSON.stringify(stripped.violations)}`);
+  }
+});
+
+test('AUDIT-0c regression: .fit()-метод и конфиг skip вне тестов — не test_skipped', async () => {
+  const res = await gate({
+    base: { 'src/model.js': 'export const x = 1;\n' },
+    candidate: {
+      'src/model.js': 'export const x = 1;\n' +
+        'export const r = model.fit(data);\n' +
+        'export const cfg = { skip' + ': true, retries: 2 };\n' +
+        'export const alt = { only' + ': true };\n',
+    },
+  });
+  assert.equal(res.ok, true, JSON.stringify(res.violations));
+  assert.deepEqual(res.violations, []);
+});
+
+test('AUDIT-0c regression: .fit()/.xit() методы в тестовом файле — не фокусировка', async () => {
+  const res = await gate({
+    base: { 'tests/ml.test.js': 'test("a", () => {});\n' },
+    candidate: {
+      'tests/ml.test.js': 'test("a", () => {});\n' +
+        'const r = model.fit(data);\n' +
+        'obj.xit(1, 2);\n' +
+        'pipe.fdescribe(run);\n',
+    },
+  });
+  assert.deepEqual(res.violations.filter((v) => v.kind === 'test_skipped'), [],
+    JSON.stringify(res.violations));
+  // Контроль: глобальный fit(...) в тестовом файле по-прежнему отклоняется.
+  const focus = await gate({
+    base: { 'tests/ml.test.js': 'test("a", () => {});\n' },
+    candidate: {
+      'tests/ml.test.js': 'test("a", () => {});\n' + 'f' + 'it("focus", () => {});\n',
+    },
+  });
+  assert.ok(focus.violations.some((v) => v.kind === 'test_skipped'),
+    JSON.stringify(focus.violations));
+});

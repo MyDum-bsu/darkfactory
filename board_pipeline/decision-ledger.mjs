@@ -6,7 +6,7 @@
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { appendFile, link, lstat, mkdir, open, readFile, readlink, realpath, rm,
-  unlink, writeFile } from 'node:fs/promises';
+  stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
@@ -178,22 +178,62 @@ export async function resolveActiveDecisions({ ledgerPath, projectId, maxChars =
   return { text: lines.join('\n'), digest, ids, truncated, total: active.length, items };
 }
 
+export const DEFAULT_STALE_LOCK_MS = 60_000;
+
+// Жив ли процесс: ESRCH — процесса нет (мёртвый лок); EPERM и прочие —
+// процесс существует, но принадлежит другому пользователю, лок живой.
+const pidAlive = pid => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== 'ESRCH';
+  }
+};
+
+// Восстановление после SIGKILL посреди записи: лок несёт JSON
+// { pid, createdAt }; лок старше staleLockMs или лок мёртвого pid снимается.
+// Нечитаемый/legacy-лок судится по mtime; свежий живой лок не трогается —
+// валидная конкурентная блокировка не ломается.
+async function clearStaleLedgerLock(lock, staleLockMs, now = Date.now()) {
+  let raw;
+  try { raw = await readFile(lock, 'utf8'); } catch { return false; }
+  let meta = null;
+  try { meta = JSON.parse(raw); } catch { /* legacy/пустой лок — судим по mtime */ }
+  let createdAtMs = NaN;
+  let pid = null;
+  if (meta !== null && typeof meta === 'object' && !Array.isArray(meta)) {
+    if (typeof meta.createdAt === 'string') createdAtMs = Date.parse(meta.createdAt);
+    if (Number.isSafeInteger(meta.pid) && meta.pid > 0) pid = meta.pid;
+  }
+  if (!Number.isFinite(createdAtMs)) {
+    try { createdAtMs = (await stat(lock)).mtimeMs; } catch { return false; }
+  }
+  const expired = Number.isFinite(createdAtMs) && (now - createdAtMs) > staleLockMs;
+  const dead = pid !== null && !pidAlive(pid);
+  if (!expired && !dead) return false;
+  await rm(lock, { force: true }).catch(() => {});
+  return true;
+}
+
 // Lockfile рядом с журналом: конкурентные recordDecision (в первую очередь
 // два supersedes одной цели) сериализуются, а не проходят оба по stale-снимку.
-async function withLedgerLock(ledgerPath, fn) {
+async function withLedgerLock(ledgerPath, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } = {}) {
   const lock = `${ledgerPath}.lock`;
   let fd;
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
-      fd = await open(lock, 'wx');
+      fd = await open(lock, 'wx', 0o600);
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
+      await clearStaleLedgerLock(lock, staleLockMs);
       await delay(50);
     }
   }
   if (fd === undefined) throw new Error('decision_ledger_locked');
   try {
+    await fd.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
     return await fn();
   } finally {
     await fd.close().catch(() => {});
@@ -329,6 +369,36 @@ export function pinDecisions(resolve_, { persistDir } = {}) {
     }
     return pin;
   };
+}
+
+// Компактная Markdown-таблица активных решений для intake-сверки Лида/CTO:
+// id, scope, rule, source_card. Погашенные решения отфильтровываются по
+// семантике append-only журнала: status superseded или цель чужого supersedes.
+// Пайпы и переводы строк в тексте экранируются, чтобы таблица не ломалась.
+export function formatDecisionsMarkdown(decisions) {
+  const list = (Array.isArray(decisions) ? decisions : [])
+    .filter(d => d !== null && typeof d === 'object' && !Array.isArray(d));
+  const dead = new Set();
+  for (const d of list) {
+    if (typeof d.id === 'string' && d.status !== undefined && d.status !== 'active') dead.add(d.id);
+    if (typeof d.supersedes === 'string') dead.add(d.supersedes);
+  }
+  const rows = list
+    .map(d => ({
+      id: typeof d.id === 'string' ? d.id : '',
+      scope: typeof d.scope === 'string' ? d.scope : '',
+      rule: typeof d.rule === 'string' ? d.rule.trim() : '',
+      sourceCard: String(d.sourceCard ?? d.source_card ?? ''),
+    }))
+    .filter(d => d.id && d.scope && d.rule && !dead.has(d.id));
+  if (rows.length === 0) return '_No active decisions._';
+  const esc = text => text.replace(/\|/g, '\\|').replace(/\s*\n+\s*/g, ' ');
+  const lines = [
+    '| id | scope | rule | source_card |',
+    '| --- | --- | --- | --- |',
+    ...rows.map(d => `| ${esc(d.id)} | ${esc(d.scope)} | ${esc(d.rule)} | ${esc(d.sourceCard)} |`),
+  ];
+  return lines.join('\n');
 }
 
 // Разрешение пути из конфигурации/env: явный аргумент > policy.decisionLedger

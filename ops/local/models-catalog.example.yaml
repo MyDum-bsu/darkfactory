@@ -1,0 +1,99 @@
+# Канонический пример реестра моделей Darkfactory.
+# Пользовательская копия: $XDG_CONFIG_HOME/darkfactory/models-catalog.yaml
+# until: ISO-дата означает конец этого UTC-дня; ISO-timestamp — точный момент.
+version: 1
+models:
+  - id: swe-2-1-medium
+    provider: acp-devin
+    model: swe-2-1-medium
+    family: cognition
+    status: promo_free
+    cost_tier: free
+    until: "2026-12-08"
+    capabilities: [code, reasoning, fast]
+    quota_source: devin-usage
+    notes: Основной экономичный исполнитель Cognition в промо-периоде.
+
+  - id: swe-2-1-high
+    provider: acp-devin
+    model: swe-2-1-high
+    family: cognition
+    status: promo_free
+    cost_tier: free
+    until: "2026-12-08"
+    capabilities: [code, reasoning]
+    quota_source: devin-usage
+    notes: Усиленный исполнитель Cognition для обычных и тяжёлых задач.
+
+  - id: swe-2-1-xhigh
+    provider: acp-devin
+    model: swe-2-1-xhigh
+    family: cognition
+    status: promo_free
+    cost_tier: free
+    until: "2026-12-08"
+    capabilities: [code, reasoning]
+    quota_source: devin-usage
+    notes: Тяжёлый исполнитель Cognition с повышенным reasoning budget.
+
+  - id: swe-2-1-max
+    provider: acp-devin
+    model: swe-2-1-max
+    family: cognition
+    status: promo_free
+    cost_tier: free
+    until: "2026-12-08"
+    capabilities: [code, reasoning]
+    quota_source: devin-usage
+    notes: Максимальный исполнитель Cognition для sprint-режима.
+
+  - id: swe-2-high
+    provider: acp-devin
+    model: swe-2-high
+    family: cognition
+    status: standby
+    cost_tier: subscription
+    capabilities: [code, reasoning]
+    quota_source: devin-usage
+    notes: Legacy-подписочная модель Cognition, резерв после промо.
+
+  - id: gemini-4-neon
+    provider: acp-antigravity-acp
+    model: gemini-4-neon
+    family: google
+    status: active
+    cost_tier: subscription
+    capabilities: [code, reasoning, vision, review]
+    quota_source: antigravity
+    notes: Основной независимый ревьюер и UX-критик с vision.
+
+  - id: deepseek-v4.1-flash
+    provider: pi
+    model: opencode-go/deepseek-v4.1-flash
+    family: deepseek
+    status: active
+    cost_tier: subscription
+    capabilities: [code, reasoning, fast, review]
+    quota_source: manual
+    notes: Быстрый подписочный исполнитель, ревьюер и арбитр через Pi/OpenCode Go.
+
+  - id: claude-opus-5.5
+    provider: acp-devin
+    model: claude-opus-5-5-medium
+    family: anthropic
+    status: standby
+    cost_tier: subscription
+    capabilities: [code, reasoning, review]
+    quota_source: manual
+    notes: Резервный ревьюер/арбитр Anthropic через ACP Devin.
+
+  - id: gpt-6.2-sol
+    provider: pi
+    model: openai/gpt-6.2-sol
+    family: openai
+    status: quota_paused
+    cost_tier: subscription
+    until: "2026-11-27"
+    capabilities: [code, reasoning, review]
+    quota_source: manual
+    notes: Sol временно на паузе по квоте; автоматически возвращается после until.

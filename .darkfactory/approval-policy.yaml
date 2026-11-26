@@ -1,0 +1,27 @@
+version: 1
+autoApprove:
+  enabled: true
+  allowedCategories:
+    - docs
+    - typo
+    - deps
+  maxChangedFiles: 10
+  maxChangedLines: 400
+  requireGreenL1: true
+  requireCleanTamper: true
+  allowPathPatterns:
+    - "docs/**/*.md"
+    - "README.md"
+    - "*.md"
+    - "package-lock.json"
+  denyPathPatterns:
+    - "board_pipeline/**"
+    - "ops/**"
+    - ".darkfactory/**"
+    - "specs/**"
+    - ".github/**"
+    - "**/*.mjs"
+    - "**/*.cjs"
+    - "**/*.js"
+    - "**/*.py"
+    - "**/*.sh"

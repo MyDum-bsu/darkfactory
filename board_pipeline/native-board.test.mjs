@@ -1,14 +1,48 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { memoryBoardSdk } from './board-test-fixture.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 
-const { board, local } = loadSdk();
+let sdk;
+let memoryFallback = false;
+try {
+  sdk = loadSdk();
+} catch {
+  sdk = memoryBoardSdk();
+  memoryFallback = true;
+}
+const { board, local } = sdk;
+
+function compatibleHandle(handle) {
+  if (!memoryFallback) return handle;
+  return {
+    ...handle,
+    tasks: {
+      ...handle.tasks,
+      async createMany(channel, items, options) {
+        const keyed = new Map();
+        const created = [];
+        for (const item of items) {
+          const needs = (item.needs ?? []).map(dep => {
+            if (dep === null || typeof dep !== 'object' || typeof dep.key !== 'string') return dep;
+            if (!keyed.has(dep.key)) throw new Error(`Unknown keyed dependency ${dep.key}`);
+            return keyed.get(dep.key);
+          });
+          const { task } = await handle.tasks.create(channel, { ...item, needs });
+          if (typeof item.key === 'string') keyed.set(item.key, task.id);
+          created.push(task);
+        }
+        return created;
+      },
+    },
+  };
+}
 
 async function isolated(t) {
   const backend = local({ memory: true });
   t.after(() => backend.close());
-  const handle = board({ backend });
+  const handle = compatibleHandle(board({ backend }));
   await handle.createChannel('pilot');
   return handle;
 }
@@ -72,7 +106,7 @@ const FILTER = {
 async function claimedBoard(t) {
   const backend = local({ memory: true });
   t.after(() => backend.close());
-  const handle = board({ backend });
+  const handle = compatibleHandle(board({ backend }));
   await handle.createChannel('pilot');
   const seen = { claim: 0 };
   const ported = {
@@ -97,11 +131,13 @@ function contractTask(handle, labels, over = {}) {
 test('claimReady takes the oldest admitted ready card and returns its contract labels', async t => {
   const { handle, ported, seen } = await claimedBoard(t);
   const plain = await contractTask(handle, { queue: 'vs1', finish: 'verified' });
-  const admitted = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const admitted = await contractTask(handle, { ...CONTRACT, queue: 'vs1' },
+    { text: 'Card-specific claimReady specification' });
   const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
   const picked = await port.claimReady(FILTER);
   assert.equal(picked.taskId, admitted.task.id);
   assert.equal(picked.labels.spec_digest, CONTRACT.spec_digest);
+  assert.equal(picked.text, 'Card-specific claimReady specification');
   assert.notEqual(picked.taskId, plain.task.id);
   assert.equal(seen.claim, 1, 'ровно один native claim — только допущенная карточка');
   const held = await port.verifyHeld(picked.taskId, picked.epoch);
@@ -271,4 +307,69 @@ test('claim() refuses a card that is not ready', async t => {
   await assert.rejects(port.claim(head.id), /not ready for a native claim/, 'повторный claim захваченной карточки');
   assert.equal(seen.claim, 1, 'SDK claim сделан ровно один раз');
   await port.complete(head.id, epoch, { sha: 'c'.repeat(40) });
+});
+
+test('claimReady continues past an individual 409 claim conflict and claims the next ready card', async t => {
+  const { handle, ported } = await claimedBoard(t);
+  const first = await contractTask(handle, { ...CONTRACT, queue: 'vs1' }, { text: 'raced card' });
+  const second = await contractTask(handle, { ...CONTRACT, queue: 'vs1' }, { text: 'claimable card' });
+  const realClaim = handle.tasks.claim.bind(handle.tasks);
+  const calls = [];
+  ported.tasks.claim = async (id, opts) => {
+    calls.push(id);
+    if (id === first.task.id) {
+      const error = new Error('already_claimed');
+      error.code = 'already_claimed';
+      error.statusCode = 409;
+      throw error;
+    }
+    return realClaim(id, opts);
+  };
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  const picked = await port.claimReady(FILTER);
+  assert.equal(picked.taskId, second.task.id);
+  assert.deepEqual(calls, [first.task.id, second.task.id]);
+  assert.equal((await port.lookup(first.task.id)).state, 'ready');
+  assert.equal((await port.lookup(second.task.id)).state, 'claimed');
+});
+
+test('verifyHeld preserves the held capability through transient renew failures but drops definitive loss', async t => {
+  const { handle, ported } = await claimedBoard(t);
+  const { task } = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const realClaim = handle.tasks.claim.bind(handle.tasks);
+  let renews = 0;
+  let transientFailures = 2;
+  let definitiveLoss = false;
+  ported.tasks.claim = async (id, opts) => {
+    const capability = await realClaim(id, opts);
+    return {
+      ...capability,
+      async renew(lease) {
+        renews++;
+        if (transientFailures > 0) {
+          transientFailures--;
+          const error = new Error(transientFailures === 1 ? 'temporary network timeout' : 'HTTP 503');
+          if (transientFailures === 0) error.statusCode = 503;
+          throw error;
+        }
+        if (definitiveLoss) {
+          const error = new Error('claim_lost');
+          error.code = 'claim_lost';
+          error.statusCode = 409;
+          throw error;
+        }
+        return capability.renew(lease);
+      },
+    };
+  };
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  const claimed = await port.claim(task.id);
+  await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /temporary network timeout/);
+  await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /HTTP 503/);
+  const held = await port.verifyHeld(task.id, claimed.epoch);
+  assert.equal(held.epoch, claimed.epoch);
+  assert.equal(renews, 3, 'transient failures did not delete the held capability');
+  definitiveLoss = true;
+  await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /claim_lost/);
+  await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /no native claim is held/);
 });

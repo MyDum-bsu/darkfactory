@@ -11,6 +11,8 @@ import {
   evaluateReworkProgress,
   FALLBACK_ANTIGRAVITY_NEON,
   hasDodViolation,
+  l2ReworkLimitExceeded,
+  DEFAULT_L2_REWORK_LIMIT,
   maxHarmOf,
   NARROW_RESERVE_PI,
   normalizeRoutingPolicy,
@@ -18,12 +20,14 @@ import {
   PRIMARY_WORKER,
   resolveArbitration,
   retiredProviderViolation,
+  roundGate,
   roundSignature,
   selectEscalationReviewer,
   selectWorker,
   workerFamily,
 } from './worker-selector.mjs';
 import { ReviewDenied } from './review-runner.mjs';
+import { createWorkerRuntime } from './worker-runtime.mjs';
 
 const BASE = 'a'.repeat(40);
 const ATTEMPT = { task_id: '7', epoch: 3, attempt_id: 'att-1', base_sha: BASE };
@@ -48,6 +52,7 @@ function spawnLog(results) {
 }
 
 test('selectWorker: acp-devin первым, затем pi/deepseek и antigravity/gemini', () => {
+  assert.deepEqual(PRIMARY_WORKER, { provider: 'acp-devin', model: 'swe-2-1-medium' });
   // Routing Policy v2: резервы ZCode в плане нет; два согласованных резерва
   // независимых семейств идут сразу за первичным.
   assert.deepEqual(selectWorker({ route: {} }),
@@ -95,6 +100,37 @@ test('подтверждённый отказ первичного → резе�
   // google-критик ломает antigravity/gemini — он записан пропущенным до попыток.
   assert.equal(selection.attemptedWorkers.length, 3);
   assert.equal(selection.attemptedWorkers[0].verdict, 'skipped');
+});
+
+test('portable probe confirmed_refusal drives fallback end-to-end', async () => {
+  const missing = Object.assign(new Error('spawn devin ENOENT'), { code: 'ENOENT' });
+  const runtime = createWorkerRuntime({ kind: 'subproc', exec: async command => {
+    if (command === 'devin') throw missing;
+    return { stdout: '1.0' };
+  } });
+  const probed = [];
+  const { calls, spawn } = spawnLog([{ threadId: 'thr_dse2e' }]);
+  const selection = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn, inspectWorktree: cleanTree,
+    probe: async worker => {
+      const result = await runtime.probeAvailability(worker);
+      probed.push([worker.provider, result]);
+      return result;
+    },
+  });
+  assert.equal(selection.outcome, 'spawned');
+  assert.equal(selection.worker.provider, 'pi');
+  assert.equal(selection.threadId, 'thr_dse2e');
+  assert.equal(selection.fallbackReason, 'confirmed_refusal:acp-devin');
+  assert.deepEqual(probed[0], ['acp-devin',
+    { status: 'confirmed_refusal', activeBackgroundAgentCount: 0, reason: 'devin_not_found' }]);
+  assert.deepEqual(calls.map(c => c.provider), ['pi']);
+});
+
+test('roundGate classifies scope fence violations as scope_fence', () => {
+  assert.equal(roundGate({ reason: 'scope_fence_violation' }), 'scope_fence');
+  assert.equal(roundGate({ reason: 'local_checks_failed' }), 'l1');
+  assert.equal(roundGate({ reason: 'tamper_gate_failed' }), 'tamper');
 });
 
 // Резерв, нарушающий триаду, пропускается: критик google ломает
@@ -303,6 +339,43 @@ const detRound = (gate, sig, over = {}) => ({
   dispute: null, contradictory: false, ...over,
 });
 
+// Board #1666: circuit breaker L2 REWORK — потолок раундов критика, по
+// умолчанию 4, настраиваемый; детерминированные гейты лимит не расходуют.
+test('l2ReworkLimitExceeded: четвёртый L2-раунд достигает дефолтного потолка', () => {
+  assert.equal(DEFAULT_L2_REWORK_LIMIT, 4);
+  const l2 = n => Array.from({ length: n }, (_, i) => l2Round({ signature: `s${i}` }));
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(3) }), false);
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(4) }), true);
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(5) }), true);
+  // Раунды l1/tamper/l3 не считаются — лимит только за L2-критиком.
+  const mixed = [detRound('l1', 'a'), detRound('tamper', 'b'), ...l2(3), detRound('l3', 'c')];
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: mixed }), false);
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: [...mixed, l2Round({ signature: 's4' })] }), true);
+  // Настраиваемый лимит только ужесточает: выше дефолтного потолка или
+  // невалидный — fail-closed на дефолт, четвёртый раунд всегда лимитный.
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(2), limit: 2 }), true);
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(1), limit: 2 }), false);
+  for (const loose of [5, 10, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(4), limit: loose }), true, `${loose}`);
+  }
+  for (const bad of [0, -1, 1.5, '4', NaN]) {
+    assert.equal(l2ReworkLimitExceeded({ roundsHistory: l2(4), limit: bad }), true, `${bad}`);
+  }
+  assert.equal(l2ReworkLimitExceeded({ roundsHistory: [] }), false);
+});
+
+// Дефолтная триада (Board #1666): первичный L2-критик — Gemini 4 Neon
+// medium, Pi/Sol — только арбитр; семейства независимы.
+test('дефолтный критик — Gemini 4 Neon medium, дефолтный арбитр — Sol', () => {
+  assert.deepEqual(DEFAULT_CRITIC,
+    { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' });
+  assert.deepEqual(DEFAULT_ARBITER,
+    { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' });
+  const triad = assertTriadIndependent({ executor: PRIMARY_WORKER });
+  assert.notEqual(triad.executor, triad.critic);
+  assert.notEqual(triad.critic, triad.arbiter);
+});
+
 test('сходящаяся починка любой длины не даёт триггеров — нет правила «два круга»', () => {
   const history = [
     detRound('l1', 'sig-1'),
@@ -325,13 +398,31 @@ test('no_progress: повторный tree_sha', () => {
 });
 
 test('no_progress: два раза подряд красный детерминированный гейт с той же сигнатурой', () => {
-  for (const gate of ['l1', 'tamper', 'l3']) {
+  for (const gate of ['l1', 'tamper', 'l3', 'scope_fence']) {
     const history = [detRound(gate, 'same-sig'), detRound(gate, 'same-sig')];
     const p = evaluateReworkProgress({ roundsHistory: history });
     assert.equal(p.trigger, 'no_progress', gate);
     assert.equal(p.kind, 'repeated_deterministic_failure');
     assert.equal(p.deterministicGate, true);
   }
+});
+
+test('no_progress: scope_fence duplicate tree_sha stays deterministic and fails closed', () => {
+  const tree = 'a'.repeat(40);
+  const duplicate = evaluateReworkProgress({ roundsHistory: [
+    detRound('scope_fence', 'sig-a', { tree_sha: tree }),
+    detRound('scope_fence', 'sig-b', { tree_sha: tree }),
+  ] });
+  assert.equal(duplicate.trigger, 'no_progress');
+  assert.equal(duplicate.kind, 'duplicate_tree_sha');
+  assert.equal(duplicate.deterministicGate, true);
+  const repeated = evaluateReworkProgress({ roundsHistory: [
+    detRound('scope_fence', 'same-sig', { tree_sha: 'a'.repeat(40) }),
+    detRound('scope_fence', 'same-sig', { tree_sha: 'b'.repeat(40) }),
+  ] });
+  assert.equal(repeated.trigger, 'no_progress');
+  assert.equal(repeated.kind, 'repeated_deterministic_failure');
+  assert.equal(repeated.deterministicGate, true);
 });
 
 // Пункт 6: разные упавшие проверки L1 дают разные сигнатуры — починка сходится.
@@ -862,20 +953,21 @@ test('selectEscalationReviewer: ни один вариант не сохраня
   assert.equal(unknown.outcome, 'rejected');
 });
 
-// ── Routing Policy v2 rev.2: полный запрет acp-zcode-start ─────────────────
+// ── Owner Decision #18: acp-zcode-start допускается при наличии квоты ──────
 test('retiredProviderViolation: acp-zcode-start отклоняется в любом списке', () => {
   assert.equal(retiredProviderViolation(PRIMARY_WORKER), null);
   assert.equal(retiredProviderViolation({ provider: 'pi', model: 'opencode-go/deepseek-v4' }), null);
   assert.equal(retiredProviderViolation({
-    provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }),
-    'zcode_provider_retired');
+    provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }), null);
+  assert.equal(retiredProviderViolation('zcode'), null);
+  assert.equal(retiredProviderViolation('acp-zcode-start/builtin:zai-start-plan\\GLM-5.3-Flash'), null);
 });
 
 test('явный plan с acp-zcode-start: резерв пропускается, первичный — отказ', async () => {
   const refused = { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
   const zcode = { provider: 'acp-zcode-start',
     model: 'builtin:zai-start-plan\\GLM-5.3-Flash', effort: 'max' };
-  // Резерв zcode — пропуск с явной причиной, маршрут продолжается.
+  // Доступный резерв zcode запускается по обычному порядку fallback.
   const { calls, spawn } = spawnLog([{ threadId: 'thr_ds9' }]);
   const sel = await attemptSpawnWithFallback({
     attempt: ATTEMPT, spawn, inspectWorktree: cleanTree,
@@ -883,26 +975,40 @@ test('явный plan с acp-zcode-start: резерв пропускается,
     probe: async w => w.provider === 'acp-devin' ? refused : QUOTA_OK,
   });
   assert.equal(sel.outcome, 'spawned');
-  assert.equal(sel.worker.provider, 'pi');
-  const retired = sel.attemptedWorkers.find(w => w.provider === 'acp-zcode-start');
-  assert.equal(retired.verdict, 'skipped');
-  assert.equal(retired.reason, 'zcode_provider_retired');
-  // Первичный zcode — отказ маршрута до spawn.
-  const x = spawnLog([{ threadId: 'thr_never' }]);
-  const rej = await attemptSpawnWithFallback({
+  assert.equal(sel.worker, zcode);
+  assert.equal(sel.fallbackReason, 'confirmed_refusal:acp-devin');
+  assert.deepEqual(calls, [zcode]);
+  const spawned = sel.attemptedWorkers.find(w => w.provider === 'acp-zcode-start');
+  assert.equal(spawned.verdict, 'spawned');
+  // Первичный zcode при доступной квоте тоже запускается.
+  const x = spawnLog([{ threadId: 'thr_zcode1' }]);
+  const ok = await attemptSpawnWithFallback({
     attempt: ATTEMPT, spawn: x.spawn, plan: [zcode, NARROW_RESERVE_PI],
     probe: async () => QUOTA_OK, inspectWorktree: cleanTree,
   });
-  assert.equal(rej.outcome, 'rejected');
-  assert.equal(rej.reason, 'zcode_provider_retired');
-  assert.equal(x.calls.length, 0);
+  assert.equal(ok.outcome, 'spawned');
+  assert.equal(ok.worker, zcode);
+  assert.equal(ok.fallbackReason, null);
+  assert.deepEqual(x.calls, [zcode]);
+  // Подтверждённый отказ/исчерпание квоты zcode переводит маршрут на резерв.
+  const y = spawnLog([{ threadId: 'thr_afterzcode' }]);
+  const fallback = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn: y.spawn, plan: [zcode, NARROW_RESERVE_PI],
+    probe: async w => w.provider === 'acp-zcode-start' ? refused : QUOTA_OK,
+    inspectWorktree: cleanTree,
+  });
+  assert.equal(fallback.outcome, 'spawned');
+  assert.equal(fallback.worker.provider, 'pi');
+  assert.equal(fallback.fallbackReason, 'confirmed_refusal:acp-zcode-start');
 });
 
 test('allowlist.worker с acp-zcode-start — отказ политики', () => {
-  assert.throws(() => normalizeRoutingPolicy({
-    routing: { allowlist: { worker: [
-      { provider: 'acp-zcode-start', model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }] } },
-  }), e => e instanceof ReviewDenied && e.reason === 'zcode_provider_retired');
+  const zcode = { provider: 'acp-zcode-start',
+    model: 'builtin:zai-start-plan\\GLM-5.3-Flash' };
+  const normalized = normalizeRoutingPolicy({
+    routing: { allowlist: { worker: [zcode] } },
+  });
+  assert.deepEqual(normalized.allowlist.worker, [zcode]);
 });
 
 // ── Rev.2: строгий DeepSeek-only — аттестованное семейство, не префикс ─────
@@ -974,12 +1080,13 @@ test('selectEscalationReviewer: worker и critic одного семейства
 
 test('retiredProviderViolation рекурсивен: pi/acp-zcode-start в allowlist и plan', async () => {
   const nested = { provider: 'pi', model: 'acp-zcode-start/builtin:zai-start-plan\\GLM-5.3-Flash' };
-  assert.equal(retiredProviderViolation(nested), 'zcode_provider_retired');
-  // normalizeRoutingPolicy: вложенный zcode через харнесс — тот же отказ.
-  assert.throws(() => normalizeRoutingPolicy({
+  assert.equal(retiredProviderViolation(nested), null);
+  // normalizeRoutingPolicy: вложенный zcode через харнесс допускается.
+  const normalized = normalizeRoutingPolicy({
     routing: { allowlist: { worker: [nested] } },
-  }), e => e instanceof ReviewDenied && e.reason === 'zcode_provider_retired');
-  // Явный plan: вложенный zcode-резерв пропускается с той же причиной.
+  });
+  assert.deepEqual(normalized.allowlist.worker, [nested]);
+  // Явный plan: доступный вложенный zcode-резерв запускается.
   const refused = { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
   const { calls, spawn } = spawnLog([{ threadId: 'thr_ds10' }]);
   const sel = await attemptSpawnWithFallback({
@@ -988,18 +1095,18 @@ test('retiredProviderViolation рекурсивен: pi/acp-zcode-start в allow
     probe: async w => w.provider === 'acp-devin' ? refused : QUOTA_OK,
   });
   assert.equal(sel.outcome, 'spawned');
+  assert.equal(sel.worker, nested);
   assert.equal(sel.worker.provider, 'pi');
-  assert.equal(sel.worker.model, 'opencode-go/deepseek-v4.1-flash');
-  const retired = sel.attemptedWorkers.find(w => w.model === nested.model);
-  assert.equal(retired.verdict, 'skipped');
-  assert.equal(retired.reason, 'zcode_provider_retired');
-  assert.equal(calls.length, 1);
+  assert.equal(sel.worker.model, nested.model);
+  const spawned = sel.attemptedWorkers.find(w => w.model === nested.model);
+  assert.equal(spawned.verdict, 'spawned');
+  assert.deepEqual(calls, [nested]);
 });
 
 test('строковые id в plan: zcode и не-DeepSeek opencode-go отклоняются', async () => {
   const refused = { status: 'confirmed_refusal', activeBackgroundAgentCount: 0 };
   const ZCODE_STR = 'acp-zcode-start/builtin:zai-start-plan\\GLM-5.3-Flash';
-  // Строковый zcode-резерв — пропуск с zcode_provider_retired.
+  // Строковый zcode-резерв при доступной квоте запускается.
   const { calls, spawn } = spawnLog([{ threadId: 'thr_ds11' }]);
   const sel = await attemptSpawnWithFallback({
     attempt: ATTEMPT, spawn, inspectWorktree: cleanTree,
@@ -1007,19 +1114,19 @@ test('строковые id в plan: zcode и не-DeepSeek opencode-go откл
     probe: async w => (w === PRIMARY_WORKER ? refused : QUOTA_OK),
   });
   assert.equal(sel.outcome, 'spawned');
-  assert.equal(calls.length, 1);
-  const retired = sel.attemptedWorkers.find(w => w.id === ZCODE_STR);
-  assert.equal(retired.verdict, 'skipped');
-  assert.equal(retired.reason, 'zcode_provider_retired');
-  // Строковый zcode-первичный — отказ маршрута до spawn.
-  const x = spawnLog([{ threadId: 'thr_never' }]);
-  const rej = await attemptSpawnWithFallback({
+  assert.equal(sel.worker, ZCODE_STR);
+  assert.deepEqual(calls, [ZCODE_STR]);
+  const spawned = sel.attemptedWorkers.find(w => w.verdict === 'spawned');
+  assert.equal(spawned.family, 'glm');
+  // Строковый zcode-первичный — обычный запуск маршрута.
+  const x = spawnLog([{ threadId: 'thr_zcode2' }]);
+  const primary = await attemptSpawnWithFallback({
     attempt: ATTEMPT, spawn: x.spawn, plan: [ZCODE_STR],
     probe: async () => QUOTA_OK, inspectWorktree: cleanTree,
   });
-  assert.equal(rej.outcome, 'rejected');
-  assert.equal(rej.reason, 'zcode_provider_retired');
-  assert.equal(x.calls.length, 0);
+  assert.equal(primary.outcome, 'spawned');
+  assert.equal(primary.worker, ZCODE_STR);
+  assert.deepEqual(x.calls, [ZCODE_STR]);
   // Строковый не-DeepSeek opencode-go — первичный отказ и пропуск резерва.
   const y = spawnLog([{ threadId: 'thr_never2' }]);
   const rej2 = await attemptSpawnWithFallback({
@@ -1047,8 +1154,8 @@ test('строковые id в plan: zcode и не-DeepSeek opencode-go откл
   });
   assert.equal(sel3.outcome, 'spawned');
   // И прямые вызовы предикатов со строками.
-  assert.equal(retiredProviderViolation(ZCODE_STR), 'zcode_provider_retired');
-  assert.equal(retiredProviderViolation('pi/acp-zcode-start/x'), 'zcode_provider_retired');
+  assert.equal(retiredProviderViolation(ZCODE_STR), null);
+  assert.equal(retiredProviderViolation('pi/acp-zcode-start/x'), null);
   assert.equal(opencodeGoPolicyViolation('opencode-go/glm-5'), 'opencode_go_non_deepseek_disallowed');
   assert.equal(opencodeGoPolicyViolation('pi/opencode-go/qwen3'), 'opencode_go_non_deepseek_disallowed');
   assert.equal(opencodeGoPolicyViolation('opencode-go/deepseek-v4'), null);

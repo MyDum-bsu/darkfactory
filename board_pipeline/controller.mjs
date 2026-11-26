@@ -3,14 +3,42 @@ import { createQuestion, questionBlockText } from './question-gate.mjs';
 import { advanceQuestion, QUESTION_PHASES } from './question-resume.mjs';
 import { createReleasePackage, releaseQuestionDetails, ReleaseDenied } from './release-contract.mjs';
 import { advanceRelease, RELEASE_PHASES } from './release-flow.mjs';
+import { roundGate, roundSignature, effectiveL2ReworkLimit, l2ReworkLimitExceeded } from './worker-selector.mjs';
+import { partitionFindingsBySeverity } from './review-policy.mjs';
+import { isWorkerThreadId } from './worker-runtime.mjs';
+import { PilotDenied } from './pilot-gate.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
 const shaRE = /^[a-f0-9]{40}$/;
+const confirmedThreadId = value => isWorkerThreadId(value);
 
 // Контракт приёмки, который карточка обязана нести в метках для захвата из очереди:
 // разрешённый профиль, identity репозитория и валидные хэши спеки/политики.
 const CONTRACT_LABELS = ['profile_id', 'repo_id', 'spec_digest', 'policy_digest'];
+
+// Проекция находки критика на whitelist validateAttempt (#1670): критик волен
+// вернуть любые ключи/значения — в verification.prior_findings уходят только
+// примитивные поля приёмки, violates_dod переносится в dod_violation, строки
+// обрезаются до 2000 символов.
+const PRIOR_FINDING_KEYS = ['file', 'line', 'input', 'expected', 'actual', 'freq',
+  'frequency', 'harm', 'severity', 'dod_violation'];
+
+function projectPriorFinding(f) {
+  const out = {};
+  if (f !== null && typeof f === 'object' && !Array.isArray(f)) {
+    for (const k of PRIOR_FINDING_KEYS) {
+      const v = f[k];
+      if (v === undefined) continue;
+      if (v === null || typeof v === 'number' || typeof v === 'boolean') out[k] = v;
+      else if (typeof v === 'string') out[k] = v.slice(0, 2000);
+    }
+    if (out.dod_violation === undefined && typeof f.violates_dod === 'boolean') {
+      out.dod_violation = f.violates_dod;
+    }
+  }
+  return out;
+}
 
 function isAllowlist(a) {
   if (!a || typeof a !== 'object' || Array.isArray(a)) return false;
@@ -33,6 +61,10 @@ function checkRoute(r) {
   if (!/^[1-9][0-9]{0,14}$/.test(r.taskId ?? '') && !isAllowlist(r.allowlist)) {
     throw new Error('A trusted, enrolled route is required');
   }
+  if (r.maxL2ReworkRounds !== undefined &&
+      (!Number.isSafeInteger(r.maxL2ReworkRounds) || r.maxL2ReworkRounds < 1)) {
+    throw new Error('A trusted, enrolled route is required');
+  }
 }
 
 // Фильтр claimReady: канал закреплён адаптером, остальное — allowlist маршрута.
@@ -50,14 +82,36 @@ function queueFilter(route) {
 }
 
 function contractOf(labels) {
+  const pinnedLabels = Object.fromEntries([
+    ...['requires_lean', 'requires_colab', 'touches_migrations', 'pr_ci_red', 'test_first']
+      .map(key => [key, labels?.[key] === 'true' ? true : labels?.[key] === 'false' ? false : undefined]),
+    ['has_ui', labels?.has_ui === 'true' ? true : labels?.has_ui === 'false' ? false : undefined],
+    ['domain', typeof labels?.domain === 'string' && /^[a-z][a-z0-9-]{0,47}$/.test(labels.domain)
+      ? labels.domain : undefined],
+  ].filter(([, value]) => value !== undefined));
+  const hasAllowedPaths = typeof labels?.allowed_paths === 'string' && labels.allowed_paths.length > 0;
+  if (hasAllowedPaths) pinnedLabels.allowed_paths = labels.allowed_paths;
   return {
     repo_id: labels?.repo_id,
     spec_digest: labels?.spec_digest,
     policy_digest: labels?.policy_digest,
     fixtures_digest: typeof labels?.fixtures_digest === 'string' ? labels.fixtures_digest : null,
+    // Явный L1-выбор оператора при постановке — контрактная метка:
+    // контроллер обязан применить именно её, а не свой дефолт repo_id.
+    // Значение передаётся без приведения: заданное нестроковое значение
+    // обязано быть отклонено fail-closed на приёмке, а не трактоваться
+    // как отсутствие метки.
+    l1_profile: labels?.l1_profile,
     // Метка has_ui карточки может только ВКЛЮЧИТЬ L3; 'false' не выключает
     // обязательный profile.has_ui — решение остаётся у оператора.
     has_ui: labels?.has_ui === 'true' ? true : undefined,
+    // Категория рутинной работы для policy-driven auto-approve (#1745):
+    // контрактная метка карточки, не слово воркера.
+    category: typeof labels?.category === 'string' ? labels.category : undefined,
+    ...(hasAllowedPaths ? { allowed_paths: labels.allowed_paths } : {}),
+    // Декларируемые предикаты skillPicker из меток карточки: boolean-метки
+    // нормализуются 'true'/'false' → boolean, domain — id-строкой.
+    labels: pinnedLabels,
   };
 }
 
@@ -76,7 +130,15 @@ function attemptOf(record, route) {
     attempt.spec_digest = record.contract.spec_digest;
     attempt.policy_digest = record.contract.policy_digest;
     attempt.fixtures_digest = record.contract.fixtures_digest ?? null;
+    if (record.contract.l1_profile !== undefined) attempt.l1_profile = record.contract.l1_profile;
     if (record.contract.has_ui !== undefined) attempt.has_ui = record.contract.has_ui;
+    if (record.contract.category !== undefined) attempt.category = record.contract.category;
+    if (record.contract.allowed_paths !== undefined) attempt.allowed_paths = record.contract.allowed_paths;
+    if (record.contract.labels !== undefined) {
+      attempt.labels = Object.fromEntries(Object.entries(record.contract.labels)
+        .filter(([key]) => key !== 'allowed_paths'));
+    }
+    if (typeof record.contract.specText === 'string') attempt.specText = record.contract.specText;
   }
   return attempt;
 }
@@ -86,16 +148,33 @@ function attemptOf(record, route) {
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
 export async function advance({ route, state, board, bb, submissions, verify, authorize,
-  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger }) {
+  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger, eventBus }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const hazards = mutants ?? {};
   const binding = createHash('sha256').update(JSON.stringify(route)).digest('hex');
   let record = await state.load();
   if (record && record.binding !== binding) throw new Error('The enrolled route changed');
+  let lastEmittedPhase = record?.phase;
+  // Fail-open события фаз для Control Room (V2-3): bus необязателен, его
+  // отсутствие и любая ошибка доставки не влияют на WAL и тик.
+  const emitPhase = () => {
+    if (!record?.phase || record.phase === lastEmittedPhase) return;
+    const phase = record.phase;
+    lastEmittedPhase = phase;
+    const attempt = attemptOf(record, route);
+    const kind = phase === 'awaiting_answer' ? 'question_blocked'
+      : phase === 'done' ? 'completed'
+      : TERMINAL.has(phase) ? phase
+      : 'phase';
+    eventBus?.emit({ kind, phase, task_id: attempt.task_id, attempt_id: attempt.attempt_id,
+      epoch: attempt.epoch, reason: record.reason ?? null, role: 'controller',
+      detail: { threadId: record.threadId ?? null, sha: record.sha ?? null } });
+  };
   const save = async patch => {
     record = patch === null ? null : { ...record, ...patch };
     await state.save(record);
+    emitPhase();
   };
   const visible = () => ({ phase: record.phase, attemptId: record.attemptId,
     epoch: record.epoch, threadId: record.threadId, reason: record.reason, sha: record.sha,
@@ -155,11 +234,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       // GUARD:NoDuplicateSpawn — только ровно одно точное совпадение маркера
       // при живой аренде подхватывает тред; empty/ambiguous/ошибка — карантин
       // с сохранением брони worktree и нулём повторных bb.spawn.
-      const confirmed = res?.status === 'matched' && /^thr_[a-z0-9]+$/.test(res.threadId ?? '');
+      const confirmed = ['matched', 'found'].includes(res?.status) && confirmedThreadId(res.threadId);
       if (hazards.retrySpawnOnEmpty && !confirmed) {
         try {
           const retried = await bb.spawn(attemptOf(record, route));
-          if (/^thr_[a-z0-9]+$/.test(retried?.threadId ?? '')) {
+          if (confirmedThreadId(retried?.threadId)) {
             await save({ phase: 'working', threadId: retried.threadId,
               receipt: { kind: 'spawn', threadId: retried.threadId, confirmed: 'unsafe_retry' } });
             return visible();
@@ -188,6 +267,17 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       await save({ phase: 'working',
         receipt: { kind: 'feedback', feedbackId: intent.feedbackId, confirmed: 'reconciled' } });
       return visible();
+    }
+    if (record.phase === 'claiming' && record.taskId === undefined) {
+      if (route.taskId === undefined) {
+        await save(null);
+        return { phase: 'idle' };
+      }
+      const looked = await board.lookup(route.taskId).catch(() => null);
+      if (looked?.state === 'ready') {
+        await save(null);
+        return { phase: 'idle' };
+      }
     }
     // claiming/checking или отсутствующий intent: внешний эффект не доказан.
     return uncertain(`interrupted_${record.phase}`);
@@ -221,7 +311,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         return visible();
       }
       try {
-        const [primary] = workerSelector.selectWorker({ route });
+        const primary = workerSelector.baseWorker ?? workerSelector.selectWorker({ route })[0];
         workerSelector.assertTriadIndependent({ executor: primary, critic: selCritic, arbiter: selArbiter });
       } catch (e) {
         await save({ binding, phase: 'hold',
@@ -252,15 +342,28 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         }
         claim = picked;
         contract = contractOf(picked.labels);
+        if (typeof picked.text === 'string') contract.specText = picked.text;
       }
       if (!Number.isSafeInteger(claim.epoch) || claim.epoch < 1) throw new Error('No native claim epoch');
       await save({ phase: 'launching', taskId: claim.taskId ?? route.taskId, epoch: claim.epoch,
         until: claim.until, ...(contract ? { contract } : {}),
         intent: { kind: 'spawn', attemptId: record.attemptId, epoch: claim.epoch,
           marker: record.attemptId } });
-      if (!await authorize('claimed', record.taskId)) {
-        await save({ phase: 'hold', reason: 'route_changed_before_spawn' });
+      const blockBeforeSpawn = async (reason, extraState = null) => {
+        const blockText = board.blockText?.(record.epoch, reason) ?? reason;
+        await save({ phase: 'blocking', ...(extraState ?? {}),
+          intent: { kind: 'block', attemptId: record.attemptId, epoch: record.epoch,
+            reason, blockText: blockText.slice(0, 1000) } });
+        try {
+          await board.block(record.taskId, record.epoch, blockText);
+          await save({ phase: 'hold', reason, receipt: { kind: 'block' } });
+        } catch {
+          return reconcileInFlight();
+        }
         return visible();
+      };
+      if (!await authorize('claimed', record.taskId)) {
+        return blockBeforeSpawn('route_changed_before_spawn');
       }
       const proof = await board.verifyHeld(record.taskId, claim.epoch).catch(() => null);
       if (proof?.epoch !== claim.epoch) {
@@ -283,12 +386,24 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           } catch {
             // Исключение пина — fail-closed: дефолтный воркер не запускается
             // на недоказанной триаде (ревью #1263 r2).
-            await save({ phase: 'hold', reason: 'route_pin_failed' });
-            return visible();
+            return blockBeforeSpawn('route_pin_failed');
           }
         }
         if (pinned?.outcome === 'rejected') {
-          await save({ phase: 'hold', reason: pinned.reason ?? 'route_rejected' });
+          // Карточка уже захвачена (claim выполнен до пина): отказ триады без
+          // блока оставил бы бесхозный claim до истечения аренды — штатно
+          // блокируем с причиной для владельца (#1666 r3).
+          const reason = pinned.reason ?? 'route_rejected';
+          const blockText = board.blockText?.(record.epoch, reason) ?? reason;
+          await save({ phase: 'blocking',
+            intent: { kind: 'block', attemptId: record.attemptId, epoch: record.epoch,
+              reason, blockText: blockText.slice(0, 1000) } });
+          try {
+            await board.block(record.taskId, record.epoch, blockText);
+            await save({ phase: 'hold', reason, receipt: { kind: 'block' } });
+          } catch {
+            return reconcileInFlight();
+          }
           return visible();
         }
         const attemptCritic = pinned?.critic ?? selCritic;
@@ -299,7 +414,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         // ответе reconcileSpawn восстанавливает попытку уже с триадой —
         // worker пишется по факту после выбора исполнителя.
         await save({ triad: { worker: attemptPlan[0], critic: attemptCritic, arbiter: attemptArbiter } });
-        // Приоритет acp-devin/swe-2-high; резерв только при подтверждённом
+        // Приоритет acp-devin/swe-2-1-medium; резерв только при подтверждённом
         // отказе, неизвестный исход — карантин без второго писателя.
         const selection = await workerSelector.attemptSpawnWithFallback({
           route, attempt: attemptOf(record, route),
@@ -323,9 +438,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           return reconcileInFlight('worker_launch_outcome_unknown');
         }
         if (selection.outcome !== 'spawned') {
-          await save({ phase: 'hold', reason: selection.reason ?? 'no_available_worker',
-            attemptedWorkers: selection.attemptedWorkers });
-          return visible();
+          return blockBeforeSpawn(selection.reason ?? 'no_available_worker',
+            { attemptedWorkers: selection.attemptedWorkers });
         }
         launched = { threadId: selection.threadId };
         workerTrail = { executor: selection.worker, fallbackReason: selection.fallbackReason ?? null,
@@ -336,7 +450,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       } else {
         launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
       }
-      if (!/^thr_[a-z0-9]+$/.test(launched?.threadId ?? '')) throw new Error('No confirmed BB thread');
+      if (!confirmedThreadId(launched?.threadId)) throw new Error('No confirmed BB thread');
       await save({ phase: 'working', threadId: launched.threadId,
         receipt: { kind: 'spawn', threadId: launched.threadId }, ...(workerTrail ?? {}) });
     } catch (e) {
@@ -395,6 +509,26 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   if (!after && record.seenShas.length && (!submission || record.seenShas.includes(submission.candidate_sha))) {
     return visible();
   }
+  const workerCrashed = observation.state === 'exited' && observation.exitCode !== 0 &&
+    (submission === undefined || submission === null);
+  if (workerCrashed) {
+    const crashResumes = Number.isSafeInteger(record.crashResumes) ? record.crashResumes : 0;
+    if (crashResumes < 2 && typeof bb.resume === 'function') {
+      let resumeFailed = false;
+      let resumed;
+      try {
+        resumed = await bb.resume({ attempt, turnSeq, reason: 'worker_crashed', crashResumes });
+      } catch {
+        resumeFailed = true;
+      }
+      if (!resumeFailed && resumed?.resumed !== false && resumed?.confirmed !== false &&
+          (resumed?.threadId === undefined || resumed.threadId === attempt.bb_thread_id)) {
+        await save({ phase: 'working', turnSeq, crashResumes: crashResumes + 1,
+          receipt: { kind: 'resume', confirmed: 'started' } });
+        return visible();
+      }
+    }
+  }
   const stopWith = async (reason, extraState = null, detail = '') => {
     const privateText = `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}.${detail ? ` ${detail}` : ''} Проверьте ход; повтор не отправлен.`;
     const blockText = board.blockText?.(attempt.epoch, privateText) ?? privateText;
@@ -448,7 +582,12 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       evidence: 'Проверки и seal пройдены.',
     } : { prompt: 'Передать проверенный кандидат в стадию допуска к выпуску?',
       evidence: 'Проверки и seal пройдены. Ответ не запускает выпуск.' }) });
-  if (!submission) return stopWith(after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
+  if (submission === undefined) {
+    return stopWith(after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
+  }
+  if (submission === null || typeof submission !== 'object' || Array.isArray(submission)) {
+    return stopWith('invalid_or_stale_submission');
+  }
   const taskId = Number.isSafeInteger(submission.task_id) ? String(submission.task_id) : submission.task_id;
   if (taskId !== attempt.task_id || submission.epoch !== attempt.epoch ||
       submission.attempt_id !== attempt.attempt_id || submission.worker_thread_id !== attempt.bb_thread_id) {
@@ -473,34 +612,87 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     try { prepared = await release.prepare(submission.candidate_sha); }
     catch (cause) { return stopWith(cause instanceof ReleaseDenied ? cause.code : 'release_prepare_failed'); }
   }
-  const verification = prepared ? { ...attempt, release_target: { finish: 'deployed', target_id: prepared.target,
-    release_channel: 'isolated-static', previous_live_digest: prepared.previous.digest } } : attempt;
-  const result = await verify(verification, { ...submission, task_id: taskId });
+  // Diff-Scoped Round 2+ (#1745): следующий критик получает номер L2-раунда и
+  // блокирующие находки прошлого раунда из доверенной истории попытки —
+  // верификация проверяет закрытие P0/P1 и отсутствие новых регрессий,
+  // а не полный аудит заново.
+  const priorL2 = (record.roundsHistory ?? []).filter(r => r?.gate === 'l2');
+  const lastL2 = priorL2.at(-1);
+  // Блокирующие находки прошлого раунда; excerpt-only возражение (валидный
+  // REVIEW_BLOCKED без structured findings) не пропадает из скоупа — оно
+  // синтезируется в находку для критика.
+  const priorBlocking = partitionFindingsBySeverity(lastL2?.findings).blocking
+    .slice(0, 256).map(projectPriorFinding);
+  const excerptFinding = !priorBlocking.length && typeof lastL2?.excerpt === 'string' &&
+    lastL2.excerpt.trim()
+    ? [{ file: 'review.excerpt', expected: lastL2.excerpt.slice(0, 2000),
+        actual: 'blocking objection without structured findings' }]
+    : [];
+  const verification = { ...attempt,
+    review_round: priorL2.length + 1,
+    prior_findings: priorBlocking.length ? priorBlocking : excerptFinding,
+    // Предыдущий проверенный SHA: раннеры строят инкрементальный diff
+    // prior→current, отделяя новые регрессии от уже проверенных изменений.
+    ...(shaRE.test(lastL2?.sha ?? '') ? { prior_sha: lastL2.sha } : {}),
+    ...(prepared ? { release_target: { finish: 'deployed', target_id: prepared.target,
+      release_channel: 'isolated-static', previous_live_digest: prepared.previous.digest } } : {}) };
+  let result;
+  try {
+    result = await verify(verification, { ...submission, task_id: taskId });
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    const leaseEvidence = `${error?.code ?? ''} ${message}`;
+    if (/lease[_ ]lost|claim_not_held|claim_lost|epoch_mismatch/i.test(leaseEvidence)) {
+      await save({ phase: 'lease_lost', reason: message.slice(0, 200) || 'lease_lost' });
+      return visible();
+    }
+    await save({ phase: 'uncertain', reason: 'verify_interrupted' });
+    if (error instanceof PilotDenied) throw error;
+    return visible();
+  }
+  if (result === null || typeof result !== 'object' || typeof result.outcome !== 'string') {
+    await save({ phase: 'uncertain', reason: 'verify_interrupted' });
+    return visible();
+  }
   if (result.outcome === 'rework') {
     let roundsHistory;
     let arbitrationUsed = record.arbitrationUsed ?? 0;
     let feedbackReason = result.reason;
     let feedbackEvidence = result.feedback;
     let feedbackSuffix = '';
+    // Раунд фиксируется в истории попытки независимо от селектора (#1666 r5):
+    // без workerSelector история и лимитный L2-ревью-стоп те же. Сходящаяся
+    // починка не ограничена счётчиком кругов — триггеры только содержательные.
+    // tree_sha берётся из реальной инспекции снимка (result.tree_sha), не из
+    // слов воркера.
+    const roundGateOf = workerSelector?.roundGate ?? roundGate;
+    const roundSignatureOf = workerSelector?.roundSignature ?? roundSignature;
+    const effectiveL2LimitOf = workerSelector?.effectiveL2ReworkLimit ?? effectiveL2ReworkLimit;
+    const l2LimitExceededOf = workerSelector?.l2ReworkLimitExceeded ?? l2ReworkLimitExceeded;
+    const roundFindings = Array.isArray(result.feedback?.findings)
+      ? result.feedback.findings : [];
+    const round = {
+      sha: submission.candidate_sha,
+      tree_sha: result.tree_sha ?? result.receipt?.tree_sha ?? null,
+      gate: roundGateOf(result),
+      signature: roundSignatureOf(result),
+      blocking: roundFindings.length ? roundFindings.length : null,
+      findings: roundFindings,
+      excerpt: result.feedback?.excerpt ?? null,
+      checkpoint: result.feedback?.checkpoint ?? result.checkpoint ?? null,
+      dispute: submission.dispute ?? null,
+      contradictory: result.contradictory === true,
+    };
+    roundsHistory = [...(record.roundsHistory ?? []), round];
+    // Circuit breaker L2 (Board #1666): лимитный L2-раунд останавливает
+    // попытку без следующего круга и до арбитража — directed_rework был бы
+    // пятым раундом. Эскалация — hold карточки владельцу с причиной.
+    const l2Limit = effectiveL2LimitOf(route.maxL2ReworkRounds);
+    if (l2LimitExceededOf({ roundsHistory, limit: l2Limit })) {
+      return stopWith('l2_rework_limit_exceeded', { roundsHistory },
+        JSON.stringify({ limit: l2Limit }));
+    }
     if (workerSelector) {
-      // Раунд фиксируется в истории попытки; сходящаяся починка не ограничена
-      // счётчиком кругов — триггеры только содержательные. tree_sha берётся из
-      // реальной инспекции снимка (result.tree_sha), не из слов воркера.
-      const roundFindings = Array.isArray(result.feedback?.findings)
-        ? result.feedback.findings : [];
-      const round = {
-        sha: submission.candidate_sha,
-        tree_sha: result.tree_sha ?? result.receipt?.tree_sha ?? null,
-        gate: workerSelector.roundGate(result),
-        signature: workerSelector.roundSignature(result),
-        blocking: roundFindings.length ? roundFindings.length : null,
-        findings: roundFindings,
-        excerpt: result.feedback?.excerpt ?? null,
-        checkpoint: result.feedback?.checkpoint ?? result.checkpoint ?? null,
-        dispute: submission.dispute ?? null,
-        contradictory: result.contradictory === true,
-      };
-      roundsHistory = [...(record.roundsHistory ?? []), round];
       const progress = workerSelector.evaluateReworkProgress({ roundsHistory });
       if (progress.trigger === 'no_progress' && progress.deterministicGate) {
         // Красный детерминированный гейт без прогресса не арбитрируется.
@@ -524,7 +716,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           subjectDigest,
           dodViolation: workerSelector.hasDodViolation?.(allFindings) === true,
           verifyHeld: (id, ep) => board.verifyHeld(id, ep),
-          arbitrate: workerSelector.arbitrate,
+          arbitrate: typeof workerSelector.arbitrate === 'function'
+            ? request => workerSelector.arbitrate({ ...request,
+                ...(attempt.spec_digest !== undefined ? { spec_digest: attempt.spec_digest } : {}),
+                ...(attempt.specText !== undefined ? { specText: attempt.specText } : {}) })
+            : workerSelector.arbitrate,
         });
         if (ruling.decision === 'lease_lost') {
           await save({ phase: 'lease_lost', reason: ruling.reason, roundsHistory });
@@ -610,9 +806,12 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       .catch(() => null);
     if (!sent?.confirmed) return reconcileInFlight();
     await save({ phase: 'working', receipt: { kind: 'feedback', feedbackId } });
+    eventBus?.emit({ kind: 'rework', phase: 'working', task_id: attempt.task_id,
+      attempt_id: attempt.attempt_id, epoch: attempt.epoch, reason: feedbackReason,
+      round: roundsHistory?.filter(r => r.gate === 'l2').length ?? null });
   } else if (result.outcome === 'verified' && result.receipt?.settle === 'completed' && route.finish === 'verified') {
-    const settled = await board.lookup(attempt.task_id);
-    if (settled.state !== 'completed' || settled.result?.sha !== submission.candidate_sha) {
+    const settled = await board.lookup(attempt.task_id).catch(() => null);
+    if (settled?.state !== 'completed' || settled.result?.sha !== submission.candidate_sha) {
       await save({ phase: 'uncertain', reason: 'completed_sha_not_confirmed' });
     } else {
       await save({ phase: 'done' });
@@ -629,6 +828,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     } catch {
       return reconcileInFlight();
     }
+  } else if (/claim_not_held/.test(String(result.reason ?? ''))) {
+    await save({ phase: 'lease_lost', reason: result.reason ?? 'claim_not_held' });
   } else {
     await save({ phase: result.outcome === 'uncertain' ? 'uncertain' : 'hold', reason: result.reason ?? 'unverified' });
   }

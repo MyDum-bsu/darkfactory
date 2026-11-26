@@ -3,12 +3,25 @@ import test from 'node:test';
 import { advance } from './controller.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
+import { memoryBoardSdk } from './board-test-fixture.mjs';
 import * as ws from './worker-selector.mjs';
 
 const workerSelector = (over = {}) => ({ ...ws, ...over });
 
+// Детерминированный check-контейнер (rootless Docker, --network=none) не
+// содержит приватного host-SDK: там тесты идут на in-memory Board той же
+// формы. На хосте с установленным SDK — как и раньше через loadSdk.
+function sdk() {
+  try {
+    return loadSdk();
+  } catch (error) {
+    if (error?.code !== 'MODULE_NOT_FOUND' && error?.code !== 'ERR_MODULE_NOT_FOUND') throw error;
+    return memoryBoardSdk();
+  }
+}
+
 async function lab(t, finish = 'verified') {
-  const { board, local } = loadSdk();
+  const { board, local } = sdk();
   const backend = local({ memory: true });
   t.after(() => backend.close());
   const handle = board({ backend });
@@ -50,7 +63,7 @@ async function lab(t, finish = 'verified') {
 
 // Очередный (queue-driven) слот: маршрут без taskId, допуск по allowlist, две связанные карточки.
 async function queueLab(t, { finish = 'verified', owner = 'board:client', labels = CONTRACT, extra } = {}) {
-  const { board, local } = loadSdk();
+  const { board, local } = sdk();
   const backend = local({ memory: true });
   t.after(() => backend.close());
   const handle = board({ backend });
@@ -302,6 +315,22 @@ test('queue mode pins the card contract into the attempt for the subject manifes
   assert.equal(x.effects.spawn, 1);
 });
 
+test('queue mode pins the card l1_profile label into the attempt', async t => {
+  // Явный L1-выбор оператора при постановке — контрактная метка:
+  // попытка несёт её в verify, а не дефолт repo_id контроллера.
+  const x = await queueLab(t, { labels: { ...CONTRACT, l1_profile: 'python-node' } });
+  await x.tick();
+  x.submit('c');
+  await x.tick();
+  assert.equal(x.effects.attempts.at(-1).l1_profile, 'python-node');
+  // Без метки попытка не несёт явного выбора — действует дефолт.
+  const plain = await queueLab(t);
+  await plain.tick();
+  plain.submit('c');
+  await plain.tick();
+  assert.equal(plain.effects.attempts.at(-1).l1_profile, undefined);
+});
+
 test('queue mode does not claim foreign, unauthorized, incomplete-contract or held cards', async t => {
   for (const [opts, phase, reason] of [
     [{ owner: 'board:other' }, 'idle', undefined],
@@ -442,6 +471,59 @@ test('a triad violation rejects the route before any claim or spawn', async t =>
   assert.equal(x.effects.spawn, 0);
 });
 
+test('pre-claim triad validation uses configured baseWorker over selectWorker fallback', async t => {
+  const x = await lab(t);
+  const configured = { provider: 'acp-devin', model: 'swe-2-1-max' };
+  x.cfg.route.critic = { provider: 'acp-devin', model: 'swe-2-medium' };
+  x.cfg.workerSelector = workerSelector({
+    baseWorker: configured,
+    selectWorker: () => [{ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' }],
+  });
+  assert.equal((await x.tick()).reason, 'route_triad_violation:review_same_family');
+  assert.equal((await x.inspect()).state, 'ready');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('pre-claim triad validation accepts an independent configured baseWorker', async t => {
+  const x = await lab(t);
+  const configured = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const critic = { provider: 'acp-devin', model: 'swe-2-medium' };
+  x.cfg.route.critic = critic;
+  x.cfg.workerSelector = workerSelector({
+    critic,
+    baseWorker: configured,
+    selectWorker: () => [ws.PRIMARY_WORKER],
+    pinTriad: async () => ({ plan: [configured], critic, arbiter: ws.DEFAULT_ARBITER }),
+  });
+  x.cfg.bb.probeAvailability = async () => ({ status: 'available', activeBackgroundAgentCount: 0 });
+  x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
+  x.cfg.bb.spawn = async envelope => {
+    x.effects.spawn++;
+    assert.deepEqual(envelope.executor, configured);
+    return { threadId: 'thr_configured' };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.deepEqual(record.executor, configured);
+  assert.equal(x.effects.spawn, 1);
+});
+
+test('pre-claim triad validation keeps the selectWorker fallback when baseWorker is undefined', async t => {
+  const x = await lab(t);
+  let selected = 0;
+  x.cfg.route.critic = { provider: 'acp-devin', model: 'swe-2-medium' };
+  x.cfg.workerSelector = workerSelector({
+    selectWorker: () => {
+      selected++;
+      return [ws.PRIMARY_WORKER];
+    },
+  });
+  assert.equal((await x.tick()).reason, 'route_triad_violation:review_same_family');
+  assert.equal(selected, 1);
+  assert.equal((await x.inspect()).state, 'ready');
+  assert.equal(x.effects.spawn, 0);
+});
+
 // Пункт 4: нарушение триады первичным отклоняет маршрут до claim; нарушение
 // резервом — пропуск резерва, маршрут продолжается со следующим кандидатом.
 test('a fallback violating the triad is skipped, the route continues', async t => {
@@ -502,6 +584,136 @@ test('three converging rework rounds complete without a round cap', async t => {
   assert.equal(arbitrations, 0, 'арбитр не вызывался при нормальной сходимости');
   const record = await x.cfg.state.load();
   assert.equal(record.roundsHistory.length, 3);
+});
+
+// Board #1666: circuit breaker L2 REWORK — четвёртый L2-раунд останавливает
+// попытку без пятого круга; даже триггер no_progress не доходит до арбитража.
+test('the fourth L2 rework round stops with l2_rework_limit_exceeded and no fifth round', async t => {
+  const x = await lab(t);
+  let arbitrations = 0;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => { arbitrations++; } });
+  await x.tick();
+  const rework = (finding, extra = {}) => ({ outcome: 'rework',
+    reason: 'review_verdict:REVIEW_BLOCKED',
+    feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings: [finding] }, ...extra });
+  const bad = {
+    [BAD1]: rework({ file: 'a.js', expected: 'e1', actual: 'x1' }),
+    [BAD2]: rework({ file: 'b.js', expected: 'e2', actual: 'x2' }),
+    [BAD3]: rework({ file: 'c.js', expected: 'e3', actual: 'x3' }),
+    // Четвёртый раунд повторяет находку третьего: без потолка здесь был бы
+    // триггер repeated_l2_finding и арбитраж; потолок срабатывает раньше.
+    ['b' + '4'.repeat(39)]: rework({ file: 'c.js', expected: 'e3', actual: 'x3' }),
+  };
+  x.cfg.verify = async (attempt, submission) => {
+    x.effects.verify++;
+    const scripted = bad[submission.candidate_sha];
+    if (scripted) return scripted;
+    await x.cfg.board.complete(attempt.task_id, attempt.epoch, { sha: submission.candidate_sha });
+    return { outcome: 'verified', receipt: { settle: 'completed' } };
+  };
+  for (const sha of Object.keys(bad).slice(0, 3)) {
+    x.submit(sha);
+    assert.equal((await x.tick()).phase, 'working', `раунд ${sha.slice(-2)} — обычный возврат`);
+  }
+  x.submit('b' + '4'.repeat(39));
+  const stopped = await x.tick();
+  assert.equal(stopped.phase, 'hold');
+  assert.equal(stopped.reason, 'l2_rework_limit_exceeded');
+  assert.equal(x.effects.feedback.length, 3, 'четвёртый REWORK не вернулся воркеру — пятого круга нет');
+  assert.equal(arbitrations, 0, 'арбитраж после лимитного раунда не запускается');
+  const record = await x.cfg.state.load();
+  assert.equal(record.roundsHistory.length, 4);
+  assert.match((await x.inspect()).blocked.reason, /l2_rework_limit_exceeded/);
+  // Пятый раунд невозможен: новый handoff по той же попытке не возобновляет проверку.
+  const verifies = x.effects.verify;
+  x.submit('c');
+  const after = await x.tick();
+  assert.equal(after.phase, 'hold');
+  assert.equal(x.effects.verify, verifies, 'verify на пятый раунд не вызывался');
+});
+
+// Board #1666 r5: circuit breaker не зависит от селектора — без workerSelector
+// четвёртый L2 REWORK так же останавливает попытку hold'ом и не возвращается
+// воркеру четвёртым feedback; пятый кандидат не проверяется.
+test('the fourth L2 rework stops with l2_rework_limit_exceeded without workerSelector', async t => {
+  const x = await lab(t);
+  await x.tick();
+  const rework = finding => ({ outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+    feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings: [finding] } });
+  const bad = {
+    [BAD1]: rework({ file: 'a.js', expected: 'e1', actual: 'x1' }),
+    [BAD2]: rework({ file: 'b.js', expected: 'e2', actual: 'x2' }),
+    [BAD3]: rework({ file: 'c.js', expected: 'e3', actual: 'x3' }),
+    ['b' + '4'.repeat(39)]: rework({ file: 'd.js', expected: 'e4', actual: 'x4' }),
+  };
+  x.cfg.verify = async (attempt, submission) => {
+    x.effects.verify++;
+    const scripted = bad[submission.candidate_sha];
+    if (scripted) return scripted;
+    await x.cfg.board.complete(attempt.task_id, attempt.epoch, { sha: submission.candidate_sha });
+    return { outcome: 'verified', receipt: { settle: 'completed' } };
+  };
+  for (const sha of [BAD1, BAD2, BAD3]) {
+    x.submit(sha);
+    assert.equal((await x.tick()).phase, 'working', `раунд ${sha.slice(-2)} — обычный возврат`);
+  }
+  x.submit('b' + '4'.repeat(39));
+  const stopped = await x.tick();
+  assert.equal(stopped.phase, 'hold');
+  assert.equal(stopped.reason, 'l2_rework_limit_exceeded');
+  assert.equal(x.effects.feedback.length, 3, 'четвёртый REWORK не вернулся воркеру');
+  const record = await x.cfg.state.load();
+  assert.equal(record.roundsHistory.length, 4);
+  assert.match((await x.inspect()).blocked.reason, /l2_rework_limit_exceeded/);
+  const verifies = x.effects.verify;
+  x.submit('c');
+  const after = await x.tick();
+  assert.equal(after.phase, 'hold');
+  assert.equal(x.effects.verify, verifies, 'verify на пятый раунд не вызывался');
+});
+
+test('route.maxL2ReworkRounds настраивает потолок L2-раундов', async t => {
+  const x = await lab(t);
+  x.cfg.route.maxL2ReworkRounds = 2;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => ({ decision: 'directed_rework' }) });
+  await x.tick();
+  const rework = finding => ({ outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+    feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings: [finding] } });
+  x.cfg.verify = async (attempt, submission) => submission.candidate_sha === BAD1
+    ? rework({ file: 'a.js', expected: 'e1', actual: 'x1' })
+    : rework({ file: 'b.js', expected: 'e2', actual: 'x2' });
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit(BAD2);
+  const stopped = await x.tick();
+  assert.equal(stopped.phase, 'hold');
+  assert.equal(stopped.reason, 'l2_rework_limit_exceeded');
+  assert.equal(x.effects.feedback.length, 1);
+});
+
+// Лимит маршрута только ужесточает потолок: значение выше дефолтного не
+// ослабляет circuit breaker — четвёртый L2 REWORK всё равно лимитный.
+test('route.maxL2ReworkRounds выше дефолта не отменяет остановку на четвёртом REWORK', async t => {
+  const x = await lab(t);
+  x.cfg.route.maxL2ReworkRounds = 5;
+  x.cfg.workerSelector = workerSelector({ arbitrate: async () => { throw new Error('no arbitration'); } });
+  await x.tick();
+  const rework = finding => ({ outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+    feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings: [finding] } });
+  x.cfg.verify = async (attempt, submission) =>
+    rework({ file: 'a.js', expected: 'e', actual: `x-${submission.candidate_sha.slice(0, 4)}` });
+  for (const sha of [BAD1, BAD2, BAD3]) {
+    x.submit(sha);
+    assert.equal((await x.tick()).phase, 'working');
+  }
+  x.submit('b' + '4'.repeat(39));
+  const stopped = await x.tick();
+  assert.equal(stopped.phase, 'hold');
+  assert.equal(stopped.reason, 'l2_rework_limit_exceeded');
+  assert.equal(x.effects.feedback.length, 3);
+  // Причина владельцу сообщает фактически применённый лимит, а не сырое
+  // значение маршрута выше потолка (#1666 r4).
+  assert.match((await x.inspect()).blocked?.reason ?? '', /\{"limit":4\}/);
 });
 
 // Пункт 6: L1 починил тест A, упал тест B — разные сигнатуры, починка сходится.
@@ -1004,6 +1216,11 @@ test('rejected pinTriad — явный hold без spawn', async t => {
   assert.equal(out.phase, 'hold');
   assert.equal(out.reason, 'route_base_triad_violation:x');
   assert.equal(x.effects.spawn, 0);
+  // Отказ после claim: карточка заблокирована с причиной, а не оставлена
+  // захваченной до истечения аренды (#1666 r3).
+  const card = await x.inspect();
+  assert.equal(card.state, 'blocked');
+  assert.match(card.blocked?.reason ?? '', /route_base_triad_violation/);
 });
 
 test('исключение pinTriad — fail-closed hold, дефолтный воркер не запускается', async t => {
@@ -1106,4 +1323,157 @@ test('reconcileSpawn после потери ответа резервного �
   await x.tick();
   assert.deepEqual(x.effects.attempts[0].executor, RESERVE);
   assert.deepEqual(x.effects.attempts[0].triad, record.triad);
+});
+
+// Board #1670: находки критика с произвольными ключами/значениями проецируются
+// на whitelist validateAttempt до передачи в verification.prior_findings —
+// раунд 2+ не падает с invalid_prior_findings на грязной находке раунда 1.
+test('prior_findings are projected onto the acceptance whitelist before verify', async t => {
+  const x = await lab(t);
+  await x.tick();
+  const messy = {
+    file: 'a.js', line: 12, expected: 'e1', actual: 'x'.repeat(2500),
+    severity: 'P1', title: 'stray critic key', violates_dod: true,
+    harm: ['arrays', 'dropped'], input: { nested: 'object' }, freq: 3,
+  };
+  const bad = {
+    [BAD1]: { outcome: 'rework', reason: 'review_verdict:REVIEW_BLOCKED',
+      feedback: { reason: 'review_verdict:REVIEW_BLOCKED', findings: [messy] } },
+  };
+  const seen = [];
+  x.cfg.verify = async (attempt, submission) => {
+    seen.push(attempt.prior_findings);
+    const scripted = bad[submission.candidate_sha];
+    if (scripted) return scripted;
+    await x.cfg.board.complete(attempt.task_id, attempt.epoch, { sha: submission.candidate_sha });
+    return { outcome: 'verified', receipt: { settle: 'completed' } };
+  };
+  x.submit(BAD1);
+  assert.equal((await x.tick()).phase, 'working');
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.deepEqual(seen[1], [{ file: 'a.js', line: 12, expected: 'e1',
+    actual: 'x'.repeat(2000), freq: 3, severity: 'P1', dod_violation: true }]);
+});
+
+test('queue mode pins allowed_paths into the contract and verification attempt', async t => {
+  const scoped = 'board_pipeline/,ops/control-room/';
+  const x = await queueLab(t, { labels: { ...CONTRACT, allowed_paths: scoped } });
+  await x.tick();
+  const record = await x.cfg.state.load();
+  assert.equal(record.contract.allowed_paths, scoped);
+  assert.equal(record.contract.labels.allowed_paths, scoped);
+  x.submit('c');
+  await x.tick();
+  const attempt = x.effects.attempts.at(-1);
+  assert.equal(attempt.allowed_paths, scoped);
+  assert.equal(attempt.labels.allowed_paths, undefined);
+  assert.deepEqual(attempt.labels, {});
+
+  const empty = await queueLab(t, { labels: { ...CONTRACT, allowed_paths: '' } });
+  await empty.tick();
+  const emptyRecord = await empty.cfg.state.load();
+  assert.equal(emptyRecord.contract.allowed_paths, undefined);
+  assert.equal(emptyRecord.contract.labels.allowed_paths, undefined);
+});
+
+test('claim_not_held verification outcomes and lease-loss throws become lease_lost', async t => {
+  for (const verify of [
+    async () => ({ outcome: 'denied', reason: 'claim_not_held:409' }),
+    async () => { throw new Error('Lease lost'); },
+  ]) {
+    const x = await lab(t);
+    await x.tick();
+    x.cfg.verify = verify;
+    x.submit('c');
+    const out = await x.tick();
+    assert.equal(out.phase, 'lease_lost');
+    const record = await x.cfg.state.load();
+    assert.equal(record.phase, 'lease_lost');
+    assert.equal(x.effects.feedback.length, 0);
+  }
+});
+
+test('an interrupted queue claiming attempt without a task is cleared and retried cleanly', async t => {
+  const x = await queueLab(t);
+  const claimReady = x.cfg.board.claimReady.bind(x.cfg.board);
+  x.cfg.board.claimReady = async () => { throw new Error('transient board read'); };
+  assert.equal((await x.tick()).phase, 'idle');
+  assert.equal(await x.cfg.state.load(), null);
+  assert.equal(x.effects.spawn, 0);
+  x.cfg.board.claimReady = claimReady;
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(x.effects.spawn, 1);
+});
+
+test('route change before spawn blocks the claimed card instead of orphaning the lease', async t => {
+  const x = await lab(t);
+  x.cfg.authorize = async state => state !== 'claimed';
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'route_changed_before_spawn');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('confirmed refusal of every pre-spawn worker blocks the claimed card', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => ({ plan: [ws.PRIMARY_WORKER] }),
+  });
+  x.cfg.bb.probeAvailability = async () => ({ status: 'confirmed_refusal', activeBackgroundAgentCount: 0 });
+  x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'all_workers_confirmed_refused');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('pinTriad exceptions block the claimed card instead of orphaning the lease', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => { throw new Error('scorecard exploded'); },
+  });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'route_pin_failed');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('a crashed worker is resumed at most twice and then held deterministically', async t => {
+  const x = await lab(t);
+  const resumes = [];
+  x.cfg.bb.resume = async packet => {
+    resumes.push(packet);
+    return { resumed: true, threadId: packet.attempt.bb_thread_id };
+  };
+  x.cfg.submissions.read = async (attempt, after) => ({
+    turnSeq: after + 1, completed: false, state: 'exited', exitCode: 1,
+  });
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(resumes.length, 2);
+  assert.deepEqual(resumes.map(packet => packet.crashResumes), [0, 1]);
+  const record = await x.cfg.state.load();
+  assert.equal(record.crashResumes, 2);
+  assert.equal(record.phase, 'working');
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_turn_finished_without_new_handoff');
+  assert.equal(resumes.length, 2);
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('a typed invalid handoff blocks as invalid instead of crashing verification', async t => {
+  const x = await lab(t);
+  await x.tick();
+  x.cfg.submissions.read = async () => ({ turnSeq: 1, completed: true, state: 'idle', submission: null });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'invalid_or_stale_submission');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.verify, 0);
 });

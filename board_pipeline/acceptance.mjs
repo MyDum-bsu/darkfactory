@@ -1,15 +1,20 @@
 // Ядро приёмки F1: submit → local_checks → review → completed | blocked.
 // Все внешние эффекты — только через порты. Журнал append-only: intent ДО эффекта.
 
+import { execFile } from 'node:child_process';
 import { open, readFile, appendFile, lstat, realpath, stat } from 'node:fs/promises';
+import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
-import { isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter, NEON_ISOLATION } from './review-policy.mjs';
+import { evaluateAutoApprove, isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter,
+  NEON_ISOLATION, parseApprovalPolicy, partitionFindingsBySeverity } from './review-policy.mjs';
 import { l2RunnableSpec, runnerReviewSpec } from './review-runner.mjs';
 import { assertTriadIndependent, opencodeGoPolicyViolation,
   retiredProviderViolation, workerFamily } from './worker-selector.mjs';
+import { isValidL1Profile } from './l1-profiles.mjs';
+import { isWorkerThreadId } from './worker-runtime.mjs';
 
 const HANDOFF_KEYS = [
   'task_id',
@@ -40,6 +45,7 @@ const ATTEMPT_OPTIONAL = [
   'spec_digest',
   'policy_digest',
   'fixtures_digest',
+  'l1_profile',
   'release_target',
   'has_ui',
   'executor',
@@ -47,6 +53,12 @@ const ATTEMPT_OPTIONAL = [
   'triad',
   'fallback_reason',
   'attempted_workers',
+  'review_round',
+  'prior_findings',
+  'prior_sha',
+  'category',
+  'labels',
+  'allowed_paths',
 ];
 const CONTRACT_REQUIRED = ['repo_id', 'spec_digest', 'policy_digest'];
 const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
@@ -58,11 +70,14 @@ const SUBMISSION_OPTIONAL = ['dispute'];
 const SHA_RE = /^[0-9a-f]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
+const acceptedWorkerThreadId = value =>
+  typeof value === 'string' && value.length <= 64 && isWorkerThreadId(value);
 const ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 const REVIEW_OK = 'REVIEW_OK';
 const REVIEW_BLOCKED = 'REVIEW_BLOCKED';
 const REVIEW_ESCALATE = 'REVIEW_ESCALATE';
 const FINISH = new Set(['verified', 'deployed']);
+const execGit = promisify(execFile);
 
 class Denied extends Error {
   constructor(reason) {
@@ -99,7 +114,7 @@ function validateHandoff(handoff) {
     }
   }
   if (!/^[1-9][0-9]{0,14}$/.test(handoff.task_id)) throw new Denied('invalid_task_id');
-  if (!/^thr_[a-z0-9]{1,60}$/.test(handoff.worker_thread_id)) throw new Denied('invalid_worker_thread');
+  if (!acceptedWorkerThreadId(handoff.worker_thread_id)) throw new Denied('invalid_worker_thread');
   if (!path.isAbsolute(handoff.worktree)) throw new Denied('worktree_not_absolute');
   if (!SHA_RE.test(handoff.candidate_sha)) throw new Denied('candidate_sha_not_full');
   if (!SHA_RE.test(handoff.base_sha)) throw new Denied('base_sha_not_full');
@@ -116,6 +131,25 @@ function validatePolicy(policy, checkProfile, { allowNeon = false, pinned = fals
   const profile = Object.hasOwn(profiles, checkProfile) ? profiles[checkProfile] : null;
   if (profile === null || typeof profile !== 'object') {
     throw new Denied(`unknown_profile:${checkProfile}`);
+  }
+  // Заданный l1Profile обязан быть именем из доверенного реестра —
+  // fail-closed до любой проверки ревью и любого эффекта.
+  if (profile.l1Profile !== undefined && !isValidL1Profile(profile.l1Profile)) {
+    throw new Denied(`unknown_l1_profile:${String(profile.l1Profile)}`);
+  }
+  // Тот же реестр действует на l1Profile внутри каждого рецепта профиля:
+  // ручной submit/accept с невалидным recipe.l1Profile (включая visual при
+  // has_ui=false) отклоняется до любого эффекта, а явный рецепт,
+  // расходящийся с явным profile.l1Profile, — мисматч, а не приоритет.
+  for (const recipe of [...(Array.isArray(profile.checks) ? profile.checks : []),
+    profile.check, profile.visual]) {
+    if (recipe?.l1Profile === undefined) continue;
+    if (!isValidL1Profile(recipe.l1Profile)) {
+      throw new Denied(`unknown_l1_profile:${String(recipe.l1Profile)}`);
+    }
+    if (profile.l1Profile !== undefined && recipe.l1Profile !== profile.l1Profile) {
+      throw new Denied('l1_profile_mismatch');
+    }
   }
   const legacy = isLegacyPiReview(profile.review);
   const neon = allowNeon && isNeonReview(profile.review) && isReviewSkillList(profile.review.skills);
@@ -168,7 +202,7 @@ function strictKeys(record, allowed, optional = []) {
 function validateContract(attempt) {
   const pinned = CONTRACT_REQUIRED.some(key => attempt[key] !== undefined);
   if (!pinned) {
-    for (const key of ['tree_sha', 'fixtures_digest', 'release_target']) {
+    for (const key of ['tree_sha', 'fixtures_digest', 'l1_profile', 'release_target']) {
       if (attempt[key] !== undefined) throw new Denied('subject_contract_incomplete');
     }
     return;
@@ -189,6 +223,12 @@ function validateContract(attempt) {
     if (attempt.fixtures_digest !== null && !SHA256_RE.test(attempt.fixtures_digest)) {
       throw new Denied('invalid_fixtures_digest');
     }
+  }
+  // Закреплённый L1-выбор карточки — тот же fail-closed реестр, что и
+  // профиль: нестроковое или неизвестное значение метки отклоняется, а
+  // не трактуется как отсутствие выбора.
+  if (attempt.l1_profile !== undefined && !isValidL1Profile(attempt.l1_profile)) {
+    throw new Denied(`unknown_l1_profile:${String(attempt.l1_profile)}`);
   }
   const target = attempt.release_target;
   if (target !== undefined) {
@@ -213,7 +253,7 @@ function validateAttempt(attempt) {
   if (!/^[1-9][0-9]{0,14}$/.test(attempt.task_id)) throw new Denied('invalid_task_id');
   if (!Number.isSafeInteger(attempt.epoch) || attempt.epoch <= 0) throw new Denied('invalid_epoch');
   if (!ID_RE.test(attempt.attempt_id)) throw new Denied('invalid_attempt_id');
-  if (!/^thr_[a-z0-9]{1,60}$/.test(attempt.bb_thread_id)) throw new Denied('invalid_worker_thread');
+  if (!acceptedWorkerThreadId(attempt.bb_thread_id)) throw new Denied('invalid_worker_thread');
   if (!path.isAbsolute(attempt.worktree)) throw new Denied('worktree_not_absolute');
   if (!SHA_RE.test(attempt.base_sha)) throw new Denied('base_sha_not_full');
   if (!FINISH.has(attempt.finish)) throw new Denied('invalid_finish');
@@ -246,6 +286,50 @@ function validateAttempt(attempt) {
           !Array.isArray(w) && typeof w.provider === 'string' && w.provider.length > 0))) {
     throw new Denied('invalid_attempted_workers');
   }
+  // Раунд L2 и блокирующие находки прошлого раунда доверенно поставляет
+  // контроллер (история попытки), не воркер: diff-scoped пересмотр раунда 2+
+  // работает только с этой связкой. Невалидная форма — отказ до эффектов.
+  if (attempt.review_round !== undefined &&
+      (!Number.isSafeInteger(attempt.review_round) || attempt.review_round < 1 ||
+        attempt.review_round > 64)) {
+    throw new Denied('invalid_review_round');
+  }
+  if (attempt.prior_findings !== undefined &&
+      (!Array.isArray(attempt.prior_findings) || attempt.prior_findings.length > 256 ||
+        !attempt.prior_findings.every(f => f !== null && typeof f === 'object' &&
+          !Array.isArray(f) &&
+          Object.entries(f).every(([k, v]) =>
+            ['file', 'line', 'input', 'expected', 'actual', 'freq', 'frequency', 'harm',
+              'severity', 'dod_violation'].includes(k) &&
+            (v === undefined || v === null || typeof v === 'number' ||
+              typeof v === 'boolean' ||
+              (typeof v === 'string' && v.length <= 2000)))))) {
+    throw new Denied('invalid_prior_findings');
+  }
+  if (attempt.category !== undefined &&
+      (typeof attempt.category !== 'string' || !/^[a-z][a-z0-9-]{0,47}$/.test(attempt.category))) {
+    throw new Denied('invalid_category');
+  }
+  // Закреплённый scope fence попытки — строка или отсутствие: нестроковое
+  // значение не нормализуется молча в null, а отклоняется fail-closed.
+  if (attempt.allowed_paths !== undefined && typeof attempt.allowed_paths !== 'string') {
+    throw new Denied('invalid_allowed_paths');
+  }
+  // Предыдущий проверенный кандидат для инкрементального diff раунда 2+ —
+  // доверенное значение из истории попытки, не из сдачи.
+  if (attempt.prior_sha !== undefined && !SHA_RE.test(attempt.prior_sha)) {
+    throw new Denied('invalid_prior_sha');
+  }
+  // Контрактные метки карточки для skillPicker формана: плоский словарь
+  // boolean/id-строк, ключи — декларируемые предикаты пикера.
+  if (attempt.labels !== undefined &&
+      (attempt.labels === null || typeof attempt.labels !== 'object' ||
+        Array.isArray(attempt.labels) || Object.keys(attempt.labels).length > 16 ||
+        !Object.entries(attempt.labels).every(([k, v]) =>
+          /^[a-z][a-z0-9_]{0,47}$/.test(k) &&
+          (typeof v === 'boolean' || (typeof v === 'string' && /^[a-z][a-z0-9-]{0,47}$/.test(v)))))) {
+    throw new Denied('invalid_labels');
+  }
   validateContract(attempt);
 }
 
@@ -272,11 +356,25 @@ function attemptSubject(attempt, submission, treeSha) {
   });
 }
 
+// Явный L1-выбор, определяющий среду проверок запуска: закреплённая метка
+// попытки, иначе явный l1Profile профиля (в т.ч. эффективный выбор CLI,
+// подставленный контроллером). Значения сверены заранее fail-closed —
+// оба заданных равны; undefined — выбора нет, среда из дефолта/рецептов,
+// а те уже закреплены policy_digest.
+function contractL1Profile(attempt, profile) {
+  const l1 = attempt.l1_profile ?? profile?.l1Profile;
+  return l1 === undefined ? null : l1;
+}
+
 // Ключ контракта для журнала: смена spec/policy/fixtures/release/tree при том же SHA
 // создаёт новый запуск вместо переиспользования старого терминального вердикта.
 // Закреплённый tree_sha входит в ключ; когда дерево берётся из снимка, в ключе null.
-function contractKey(attempt) {
+// Явный L1-выбор добавляется в ключ только заданным: попытка без выбора
+// получает прежний ключ и прежнюю запись журнала (повтор/восстановление),
+// а смена выбора — новый запуск, результат под другим L1 не переиспользуется.
+function contractKey(attempt, profile) {
   if (attempt.spec_digest === undefined) return null;
+  const l1 = contractL1Profile(attempt, profile);
   return createHash('sha256').update(canonicalJson({
     repo_id: attempt.repo_id,
     base_sha: attempt.base_sha,
@@ -287,12 +385,13 @@ function contractKey(attempt) {
     release_target: attempt.release_target ?? null,
     finish: attempt.finish,
     has_ui: attempt.has_ui ?? null,
+    ...(l1 === null ? {} : { l1_profile: l1 }),
   })).digest('hex');
 }
 
 // Сверка контракта записи журнала с текущей попыткой: ключ совпал, а контракт нет —
 // журнал не может подтвердить вердикт для этого манифеста.
-function sameContract(runEntry, attempt) {
+function sameContract(runEntry, attempt, profile) {
   if (attempt.spec_digest === undefined) return true;
   const recorded = runEntry?.contract;
   if (recorded === null || typeof recorded !== 'object') return false;
@@ -303,7 +402,8 @@ function sameContract(runEntry, attempt) {
     (recorded.fixtures_digest ?? null) === (attempt.fixtures_digest ?? null) &&
     (JSON.stringify(recorded.release_target ?? null) ===
       JSON.stringify(attempt.release_target ?? null)) &&
-    (recorded.has_ui ?? null) === (attempt.has_ui ?? null);
+    (recorded.has_ui ?? null) === (attempt.has_ui ?? null) &&
+    (recorded.l1_profile ?? null) === contractL1Profile(attempt, profile);
 }
 
 // Сверка сдачи с доверенной попыткой. Любое расхождение — отказ до эффекта.
@@ -318,7 +418,7 @@ function validateSubmission(submission, attempt) {
   if (!/^[1-9][0-9]{0,14}$/.test(submission.task_id)) throw new Denied('invalid_task_id');
   if (!Number.isSafeInteger(submission.epoch) || submission.epoch <= 0) throw new Denied('invalid_epoch');
   if (!ID_RE.test(submission.attempt_id)) throw new Denied('invalid_attempt_id');
-  if (!/^thr_[a-z0-9]{1,60}$/.test(submission.worker_thread_id)) throw new Denied('invalid_worker_thread');
+  if (!acceptedWorkerThreadId(submission.worker_thread_id)) throw new Denied('invalid_worker_thread');
   if (!SHA_RE.test(submission.candidate_sha)) throw new Denied('candidate_sha_not_full');
   if (submission.task_id !== attempt.task_id) throw new Denied('task_mismatch');
   if (submission.epoch !== attempt.epoch) throw new Denied('epoch_mismatch');
@@ -626,6 +726,93 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     visual = vis;
   }
 
+  // Policy-Driven Auto-Approve (#1745): доверенная approval-политика
+  // применяется только после зелёной L1 и чистого Tamper Gate. Одобрение
+  // allowlist-категории (docs/typo/deps) снимает L2-критика, но никогда не
+  // ослабляет гейты выше; любой отказ политики возвращает обычный путь L2.
+  // Повторный раунд с неперепроверенными блокирующими находками обязан пройти
+  // L2 re-review: auto-approve по allowlist-категории не снимает эту обязанность.
+  const reReviewRequired = (binding.review_round ?? 1) > 1 ||
+    (Array.isArray(binding.prior_findings) && binding.prior_findings.length > 0);
+  let autoApprove = null;
+  if (typeof binding.category === 'string' && binding.category && !reReviewRequired) {
+    // Правила auto-approve — операторские, не кандидатские: политика читается
+    // из байтов закреплённого base_sha. Кандидат может менять
+    // .darkfactory/approval-policy.yaml в своём дереве — это не влияет на
+    // решение о его допуске (и без того отклоняется denyPathPatterns).
+    let loaded = null;
+    try {
+      const policyBlob = await execGit('git', ['-C', binding.worktree, 'show',
+        `${binding.base_sha}:.darkfactory/approval-policy.yaml`],
+        { timeout: 30_000, maxBuffer: 64 * 1024, encoding: 'buffer' });
+      loaded = parseApprovalPolicy(policyBlob.stdout);
+    } catch (e) {
+      // Отсутствие политики в базе — auto-approve не настроен, обычный путь L2;
+      // битая доверенная политика — операционный hold, а не молчаливый пропуск.
+      if (e?.code === undefined || e.code === 0) {
+        await step('review', false, messageOf(e));
+        return { status: 'hold', reason: 'approval_policy_invalid' };
+      }
+    }
+    if (loaded !== null) {
+      let changedFiles = null;
+      let changedLines = 0;
+      // AUDIT-0b: diff для auto-approve исполняется изолированно — без
+      // textconv/ext-diff/color-драйверов, fsmonitor и внешних атрибутов,
+      // с отключённой пользовательской/системной конфигурацией git: кандидат
+      // не влияет на счёт строк через .gitattributes или diff-драйвер.
+      const isolatedGitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0' };
+      const isolatedGitArgs = ['-C', binding.worktree,
+        '-c', 'core.fsmonitor=false', '-c', 'diff.external=',
+        '-c', 'core.attributesfile=/dev/null'];
+      const diffOptions = ['--no-textconv', '--no-ext-diff', '--no-color'];
+      // Бинарная строка numstat ('-\t-\t<path>') не считается нулём строк:
+      // бинарная полезная нагрузка не может обойти maxChangedLines —
+      // auto-approve отклоняется, кандидат идёт на обязательный L2.
+      let binaryDiff = false;
+      try {
+        const names = await execGit('git', [...isolatedGitArgs, 'diff', '--no-renames',
+          '-z', '--name-only', ...diffOptions, binding.base_sha, binding.candidate_sha, '--'],
+          { timeout: 30_000, maxBuffer: 4 * 1024 * 1024, env: isolatedGitEnv });
+        changedFiles = names.stdout.split('\0').filter(name => name.length > 0);
+        const numstat = await execGit('git', [...isolatedGitArgs, 'diff', '--no-renames',
+          '--numstat', ...diffOptions, binding.base_sha, binding.candidate_sha, '--'],
+          { timeout: 30_000, maxBuffer: 4 * 1024 * 1024, env: isolatedGitEnv });
+        for (const line of numstat.stdout.split('\n')) {
+          if (line === '') continue;
+          const [add, del] = line.split('\t');
+          if (add === '-' || del === '-') {
+            binaryDiff = true;
+            continue;
+          }
+          changedLines += (Number.parseInt(add, 10) || 0) + (Number.parseInt(del, 10) || 0);
+        }
+      } catch (e) {
+        await step('review', false, messageOf(e));
+        return { status: 'hold', reason: `auto_approve_diff_failed:${messageOf(e)}` };
+      }
+      if (binaryDiff) {
+        await step('review', true, { auto_approve: { approved: false, reason: 'binary_diff_disallowed' } });
+      } else {
+        const decision = evaluateAutoApprove({ policy: loaded.policy, digest: loaded.digest,
+          category: binding.category, changedFiles, changedLines,
+          l1Passed: true, tamperPassed: tamper?.ok === true });
+        if (decision.approved === true) autoApprove = decision;
+        await step('review', true, { auto_approve: decision });
+      }
+    }
+  }
+  if (autoApprove !== null) {
+    // Одобренный политикой кандидат получает синтетическую квитанцию L2:
+    // checkpoint — digest доверенной политики, находок нет, гейты зелёные.
+    const rev = { verdict: REVIEW_OK, status: 'PASS', summary: `auto-approved: ${autoApprove.reason}`,
+      findings: [], checked_invariants: ['policy_auto_approve'], checkpoint: autoApprove.policyDigest,
+      auto_approved: true, policy_digest: autoApprove.policyDigest,
+      actual: { provider: 'policy', model: 'auto-approve', reasoningLevel: null } };
+    return { status: 'verified', loc, review: rev, actual: rev.actual, tamper, visual };
+  }
+
   // Независимое ревью, квитанция на тот же SHA; не запускать после потери hold.
   if (beforeReview) {
     try { await beforeReview(); } catch (error) {
@@ -638,7 +825,8 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     // Рецензент получает subject_digest манифеста в запросе; квитанция обязана
     // вернуть тот же digest (проверка ниже).
     const digestForReview = typeof subjectDigest === 'function' ? subjectDigest() : null;
-    rev = await ports.review({ ...binding, subject_digest: digestForReview }, profile);
+    const reviewProfile = visual?.capture_dir ? { ...profile, capturesDir: visual.capture_dir } : profile;
+    rev = await ports.review({ ...binding, subject_digest: digestForReview }, reviewProfile);
     await step('review', true, rev);
   } catch (e) {
     await step('review', false, messageOf(e));
@@ -705,6 +893,24 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     } else if (rev.subject_digest !== digestNow) {
       return { status: 'hold', reason: 'review_subject_mismatch' };
     }
+  }
+  // Severity Gating (#1745) дублируется на границе приёмки: REVIEW_OK,
+  // несущий блокирующую находку (P0/P1 или неразмеченную), не считается
+  // зелёным — противоречивый вердикт идёт на доработку с теми же находками.
+  if (rev.verdict === REVIEW_OK && Array.isArray(rev.findings) &&
+      partitionFindingsBySeverity(rev.findings).blocking.length > 0) {
+    const blocking = partitionFindingsBySeverity(rev.findings).blocking;
+    return {
+      status: 'rework',
+      reason: `review_verdict:${REVIEW_BLOCKED}`,
+      feedback: { reason: `review_verdict:${REVIEW_BLOCKED}`, verdict: REVIEW_BLOCKED,
+        checkpoint: rev.checkpoint, threadId: rev.threadId,
+        excerpt: rev.excerpt ?? blocking.map(f =>
+          `${f.file ?? '?'}${f.line != null ? `:${f.line}` : ''}: expected ${f.expected ?? '?'}, ` +
+          `actual ${f.actual ?? '?'}`).join('\n').slice(0, 1400),
+        findings: blocking, summary: rev.summary },
+      loc, tamper, visual, review: rev, actual,
+    };
   }
   if (rev.verdict !== REVIEW_OK) {
     // REVIEW_BLOCKED/REWORK требует содержательного возражения: валидный finding
@@ -906,6 +1112,25 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     profile = validatePolicy(policy, attempt.check_profile,
       { allowNeon: true, pinned: attempt.triad !== undefined });
     validateEnrolled(attempt, profile);
+    // Закреплённый l1_profile попытки сверяется с профилем и каждым рецептом
+    // до любого порта приёмки: прямой вызов acceptHeld применяет тот же
+    // инвариант, что контроллер при формировании попытки.
+    if (attempt.l1_profile !== undefined) {
+      if (profile.l1Profile !== undefined && attempt.l1_profile !== profile.l1Profile) {
+        throw new Denied('l1_profile_mismatch');
+      }
+      for (const recipe of [...(Array.isArray(profile.checks) ? profile.checks : []),
+        profile.check, profile.visual]) {
+        if (recipe?.l1Profile !== undefined && attempt.l1_profile !== recipe.l1Profile) {
+          throw new Denied('l1_profile_mismatch');
+        }
+      }
+      // Портам передаётся эффективный профиль: закреплённый выбор попытки
+      // применяется и при прямом acceptHeld без контроллера.
+      if (profile.l1Profile === undefined) {
+        profile = { ...profile, l1Profile: attempt.l1_profile };
+      }
+    }
     // Исполнитель из доверенной попытки (или профиля) и критик — разные семейства.
     // При настроенном арбитре проверяется вся триада: арбитр обязан быть из
     // третьего независимого семейства — как для первичного воркера, так и после
@@ -957,7 +1182,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     }
     throw e;
   }
-  const key = contractKey(attempt);
+  const key = contractKey(attempt, profile);
 
   const binding = {
     task_id: attempt.task_id,
@@ -968,14 +1193,24 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     candidate_sha: submission.candidate_sha,
     has_ui: attempt.has_ui,
     executor: attempt.executor ?? profile.executor,
+    review_round: attempt.review_round ?? 1,
+    prior_findings: attempt.prior_findings ?? [],
+    prior_sha: attempt.prior_sha,
+    category: attempt.category,
+    labels: attempt.labels,
   };
   // Ключ запуска включает контракт и требование L3: новый манифест или смена
   // has_ui при том же SHA не переиспользуют терминальный вердикт старого запуска.
+  // У незакреплённой попытки (без spec_digest) контрактного ключа нет — явный
+  // L1-выбор добавляется в хэш сам: вердикт под node не подтверждает запуск
+  // под python-node, а повтор без выбора сохраняет прежнее имя файла.
+  const unpinnedL1 = key === null ? contractL1Profile(attempt, profile) : null;
   const id = journalId(runId(`${attempt.task_id}.${attempt.attempt_id}.${attempt.epoch}`,
     submission.candidate_sha, policy.version) + (key ? `-s${key}` : '') +
     '-h' + createHash('sha256').update(JSON.stringify([
       attempt.task_id, attempt.attempt_id, attempt.epoch, submission.candidate_sha,
       policy.version, attempt.has_ui ?? null, key ?? null,
+      ...(unpinnedL1 === null ? [] : [unpinnedL1]),
     ])).digest('hex').slice(0, 16));
   const file = path.join(journal, `${id}.jsonl`);
 
@@ -1008,7 +1243,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         run: id,
       };
     }
-    if (!sameContract(runEntry, attempt)) {
+    if (!sameContract(runEntry, attempt, profile)) {
       return {
         outcome: 'denied',
         reason: 'journal_subject_mismatch',
@@ -1067,6 +1302,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       fixtures_digest: attempt.fixtures_digest ?? null,
       release_target: attempt.release_target ?? null,
       has_ui: attempt.has_ui ?? null,
+      l1_profile: contractL1Profile(attempt, profile),
     } } : {}),
   });
 
@@ -1197,6 +1433,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         spec_digest: attempt.spec_digest,
         policy_digest: attempt.policy_digest,
       };
+      // Закреплённая категория сверяется с живой меткой карточки: auto-approve
+      // по allowlist не может завершить кандидата, если категория вышла из
+      // списка или сменилась до seal.
+      if (attempt.category !== undefined) expectedLabels.category = attempt.category;
       for (const [field, expected] of Object.entries(expectedLabels)) {
         // GUARD:NoStaleCommit — seal обязан видеть живые метки равными контракту.
         if (!ports.__unsafeSkipSealCheck && labels[field] !== expected) {
@@ -1212,6 +1452,27 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         await step('seal', false, 'has_ui_drift');
         return { fail: 'has_ui_drift' };
       }
+      // AUDIT-0b: эскалация в обратную сторону — карточка, закреплённая без
+      // требования UI (ни attempt, ни профиль), не может получить live-метку
+      // has_ui 'true' перед seal: позднее включение L3 пересматривает допуск,
+      // а не закрывается устаревшим вердиктом.
+      if (attempt.has_ui !== true && profile.has_ui !== true &&
+          labels.has_ui === 'true') {
+        await step('seal', false, 'has_ui_drift');
+        return { fail: 'has_ui_drift' };
+      }
+      // AUDIT-0b: scope fence закреплён на попытку — live-дрейф метки
+      // allowed_paths (появление, удаление или смена значения после L2)
+      // останавливает кандидата до complete.
+      const pinnedAllowedPaths = (() => {
+        const raw = attempt.allowed_paths ?? attempt.labels?.allowed_paths ?? null;
+        return typeof raw === 'string' ? raw : null;
+      })();
+      const liveAllowedPaths = typeof labels.allowed_paths === 'string' ? labels.allowed_paths : null;
+      if (liveAllowedPaths !== pinnedAllowedPaths) {
+        await step('seal', false, 'allowed_paths_drift');
+        return { fail: 'allowed_paths_drift' };
+      }
       // fixtures_digest сверяется всегда и нормализуется как в манифесте: отсутствие
       // значения в контракте и на карточке — null, появление метки во время L2 — дрейф.
       const expectedFixtures = attempt.fixtures_digest ?? null;
@@ -1219,6 +1480,14 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       if (liveFixtures !== expectedFixtures) {
         await step('seal', false, 'fixtures_digest_drift');
         return { fail: 'fixtures_digest_drift' };
+      }
+      // l1_profile — та же контрактная метка: смена закреплённого выбора
+      // после проверок останавливает кандидата до complete, а не закрывает
+      // карточку со свидетельством под другим профилем.
+      const liveL1 = typeof labels.l1_profile === 'string' ? labels.l1_profile : null;
+      if (liveL1 !== (attempt.l1_profile ?? null)) {
+        await step('seal', false, 'l1_profile_drift');
+        return { fail: 'l1_profile_drift' };
       }
       if (policy.digest !== undefined && policy.digest !== attempt.policy_digest) {
         await step('seal', false, 'policy_digest_drift');
@@ -1313,6 +1582,41 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         }
       }
       if (!receiptOk) return hold('invalid_arbitration_receipt');
+      // AUDIT-0b (P1-11): арбитр квитанции обязан совпасть с закреплённым
+      // арбитром попытки (триада, затем attempt, затем профиль) по provider
+      // и model — accept_with_notes от подменённого арбитра не принимается.
+      // Сверка в runner-форме, как закреплённая триада: pi/openai/… пин и
+      // openai/… квитанция описывают один spec. Для Neon-ревью арбитр обязан
+      // быть аттестованным Sol — независимо от содержимого квитанции.
+      const pinnedArbiter = attempt.triad?.arbiter ?? attempt.arbiter ?? profile.arbiter;
+      let arbiterOk = true;
+      if (pinnedArbiter !== undefined && pinnedArbiter !== null) {
+        // Пин может быть строкой 'provider/model' — той же формой, что
+        // принимает validWorkerSpec и таблица семейств: нормализация к
+        // объекту до runner-сверки, а не ложный mismatch.
+        const normalize = spec => {
+          const objectSpec = typeof spec === 'string' && spec.includes('/')
+            ? { provider: spec.slice(0, spec.indexOf('/')), model: spec.slice(spec.indexOf('/') + 1) }
+            : spec;
+          return runnerReviewSpec(objectSpec) ?? objectSpec;
+        };
+        const expected = normalize(pinnedArbiter);
+        const presented = normalize(arbitrationReceipt.arbiter);
+        arbiterOk = expected?.provider === presented?.provider &&
+          expected?.model === presented?.model;
+      }
+      if (arbiterOk && isNeonReview(profile.review)) {
+        arbiterOk = isSolArbiter(arbitrationReceipt.arbiter);
+      }
+      if (!arbiterOk) return hold('arbiter_mismatch');
+      // AUDIT-0b (P1-11/P2-2): max harm и dod_violation вычисляются
+      // независимо из находок самого вердикта — квитанция арбитра не может
+      // занизить harm>=10 или скрыть dod_violation, присутствующие в review.
+      const reviewFindings = Array.isArray(verdict.review?.findings) ? verdict.review.findings : [];
+      const blockingFindings = reviewFindings.some(finding =>
+        (typeof finding?.harm === 'number' && Number.isFinite(finding.harm) && finding.harm >= 10) ||
+        finding?.dod_violation === true);
+      if (blockingFindings) return hold('blocking_findings_present');
       const sealed = await doSeal();
       if (sealed.denied) return settle('denied', { reason: sealed.denied });
       if (sealed.fail) return hold(sealed.fail);
@@ -1326,7 +1630,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         checks: verdict.loc?.evidence ?? [],
         tamper: verdict.tamper ? 'pass' : 'na',
         visual: verdict.visual,
-        review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
+        review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual,
+          transcript_sha256: rev.transcript_sha256 },
         arbitration: arbitrationReceipt,
       }, id);
       const gateReceipts = {
@@ -1387,7 +1692,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     checks: loc.evidence,
     tamper: tamper ? 'pass' : 'na',
     visual,
-    review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
+    review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual,
+      transcript_sha256: rev.transcript_sha256 },
   }, id);
 
   // Полные квитанции L1-tamper и L3 остаются в локальном журнале, привязанные к

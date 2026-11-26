@@ -7,15 +7,35 @@
 
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { unpackExact } from './runtime.mjs';
 import { withModelProxy } from './model-proxy.mjs';
+import { applySeverityGating, buildReviewInstruction } from './review-policy.mjs';
 import { sumUsages } from './telemetry.mjs';
+import { createStreamLoopGuard } from './loop-detector.mjs';
 
 const exec = promisify(execFile);
+
+function execWithInput(file, args, options, input) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(file, args, options, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
+    child.stdin?.on('error', () => { /* контейнер мог завершиться до EOF stdin */ });
+    if (input !== undefined) child.stdin?.write(input);
+    child.stdin?.end();
+  });
+}
+
 const SHA = /^[a-f0-9]{40}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const CHECKPOINT = /^[0-9a-f]{8,64}$/;
@@ -25,10 +45,111 @@ export const REVIEW_IMAGE =
   'node@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9';
 
 // В контейнер критика монтируются только каталоги кода ~/.pi/agent:
-// sessions/, subagents/ и auth.json исключены — секрет едет копией в tmpfs.
+// sessions/, subagents/ и auth.json исключены — секрет едет stdin в tmpfs.
 const PROXY_BOOTSTRAP = new URL('./model-proxy-client.cjs', import.meta.url).pathname;
 
 const READ_ONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
+
+// Причины разбора, означающие действительно оборванный поток — только они
+// открывают transient-классификацию ненулевого выхода раннера.
+const TRUNCATED_TRANSCRIPT = new Set([
+  'review_transcript_empty', 'review_transcript_corrupt', 'review_incomplete_turn',
+]);
+
+const VALID_RAW_STOP_REASONS = new Set(['completed', 'stop', 'STOP', 'end_turn']);
+
+// Незавершённый поток может быть уже дисквалифицирующим, а не оборванным:
+// явный error/auto_retry_end со сбросом либо assistant-сообщение с
+// провайдером/моделью/effort, противоречащими закреплённому критику. Такой
+// ответ — hold, а не transient: повтор не должен стирать зафиксированный
+// отказ или mismatch. Возвращает причину отказа либо null.
+function transcriptDisqualifying(ndjson, critic) {
+  const tools = new Set();
+  let finishedResponse = false;
+  const noteTools = (list) => {
+    if (Array.isArray(list)) {
+      for (const t of list) tools.add(typeof t === 'string' ? t : t?.name);
+    }
+  };
+  for (const line of String(ndjson).split('\n')) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue; // битая строка — сама по себе признак обрыва
+    }
+    // Нарушение политики инструментов зафиксировано потоком — hold, не
+    // transient: пропуск session_info/message с запрещённым toolsAdded
+    // позволил бы второму вызову стереть зафиксированное нарушение.
+    noteTools(event?.toolsAdded);
+    noteTools(event?.message?.toolsAdded);
+    if (event?.type === 'session_info') noteTools(event.data?.toolsAdded);
+    if (Array.isArray(event?.messages)) {
+      for (const m of event.messages) noteTools(m?.toolsAdded);
+    }
+    if (event?.type === 'error' ||
+        (event?.type === 'auto_retry_end' && event.success === false)) {
+      return 'review_runner_reported_error';
+    }
+    if (event?.type !== 'message_end') continue;
+    const message = event.message ?? event.data?.message;
+    if (message?.role !== 'assistant') continue;
+    // Отказ провайдера может быть записан в самом assistant-сообщении
+    // (stopReason 'error' / errorMessage) без верхнеуровневого error-события —
+    // зафиксированный отказ — hold, не transient.
+    if (message.stopReason === 'error' || nonEmpty(message.errorMessage)) {
+      return 'review_runner_reported_error';
+    }
+    const responseModel = message.responseModel ?? message.actualModel ??
+      message.usage?.responseModel ?? message.metadata?.responseModel;
+    const effort = message.providerThinkingLevel ?? message.reasoningEffort ??
+      message.usage?.providerThinkingLevel ?? message.metadata?.reasoningEffort;
+    if ((message.provider !== undefined && message.provider !== critic.provider) ||
+        (message.model !== undefined && message.model !== critic.model) ||
+        (responseModel !== undefined && responseModel !== critic.model) ||
+        (message.thinkingLevel !== undefined && message.thinkingLevel !== critic.reasoningLevel) ||
+        (effort !== undefined && effort !== critic.reasoningLevel)) {
+      return 'review_model_mismatch';
+    }
+    // Уже изданный вердикт без agent_settled — не обрыв, а зафиксированный
+    // исход: второй вызов не должен стирать записанный REWORK/ESCALATE/PASS.
+    // Дисквалифицирует и ЛЮБОЙ объект с ключом verdict (даже malformed —
+    // {"verdict":42}), и маркер legacy-вердикта в тексте хода.
+    const parts = Array.isArray(message.content) ? message.content : [];
+    const text = parts.filter(p => p?.type === 'text').map(p => p.text).join('\n');
+    // Вердиктоподобный фрагмент обязателен даже когда сам JSON битый:
+    // {"verdict":"REWORK",} не парсится, но исход уже издан — hold.
+    if (/"verdict"\s*:/.test(text)) return 'review_verdict_emitted';
+    try {
+      parseReviewVerdict(text);
+      return 'review_verdict_emitted';
+    } catch (verdictError) {
+      if (!(verdictError instanceof ReviewDenied) ||
+          verdictError.reason !== 'review_verdict_missing') {
+        return 'review_verdict_emitted';
+      }
+    }
+    // Штатно закрывшийся assistant-ответ — завершённый исход хода: даже
+    // без agent_settled и с недоказуемым вердиктом (например, битый
+    // {verdict: ...}) это hold, а не обрыв потока. rawStopReason
+    // 'completed' и 'stop' — нормальные завершения OpenAI-совместимого
+    // адаптера; отсутствие поля — тоже закрытый ответ.
+    if (message.stopReason === 'stop' &&
+        (message.rawStopReason === undefined ||
+          ['completed', 'stop'].includes(message.rawStopReason))) {
+      finishedResponse = true;
+    }
+  }
+  for (const tool of tools) {
+    if (!READ_ONLY_TOOLS.includes(tool)) return `review_forbidden_tool:${tool}`;
+  }
+  // Завершённый ответ без доказуемого вердикта — невалидный исход, а не
+  // обрыв: пропажа settlement/недоказуемое намерение не открывает повтор —
+  // второй вызов не должен заменять завершённый ответ читателя.
+  if (finishedResponse) return 'review_verdict_missing';
+  return null;
+}
 
 // Монтируются только каталоги кода; конфиги идут через /pi-cfg копией в tmpfs.
 const PI_MOUNT_DIRS = ['bin', 'install', 'npm'];
@@ -47,6 +168,18 @@ export class ReviewDenied extends Error {
   constructor(reason, options) {
     super(reason, options);
     this.reason = reason;
+  }
+}
+
+// Доказанный transient-сбой read-only раннера L2: хостовый таймаут exec или
+// подтверждённый SIGTERM контейнера (код 143). Единственный класс ошибок, по
+// которому контроллер делает один повтор того же закреплённого критика и
+// субъекта. Отказ, битый вердикт, mismatch модели и обычный REWORK сюда не
+// попадают — это не ReviewRunnerTimeout и повтора не даёт.
+export class ReviewRunnerTimeout extends ReviewDenied {
+  constructor(reason, options) {
+    super(reason, options);
+    this.transient = true;
   }
 }
 
@@ -72,6 +205,12 @@ const MODEL_FAMILY = new Map([
   ['swe-2-high', 'cognition'],
   ['swe-2-medium', 'cognition'],
   ['swe-2-low', 'cognition'],
+  ['swe-2-1', 'cognition'],
+  ['swe-2-1-low', 'cognition'],
+  ['swe-2-1-medium', 'cognition'],
+  ['swe-2-1-high', 'cognition'],
+  ['swe-2-1-xhigh', 'cognition'],
+  ['swe-2-1-max', 'cognition'],
   ['glm-5.3-flash', 'glm'],
   ['builtin:zai-start-plan\\glm-5.3-flash', 'glm'],
   ['deepseek-v4.1-flash', 'deepseek'],
@@ -231,7 +370,7 @@ export function parseReviewTranscript(ndjson) {
   const last = seen.at(-1);
   const toolsAdded = tools.size ? [...tools] : null;
   if (hasError || !seenSettled || aborted !== false || last.stopReason !== 'stop' ||
-      (last.rawStopReason !== undefined && last.rawStopReason !== 'completed') ||
+      (last.rawStopReason !== undefined && !VALID_RAW_STOP_REASONS.has(last.rawStopReason)) ||
       !last.text.trim()) {
     throw new ReviewDenied('review_incomplete_turn');
   }
@@ -465,10 +604,12 @@ export function assertToolsAllowed(toolsAdded) {
 
 // Both snapshot tools and model clients have an isolated network namespace.
 export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAGE,
-  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate', beforeEffect }) {
-  if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length) {
+  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate', input, beforeEffect, signal }) {
+  if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length ||
+      (input !== undefined && typeof input !== 'string' && !Buffer.isBuffer(input))) {
     throw new ReviewDenied('sandbox_request_invalid');
   }
+  if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
   const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
     timeout: 12_000,
   })).stdout);
@@ -477,7 +618,9 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   }
   const name = `board-review-${randomUUID()}`;
   const args = ['run', '--rm', '--name', name, '--pull=never', '--read-only', '--network=none',
-    '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0'];
+    '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0',
+    '--pids-limit=256', '--memory=2g', '--memory-swap=2g', '--cpus=2'];
+  if (input !== undefined) args.push('-i');
   args.push('--tmpfs=/tmp:rw,nosuid,nodev,size=64m', '-e', 'HOME=/tmp',
     '--mount', `type=bind,src=${snapshot},dst=/candidate,readonly`);
   for (const { src, dst } of mounts) {
@@ -496,38 +639,255 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   let code = 0;
   let stdout = '';
   let stderr = '';
+  let timedOut = false;
+  // Отмена добивает именованный контейнер этого запуска: опрос повторяется,
+  // чтобы накрыть окно между docker info и созданием контейнера. Финальный
+  // rm -f в finally самого раннера остаётся второй гарантией.
+  let stopping = null;
+  const onAbort = () => {
+    stopping ??= (async () => {
+      for (let poll = 0; poll < 8; poll++) {
+        try {
+          await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
+          return;
+        } catch { /* контейнера ещё нет — повтор */ }
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    })();
+  };
   await beforeEffect?.();
+  if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
+  signal?.addEventListener?.('abort', onAbort, { once: true });
   try {
-    const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
+    const run = await execWithInput('docker', args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, input);
     stdout = run.stdout;
     stderr = run.stderr;
   } catch (error) {
-    code = typeof error.code === 'number' ? error.code : null;
+    // Доказательство хостового таймаута: execFile добил дочерний процесс по
+    // истечении timeout (killed + SIGTERM). Нечисловой код без этого
+    // признака — обычный сбой exec (spawn/ENOENT), не доказанный таймаут.
+    ({ code, timedOut } = classifySandboxExit(error));
     stdout = error.stdout ?? '';
     stderr = error.stderr ?? '';
   } finally {
-    try {
-      await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
-    } catch (failure) {
-      if (!String(failure.stderr).includes('No such container')) {
-        throw new ReviewDenied('sandbox_cleanup_failed', { cause: failure });
+    signal?.removeEventListener?.('abort', onAbort);
+    // Сначала дождаться уже начатого удаления обработчиком отмены: повторный
+    // rm -f во время активного удаления получил бы «removal ... is already
+    // in progress» и отказ вернулся бы до завершения cleanup.
+    await stopping;
+    // Параллельный stopRun мог начать удаление этого же контейнера по id
+    // раньше rm по имени: «removal already in progress» значит удаление ещё
+    // идёт — дожидаемся его завершения, отказ только после реального cleanup.
+    for (let poll = 0; ; poll++) {
+      try {
+        await exec('docker', ['rm', '-f', name], { timeout: 15_000 });
+        break;
+      } catch (failure) {
+        const detail = String(failure.stderr);
+        if (detail.includes('No such container')) break;
+        if (!detail.includes('already in progress') || poll >= 12) {
+          throw new ReviewDenied('sandbox_cleanup_failed', { cause: failure });
+        }
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
     }
   }
-  return { code, stdout, stderr };
+  if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
+  return { code, stdout, stderr, timedOut };
 }
 
-function runModelInReadOnlySandbox({ allow, argv, env = {}, mounts = [], ...options }) {
+// Хостовое доказательство завершения child_process.execFile: числовой код —
+// выход процесса; timedOut — только когда хост добил процесс по timeout
+// (killed + SIGTERM). SIGKILL/SIGINT и spawn-ошибки таймаутом не являются.
+export function classifySandboxExit(error) {
+  return {
+    code: typeof error?.code === 'number' ? error.code : null,
+    // Доказательство deadline хоста — killed: execFile сам послал
+    // kill-сигнал (наш killSignal — SIGTERM) по таймауту. Дочерний процесс
+    // мог погибнуть им (signal = 'SIGTERM') либо обработать и выйти числом
+    // (signal = null, code = 1 и т.п.) — оба случая доказанный таймаут.
+    // Любой другой сигнал — не хостовый deadline (SIGKILL/SIGINT и т.п.).
+    timedOut: error?.killed === true &&
+      (error?.signal === 'SIGTERM' || error?.signal == null),
+  };
+}
+
+// Классификация ненулевого выхода read-only раннера: только числовой код 143
+// (SIGTERM процесса контейнера) или доказанный хостовый таймаут exec дают
+// transient ReviewRunnerTimeout. Произвольный null, строка «143» в stderr,
+// SIGKILL (137), отказ запуска и прочие коды — обычный ReviewDenied.
+export function reviewRunnerExitFailure(run) {
+  const reason = `review_runner_exit:${run?.code ?? 'timeout'}`;
+  // Код 137 — SIGKILL и нетранзиентен даже при timedOut-флаге: дочерний
+  // процесс вышел 137-м, обработав deadline-сигнал, — числовой выход
+  // доминирует над host-доказательством.
+  if (run?.code === 143 || (run?.timedOut === true && run?.code !== 137)) {
+    return new ReviewRunnerTimeout(reason);
+  }
+  return new ReviewDenied(reason);
+}
+
+// Перед единственным повтором L2: тот же зачисленный worktree на той же
+// ветке — чистый HEAD на candidate_sha, прежний base-предок, а при заданном
+// binding.branch именно эта ветка (detached HEAD и подмена ветки на тот же
+// коммит отклоняются). Невозможность проверить — отказ, повторного вызова нет.
+export async function assertRetrySubjectUnchanged(binding) {
+  if (!isAbsolute(binding?.worktree ?? '') || !SHA.test(binding?.candidate_sha ?? '')) {
+    throw new ReviewDenied('review_retry_subject_unverified');
+  }
+  // Путь обязан оставаться каноническим recorded-at-enrollment: подмена его
+  // симлинком на другой чистый checkout — не тот субъект, повтор запрещён.
+  const canonical = await realpath(binding.worktree).catch(() => null);
+  const toplevel = await git(binding.worktree, 'rev-parse', '--show-toplevel');
+  const head = await git(binding.worktree, 'rev-parse', 'HEAD');
+  const branch = await git(binding.worktree, 'branch', '--show-current');
+  const status = await git(binding.worktree, 'status', '--porcelain=v1', '--untracked-files=all');
+  if (canonical !== binding.worktree || toplevel !== binding.worktree ||
+      head !== binding.candidate_sha || status !== '' || branch === '' ||
+      (nonEmpty(binding.branch) && branch !== binding.branch)) {
+    throw new ReviewDenied('review_retry_subject_changed');
+  }
+  if (SHA.test(binding.base_sha ?? '')) {
+    await git(binding.worktree, 'merge-base', '--is-ancestor',
+      binding.base_sha, binding.candidate_sha);
+  }
+}
+
+// Контроллерские гейты перед единственным повтором: доказательство ТЕКУЩЕГО
+// lease/эпохи свежим verifyHeld (native renew + допуск 'claimed'), повторный
+// допуск карточки (владелец/метка) и сверка живых контрактных меток с
+// закреплёнными при спавне, guardTask там, где сконфигурирован, daemon и
+// pilot kill-switch, закреплённые входы оператора, передэффектные гейты.
+// Ничего не берётся из кэшированного флага — каждая проверка живая.
+export function l2ReviewRetryGuard({ port, taskId, epoch, owner, label, contract,
+  required, assertPinned, beforeEffect, assertOpen, daemonOpen }) {
+  return async () => {
+    const live = await port.verifyHeld(taskId, epoch);
+    if (live?.epoch !== epoch) throw new Error('Lease lost');
+    if (owner && label && await port.matches?.(taskId, { owner, label, state: 'claimed' }) === false) {
+      throw new Error('Task no longer authorized');
+    }
+    if (contract || required?.length) {
+      const live = await port.labels?.(taskId);
+      if (!live) throw new Error('contract_labels_unavailable');
+      if (contract) {
+        for (const key of ['repo_id', 'spec_digest', 'policy_digest',
+            'profile_id', 'finish', 'fixtures_digest', 'l1_profile']) {
+          if ((live[key] ?? null) !== (contract[key] ?? null)) {
+            throw new Error(`contract_drift:${key}`);
+          }
+        }
+        if ((live.has_ui === 'true') !== (contract.has_ui === true)) {
+          throw new Error('contract_drift:has_ui');
+        }
+      }
+      // Дополнительные required-метки маршрута — тот же допуск, что у
+      // claimReady на первичном захвате: метка, снятая во время первой
+      // попытки, делает карточку непригодной для повтора.
+      // Тот же допуск, что у claimReady/admits: метка обязана быть
+      // НЕПУСТОЙ строкой — снятая и опустошённая метки одинаково закрывают
+      // карточку для повтора.
+      for (const key of required ?? []) {
+        if (typeof live[key] !== 'string' || !live[key]) {
+          throw new Error(`required_label_missing:${key}`);
+        }
+      }
+    }
+    await port.guardTask?.(taskId, epoch);
+    await daemonOpen?.();
+    if (assertOpen) await assertOpen(); else await assertPinned?.();
+    await beforeEffect?.();
+  };
+}
+
+// Пре-эффектная граница запуска ТОЛЬКО для повтора: сначала живые гейты и
+// асинхронная сверка субъекта, затем закреплённые входы/переключатели и
+// доказательство lease — а дешёвое чтение daemon-стоп-файла идёт
+// ПОСЛЕДНИМ: закрытие switch в любом из асинхронных окон (контракт,
+// субъект, пины, renewal) отменяет запуск, а не только его более ранняя
+// проверка. Порядок фиксирован здесь, чтобы регрессионный тест мог
+// прогнать сам продукционный хук, а не его копию.
+export function l2LaunchBoundary({ retryGuard, verifySubject, assertOpen,
+  assertPinned, checkLease, daemonOpen }) {
+  return async () => {
+    await retryGuard?.();
+    await verifySubject?.();
+    if (assertOpen) await assertOpen(); else await assertPinned?.();
+    await checkLease?.();
+    await daemonOpen?.();
+  };
+}
+
+// Пара read-only читателей L2 одного закреплённого критика: первый запуск
+// идёт прежним beforeEffect — тем же хуком, что до DF-OPS-1, без новых
+// daemon-чтений, ожидания renewal и повторных гейтов в пре-эффекте. Второй
+// экземпляр того же раннера и pinned-модели получает retry-only хук
+// границы запуска — retry-проверки существуют только у него.
+// Оба раннера конструируются ЛЕНИВО, при первом вызове: проверки
+// review-порта (renewal, пины, пре-эффект) остаются впереди и
+// конструирования читателя, а не только его запуска.
+export function l2CriticRunners({ makeRunner, options, beforeEffect, retryBeforeEffect }) {
+  const lazy = hook => {
+    let runner;
+    return (binding, profile) =>
+      (runner ??= makeRunner({ ...options, beforeEffect: hook }))(binding, profile);
+  };
+  return { review: lazy(beforeEffect), retry: lazy(retryBeforeEffect) };
+}
+
+// Доказательство lease на границе запуска — только свежий нативный
+// verifyHeld с точной эпохой: кэшированный флаг renewal-цикла и await
+// pending-промиса не доказывают текущее удержание карточки.
+export function l2FreshLeaseCheck({ port, taskId, epoch }) {
+  return async () => {
+    const live = await port.verifyHeld(taskId, epoch);
+    if (live?.epoch !== epoch) throw new Error('Lease lost');
+  };
+}
+
+// Один повторный вызов L2-критика внутри review-порта — только по
+// ReviewRunnerTimeout, без сна и скрытых циклов. Повтор идёт с теми же
+// binding/profile: тот же критик, модель/effort и subject_digest
+// гарантированы идентичностью аргументов. beforeRetry — контроллерские
+// гейты (lease/epoch, допуск карточки, kill-switch, закреплённые входы);
+// любой неуспех гейта отменяет повтор, ошибка уходит в обычный hold.
+// Второй сбой пробрасывается наружу без третьей попытки.
+export async function l2ReviewWithTransientRetry({ review, retry = review, binding, profile,
+  beforeRetry, verifySubject = assertRetrySubjectUnchanged, log }) {
+  try {
+    return await review(binding, profile);
+  } catch (error) {
+    if (!(error instanceof ReviewRunnerTimeout)) throw error;
+    // Сначала неизменность субъекта (fs/git), затем живые контроллерские
+    // гейты непосредственно перед dispatch: дрейф во время subject-check
+    // не должен пропустить второй вызов под устаревшей авторизацией.
+    await verifySubject(binding);
+    await beforeRetry?.();
+    // Дрейф за время живых гейтов: субъект сверяется повторно непосредственно
+    // перед dispatch — смена HEAD/чистоты во время ожидания lease/daemon
+    // проверок не должна пропустить экспорт другого коммита второму читателю.
+    await verifySubject(binding);
+    log?.({ kind: 'l2_review_retry', task: binding?.task_id ?? null,
+      sha: binding?.candidate_sha ?? null, reason: error.reason });
+    // Второй вызов может идти отдельным экземпляром того же раннера с
+    // retry-only пре-эффектом — первый запуск retry-гейтов не несёт.
+    return await retry(binding, profile);
+  }
+}
+
+function runModelInReadOnlySandbox({ allow, argv, env = {}, mounts = [], input, selfProxied = false,
+  ...options }) {
   const { NODE_OPTIONS, ...bootEnv } = env;
   if (NODE_OPTIONS) bootEnv.DF_CHILD_NODE_OPTIONS = NODE_OPTIONS;
+  const proxiedArgv = selfProxied ? argv : ['node', '/model-proxy/client.cjs', ...argv];
   return withModelProxy({ allow, beforeConnect: options.beforeEffect }, socket => runInReadOnlySandbox({ ...options,
-    argv: ['node', '/model-proxy/client.cjs', ...argv], env: bootEnv,
+    argv: proxiedArgv, env: bootEnv, input,
     mounts: [...mounts, { src: PROXY_BOOTSTRAP, dst: '/model-proxy/client.cjs' },
       { src: socket, dst: '/model-proxy/upstream.sock' }] }));
 }
 
 function piSandbox(opts) {
-  return runModelInReadOnlySandbox(opts);
+  return runModelInReadOnlySandbox({ ...opts, selfProxied: true });
 }
 
 async function sandboxPiCredential(piRoot, provider, kind, beforeEffect) {
@@ -555,7 +915,7 @@ async function sandboxPiCredential(piRoot, provider, kind, beforeEffect) {
 
 // Legacy Pi/Sol ReviewPort on the hardened snapshot; VS-2 uses the Neon adapter.
 export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
-  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect }) {
+  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect, signal }) {
   if (!isAbsolute(journal ?? '') || !isAbsolute(piRoot ?? '')) {
     throw new ReviewDenied('review_runner_misconfigured');
   }
@@ -594,20 +954,40 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         if (patch.trim()) await writeFile(diffFile, patch, { mode: 0o600 });
       } catch { /* без diff ревью всё равно идёт по снимку */ }
 
+      // Раунд 2+: инкрементальный diff предыдущий кандидат → текущий.
+      // Именно он отделяет новые регрессии от уже проверенных изменений —
+      // без него diff-scoped пересмотр невозможен: отказ до запуска критика,
+      // без вердикта (слепой base-diff не различает новые регрессии).
+      const roundFile = join(scratch, 'round.diff');
+      const reviewRound = Number.isSafeInteger(binding.review_round) ? binding.review_round : 1;
+      if (reviewRound > 1) {
+        if (!SHA.test(binding.prior_sha ?? '') ||
+            binding.prior_sha === binding.candidate_sha) {
+          throw new ReviewDenied('review_round_diff_missing');
+        }
+        try {
+          const { stdout: patch } = await exec('git',
+            ['-C', binding.worktree, 'diff', `${binding.prior_sha}..${binding.candidate_sha}`],
+            { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+          await writeFile(roundFile, patch, { mode: 0o600 });
+        } catch (cause) {
+          throw new ReviewDenied(`review_round_diff_failed:${String(cause?.message ?? cause)}`);
+        }
+      }
+
       // Контрольные значения ДО запуска: дерево, байты снимка и worktree.
       const treeSha = await git(binding.worktree, 'rev-parse', `${binding.candidate_sha}^{tree}`);
       const before = await snapshotDigest(source);
       const fpBefore = await worktreeFingerprint(binding.worktree);
 
       // Монтирования критика: только каталоги кода ~/.pi/agent — ни sessions/,
-      // ни auth.json на диске контейнера. Конфиги собираются в /pi-cfg и
-      // копируются в tmpfs /tmp/.pi/agent: auth.json содержит ТОЛЬКО запись
-      // одного провайдера критика и уничтожается pi-guard после первого чтения.
+      // ни auth.json в /pi-cfg. Конфиги собираются в /pi-cfg и копируются в
+      // tmpfs /tmp/.pi/agent: auth.json содержит ТОЛЬКО запись одного
+      // провайдера критика, едет stdin и уничтожается pi-guard после первого чтения.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
       const credential = await sandboxPiCredential(piRoot, critic.provider, 'review', beforeEffect);
-      await writeFile(join(cfgDir, 'auth.json'),
-        JSON.stringify({ [critic.provider]: credential }), { mode: 0o600 });
+      const authInput = JSON.stringify({ [critic.provider]: credential });
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
@@ -621,6 +1001,9 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       if (await lstat(diffFile).catch(() => null)) {
         mounts.push({ src: diffFile, dst: '/review/diff.patch' });
       }
+      if (await lstat(roundFile).catch(() => null)) {
+        mounts.push({ src: roundFile, dst: '/review/round.diff' });
+      }
       for (const component of PI_MOUNT_DIRS) {
         const src = join(piRoot, component);
         const info = await lstat(src).catch(() => null);
@@ -631,39 +1014,32 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         PI_ALLOW_CONNECT: allow.join(',') };
 
       const hasDiff = mounts.some((m) => m.dst === '/review/diff.patch');
+      const hasRound = mounts.some((m) => m.dst === '/review/round.diff');
       const diffLine = hasDiff
-        ? 'and the exact diff base→candidate is mounted read-only at /review/diff.patch'
+        ? 'and the exact diff base→candidate is mounted read-only at /review/diff.patch' +
+          (hasRound ? ', and the incremental previous-candidate→current diff is at /review/round.diff — ' +
+            'only changes inside it are new this round' : '')
         : 'and the base→candidate diff is not available (review the tree as a whole)';
       const subjectLine = binding.subject_digest
         ? `The required subject_digest for this candidate is "${binding.subject_digest}". ` +
           'Echo that exact string as "subject_digest" inside the verdict JSON — ' +
           'copy it verbatim, do NOT compute or invent a digest yourself.'
         : '';
-      const instruction = [
-        `Independent, read-only review for Board #${binding.task_id} at ${binding.candidate_sha}.`,
-        `The candidate tree is mounted read-only at /candidate, ${diffLine}.`,
-        'Review against the spec below. You have read-only tools only;',
-        'do not attempt to write.',
-        'Finish with exactly one verdict: a JSON code block {"verdict":"PASS"|"REWORK"|"ESCALATE",',
-        '"summary":"...","findings":[{"file","line","input","expected","actual","freq","harm"}],',
-        '"checked_invariants":["..."]}, or a final line REVIEW_OK or REVIEW_BLOCKED.',
-        'A REWORK verdict is rejected unless "findings" contains at least one object',
-        'with non-empty "file", "expected" and "actual" (or an explicit "excerpt" string).',
-        subjectLine,
-        '',
-        prompt,
-      ].join('\n');
+      const instruction = buildReviewInstruction({ binding, diffLine, subjectLine,
+        prompt, round: reviewRound,
+        priorBlockingFindings: binding.prior_findings ?? [] });
 
       // Каталоги pi — симлинки на read-only монтирования кода; конфиги
       // копируются в tmpfs (pi кладёт <name>.lock рядом), guard — в /tmp.
       const piArgv = ['/bin/sh', '-c',
-        'mkdir -p /tmp/.pi/agent /tmp/session; ' +
+        'set -eu; mkdir -p /tmp/.pi/agent /tmp/session; umask 077; ' +
+        'cat > /tmp/.pi/agent/auth.json; chmod 600 /tmp/.pi/agent/auth.json; ' +
         'for f in bin install npm; do ' +
         '[ -e "/pi-ro/$f" ] && ln -s "/pi-ro/$f" "/tmp/.pi/agent/$f"; done; ' +
-        'for f in auth.json settings.json models.json models-store.json; do ' +
+        'for f in settings.json models.json models-store.json; do ' +
         '[ -e "/pi-cfg/$f" ] && cp "/pi-cfg/$f" "/tmp/.pi/agent/$f"; done; ' +
         'cp /pi-guard/pi-guard.cjs /tmp/pi-guard.cjs; ' +
-        'exec /pi-ro/bin/pi "$@"', 'pi',
+        'exec node /model-proxy/client.cjs /bin/sh -c \'exec /pi-ro/bin/pi \"$@\" </dev/null\' pi "$@"', 'pi',
         '--print', '--mode', 'json',
         '--provider', critic.provider, '--model', critic.model,
         '--thinking', critic.reasoningLevel,
@@ -671,14 +1047,43 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         '--no-approve', '--tools', READ_ONLY_TOOLS.join(','),
         '--session-dir', '/tmp/session', instruction];
 
-      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs, beforeEffect });
-      if (run.code !== 0) {
+      const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs,
+        input: authInput, beforeEffect, signal });
+      const dirtyExit = run.code !== 0;
+      if (dirtyExit) {
         // Сырой вывод — только в приватный журнал (0600), не в причину Board.
         try {
           await writeFile(join(journal, `${name}.stderr`),
             String(run.stderr || run.stdout || ''), { flag: 'wx', mode: 0o600 });
         } catch { /* журнал недоступен — не маскируем исходную ошибку */ }
-        throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
+        // Завершённый транскрипт при ненулевом выходе — не «чистый» transient:
+        // ответ проходит обычную валидацию (модель, tools, verdict, REWORK),
+        // чтобы повтор не стёр содержательный исход. Структурные и
+        // аттестационные отказы парсера (mismatch модели/effort) сохраняются
+        // как есть — повтор по ним запрещён; transient-классификация только
+        // для действительно оборванного потока: даже незавершённый поток с
+        // явным error-событием или чужой закреплённой моделью — отказ, не retry.
+        try {
+          parseReviewTranscript(run.stdout);
+        } catch (error) {
+          if (error instanceof ReviewDenied && !TRUNCATED_TRANSCRIPT.has(error.reason)) {
+            throw error;
+          }
+          // Скан дисквалификации идёт по сырому потоку при ЛЮБОЙ усечённой
+          // причине: поток из одного error-события парсится как empty,
+          // битая строка — как corrupt; оба случая могут уже содержать
+          // зафиксированный отказ или чужую закреплённую модель.
+          const disqualified = transcriptDisqualifying(run.stdout, critic);
+          if (disqualified) throw new ReviewDenied(disqualified);
+          const exitError = reviewRunnerExitFailure(run);
+          if (exitError instanceof ReviewRunnerTimeout) {
+            // Прежде чем выход станет повторяемым — снимок первого читателя
+            // обязан быть нетронут: нарушение read-only границы — hold,
+            // не transient, иначе повтор сотрёт следы инцидента.
+            await verifySnapshotUnchanged(source, before);
+          }
+          throw exitError;
+        }
       }
 
       // Приватный сырой транскрипт: контроллер владеет каталогом журнала.
@@ -687,19 +1092,40 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       await writeFile(join(journal, name), transcript, { flag: 'wx', mode: 0o600 });
 
       const parsed = parseReviewTranscript(transcript);
+      // Observe-метрика зацикливания критика (V2-3): детектор не меняет
+      // вердикт — сработка видна в журнале для калибровки abort-режима.
+      try {
+        const guard = createStreamLoopGuard({ mode: 'observe' });
+        guard.push('content', parsed.finalText ?? '');
+        const loopMetric = guard.finish();
+        if (loopMetric.looped) {
+          console.log(JSON.stringify({ loop_guard: 'l2_critic', task_id: binding.task_id,
+            content: loopMetric.content }));
+        }
+      } catch { /* метрика не влияет на приёмку */ }
       for (const key of ['provider', 'model', 'reasoningLevel']) {
         if (parsed.actual[key] !== critic[key]) {
           throw new ReviewDenied(`review_${key}_mismatch`);
         }
       }
       assertToolsAllowed(parsed.toolsAdded);
-      const verdict = parseReviewVerdict(parsed.finalText);
+      const verdict = await applySeverityGating(parseReviewVerdict(parsed.finalText),
+        { journal, taskId: binding.task_id, candidateSha: binding.candidate_sha,
+          round: binding.review_round ?? 1 });
       if (binding.subject_digest != null
           ? verdict.subject_digest !== binding.subject_digest
           : nonEmpty(verdict.subject_digest)) {
         // При заданном дайджесте вердикт обязан подтвердить именно его;
         // непрошенный subject_digest без binding — тоже отказ.
         throw new ReviewDenied('review_verdict_subject_mismatch');
+      }
+
+      // Ненулевой выход не даёт квитанции вообще: завершённый поток прошёл
+      // обычную валидацию выше (mismatch-модели — уже hold со своей причиной),
+      // но любой вердикт по грязному выходу, включая REWORK/ESCALATE при
+      // transient-коде, — обычный hold, как до добавления повтора.
+      if (dirtyExit) {
+        throw new ReviewDenied(`review_runner_exit:${run.code ?? 'timeout'}`);
       }
 
       // После завершения: снимок и worktree обязаны быть побайтово неизменны.
@@ -723,6 +1149,8 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         status: verdict.status,
         summary: verdict.summary,
         findings: verdict.findings,
+        sidecar_findings: verdict.sidecar_findings ?? [],
+        severity_gated: verdict.severity_gated === true,
         checked_invariants: verdict.checked_invariants,
         excerpt: verdict.excerpt,
         checkpoint,
@@ -836,12 +1264,11 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
     }
     const scratch = await mkdtemp(join(tmpdir(), 'board-arbiter-'));
     try {
-      // auth только одного провайдера арбитра — как у критика, копией в tmpfs.
+      // auth только одного провайдера арбитра — как у критика, через stdin в tmpfs.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
       const credential = await sandboxPiCredential(piRoot, arbiter.provider, 'arbiter', beforeEffect);
-      await writeFile(join(cfgDir, 'auth.json'),
-        JSON.stringify({ [arbiter.provider]: credential }), { mode: 0o600 });
+      const authInput = JSON.stringify({ [arbiter.provider]: credential });
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
@@ -883,13 +1310,14 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
       ].join('\n');
 
       const piArgv = ['/bin/sh', '-c',
-        'mkdir -p /tmp/.pi/agent /tmp/session; ' +
+        'set -eu; mkdir -p /tmp/.pi/agent /tmp/session; umask 077; ' +
+        'cat > /tmp/.pi/agent/auth.json; chmod 600 /tmp/.pi/agent/auth.json; ' +
         'for f in bin install npm; do ' +
         '[ -e "/pi-ro/$f" ] && ln -s "/pi-ro/$f" "/tmp/.pi/agent/$f"; done; ' +
-        'for f in auth.json settings.json models.json models-store.json; do ' +
+        'for f in settings.json models.json models-store.json; do ' +
         '[ -e "/pi-cfg/$f" ] && cp "/pi-cfg/$f" "/tmp/.pi/agent/$f"; done; ' +
         'cp /pi-guard/pi-guard.cjs /tmp/pi-guard.cjs; ' +
-        'exec /pi-ro/bin/pi "$@"', 'pi',
+        'exec node /model-proxy/client.cjs /bin/sh -c \'exec /pi-ro/bin/pi \"$@\" </dev/null\' pi "$@"', 'pi',
         '--print', '--mode', 'json',
         '--provider', arbiter.provider, '--model', arbiter.model,
         '--thinking', effort,
@@ -899,7 +1327,8 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
 
       const snapshot = join(scratch, 'empty');
       await mkdir(snapshot);
-      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, allow, timeoutMs, beforeEffect });
+      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, allow, timeoutMs,
+        input: authInput, beforeEffect });
       if (run.code !== 0) {
         throw new ReviewDenied(`arbiter_runner_exit:${run.code ?? 'timeout'}`);
       }

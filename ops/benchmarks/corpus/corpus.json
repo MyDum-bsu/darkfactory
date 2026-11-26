@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "benchmark": "V2-6 Warp Factory Benchmarks",
+  "seed": "v2-6-deterministic-corpus",
+  "cases": [
+    {
+      "id": "code-policy",
+      "title": "Pure policy key validator with node:test coverage",
+      "kind": "code-policy",
+      "domain": "backend",
+      "size": "S",
+      "spec": "code-policy/SPEC.md",
+      "expectedArtifacts": ["src/policy-key.mjs", "src/policy-key.test.mjs"],
+      "verifier": "unit",
+      "pilotCase": "policy"
+    },
+    {
+      "id": "code-test-first",
+      "title": "Red-first regression repair for boundary parsing",
+      "kind": "code-test-first",
+      "domain": "backend",
+      "size": "S",
+      "spec": "code-test-first/SPEC.md",
+      "expectedArtifacts": ["src/boundary-parser.mjs", "src/boundary-parser.test.mjs"],
+      "verifier": "test-first"
+    },
+    {
+      "id": "ui-holdout",
+      "title": "Accessible collapsible status widget under hidden UI holdout",
+      "kind": "ui-holdout",
+      "domain": "ui",
+      "size": "M",
+      "spec": "ui-holdout/SPEC.md",
+      "expectedArtifacts": ["widget/index.html", "widget/styles.css", "widget/widget.js"],
+      "verifier": "holdout",
+      "holdout": "../holdouts/ui-holdout.assertions.json"
+    },
+    {
+      "id": "docs-contract",
+      "title": "Structured handoff specification with zero-dependency validator",
+      "kind": "docs-contract",
+      "domain": "docs",
+      "size": "S",
+      "spec": "docs-contract/SPEC.md",
+      "expectedArtifacts": ["docs/handoff-contract.md", "scripts/validate-handoff-contract.mjs"],
+      "verifier": "contract",
+      "pilotCase": "docs"
+    },
+    {
+      "id": "security-guard",
+      "title": "Shell safety and path traversal boundary module",
+      "kind": "security-guard",
+      "domain": "security",
+      "size": "M",
+      "spec": "security-guard/SPEC.md",
+      "expectedArtifacts": ["src/path-command-guard.mjs", "src/path-command-guard.test.mjs"],
+      "verifier": "unit"
+    },
+    {
+      "id": "refactor-review",
+      "title": "Small behavior-preserving refactor with severity-gated review",
+      "kind": "refactor-review",
+      "domain": "backend",
+      "size": "S",
+      "spec": "refactor-review/SPEC.md",
+      "expectedArtifacts": ["src/report-format.mjs", "src/report-format.test.mjs"],
+      "verifier": "review"
+    }
+  ]
+}

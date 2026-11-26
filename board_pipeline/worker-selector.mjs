@@ -9,7 +9,8 @@
 // второго писателя.
 
 import { executorFamily, l2RunnableSpec, ReviewDenied } from './review-runner.mjs';
-import { NEON_CRITIC, SOL_ARBITER, isSolArbiter } from './review-policy.mjs';
+import { isWorkerThreadId } from './worker-runtime.mjs';
+import { NEON_CRITIC, SOL_ARBITER, detectStalledReview, isSolArbiter } from './review-policy.mjs';
 import {
   DEFAULT_MIN_OBSERVATIONS,
   modelKey,
@@ -22,7 +23,7 @@ import {
 // согласованных резерва независимых семейств. Резерв, нарушающий
 // кросс-семейственную триаду конкретного маршрута, пропускается — маршрут
 // продолжается по следующему кандидату.
-export const PRIMARY_WORKER = Object.freeze({ provider: 'acp-devin', model: 'swe-2-high' });
+export const PRIMARY_WORKER = Object.freeze({ provider: 'acp-devin', model: 'swe-2-1-medium' });
 export const NARROW_RESERVE_PI = Object.freeze({
   provider: 'pi',
   model: 'opencode-go/deepseek-v4.1-flash',
@@ -37,11 +38,12 @@ export const FALLBACK_ANTIGRAVITY_NEON = Object.freeze({
 export const DEFAULT_CRITIC = NEON_CRITIC;
 export const DEFAULT_ARBITER = SOL_ARBITER;
 
-const DETERMINISTIC_GATES = new Set(['l1', 'tamper', 'l3']);
+const DETERMINISTIC_GATES = new Set(['l1', 'tamper', 'l3', 'scope_fence']);
 const GATE_BY_REASON = new Map([
   ['local_checks_failed', 'l1'],
   ['tamper_gate_failed', 'tamper'],
   ['visual_gate_failed', 'l3'],
+  ['scope_fence_violation', 'scope_fence'],
 ]);
 const DIGEST64 = /^[0-9a-f]{64}$/;
 
@@ -79,34 +81,15 @@ export function opencodeGoPolicyViolation(spec) {
     ? null : 'opencode_go_non_deepseek_disallowed';
 }
 
-// Полный запрет выбывшего провайдера: acp-zcode-start отклоняется в любом
-// списке кандидатов (явный plan, allowlist политики), не только в дефолтном
-// плане. Проверка рекурсивна: харнесс 'pi' с вложенной моделью вида
-// 'acp-zcode-start/...' (в любой вложенности) тоже отклоняется.
-// Причина — 'zcode_provider_retired'.
+// Owner Decision #18: acp-zcode-start/zcode и glm допускаются при наличии
+// квоты — выбывших провайдеров в действующей политике нет. Сигнатура
+// сохраняется для обратной совместимости вызовов (stage-sandbox-transport
+// и маршрутизатор): отсутствие нарушения обозначается null, как прежде.
 export function retiredProviderViolation(spec) {
-  const retired = id => typeof id === 'string' && id.toLowerCase() === 'acp-zcode-start';
-  // Строковый id 'provider/model': каждый сегмент проверяется — вложенный
-  // 'pi/acp-zcode-start/...' отклоняется так же, как и верхний провайдер.
-  const scanId = id => {
-    const i = id.indexOf('/');
-    return i < 0 ? retired(id) : retired(id.slice(0, i)) || scanId(id.slice(i + 1));
-  };
-  if (typeof spec === 'string') return scanId(spec) ? 'zcode_provider_retired' : null;
-  const scan = entry => {
-    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
-    if (retired(entry.provider)) return true;
-    if (typeof entry.model === 'string' && entry.model.includes('/')) {
-      const i = entry.model.indexOf('/');
-      if (retired(entry.model.slice(0, i))) return true;
-      return scan({ provider: entry.model.slice(0, i), model: entry.model.slice(i + 1) });
-    }
-    return false;
-  };
-  return scan(spec) ? 'zcode_provider_retired' : null;
+  return null;
 }
 
-// Упорядоченный план исполнителей маршрута: первичный acp-devin/swe-2-high,
+// Упорядоченный план исполнителей маршрута: первичный acp-devin/swe-2-1-medium,
 // затем согласованные резервы независимых семейств. Фактическая пригодность
 // резерва решается попыткой: нарушитель триады пропускается, подтверждённый
 // отказ допускает переход только при доказанной чистоте worktree.
@@ -263,7 +246,7 @@ export async function attemptSpawnWithFallback({
       lastRefusal = reason;
       continue;
     }
-    if (/^thr_[a-z0-9]+$/.test(launched?.threadId ?? '')) {
+    if (isWorkerThreadId(launched?.threadId)) {
       return {
         outcome: 'spawned',
         worker,
@@ -391,6 +374,26 @@ function contradicting(prev, latest) {
   return false;
 }
 
+// Жёсткий потолок L2-раундов попытки (Board #1666): на лимитном REWORK
+// контроллер останавливается без следующего круга и эскалирует карточку
+// владельцу ('l2_rework_limit_exceeded'). Считаются только раунды с
+// gate === 'l2' — детерминированные гейты лимит не расходуют. Лимит
+// настраивается маршрутом (route.maxL2ReworkRounds), по умолчанию 4;
+// маршрут может потолок только ужесточить — значение выше потолка и
+// невалидное одинаково откатываются к дефолту, четвёртый REWORK всегда
+// лимитный.
+export const DEFAULT_L2_REWORK_LIMIT = 4;
+// Фактически применённый лимит: валидное значение маршрута, прижатое к
+// потолку; невалидное и отсутствующее — дефолт. Причина остановки владецу
+// сообщает именно это число, не сырое значение маршрута (#1666 r4).
+export function effectiveL2ReworkLimit(limit = DEFAULT_L2_REWORK_LIMIT) {
+  if (!Number.isSafeInteger(limit) || limit < 1) return DEFAULT_L2_REWORK_LIMIT;
+  return Math.min(limit, DEFAULT_L2_REWORK_LIMIT);
+}
+export function l2ReworkLimitExceeded({ roundsHistory = [], limit = DEFAULT_L2_REWORK_LIMIT } = {}) {
+  return roundsHistory.filter(r => r?.gate === 'l2').length >= effectiveL2ReworkLimit(limit);
+}
+
 // Детектор отсутствия прогресса и содержательного спора. roundsHistory —
 // включая последний раунд (поля: gate, signature, blocking, findings, excerpt,
 // checkpoint, tree_sha, dispute, contradictory). Сходящаяся починка любой
@@ -412,6 +415,16 @@ export function evaluateReworkProgress({ roundsHistory = [] } = {}) {
       (latest.contradictory === true || contradicting(prev, latest))) {
     return { trigger: 'substantive_dispute', kind: 'contradictory_l2_findings',
       evidence: latest };
+  }
+  // Ранняя стагнация L2 (V2-2): повтор SHA-сигнатуры блокирующих находок
+  // любого предыдущего L2-раунда — даже не подряд (раунд 1 и 3) — запускает
+  // арбитра на раундах 2–3, до исчерпания лимита.
+  if (latest.gate === 'l2') {
+    const stalled = detectStalledReview({ roundsHistory });
+    if (stalled.stalled) {
+      return { trigger: 'no_progress', kind: stalled.kind,
+        deterministicGate: false, signatureSha: stalled.signatureSha, evidence: latest };
+    }
   }
   // Повторный tree_sha уже встречался в этой попытке — прогресса нет.
   if (typeof latest.tree_sha === 'string' && latest.tree_sha &&
@@ -778,8 +791,9 @@ export function routeTriad({ size, domain, policy, scorecard,
     mode: steps.worker.mode, selected, steps };
 }
 
-// Допуск кандидата по политике #1247: 0 zcode, DeepSeek-only в opencode-go,
-// а при непустом allowlist роли — строго внутри него.
+// Допуск кандидата по политике #1247 с поправкой Owner Decision #18:
+// zcode допустим при квоте, DeepSeek-only в opencode-go сохраняется, а при
+// непустом allowlist роли выбор остаётся строго внутри него.
 const admissible = (spec, list) =>
   retiredProviderViolation(spec) === null && opencodeGoPolicyViolation(spec) === null &&
   (list.length === 0 || inAllowlist(spec, list));

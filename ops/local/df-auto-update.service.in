@@ -1,0 +1,20 @@
+# Template for the Darkfactory fleet auto-updater user service.
+# Substitute @NODE@, @REPO@, @ROLE@, and @EXTRA_ARGS@ before installation.
+[Unit]
+Description=Darkfactory fleet auto-update
+After=network-online.target default.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO@
+ExecStart=@NODE@ @REPO@/ops/local/df-auto-update.mjs --role @ROLE@ --repo @REPO@ --state-file %h/.local/state/darkfactory/auto-update.json @EXTRA_ARGS@
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=false
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
