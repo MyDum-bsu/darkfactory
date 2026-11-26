@@ -138,12 +138,11 @@ test('Agy transport launches in the read-only staged snapshot and never inherits
   } finally { await chmod(cwd, 0o700); }
 });
 
-test('Agy version attestation accepts 1.5.14-1.5.16 and rejects unattested versions', async t => {
+test('Agy version attestation accepts >= 1.5.14 (no upper cap) and rejects older or malformed versions', async t => {
   const { journal } = await neonFixture(t);
-  assert.deepEqual([...agyStream.ATTESTED_AGY_VERSIONS], ['1.5.14', '1.5.15', '1.5.16']);
   const base = { cwd: journal, env: process.env, prompt: 'synthetic candidate',
     timeoutMs: 3000, sealBootstrap: async () => {} };
-  for (const version of ['1.5.14', '1.5.15', '1.5.16']) {
+  for (const version of ['1.5.14', '1.5.18', '1.6.0', '2.0.0']) {
     const binary = join(journal, `fake-agy-${version}`);
     const lines = agyStreamFixture(verdict, { cwd: journal }).split('\n');
     await writeFile(binary, `#!${process.execPath}
@@ -156,8 +155,8 @@ process.stdin.once('data', () => { for (const line of lines.slice(1)) console.lo
     assert.equal(result.code, 0, result.stderr);
     assert.match(result.stdout, /"status":"SUCCESS"/);
   }
-  for (const version of ['1.5.17', '2.0.0']) {
-    const binary = join(journal, `fake-agy-${version}`);
+  for (const version of ['1.5.13', '1.4.9', 'unknown', '']) {
+    const binary = join(journal, `fake-agy-bad-${version || 'empty'}`);
     await writeFile(binary, `#!${process.execPath}
 if (process.argv.includes('--version')) { console.log(${JSON.stringify(version)}); process.exit(0); }
 process.exit(1);
