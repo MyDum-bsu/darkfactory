@@ -27,11 +27,34 @@ import { parseArgs, promisify } from 'node:util';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
 import { resolveL1Profile } from '../board_pipeline/l1-profiles.mjs';
 import { assertNoBranchDrift } from '../board_pipeline/branch-drift.mjs';
+import { parseAllowedPaths } from '../board_pipeline/scope-fence.mjs';
 
 const execFileAsync = promisify(execFile);
 const HEX64 = /^[0-9a-f]{64}$/;
 const REPO_LABEL = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 const FINISH = new Set(['verified', 'deployed']);
+// Метка allowed_paths — scope fence воркера: список относительных путей
+// через запятую, не длиннее 256 символов. Невалидное значение (абсолютный
+// путь, '~', сегмент '..', пустой сегмент, обратный слэш, управляющие
+// символы) доезжало бы до Board и отклонялось бы поздно на verify/seal —
+// отказ здесь, до вызова vb.
+const ALLOWED_PATHS_LIMIT = 256;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+function validateAllowedPathsLabel(value) {
+  if (typeof value !== 'string' || value.length === 0) fail('allowed_paths_invalid');
+  if (value.length > ALLOWED_PATHS_LIMIT) fail('allowed_paths_too_long');
+  try {
+    parseAllowedPaths(value);
+  } catch {
+    fail('allowed_paths_invalid');
+  }
+  for (const entry of value.split(',')) {
+    const trimmed = entry.trim();
+    if (trimmed.startsWith('~') || CONTROL_CHARS.test(trimmed)) {
+      fail('allowed_paths_invalid');
+    }
+  }
+}
 // Контрактные метки и ключи проверенных CLI-путей: произвольный --label их
 // не переопределяет (иначе в Board уйдёт путь без проверки).
 const RESERVED_LABELS = new Set(
@@ -449,6 +472,9 @@ export async function buildEnqueuePlan(values, deps = {}) {
     // 'false' в нижнем регистре, любое другое значение ('TRUE', '1')
     // молча меняло бы смысл карточки — отказ до вызова vb.
     if (key === 'has_ui' && value !== 'true' && value !== 'false') fail('has_ui_invalid');
+    // allowed_paths — scope fence воркера: malformed-пути отклоняются
+    // здесь, а не поздно на verify/seal.
+    if (key === 'allowed_paths') validateAllowedPathsLabel(value);
     labels[key] = value;
   }
 

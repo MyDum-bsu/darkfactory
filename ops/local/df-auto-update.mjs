@@ -18,6 +18,10 @@ const BUSY_PATTERNS = Object.freeze([
   /factory-run\.mjs(?:\s|$)/,
   /factory-benchmark\.mjs(?:\s|$)/,
   /board_pipeline\/daemon\.mjs(?:\s|$)/,
+  // hc — CLI herdr-core: активная оркестрация воркеров --runtime hc. Токен
+  // сопоставляется целиком (границы start/слеш/пробел + пробел/конец), иначе
+  // подстроки в 'which'/'dhcpcd' ложно блокировали бы обновление.
+  /(^|[/\s])hc(?:\s|$)/,
 ]);
 
 function defaultHome(deps) {

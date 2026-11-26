@@ -14,10 +14,12 @@ import {
   EXAMPLE_CATALOG_PATH,
   EXAMPLE_POLICY_PATH,
   effectiveStatus,
+  isL2RunnableEntry,
   loadModelRegistry,
   registrySnapshot,
   resolveRoleChain,
   resolveTriad,
+  toPipelineAllowlist,
 } from './model-registry.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -504,5 +506,194 @@ test('P2: symlink родительского config dir допустим, symlin
     await symlink(target, paths.catalogPath);
     await assert.rejects(loadModelRegistry({ configDir: linked, now: NOW }),
       /model_registry_file_invalid/);
+  });
+});
+
+// Записи с прямыми L2-исполняемыми провайдерами: в example-каталоге
+// google/anthropic модели идут через ACP-харнессы, а мост strictL2
+// проверяется на прямой форме, реально запускаемой read-only раннером.
+const L2_DIRECT_ENTRIES = [
+  { id: 'neon-direct', provider: 'google', model: 'gemini-4-neon', family: 'google',
+    status: 'active', cost_tier: 'subscription',
+    capabilities: ['code', 'reasoning', 'vision', 'review'],
+    quota_source: 'manual', notes: 'direct google neon fixture' },
+  { id: 'sol-direct', provider: 'openai', model: 'gpt-6.2-sol', family: 'openai',
+    status: 'active', cost_tier: 'subscription',
+    capabilities: ['code', 'reasoning', 'review'],
+    quota_source: 'manual', notes: 'direct openai sol fixture' },
+  { id: 'claude-direct', provider: 'anthropic', model: 'claude-opus-5.5', family: 'anthropic',
+    status: 'active', cost_tier: 'subscription',
+    capabilities: ['code', 'reasoning', 'review'],
+    quota_source: 'manual', notes: 'direct anthropic claude fixture' },
+];
+
+test('isL2RunnableEntry: позитивный список провайдеров, ACP-харнессы исключены', () => {
+  for (const provider of ['google', 'openai', 'anthropic', 'deepseek', 'pi', 'opencode-go']) {
+    assert.equal(isL2RunnableEntry({ provider, model: 'm' }), true, provider);
+  }
+  for (const provider of ['acp-devin', 'acp-zcode-start', 'codex-acp', 'bb',
+    'acp-antigravity-acp', 'agy', 'glm', 'cognition', '', 'Google']) {
+    assert.equal(isL2RunnableEntry({ provider, model: 'm' }), false, provider);
+  }
+  // Не-объект, пустой объект и нестроковый provider — неисполняемы.
+  for (const bad of [null, undefined, {}, [], 'google', 42,
+    { provider: 42 }, { model: 'm' }, { provider: null }]) {
+    assert.equal(isL2RunnableEntry(bad), false, JSON.stringify(bad));
+  }
+  // Форма публичной записи цепочки (provider/model/family/...) — та же проверка.
+  assert.equal(isL2RunnableEntry({ provider: 'pi', model: 'openai/gpt-6.2-sol',
+    family: 'openai', status: 'active' }), true);
+});
+
+test('resolveTriad strictL2: ACP-харнессы отфильтрованы, Neon поднимает Sol арбитром', async () => {
+  await tmp(async dir => {
+    const registry = await loadFixture(dir, catalog => {
+      catalog.models.push(...L2_DIRECT_ENTRIES.map(entry => ({ ...entry })));
+      catalog.models.find(entry => entry.id === 'claude-opus-5.5').status = 'active';
+    }, policy => {
+      for (const mode of Object.values(policy.modes)) {
+        mode.candidates.coder_default = ['deepseek-v4.1-flash'];
+        mode.candidates.reviewer = ['claude-opus-5.5', 'neon-direct', 'claude-direct'];
+        mode.candidates.arbiter = ['claude-opus-5.5', 'claude-direct', 'sol-direct'];
+      }
+    });
+    // Дефолт strictL2=false — прежний контракт: reviewer ACP-харнесса
+    // допустим резолвом (аудит-дефект воспроизводится и документируется).
+    const loose = resolveTriad(registry, { mode: 'balanced', now: NOW });
+    assert.equal(loose.reviewer.id, 'claude-opus-5.5');
+    assert.equal(loose.reviewer.provider, 'acp-devin');
+
+    const strict = resolveTriad(registry, { mode: 'balanced', now: NOW, strictL2: true });
+    assert.equal(strict.coder.id, 'deepseek-v4.1-flash');
+    // acp-devin кандидат отфильтрован: reviewer — первый L2-исполняемый.
+    assert.equal(strict.reviewer.id, 'neon-direct');
+    assert.ok(strict.reviewer.chain.every(isL2RunnableEntry));
+    assert.ok(!strict.reviewer.chain.some(entry => entry.provider === 'acp-devin'));
+    assert.ok(strict.arbiter.chain.every(isL2RunnableEntry));
+    // При reviewer Neon арбитр Sol идёт первым, хотя общий порядок
+    // кандидатов ставил claude-direct раньше.
+    assert.equal(strict.arbiter.id, 'sol-direct');
+    assert.deepEqual(strict.arbiter.chain.map(entry => entry.id),
+      ['sol-direct', 'claude-direct']);
+
+    // Sol на паузе по квоте — не допустим, приоритизация не действует:
+    // арбитром остаётся следующий L2-исполняемый кандидат.
+    const paused = resolveTriad(registry, { mode: 'balanced', now: NOW, strictL2: true,
+      quotas: { 'sol-direct': 96 } });
+    assert.equal(paused.reviewer.id, 'neon-direct');
+    assert.equal(paused.arbiter.id, 'claude-direct');
+  });
+});
+
+test('resolveTriad strictL2: без reviewer Neon порядок арбитра не переставляется', async () => {
+  await tmp(async dir => {
+    const registry = await loadFixture(dir, catalog => {
+      catalog.models.push(...L2_DIRECT_ENTRIES.map(entry => ({ ...entry })));
+    }, policy => {
+      for (const mode of Object.values(policy.modes)) {
+        mode.candidates.coder_default = ['deepseek-v4.1-flash'];
+        mode.candidates.reviewer = ['claude-direct', 'neon-direct'];
+        mode.candidates.arbiter = ['neon-direct', 'sol-direct', 'claude-direct'];
+      }
+    });
+    const strict = resolveTriad(registry, { mode: 'balanced', now: NOW, strictL2: true });
+    assert.equal(strict.reviewer.id, 'claude-direct');
+    // Reviewer не Neon: кандидатный порядок режима сохраняется, Sol
+    // искусственно не поднимается — первый допустимый arbiter Neon.
+    assert.equal(strict.arbiter.id, 'neon-direct');
+    assert.deepEqual(strict.arbiter.chain.map(entry => entry.id),
+      ['neon-direct', 'sol-direct']);
+  });
+});
+
+test('resolveTriad strictL2: reviewer=null при отсутствии L2-исполняемых кандидатов', async () => {
+  await tmp(async dir => {
+    const registry = await loadFixture(dir, null, policy => {
+      for (const mode of Object.values(policy.modes)) {
+        mode.candidates.coder_default = ['deepseek-v4.1-flash'];
+        // Все кандидаты reviewer/arbiter — ACP-харнессы: strictL2 не
+        // выдумывает исполняемость, тройка деградирует fail-closed.
+        mode.candidates.reviewer = ['gemini-4-neon', 'claude-opus-5.5'];
+        mode.candidates.arbiter = ['gemini-4-neon', 'claude-opus-5.5'];
+      }
+    });
+    const strict = resolveTriad(registry, { mode: 'balanced', now: NOW, strictL2: true });
+    assert.equal(strict.reviewer, null);
+    // Без strictL2 те же кандидаты резолвятся — фильтр строго опционален.
+    const loose = resolveTriad(registry, { mode: 'balanced', now: NOW });
+    assert.notEqual(loose.reviewer, null);
+  });
+});
+
+test('toPipelineAllowlist: worker без фильтра, critic/arbiter только L2-исполняемые', async () => {
+  await tmp(async dir => {
+    const registry = await loadFixture(dir, catalog => {
+      catalog.models.push(...L2_DIRECT_ENTRIES.map(entry => ({ ...entry })));
+    }, policy => {
+      for (const mode of Object.values(policy.modes)) {
+        mode.candidates.reviewer.push('neon-direct', 'claude-direct', 'sol-direct');
+        mode.candidates.arbiter.push('neon-direct', 'claude-direct', 'sol-direct');
+      }
+    });
+    const allowlist = toPipelineAllowlist(registry, { mode: 'balanced', now: NOW });
+    assert.deepEqual(Object.keys(allowlist).sort(), ['arbiter', 'critic', 'worker']);
+    // Каноническая форма спеки: ровно { provider, model }.
+    for (const role of ['worker', 'critic', 'arbiter']) {
+      assert.ok(Array.isArray(allowlist[role]), role);
+      for (const spec of allowlist[role]) {
+        assert.deepEqual(Object.keys(spec).sort(), ['model', 'provider'], role);
+      }
+    }
+    // worker — полный харнесс: ACP-исполнители остаются; critic/arbiter —
+    // только L2 read-only провайдеры.
+    assert.ok(allowlist.worker.some(spec => spec.provider === 'acp-devin'));
+    assert.deepEqual(allowlist.worker[0], { provider: 'acp-devin', model: 'swe-2-1-medium' });
+    for (const role of ['critic', 'arbiter']) {
+      assert.ok(!allowlist[role].some(spec => spec.provider.startsWith('acp-')), role);
+      assert.ok(!allowlist[role].some(spec => spec.provider === 'bb'), role);
+    }
+    // gpt-6.2-sol example-записи на квота-паузе до 2026-11-27 и в пул не
+    // входит; прямая sol-direct active — входит. Порядок — кандидатный
+    // внутри status_priority.
+    assert.deepEqual(allowlist.critic, [
+      { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
+      { provider: 'google', model: 'gemini-4-neon' },
+      { provider: 'anthropic', model: 'claude-opus-5.5' },
+      { provider: 'openai', model: 'gpt-6.2-sol' },
+    ]);
+    // Детерминизм повторного вызова и изоляция результатов.
+    const again = toPipelineAllowlist(registry, { mode: 'balanced', now: NOW });
+    assert.deepEqual(again, allowlist);
+    // Квота механически убирает кандидата из пула.
+    const paused = toPipelineAllowlist(registry, { mode: 'balanced', now: NOW,
+      quotas: { 'deepseek-v4.1-flash': 96 } });
+    assert.ok(!paused.critic.some(spec => spec.model.includes('deepseek')));
+    assert.ok(paused.critic.some(spec => spec.provider === 'google'));
+  });
+});
+
+test('toPipelineAllowlist: пустой пул при отсутствии L2-исполняемых кандидатов', async () => {
+  await tmp(async dir => {
+    const registry = await loadFixture(dir, null, policy => {
+      for (const mode of Object.values(policy.modes)) {
+        mode.candidates.reviewer = ['gemini-4-neon', 'claude-opus-5.5'];
+        mode.candidates.arbiter = ['gemini-4-neon', 'claude-opus-5.5'];
+      }
+    });
+    const allowlist = toPipelineAllowlist(registry, { mode: 'balanced', now: NOW });
+    // Все кандидаты — ACP-харнессы: пулы критика и арбитра пусты fail-closed,
+    // worker-пул при этом не затронут.
+    assert.deepEqual(allowlist.critic, []);
+    assert.deepEqual(allowlist.arbiter, []);
+    assert.ok(allowlist.worker.length > 0);
+  });
+
+  await tmp(async dir => {
+    // Вызов без опциональных параметров: дефолтный режим политики и
+    // собственное время — детерминированная структура результата.
+    const registry = await loadFixture(dir);
+    const allowlist = toPipelineAllowlist(registry);
+    assert.deepEqual(Object.keys(allowlist).sort(), ['arbiter', 'critic', 'worker']);
+    assert.ok(Array.isArray(allowlist.worker));
   });
 });

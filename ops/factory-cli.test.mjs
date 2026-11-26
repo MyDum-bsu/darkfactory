@@ -1753,3 +1753,163 @@ test('run: --runtime validates fail-closed and forwards to run-isolated', async 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('run: node_modules mount allowlist — multi-repo цели внутри /candidate', async () => {
+  const dir = await tempdir();
+  try {
+    const wt = join(dir, 'wt');
+    await mkdir(wt);
+    const state = join(dir, 'state');
+    await mkdir(state);
+    await chmod(state, 0o700);
+    // Канонический источник маунта с basename 'node_modules' вне worktree.
+    const nodeModules = join(dir, 'node_modules');
+    await mkdir(nodeModules);
+    const recipe = to => ({ image: 'sha256:' + 'a'.repeat(64),
+      argv: ['npm', 'test'], cwd: '.', timeoutMs: 60_000,
+      mounts: [{ from: nodeModules, to }] });
+    const withMounts = mounts => ({ ...policySpec(wt),
+      profiles: { default: { branch: 'b',
+        review: { provider: 'google', model: 'gemini-4-neon' },
+        checks: mounts.map(recipe) } } });
+    // Multi-repo раскладка допускается: корень кандидата, вложенный пакет
+    // и прежняя tracker/web цель — все канонические node_modules внутри
+    // /candidate.
+    for (const to of ['/candidate/node_modules', '/candidate/app/node_modules',
+      '/candidate/web/node_modules', '/candidate/tracker/web/node_modules',
+      '/candidate/a/b/c/node_modules']) {
+      const file = await withPolicy(dir, withMounts([to]));
+      const plan = await runPlan(runValues(file, state));
+      assert.equal(plan.worktree, wt, to);
+    }
+    // Цели вне /candidate, неканонические сегменты и не-node_modules
+    // финальный сегмент отклоняются до Git-конфига.
+    for (const to of ['/outside/node_modules', '/etc/node_modules',
+      '/candidate/node_modules/../etc', '/candidate/../candidate/node_modules',
+      '/candidate/./node_modules', '/candidate//node_modules',
+      '/candidate/node_modules/', '/candidate', '/candidatex/node_modules',
+      '/candidate/node_modulesx', '/candidate/node_modules/x']) {
+      const file = await withPolicy(dir, withMounts([to]));
+      await assert.rejects(() => runPlan(runValues(file, state)),
+        /mount_outside_allowlist/, to);
+    }
+    // Каноническая цель с источником не-node_modules — тот же отказ:
+    // инвариант basename(from) сохраняется.
+    const deps = join(dir, 'deps');
+    await mkdir(deps);
+    const badFrom = { ...policySpec(wt),
+      profiles: { default: { branch: 'b',
+        review: { provider: 'google', model: 'gemini-4-neon' },
+        checks: [{ image: 'sha256:' + 'a'.repeat(64), argv: ['npm', 'test'],
+          cwd: '.', timeoutMs: 60_000,
+          mounts: [{ from: deps, to: '/candidate/node_modules' }] }] } } };
+    const badFromFile = await withPolicy(dir, badFrom);
+    await assert.rejects(() => runPlan(runValues(badFromFile, state)),
+      /mount_outside_allowlist/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run: --event-socket канонический путь вне worktree пробрасывается контроллеру', async () => {
+  const dir = await tempdir();
+  try {
+    const wt = join(dir, 'wt');
+    await mkdir(wt);
+    const state = join(dir, 'state');
+    await mkdir(state);
+    await chmod(state, 0o700);
+    const ops = join(dir, 'ops');
+    await mkdir(ops);
+    const policy = await withPolicy(dir, policySpec(wt));
+    // Сокет может ещё не существовать: родительский каталог каноничен и
+    // вне worktree — план строится, значение передаётся контроллеру.
+    const socket = join(ops, 'control-room.sock');
+    const plan = await runPlan(runValues(policy, state, { 'event-socket': socket }));
+    const index = plan.argv.indexOf('--event-socket');
+    assert.notEqual(index, -1);
+    assert.equal(plan.argv[index + 1], socket);
+    // Относительный и нестроковый путь — отказ до Git-конфига.
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { 'event-socket': 'ops/control-room.sock' })), /path_not_absolute/);
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { 'event-socket': null })), /path_not_absolute/);
+    // Неканоническая строка: '..', повторные '/', завершающий '/'.
+    for (const bad of [`${ops}/../ops/control-room.sock`, `${ops}//control-room.sock`,
+      `${socket}/`]) {
+      await assert.rejects(() => runPlan(runValues(policy, state,
+        { 'event-socket': bad })), /non_canonical_or_symlink_path/, bad);
+    }
+    // Родительский каталог не существует — path_missing до эффектов.
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { 'event-socket': join(dir, 'missing', 'x.sock') })), /path_missing/);
+    // Родительский каталог через симлинк — не канонический операторский путь.
+    const opsLink = join(dir, 'ops-link');
+    await symlink(ops, opsLink);
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { 'event-socket': join(opsLink, 'control-room.sock') })),
+      /non_canonical_or_symlink_path/);
+    // Каталог сокета внутри worktree и содержащий worktree — обе стороны
+    // границы отклоняются.
+    const innerOps = join(wt, 'ops');
+    await mkdir(innerOps);
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { 'event-socket': join(innerOps, 'control-room.sock') })),
+      /path_inside_worktree/);
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { 'event-socket': join(dir, 'control-room.sock') })),
+      /path_inside_worktree/);
+    // Существующий симлинк на месте сокета — отказ.
+    const target = join(ops, 'real.sock');
+    await writeFile(target, '');
+    const sockLink = join(ops, 'link.sock');
+    await symlink(target, sockLink);
+    await assert.rejects(() => runPlan(runValues(policy, state,
+      { 'event-socket': sockLink })), /non_canonical_or_symlink_path/);
+    // CLI-проброс через runFactory в dry-run: флаг доезжает до argv
+    // контроллера после проверенных путей.
+    const git = async argv => wt;
+    const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
+      '--policy', policy, '--state', state, '--event-socket', socket, '--dry-run'];
+    const dry = await runFactory(args, { git, env: {} });
+    assert.equal(dry.dryRun, true);
+    const dryIndex = dry.plan.argv.indexOf('--event-socket');
+    assert.notEqual(dryIndex, -1);
+    assert.equal(dry.plan.argv[dryIndex + 1], socket);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('enqueue: метка allowed_paths валидируется до вызова vb', async () => {
+  // Валидный список: относительные пути через запятую, пробелы по краям
+  // записей допустимы, граница 256 символов включительно — проходит.
+  const valid = await buildEnqueuePlan({ ...baseValues(),
+    label: ['allowed_paths=src,ops/x, board_pipeline/model-registry.mjs'] });
+  assert.equal(valid.labels.allowed_paths, 'src,ops/x, board_pipeline/model-registry.mjs');
+  const directoryPrefix = await buildEnqueuePlan({ ...baseValues(),
+    label: ['allowed_paths=src/,ops/x'] });
+  assert.equal(directoryPrefix.labels.allowed_paths, 'src/,ops/x');
+  const edge = `a/${'x'.repeat(254)}`;
+  assert.equal(edge.length, 256);
+  const edgePlan = await buildEnqueuePlan({ ...baseValues(),
+    label: [`allowed_paths=${edge}`] });
+  assert.equal(edgePlan.labels.allowed_paths, edge);
+  // Отказы: traversal, абсолютный путь, home, пустой сегмент, пустое
+  // значение, обратный слэш, внутренние управляющие символы — до вызова vb.
+  for (const bad of ['../x', 'a/../b', 'src/../../etc', '/etc/passwd', '~/secret',
+    'src,,ops', 'src,', ',src', '', 'a\\b', 'a\nb', 'x\0y', 'a\tb',
+    'a//b', './src', '.', 'C:/windows']) {
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+      label: [`allowed_paths=${bad}`] }), /allowed_paths_invalid/, JSON.stringify(bad));
+  }
+  // Длиннее 256 символов — отдельный код отказа, даже для валидных путей.
+  const tooLong = `a/${'x'.repeat(255)}`;
+  assert.equal(tooLong.length, 257);
+  await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
+    label: [`allowed_paths=${tooLong}`] }), /allowed_paths_too_long/);
+  // Другие метки валидируются независимо: произвольная метка без
+  // allowed_paths проходит без изменений.
+  const other = await buildEnqueuePlan({ ...baseValues(), label: ['domain=billing'] });
+  assert.equal(other.labels.domain, 'billing');
+});

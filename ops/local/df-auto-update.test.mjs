@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { compareVersions, runAutoUpdate } from './df-auto-update.mjs';
+import { compareVersions, findBusyProcesses, runAutoUpdate } from './df-auto-update.mjs';
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'df-auto-update-test-'));
@@ -342,4 +342,57 @@ test('concurrent invocations never share a tmp path and leave valid state', asyn
   assert.equal(typeof persisted.timestamp, 'string');
   assert.equal(persisted.components.length, first.components.length);
   assert.equal((await stat(env.stateFile)).mode & 0o777, 0o600);
+});
+
+test('findBusyProcesses: hc CLI invocations match without false positives', () => {
+  // Активная оркестрация --runtime hc: команда в начале строки, после
+  // пробела и как basename абсолютного пути — busy.
+  for (const line of [
+    'hc run --runtime hc task',
+    '123 hc run --runtime hc worker',
+    '456 /usr/local/bin/hc send task-1',
+    'hc',
+    '/opt/hc/bin/hc',
+  ]) {
+    assert.deepEqual(findBusyProcesses(line), [line], JSON.stringify(line));
+  }
+  // Подстроки внутри других слов не блокируют обновление: 'which',
+  // 'dhcpcd', 'hc' как часть аргумента без границы токена.
+  for (const line of [
+    'which node',
+    '/usr/bin/which node',
+    'dhcpcd -q',
+    '/usr/sbin/dhcpcd eth0',
+    'echo xhc',
+    'hcwhatever run',
+    '',
+  ]) {
+    assert.deepEqual(findBusyProcesses(line), [], JSON.stringify(line));
+  }
+  // Многострочный ps-снимок: busy-строки hc возвращаются, прочие нет.
+  const snapshot = '1 which node\n2 /usr/local/bin/hc send t\n3 dhcpcd -q\n4 hc run x';
+  assert.deepEqual(findBusyProcesses(snapshot),
+    ['2 /usr/local/bin/hc send t', '4 hc run x']);
+  // Пустой и nullish вход — пустой результат, без исключений.
+  assert.deepEqual(findBusyProcesses(''), []);
+  assert.deepEqual(findBusyProcesses(null), []);
+  assert.deepEqual(findBusyProcesses(undefined), []);
+});
+
+test('idle guard defers updates while hc orchestration is active', async t => {
+  const env = await fixture(t);
+  const harness = fakeHarness(env, { processList: '999 /usr/local/bin/hc send task' });
+  const report = await runAutoUpdate(options(env, 'hub'), harness);
+  assert.equal(report.status, 'deferred_busy');
+  assert.equal(report.busy, true);
+  assert.equal(harness.calls.filter(isMutating).length, 0);
+});
+
+test('which/dhcpcd process lines do not defer updates', async t => {
+  const env = await fixture(t);
+  const harness = fakeHarness(env, { processList: '123 which node\n456 dhcpcd -q' });
+  const report = await runAutoUpdate(options(env, 'hub'), harness);
+  assert.equal(report.busy, false);
+  assert.notEqual(report.status, 'deferred_busy');
+  assert.ok(harness.calls.filter(isMutating).length > 0);
 });
