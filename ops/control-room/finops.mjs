@@ -184,6 +184,7 @@ function usageFor(vm, usage, { allowRootUsage = true } = {}) {
   return {
     runningMinutesToday: Math.max(0, num(source.runningMinutesToday) ?? 0),
     runningMinutesMonth: Math.max(0, num(source.runningMinutesMonth) ?? 0),
+    activeMinutesToday: Math.max(0, num(source.activeMinutesToday ?? source.activeMinutes) ?? 0),
     wakesMonth: Math.max(0, num(source.wakesMonth) ?? 0),
     updatedAt: iso(source.updatedAt) ?? null,
     state: text(source.state ?? source.status) ?? null,
@@ -232,6 +233,122 @@ function mergeUsageJournals(stateJournal, usageJournal) {
 function daysInMonth(at) {
   const d = new Date(at);
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+}
+
+// --- Spend Dynamics & Dead-Load Detector --------------------------------------
+//
+// Чистые детерминированные функции: вход — уже нормализованные записи VM и
+// журнал usage, выход — timeseries расхода и флаги мёртвой нагрузки. Worker
+// VM (pricing spot или id c 'worker'), которая RUNNING при нуле активных и
+// взятых задач дольше порога — это инфраструктурный баг, сжигающий деньги
+// 24/7: алерт dead_load_detected (severity bad) поднимается немедленно.
+
+const round4 = n => Number(n.toFixed(4));
+
+const workerishVm = entry => {
+  const pricing = typeof entry?.pricing === 'string' ? entry.pricing.trim().toLowerCase() : '';
+  const id = typeof entry?.id === 'string' ? entry.id : '';
+  return pricing === 'spot' || /worker/i.test(id);
+};
+
+export function analyzeDeadLoad({ vmUsage, activeTasks = 0, claimedTasks = 0,
+  idleMinutesSinceLastTask = 0, deadLoadThresholdMinutes = 20 } = {}) {
+  activeTasks = Math.max(0, num(activeTasks) ?? 0);
+  claimedTasks = Math.max(0, num(claimedTasks) ?? 0);
+  idleMinutesSinceLastTask = Math.max(0, num(idleMinutesSinceLastTask) ?? 0);
+  deadLoadThresholdMinutes = Math.max(0, num(deadLoadThresholdMinutes) ?? 20);
+  const vms = (Array.isArray(vmUsage) ? vmUsage : []).filter(isRecord).map(entry => {
+    const runningMinutes = Math.max(0, num(entry.runningMinutesToday ??
+      entry.runningMinutes) ?? 0);
+    const activeMinutes = Math.min(runningMinutes,
+      Math.max(0, num(entry.activeMinutesToday ?? entry.activeMinutes) ?? 0));
+    const explicitIdle = nonNegativeNum(entry.idleMinutesToday ?? entry.idleMinutes);
+    const idleMinutes = explicitIdle ?? Math.max(0, runningMinutes - activeMinutes);
+    const idleWastePct = runningMinutes > 0 ? round4(idleMinutes / runningMinutes * 100) : 0;
+    const running = typeof entry.state === 'string' && entry.state.trim().toLowerCase() === 'running';
+    const deadLoad = workerishVm(entry) && running && activeTasks === 0 && claimedTasks === 0 &&
+      idleMinutesSinceLastTask >= deadLoadThresholdMinutes;
+    return {
+      id: clean(entry.id ?? ''),
+      state: text(entry.state) ?? null,
+      pricing: text(entry.pricing) ?? null,
+      runningMinutes: round4(runningMinutes),
+      activeMinutes: round4(activeMinutes),
+      idleMinutes: round4(idleMinutes),
+      idleWastePct,
+      deadLoad,
+    };
+  });
+  const alerts = [];
+  for (const vm of vms) {
+    if (!vm.deadLoad) continue;
+    alerts.push({ severity: 'bad', code: 'dead_load_detected', resourceId: vm.id,
+      message: `${vm.id}: worker RUNNING ${round4(vm.runningMinutes)}min без задач ` +
+        `(idle ${idleMinutesSinceLastTask}min >= ${deadLoadThresholdMinutes}min) — мёртвая нагрузка` });
+  }
+  const totalRunning = vms.reduce((sum, vm) => sum + vm.runningMinutes, 0);
+  const totalIdle = vms.reduce((sum, vm) => sum + vm.idleMinutes, 0);
+  return {
+    vms,
+    alerts,
+    deadLoadDetected: vms.some(vm => vm.deadLoad),
+    idleWastePct: totalRunning > 0 ? round4(totalIdle / totalRunning * 100) : 0,
+    activeTasks,
+    claimedTasks,
+    idleMinutesSinceLastTask,
+    thresholdMinutes: deadLoadThresholdMinutes,
+  };
+}
+
+// dailyHistory — завершённые дни текущего месяца (числа EUR или записи
+// { date, eur }); todayEur — частичный расход сегодня. Проекция повторяет
+// модель normalize(): средний расход за истёкшие дни × daysInMonth.
+// Тренд сравнивает среднее первой и второй половин ряда с зоной ±10%.
+export function buildSpendDynamics({ dailyHistory = [], todayEur = 0,
+  monthlyTargetEur = 25, dayOfMonth = 1, daysInMonth = 30 } = {}) {
+  const daily = [];
+  for (const entry of Array.isArray(dailyHistory) ? dailyHistory : []) {
+    const eur = nonNegativeNum(isRecord(entry) ? entry.eur ?? entry.costEur ?? entry.amount : entry);
+    if (eur === null) continue;
+    daily.push({ date: isRecord(entry) ? text(entry.date ?? entry.day) ?? null : null,
+      eur: round4(eur) });
+  }
+  const today = nonNegativeNum(todayEur) ?? 0;
+  daily.push({ date: null, eur: round4(today), today: true });
+
+  const elapsed = Math.max(1, num(dayOfMonth) ?? 1);
+  const span = Math.max(1, num(daysInMonth) ?? 30);
+  const totalEur = daily.reduce((sum, point) => sum + point.eur, 0);
+  const avgDaily = totalEur / elapsed;
+  const projected = avgDaily * span;
+  const target = nonNegativeNum(monthlyTargetEur) ?? 25;
+
+  let trend = 'stable';
+  if (daily.length >= 2) {
+    const mid = Math.floor(daily.length / 2);
+    const firstHalf = daily.slice(0, mid);
+    const secondHalf = daily.slice(mid);
+    const mean = list => list.reduce((sum, point) => sum + point.eur, 0) / list.length;
+    const firstMean = mean(firstHalf);
+    const secondMean = mean(secondHalf);
+    if (firstMean === 0) {
+      if (secondMean > 0) trend = 'rising';
+    } else if (secondMean > firstMean * 1.1) {
+      trend = 'rising';
+    } else if (secondMean < firstMean * 0.9) {
+      trend = 'falling';
+    }
+  }
+
+  const projectedMonthEur = Number(projected.toFixed(2));
+  return {
+    daily,
+    avgDailyEur: round4(avgDaily),
+    projectedMonthEur,
+    targetEur: target,
+    overTarget: projectedMonthEur > target,
+    trend,
+  };
 }
 
 function normalize(raw, usage, sourcePath, at) {
@@ -289,6 +406,7 @@ function normalize(raw, usage, sourcePath, at) {
       state: live?.state ?? text(entry.state) ?? null,
       runningMinutesToday: todayMinutes,
       runningMinutesMonth: monthMinutes,
+      activeMinutesToday: live?.activeMinutesToday ?? 0,
       wakesMonth: live?.wakesMonth ?? 0,
       usageUpdatedAt: live?.updatedAt ?? null,
       costTodayEur: Number(todayCost.toFixed(4)),
@@ -366,6 +484,40 @@ function normalize(raw, usage, sourcePath, at) {
       message: `прогноз расхода превышает 80% месячного бюджета` });
   }
 
+  // Spend Dynamics & Dead-Load: живые счётчики задач и простой читаются из
+  // usage/state журнала (приоритет) или явных полей бюджета; порог — из
+  // dead_load_threshold_minutes. Алерты dead_load_detected входят в общий
+  // alerts[] наряду с кредитами и бюджетом.
+  const journalNumber = (...keys) => {
+    for (const key of keys) {
+      const value = nonNegativeNum(usage?.[key]);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+  const deadLoadAnalysis = analyzeDeadLoad({
+    vmUsage: computeVms,
+    activeTasks: journalNumber('activeTasks', 'active_tasks') ??
+      nonNegativeNum(raw.active_tasks) ?? 0,
+    claimedTasks: journalNumber('claimedTasks', 'claimed_tasks') ??
+      nonNegativeNum(raw.claimed_tasks) ?? 0,
+    idleMinutesSinceLastTask: journalNumber('idleMinutesSinceLastTask',
+      'idle_minutes_since_last_task', 'idleMinutes') ?? 0,
+    deadLoadThresholdMinutes: nonNegativeNum(raw.dead_load_threshold_minutes) ?? 20,
+  });
+  alerts.push(...deadLoadAnalysis.alerts);
+  const { alerts: _deadLoadAlerts, ...deadLoad } = deadLoadAnalysis;
+
+  const dailyHistoryRaw = usage?.dailySpendEur ?? usage?.daily_history ??
+    raw.spend_daily_eur ?? raw.daily_history ?? [];
+  const spendDynamics = buildSpendDynamics({
+    dailyHistory: Array.isArray(dailyHistoryRaw) ? dailyHistoryRaw : [],
+    todayEur: spentTodayCostEur,
+    monthlyTargetEur: monthlyBudgetEur ?? 25,
+    dayOfMonth: elapsedDays,
+    daysInMonth: dim,
+  });
+
   const workspaceLinks = flattenWorkspace(raw.workspace_links, alerts);
   const round2 = n => Number(n.toFixed(2));
   const totals = {
@@ -400,6 +552,8 @@ function normalize(raw, usage, sourcePath, at) {
     totals,
     estimatedMonthCostEur: totals.estimatedMonthCostEur,
     creditRunway,
+    spendDynamics,
+    deadLoad,
     alerts: alerts.map(alert => ({ ...alert, message: clean(alert.message) })),
   };
 }
