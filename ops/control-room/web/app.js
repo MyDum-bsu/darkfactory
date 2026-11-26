@@ -360,7 +360,7 @@ function renderBoardExplorer(snap) {
 function chip(id, text, cls) {
   const node = $(id);
   node.textContent = text;
-  node.classList.remove('ok', 'warn', 'bad');
+  node.classList.remove('ok', 'warn', 'bad', 'dim');
   if (cls) node.classList.add(cls);
 }
 
@@ -371,8 +371,10 @@ function renderStatus(snap) {
   const slotWarnings = snap.repoSlots?.multiWriterWarnings?.length ?? 0;
   chip('chip-slots', `слоты ${activeByRepo || running}/repo≤1`,
     slotWarnings ? 'bad' : (activeByRepo || running) ? 'ok' : null);
-  const ks = Boolean(snap.killSwitch ?? snap.pilot?.killSwitch);
-  chip('chip-killswitch', ks ? 'KILL-SWITCH' : 'kill-switch: off',
+  const pilotState = typeof snap.pilot?.killSwitch === 'boolean' ? snap.pilot.killSwitch : null;
+  const ks = snap.killSwitch !== undefined ? snap.killSwitch : pilotState;
+  if (ks == null) chip('chip-killswitch', 'kill-switch: unknown', 'dim');
+  else chip('chip-killswitch', ks ? 'KILL-SWITCH' : 'kill-switch: off',
     ks ? 'bad' : null);
   chip('chip-disk', `disk ${fmtBytes(host.disk?.freeBytes)}`,
     host.disk && host.disk.freeBytes < 8 * (1 << 30) ? 'warn' : null);
@@ -446,6 +448,8 @@ function ownerActionControls(cardData) {
   answerInput.style.boxSizing = 'border-box';
   answerInput.style.cursor = 'text';
   answerInput.style.color = 'var(--fg)';
+  answerInput.dataset.ownerField = 'answer';
+  answerInput.dataset.ownerTaskId = taskId;
 
   const tokenInput = el('input', 'cmd owner-token-input');
   tokenInput.type = 'password';
@@ -456,6 +460,8 @@ function ownerActionControls(cardData) {
   tokenInput.style.minWidth = '0';
   tokenInput.style.cursor = 'text';
   tokenInput.style.color = 'var(--fg)';
+  tokenInput.dataset.ownerField = 'token';
+  tokenInput.dataset.ownerTaskId = taskId;
 
   const remember = el('input');
   remember.type = 'checkbox';
@@ -644,7 +650,70 @@ const list = (id, items, kind, empty, shivaLookup, ownerWriteEnabled = false) =>
   if (!items.length) box.append(el('div', 'empty', empty));
 };
 
+function isTextControl(node) {
+  const tag = String(node?.tagName ?? '').toLowerCase();
+  if (tag === 'textarea') return true;
+  if (tag !== 'input') return false;
+  return !['button', 'checkbox', 'radio', 'submit', 'file', 'range', 'color']
+    .includes(String(node.type ?? 'text').toLowerCase());
+}
+
+function domContains(root, node) {
+  if (!root || !node) return false;
+  if (typeof root.contains === 'function') return root.contains(node);
+  for (let current = node; current; current = current.parentNode) {
+    if (current === root) return true;
+  }
+  return false;
+}
+
+function captureActiveTextControl(root) {
+  const active = document.activeElement;
+  if (!domContains(root, active) || !isTextControl(active)) return null;
+  const className = String(active.className ?? '');
+  const field = active.dataset?.ownerField ??
+    (className.includes('owner-token-input') ? 'token'
+      : className.includes('owner-answer-input') ? 'answer' : null);
+  if (!field) return null;
+  let selectionStart = null;
+  let selectionEnd = null;
+  try {
+    selectionStart = active.selectionStart ?? null;
+    selectionEnd = active.selectionEnd ?? null;
+  } catch { /* password inputs могут не отдавать selection */ }
+  return {
+    field,
+    taskId: active.dataset?.ownerTaskId ?? null,
+    value: active.value ?? '',
+    selectionStart,
+    selectionEnd,
+  };
+}
+
+function findOwnerTextControl(root, wanted) {
+  if (!root) return null;
+  if (isTextControl(root) && root.dataset?.ownerField === wanted.field &&
+      String(root.dataset?.ownerTaskId ?? '') === String(wanted.taskId ?? '')) return root;
+  for (const child of root.children ?? []) {
+    const found = findOwnerTextControl(child, wanted);
+    if (found) return found;
+  }
+  return null;
+}
+
+function restoreActiveTextControl(root, captured) {
+  if (!captured) return;
+  const node = findOwnerTextControl(root, captured);
+  if (!node) return;
+  node.value = captured.value;
+  node.focus?.();
+  if (captured.selectionStart !== null && captured.selectionEnd !== null) {
+    try { node.setSelectionRange?.(captured.selectionStart, captured.selectionEnd); } catch { /* noop */ }
+  }
+}
+
 function renderBoard(snap) {
+  const activeOwnerText = captureActiveTextControl($('needs-owner'));
   $('count-running').textContent = snap.running?.length ?? 0;
   $('count-queued').textContent = snap.queued?.length ?? 0;
   $('count-owner').textContent = snap.needsOwner?.length ?? 0;
@@ -652,6 +721,7 @@ function renderBoard(snap) {
   list('queued', snap.queued ?? [], 'queued', 'Очередь пуста');
   list('needs-owner', snap.needsOwner ?? [], 'owner', 'Нет вопросов владельцу', undefined,
     snap.ownerWriteEnabled === true);
+  restoreActiveTextControl($('needs-owner'), activeOwnerText);
   const done = snap.recentlyCompleted ?? [];
   $('count-done').textContent = done.length;
   const shown = state.showAllDone ? done : done.slice(0, 10);

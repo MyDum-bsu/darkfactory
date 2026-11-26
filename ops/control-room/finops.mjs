@@ -112,9 +112,22 @@ function entries(value) {
   return [];
 }
 
+// Public FinOps contract — explicit allowlist. YAML является декларативной
+// конфигурацией, но не доверенным API-контрактом: произвольные ключи вроде
+// api_key/billing_account никогда не копируются в snapshot.
+const PUBLIC_FINOPS_ENTRY_KEYS = new Set([
+  'id', 'label', 'provider', 'totalEur', 'remainingEur', 'monthlyEur', 'expires', 'notes',
+  'machineType', 'hourlyCostUsd', 'hourlyCostEur', 'pricing', 'state',
+  'runningMinutesToday', 'runningMinutesMonth', 'activeMinutesToday', 'wakesMonth',
+  'usageUpdatedAt', 'costTodayEur', 'costMonthEur',
+  'unit', 'totalUnits', 'usedUnits', 'utilizationPct', 'status',
+  'model', 'quota', 'reset',
+]);
+
 function publicEntry(entry, extra = {}) {
   const out = {};
   for (const [key, value] of Object.entries({ ...entry, ...extra })) {
+    if (!PUBLIC_FINOPS_ENTRY_KEYS.has(key)) continue;
     if (typeof value === 'string') out[key] = clean(value);
     else if (typeof value === 'number' || typeof value === 'boolean' || value == null) out[key] = value;
     else if (Array.isArray(value)) out[key] = value.map(item => typeof item === 'string' ? clean(item) : item);
@@ -305,7 +318,8 @@ export function analyzeDeadLoad({ vmUsage, activeTasks = 0, claimedTasks = 0,
 // модель normalize(): средний расход за истёкшие дни × daysInMonth.
 // Тренд сравнивает среднее первой и второй половин ряда с зоной ±10%.
 export function buildSpendDynamics({ dailyHistory = [], todayEur = 0,
-  monthlyTargetEur = 25, dayOfMonth = 1, daysInMonth = 30 } = {}) {
+  monthlyTargetEur = 25, dayOfMonth = 1, daysInMonth = 30,
+  spentMonthCostEur = null, projectedMonthCostEur = null } = {}) {
   const daily = [];
   for (const entry of Array.isArray(dailyHistory) ? dailyHistory : []) {
     const eur = nonNegativeNum(isRecord(entry) ? entry.eur ?? entry.costEur ?? entry.amount : entry);
@@ -313,14 +327,25 @@ export function buildSpendDynamics({ dailyHistory = [], todayEur = 0,
     daily.push({ date: isRecord(entry) ? text(entry.date ?? entry.day) ?? null : null,
       eur: round4(eur) });
   }
+  const hasDailyHistory = daily.length > 0;
   const today = nonNegativeNum(todayEur) ?? 0;
   daily.push({ date: null, eur: round4(today), today: true });
 
   const elapsed = Math.max(1, num(dayOfMonth) ?? 1);
   const span = Math.max(1, num(daysInMonth) ?? 30);
-  const totalEur = daily.reduce((sum, point) => sum + point.eur, 0);
+  const observedTotalEur = daily.reduce((sum, point) => sum + point.eur, 0);
+  let totalEur = observedTotalEur;
+  let projected = null;
+  if (!hasDailyHistory) {
+    // Пустой journal daily history не означает нулевой месяц: у агрегатора
+    // уже есть фактическая месячная стоимость и честная проекция из totals.
+    const spentFallback = nonNegativeNum(spentMonthCostEur);
+    const projectedFallback = nonNegativeNum(projectedMonthCostEur);
+    if (spentFallback !== null) totalEur = spentFallback;
+    if (projectedFallback !== null) projected = projectedFallback;
+  }
   const avgDaily = totalEur / elapsed;
-  const projected = avgDaily * span;
+  if (projected === null) projected = avgDaily * span;
   const target = nonNegativeNum(monthlyTargetEur) ?? 25;
 
   let trend = 'stable';
@@ -516,6 +541,8 @@ function normalize(raw, usage, sourcePath, at) {
     monthlyTargetEur: monthlyBudgetEur ?? 25,
     dayOfMonth: elapsedDays,
     daysInMonth: dim,
+    spentMonthCostEur,
+    projectedMonthCostEur,
   });
 
   const workspaceLinks = flattenWorkspace(raw.workspace_links, alerts);
