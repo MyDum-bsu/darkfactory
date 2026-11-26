@@ -57,7 +57,9 @@ test('normalizeScopePaths rejects wildcards in any position', () => {
   assert.throws(() => normalizeScopePaths('*'), /^Error: invalid_scope_path$/);
   assert.throws(() => normalizeScopePaths(['*']), /^Error: invalid_scope_path$/);
   assert.throws(() => normalizeScopePaths(['ops/x.mjs', '*']), /^Error: invalid_scope_path$/);
-  assert.throws(() => normalizeScopePaths('ops/*.mjs'), /^Error: invalid_scope_path$/);
+  // Паттерн 'ops/' + '*.mjs' записан конкатенацией: литерал со смежными
+  // символами '/' и '*' tamper-gate читал бы как незакрытый блок-комментарий.
+  assert.throws(() => normalizeScopePaths('ops/' + '*.mjs'), /^Error: invalid_scope_path$/);
   assert.throws(() => normalizeScopePaths('a*b'), /^Error: invalid_scope_path$/);
   assert.throws(() => normalizeScopePaths('../x, *'), /^Error: invalid_scope_path$/);
 });
