@@ -5,6 +5,14 @@
 // (null/empty scope) take an exclusive repo-wide lock — the fail-closed
 // direction, because an unknown scope can never be proven disjoint.
 //
+// Path validation and prefix semantics are aligned with scope-fence.mjs, the
+// gate that actually enforces the fence at submission time: an entry ending
+// in '/' is a directory prefix, any other entry is an exact file. Entries
+// with backslashes, './' prefixes, doubled slashes, traversal segments,
+// absolute or drive-letter paths, control characters and '*' are invalid —
+// never normalized into a valid lookalike. Repository identity is canonical:
+// trimmed and lowercased, so 'REPO-A' and 'repo-a' share one lock domain.
+//
 // The module is pure and deterministic: no I/O, no randomness, no clock.
 // Ordering never depends on locale — all tie-breaks use codepoint comparison.
 
@@ -16,27 +24,38 @@ function invalidScope() {
   return new Error(INVALID_SCOPE);
 }
 
-// Normalize one raw entry after slash normalization. Validation happens after
-// normalization so that a backslash or doubled-slash variant of a traversal or
-// absolute path is rejected exactly like its canonical form — fail-closed.
-function normalizeEntry(rawEntry) {
+// Validate one scope entry with exactly the rules of scope-fence.mjs
+// (validateRelativePrefix) plus rejection of '*': the fence has no glob
+// support, so any wildcard intent can never be honored — deferring the task
+// as invalid is the fail-closed direction. The entry is preserved verbatim
+// after trim: a trailing slash stays significant because it is the only
+// difference between a directory prefix and an exact file.
+function validateScopeEntry(rawEntry) {
   if (typeof rawEntry !== 'string') throw invalidScope();
-  let value = rawEntry.trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/');
-  while (value.startsWith('./')) value = value.slice(2);
-  value = value.replace(/\/+$/, '');
-  if (value === '' || value.includes('\0')) throw invalidScope();
+  const value = rawEntry.trim();
+  if (value === '') throw invalidScope();
+  if (value.includes('\0') || value.includes('\\') || value.includes('\r') ||
+      value.includes('\n') || value.includes('*')) {
+    throw invalidScope();
+  }
   if (value.startsWith('/') || /^[A-Za-z]:/.test(value)) throw invalidScope();
+  if (value === '.' || value === './' || value.startsWith('./')) throw invalidScope();
+  if (value.includes('//')) throw invalidScope();
   const segments = value.split('/');
-  if (segments.some(segment => segment === '..' || segment === '.')) throw invalidScope();
+  if (segments.some(segment => segment === '..')) throw invalidScope();
+  if (segments.some((segment, index) => segment === '' && index !== segments.length - 1)) {
+    throw invalidScope();
+  }
   return value;
 }
 
-// Accepts a comma-separated string or a string array of relative file or
-// directory paths and returns a normalized, de-duplicated array. Returns null
-// when the task is unscoped (null/undefined input, empty input, or a wildcard
-// entry) — an unscoped task holds an exclusive repo-wide lock. Traversal
-// segments, absolute paths, empty entries and malformed input are rejected
-// fail-closed with `invalid_scope_path`.
+// Accepts a comma-separated string or a string array of relative file paths
+// and directory prefixes and returns a validated, de-duplicated array with
+// entries verbatim (trailing slashes preserved). Returns null when the task
+// is unscoped (null/undefined input or empty input) — an unscoped task holds
+// an exclusive repo-wide lock. Traversal segments, absolute paths,
+// backslashes, './' prefixes, wildcards, empty entries and malformed input
+// are rejected fail-closed with `invalid_scope_path`.
 export function normalizeScopePaths(raw) {
   if (raw === null || raw === undefined) return null;
   let entries;
@@ -50,32 +69,29 @@ export function normalizeScopePaths(raw) {
   } else {
     throw invalidScope();
   }
-  // Validation precedes wildcard widening: every entry is normalized (and
-  // thereby validated fail-closed) before any '*' is honored, so a traversal
-  // or absolute path hiding next to a wildcard is rejected, never laundered
-  // into a legitimate unscoped lock.
   if (entries.some(entry => typeof entry !== 'string' || entry === '')) throw invalidScope();
-  const normalized = entries.map(normalizeEntry);
-  // A wildcard anywhere widens the scope to the whole repository; treating it
-  // as unscoped is the safe direction (more locking, never less).
-  if (normalized.includes('*')) return null;
-  return [...new Set(normalized)];
+  return [...new Set(entries.map(validateScopeEntry))];
 }
 
-// One path pair overlaps when they are equal or one is a directory prefix of
-// the other on a `/` segment boundary — `ops/foo` never overlaps `ops/foobar`,
-// while `ops/control-room` does overlap `ops/control-room/finops.mjs`.
+// One path pair overlaps under scope-fence semantics: exact files overlap
+// only when equal, a directory prefix overlaps every entry beneath it, and
+// two directory prefixes overlap when one contains the other. An exact file
+// is never beneath a same-named directory prefix ('ops' the file and 'ops/'
+// the directory cannot coexist in one repository, so they cannot conflict).
 function pairOverlaps(a, b) {
-  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+  const aIsDir = a.endsWith('/');
+  const bIsDir = b.endsWith('/');
+  if (aIsDir && bIsDir) return a.startsWith(b) || b.startsWith(a);
+  if (aIsDir) return b.startsWith(a);
+  if (bIsDir) return a.startsWith(b);
+  return a === b;
 }
 
 // Decide whether two scope path sets overlap. Null or empty on either side
 // means an unscoped task with an exclusive repo-wide lock, which overlaps
-// everything — fail-closed. String AND array inputs are always normalized
-// before comparison: trailing slashes, backslashes, './' prefixes and
-// wildcards inside arrays must not bypass the boundary check (fail-open), so
-// the comparison never sees a raw caller-supplied form. Invalid entries
-// propagate the normalization error.
+// everything — fail-closed. String AND array inputs are always validated
+// before comparison: the comparison never sees a raw caller-supplied form,
+// and invalid entries propagate the validation error.
 export function pathsOverlap(pathsA, pathsB) {
   const a = (typeof pathsA === 'string' || Array.isArray(pathsA)) ? normalizeScopePaths(pathsA) : pathsA;
   const b = (typeof pathsB === 'string' || Array.isArray(pathsB)) ? normalizeScopePaths(pathsB) : pathsB;
@@ -89,10 +105,18 @@ export function pathsOverlap(pathsA, pathsB) {
   return false;
 }
 
+// Repository identity is canonical — trimmed and lowercased — so that lock
+// domains never split over spelling differences ('Repo-A' vs 'repo-a').
+function canonicalRepoId(repoId) {
+  if (typeof repoId !== 'string') return null;
+  const canonical = repoId.trim().toLowerCase();
+  return canonical === '' ? null : canonical;
+}
+
 function validateTask(task, index, kind) {
   if (task === null || typeof task !== 'object' || Array.isArray(task) ||
       typeof task.taskId !== 'string' || task.taskId === '' ||
-      typeof task.repoId !== 'string' || task.repoId === '') {
+      canonicalRepoId(task.repoId) === null) {
     throw new Error(`${INVALID_TASK}:${kind}:${index}`);
   }
 }
@@ -116,7 +140,7 @@ function priorityOrder(tasks) {
 // it, and a free slot remains. Deferral reasons are checked in a fixed order —
 // `invalid_scope` before `scope_conflict` before `no_free_slot` — so the output
 // is a pure function of the input. Slots are consumed in input order.
-// Active tasks whose own scope fails to normalize are treated as unscoped
+// Active tasks whose own scope fails validation are treated as unscoped
 // (exclusive lock) rather than dropped: fail-closed, never silently disjoint.
 export function planSlotAssignments({ slots, activeTasks, readyTasks } = {}) {
   const idleSlots = slots ?? [];
@@ -134,7 +158,7 @@ export function planSlotAssignments({ slots, activeTasks, readyTasks } = {}) {
     } catch {
       paths = null; // fail-closed: unparseable active scope locks the whole repo
     }
-    return { taskId: task.taskId, repoId: task.repoId, paths };
+    return { taskId: task.taskId, repoId: canonicalRepoId(task.repoId), paths };
   });
   ready.forEach((task, index) => validateTask(task, index, 'ready'));
 
@@ -151,9 +175,10 @@ export function planSlotAssignments({ slots, activeTasks, readyTasks } = {}) {
       deferred.push({ taskId: task.taskId, reason: 'invalid_scope', conflictingTaskIds: [] });
       continue;
     }
+    const repoId = canonicalRepoId(task.repoId);
     const blockers = [];
     for (const other of [...activeNorm, ...assigned]) {
-      if (other.repoId !== task.repoId) continue; // different repos never conflict
+      if (other.repoId !== repoId) continue; // different repos never conflict
       if (pathsOverlap(paths, other.paths)) blockers.push(other.taskId);
     }
     if (blockers.length > 0) {
@@ -166,8 +191,8 @@ export function planSlotAssignments({ slots, activeTasks, readyTasks } = {}) {
       continue;
     }
     const slot = freeSlots.shift();
-    assignments.push({ slot, taskId: task.taskId, repoId: task.repoId, allowedPaths: paths });
-    assigned.push({ taskId: task.taskId, repoId: task.repoId, paths });
+    assignments.push({ slot, taskId: task.taskId, repoId, allowedPaths: paths });
+    assigned.push({ taskId: task.taskId, repoId, paths });
   }
   return { assignments, deferred };
 }
