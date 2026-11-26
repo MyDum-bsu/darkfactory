@@ -8,7 +8,7 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=@REPO@
-ExecStart=@NODE@ @REPO@/board_pipeline/run-isolated.mjs --execute --daemon --policy @POLICY@ --state @STATE@ --interval-ms 15000 --switch @SWITCH@
+ExecStart=@NODE@ @REPO@/board_pipeline/run-isolated.mjs --execute --daemon --runtime hc --policy @POLICY@ --state @STATE@ --interval-ms 15000 --switch @SWITCH@
 # Рестарт только при падении: корректный стоп (SIGTERM, kill-switch 'stop',
 # терминальная фаза) завершает процесс с кодом 0 и не провоцирует
 # рестарт-луп. TimeoutStopSec даёт активному тику завершиться: слот не

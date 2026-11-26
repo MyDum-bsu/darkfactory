@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { compareVersions, findBusyProcesses, runAutoUpdate } from './df-auto-update.mjs';
+import { attemptRecordBusy, compareVersions, controllerDaemonBusy, controllerDaemonStateDir,
+  findBusyProcesses, isControllerDaemonLine, runAutoUpdate } from './df-auto-update.mjs';
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'df-auto-update-test-'));
@@ -127,6 +128,84 @@ for (const busyLine of [
   });
 }
 
+test('controller daemon detection parses --state forms and attempt phase conservatively', async t => {
+  const env = await fixture(t);
+  const stateDir = join(env.root, 'daemon-state');
+  await mkdir(stateDir, { recursive: true });
+  const spaced = `999 node /factory/board_pipeline/run-isolated.mjs --execute --daemon --state ${stateDir}`;
+  const equals = `999 node /factory/ops/factory-run.mjs --daemon --state=${stateDir}`;
+  assert.equal(isControllerDaemonLine(spaced), true);
+  assert.equal(isControllerDaemonLine(equals), true);
+  assert.equal(controllerDaemonStateDir(spaced), stateDir);
+  assert.equal(controllerDaemonStateDir(equals), stateDir);
+  assert.equal(isControllerDaemonLine('999 node /factory/board_pipeline/run-isolated.mjs --execute'), false);
+  assert.equal(isControllerDaemonLine('999 node /factory/other.mjs --daemon'), false);
+
+  assert.equal(attemptRecordBusy(null), false);
+  assert.equal(attemptRecordBusy({ phase: 'idle' }), false);
+  assert.equal(attemptRecordBusy({ phase: 'working' }), true);
+  assert.equal(attemptRecordBusy({}), true);
+
+  assert.equal(await controllerDaemonBusy(spaced), false);
+  await writeFile(join(stateDir, 'attempt.json'), 'null');
+  assert.equal(await controllerDaemonBusy(spaced), false);
+  await writeFile(join(stateDir, 'attempt.json'), '{"phase":"idle"}');
+  assert.equal(await controllerDaemonBusy(spaced), false);
+  await writeFile(join(stateDir, 'attempt.json'), '{"phase":"working"}');
+  assert.equal(await controllerDaemonBusy(spaced), true);
+  await writeFile(join(stateDir, 'attempt.json'), '{broken');
+  assert.equal(await controllerDaemonBusy(spaced), true);
+  assert.equal(await controllerDaemonBusy('999 node /factory/board_pipeline/run-isolated.mjs --daemon'), true);
+  assert.equal(await controllerDaemonBusy('999 node /factory/board_pipeline/run-isolated.mjs --daemon --state relative'), true);
+});
+
+test('continuously running idle controller daemons do not defer updates', async t => {
+  const env = await fixture(t);
+  for (const controller of ['run-isolated.mjs', 'factory-run.mjs']) {
+    const stateDir = join(env.root, `daemon-state-${controller}`);
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, 'attempt.json'), 'null');
+    const processList = `999 node /factory/${controller} --execute --daemon --runtime hc --state ${stateDir}`;
+    const harness = fakeHarness(env, { processList });
+    const report = await runAutoUpdate(options(env, 'hub'), harness);
+    assert.equal(report.busy, false, controller);
+    assert.notEqual(report.status, 'deferred_busy', controller);
+    assert.ok(harness.calls.filter(isMutating).length > 0, controller);
+  }
+});
+
+test('controller daemon with an active attempt phase defers updates', async t => {
+  const env = await fixture(t);
+  const stateDir = join(env.root, 'daemon-state-active');
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(join(stateDir, 'attempt.json'), '{"phase":"working"}');
+  const processList = `999 node /factory/board_pipeline/run-isolated.mjs --execute --daemon --state ${stateDir}`;
+  const harness = fakeHarness(env, { processList });
+  const report = await runAutoUpdate(options(env, 'hub'), harness);
+  assert.equal(report.status, 'deferred_busy');
+  assert.deepEqual(report.busyProcesses, [processList]);
+  assert.equal(harness.calls.filter(isMutating).length, 0);
+});
+
+test('non-daemon controller workers remain busy even when their attempt is idle', async t => {
+  const env = await fixture(t);
+  const stateDir = join(env.root, 'worker-state');
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(join(stateDir, 'attempt.json'), '{"phase":"idle"}');
+  const processList = `999 node /factory/board_pipeline/run-isolated.mjs --execute --state ${stateDir}`;
+  const harness = fakeHarness(env, { processList });
+  const report = await runAutoUpdate(options(env, 'hub'), harness);
+  assert.equal(report.status, 'deferred_busy');
+  assert.equal(harness.calls.filter(isMutating).length, 0);
+});
+
+test('standalone pi worker processes defer updates', async t => {
+  const env = await fixture(t);
+  const harness = fakeHarness(env, { processList: '123 /usr/local/bin/pi --print task' });
+  const report = await runAutoUpdate(options(env, 'hub'), harness);
+  assert.equal(report.status, 'deferred_busy');
+  assert.equal(harness.calls.filter(isMutating).length, 0);
+});
 
 test('process scan failure is fail-closed and defers without mutations', async t => {
   const env = await fixture(t);
@@ -186,7 +265,9 @@ test('one tool failure does not stop remaining updates; atomic state report is v
   assert.equal(byName.pi.status, 'updated');
   assert.equal(byName.darkfactory.status, 'updated');
   assert.equal(byName.gitmark.status, 'updated');
-  assert.ok(harness.calls.some(([command, args]) => command === 'systemctl' && args.includes('restart')));
+  assert.ok(harness.calls.some(([command, args]) => command === 'systemctl' &&
+    args.join(' ') === '--user restart darkfactory-daemon*.service control-room.service'));
+  assert.ok(!harness.calls.some(([, args]) => args.includes('bb-hub.service')));
   const persistedRaw = await readFile(env.stateFile, 'utf8');
   const persisted = JSON.parse(persistedRaw);
   assert.equal(persisted.status, 'partial_failure');
@@ -194,7 +275,7 @@ test('one tool failure does not stop remaining updates; atomic state report is v
   assert.equal((await stat(env.stateFile)).mode & 0o777, 0o600);
 });
 
-test('busy flip after npm install defers bb-hub restart at the final gate', async t => {
+test('busy flip after npm install defers daemon/control-room restart at the final gate', async t => {
   const env = await fixture(t);
   let busy = false;
   const harness = fakeHarness(env, {
@@ -214,7 +295,7 @@ test('busy flip after npm install defers bb-hub restart at the final gate', asyn
   assert.ok(!harness.calls.some(([command, args]) => command === 'systemctl' && args.includes('restart')));
 });
 
-test('forced run still does not restart bb-hub while agents are active', async t => {
+test('forced run still does not restart daemon/control-room services while agents are active', async t => {
   const env = await fixture(t);
   const harness = fakeHarness(env, { processList: '123 /usr/local/bin/agy worker' });
   const report = await runAutoUpdate(options(env, 'hub', { force: true }), harness);
@@ -226,12 +307,14 @@ test('forced run still does not restart bb-hub while agents are active', async t
 test('systemd templates contain required unit, service and timer fields', async () => {
   const service = await readFile(new URL('./df-auto-update.service.in', import.meta.url), 'utf8');
   const timer = await readFile(new URL('./df-auto-update.timer.in', import.meta.url), 'utf8');
+  const daemon = await readFile(new URL('./darkfactory-daemon.service.in', import.meta.url), 'utf8');
   for (const required of ['[Unit]', '[Service]', 'Type=oneshot', 'Nice=', 'IOSchedulingClass=idle', 'ExecStart=']) {
     assert.ok(service.includes(required), required);
   }
   for (const required of ['[Unit]', '[Timer]', 'OnCalendar=*-*-* 04:30:00', 'RandomizedDelaySec=900', 'Persistent=true']) {
     assert.ok(timer.includes(required), required);
   }
+  assert.match(daemon, /run-isolated\.mjs --execute --daemon --runtime hc --policy/);
 });
 
 test('compareVersions: basic ordering, equality and range boundaries', () => {
