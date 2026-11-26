@@ -1,3 +1,8 @@
+/**
+ * @deprecated Legacy V2 module (Playbooks). Superseded by the Wave 2.0 unified
+ * pipeline; retained for backward compatibility only — do not use in new code.
+ * See docs/DEPRECATED.md.
+ */
 import { createHash } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { isRoleRegistry } from './role-registry.mjs';

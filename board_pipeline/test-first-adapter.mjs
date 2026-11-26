@@ -1,3 +1,9 @@
+/**
+ * @deprecated Legacy V2 module (Foreman/Playbooks era). Superseded by the Wave 2.0
+ * unified pipeline; retained for backward compatibility only — do not use in new code.
+ * `board_pipeline/holdout-runner.mjs` is NOT deprecated: it is retained for future L3.
+ * See docs/DEPRECATED.md.
+ */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
