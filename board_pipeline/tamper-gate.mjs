@@ -593,7 +593,7 @@ export async function tamperGate(binding, profile = {}) {
     gitIsolated(worktree,
       ['diff-tree', '-r', '-z', '--no-commit-id', '-M', base_sha, candidate_sha]),
     gitIsolated(worktree,
-      ['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--unified=0',
+      ['diff', '--text', '--no-color', '--no-ext-diff', '--no-textconv', '--unified=0',
         `${base_sha}..${candidate_sha}`]),
   ]);
   const violations = [
