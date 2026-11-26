@@ -73,6 +73,17 @@ export function normalizeBoardBaseUrl(boardUrl) {
   return url.href.replace(/\/+$/, '');
 }
 
+function jsonObject(value) {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim().startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 // RO-опрос Board :44100 — только GET чтение очереди. Сбой чтения —
 // явная ошибка (не тихий []): вызывающий видит причину, а не пустую
 // очередь.
@@ -113,12 +124,13 @@ export function createBoardObserver({ boardUrl, token = null,
     ...(token ? { authorization: `Bearer ${token}` } : {}),
   };
 
-  // Один канал → либо { ok: true, status, body }, либо явный сбой.
-  const readChannel = async channel => {
+  // Одна страница канала → либо { ok: true, status, body }, либо явный сбой.
+  const readPage = async (channel, cursor = null) => {
     let res;
+    const cursorQuery = cursor === null ? '' : `&after=${encodeURIComponent(String(cursor))}`;
     try {
       res = await fetcher(
-        `${base}/tasks?channel=${encodeURIComponent(channel)}&limit=500`,
+        `${base}/tasks?channel=${encodeURIComponent(channel)}&limit=500${cursorQuery}`,
         { method: 'GET', headers, redirect: 'error',
           signal: AbortSignal.timeout(timeoutMs) });
     } catch (error) {
@@ -147,13 +159,43 @@ export function createBoardObserver({ boardUrl, token = null,
     return { ok: true, status, body };
   };
 
+  // Board отдаёт cursor следующей страницы; повтор/пустая страница — конец,
+  // а жёсткий bound защищает наблюдателя от бесконечного потока.
+  const readChannel = async channel => {
+    const maxPages = 100;
+    const seen = new Set();
+    const tasks = [];
+    let cursor = null;
+    let status = 200;
+    let firstBody = null;
+    for (let page = 0; page < maxPages; page++) {
+      const outcome = await readPage(channel, cursor);
+      if (!outcome.ok) return outcome;
+      status = outcome.status;
+      firstBody ??= outcome.body;
+      const body = outcome.body;
+      const entries = Array.isArray(body?.tasks) ? body.tasks
+        : Array.isArray(body) ? body : [];
+      tasks.push(...entries);
+      const next = body?.cursor ?? body?.next_cursor ?? body?.nextCursor ?? null;
+      if ((next !== null && typeof next !== 'string' && typeof next !== 'number') ||
+          next === null || next === '' || !entries.length || seen.has(String(next))) {
+        return { ok: true, status, body: { ...(firstBody && typeof firstBody === 'object' ? firstBody : {}), tasks } };
+      }
+      seen.add(String(next));
+      cursor = String(next);
+    }
+    return { ok: false, status, code: 'board_pagination_exceeded',
+      error: `GET /tasks → cursor pagination exceeded ${maxPages} pages` };
+  };
+
   const toTask = raw => {
     const message = raw?.message ?? raw;
     if (!message || typeof message !== 'object') return null;
     const task = message.task ?? (message.state ? message : null);
     if (!task || typeof task.state !== 'string') return null;
     const labels = message.labels ?? task.labels ?? {};
-    const result = task.result && typeof task.result === 'object' ? task.result : {};
+    const result = jsonObject(task.result) ?? {};
     const updatedAt = task.updatedAt ?? task.updated_at ?? message.updatedAt ??
       message.updated_at ?? (typeof raw?.last === 'string' ? raw.last : raw?.last?.ts ?? raw?.last?.updatedAt);
     const receiptSha = task.receiptSha ?? task.receipt_sha ?? result.sha ?? result.candidate_sha ??
@@ -169,7 +211,7 @@ export function createBoardObserver({ boardUrl, token = null,
         ? { priority: task.priority ?? labels.priority } : {}),
       ...(updatedAt !== undefined ? { updatedAt } : {}),
       ...(receiptSha !== undefined ? { receiptSha } : {}),
-      ...(task.blocked && typeof task.blocked === 'object' ? { blocked: task.blocked } : {}),
+      ...(task.blocked ? { blocked: task.blocked } : {}),
       ...(task.executor ? { executor: task.executor } : {}),
       ...(task.question ? { question: task.question } : {}),
       ...(task.reason ? { reason: task.reason } : {}),
@@ -321,9 +363,32 @@ function compactTelemetryAttempt(entry) {
   const endedMs = timeValue(entry.ended_at ?? entry.endedAt ?? entry.completed_at ?? entry.completedAt);
   const objectValue = value => value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
   const rawPhases = objectValue(entry.phases_ms) ?? objectValue(entry.phasesMs) ?? {};
+  const phaseFailures = {};
   const phasesMs = Object.fromEntries(Object.entries(rawPhases)
-    .filter(([, value]) => value === null || Number.isFinite(value))
-    .map(([key, value]) => [key, value === null ? null : Number(value)]));
+    .map(([key, value]) => {
+      if (value === null) return [key, null];
+      const elapsed = finiteNumber(value) ?? finiteNumber(value?.ms) ?? finiteNumber(value?.elapsedMs);
+      if (elapsed === null) return null;
+      const failureMarker = marker => marker === true ||
+        (typeof marker === 'string' && /fail|error|hold|rework/i.test(marker)) ||
+        (finiteNumber(marker) ?? 0) > 0;
+      const failed = value !== null && typeof value === 'object' && !Array.isArray(value) &&
+        (failureMarker(value.failed) || failureMarker(value.fail) || failureMarker(value.failures) ||
+          failureMarker(value.status) || failureMarker(value.outcome));
+      if (failed) phaseFailures[key] = true;
+      return [key, Number(elapsed)];
+    })
+    .filter(Boolean));
+  for (const source of [entry.phase_failures, entry.phaseFailures, entry.failed_phases, entry.failedPhases]) {
+    if (Array.isArray(source)) {
+      for (const key of source) if (typeof key === 'string') phaseFailures[key] = true;
+    } else if (objectValue(source)) {
+      for (const [key, value] of Object.entries(source)) {
+        if (value === true || (typeof value === 'string' && /fail|error|hold|rework/i.test(value)) ||
+            (finiteNumber(value) ?? 0) > 0) phaseFailures[key] = true;
+      }
+    }
+  }
   const rawRounds = objectValue(entry.rounds);
   const rounds = rawRounds
     ? {
@@ -356,6 +421,7 @@ function compactTelemetryAttempt(entry) {
     elapsedMs: finiteNumber(phasesMs.total) ?? firstNumber(entry.elapsed_ms, entry.elapsedMs) ??
       (startedMs !== null && endedMs !== null && endedMs >= startedMs ? endedMs - startedMs : null),
     phasesMs,
+    phaseFailures,
     rounds,
     reworkRounds,
     reason: firstText(entry.reason),
@@ -374,53 +440,82 @@ function compactTelemetryAttempt(entry) {
   };
 }
 
-async function readBoundedText(path, maxBytes) {
+async function readTailText(path, maxBytes, size) {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0 || !Number.isFinite(size) || size <= 0) return '';
+  const bytes = Math.floor(maxBytes);
+  if (bytes <= 0) return '';
+  const start = Math.max(0, size - bytes);
   const chunks = [];
-  let total = 0;
-  const stream = createReadStream(path, { encoding: 'utf8', end: maxBytes - 1 });
-  for await (const chunk of stream) {
-    total += Buffer.byteLength(chunk);
-    if (total > maxBytes) break;
-    chunks.push(chunk);
+  const stream = createReadStream(path, { start: start > 0 ? start - 1 : 0, end: size - 1 });
+  for await (const chunk of stream) chunks.push(chunk);
+  let buffer = Buffer.concat(chunks);
+  if (start > 0) {
+    const precededByNewline = buffer[0] === 10;
+    buffer = buffer.subarray(1);
+    let text = buffer.toString('utf8');
+    if (!precededByNewline) {
+      const firstBreak = /\r?\n/.exec(text);
+      if (!firstBreak) return '';
+      text = text.slice(firstBreak.index + firstBreak[0].length);
+    }
+    return text;
   }
-  return chunks.join('');
+  return buffer.toString('utf8');
 }
 
-// Safe read-only telemetry provider. It reads only regular *.jsonl files in
-// one directory, caps both file count and bytes, ignores corrupt JSONL rows,
-// and returns null when no valid run record exists. Missing directories and
-// filesystem races are observation gaps, never server failures.
+// Safe read-only telemetry provider. It reads only regular telemetry*.jsonl
+// files, caps both file count and per-file tail bytes, ignores corrupt JSONL
+// rows, and returns null when no valid run record exists. Missing directories
+// and filesystem races are observation gaps, never server failures.
 export function createTelemetryProvider({
-  telemetryDir = process.env.DF_TELEMETRY_DIR ?? DEFAULT_TELEMETRY_DIR,
+  telemetryDir,
+  stateDirs = [],
   maxBytes = TELEMETRY_MAX_BYTES,
   maxFiles = TELEMETRY_MAX_FILES,
   now = () => Date.now(),
 } = {}) {
   return async () => {
     try {
-      if (typeof telemetryDir !== 'string' || !telemetryDir) return null;
-      const dirStat = await lstat(telemetryDir).catch(() => null);
-      if (!dirStat?.isDirectory() || dirStat.isSymbolicLink()) return null;
-      const entries = await readdir(telemetryDir, { withFileTypes: true })
-        .catch(() => []);
-      const names = entries
-        .filter(entry => entry.isFile() && entry.name.endsWith('.jsonl'))
-        .map(entry => entry.name)
-        .sort()
-        .slice(0, maxFiles);
-      if (!names.length) return null;
+      const validDirectory = async dir => {
+        if (typeof dir !== 'string' || !dir) return false;
+        const dirStat = await lstat(dir).catch(() => null);
+        return Boolean(dirStat?.isDirectory() && !dirStat.isSymbolicLink());
+      };
+      const explicitTelemetryDir = telemetryDir !== undefined;
+      const primaryDir = telemetryDir ?? process.env.DF_TELEMETRY_DIR ?? DEFAULT_TELEMETRY_DIR;
+      const directories = [];
+      if (await validDirectory(primaryDir)) directories.push(primaryDir);
+      // Без явного telemetryDir дефолт — только первый кандидат: stateDirs
+      // остаются источниками даже если общий дефолт существует. Явно заданный
+      // путь использует stateDirs только когда сам missing/invalid.
+      if (!explicitTelemetryDir || !directories.length) {
+        for (const dir of Array.isArray(stateDirs) ? stateDirs : []) {
+          if (await validDirectory(dir) && !directories.includes(dir)) directories.push(dir);
+        }
+      }
+      if (!directories.length) return null;
+
+      const files = [];
+      for (const dir of directories) {
+        const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+          if (entry.isFile() && entry.name.startsWith('telemetry') && entry.name.endsWith('.jsonl')) {
+            files.push({ dir, name: entry.name });
+          }
+        }
+      }
+      files.sort((a, b) => join(a.dir, a.name).localeCompare(join(b.dir, b.name)));
+      const selected = files.slice(0, maxFiles);
+      if (!selected.length) return null;
 
       const lines = [];
-      let remaining = maxBytes;
       let latestMtimeMs = 0;
-      for (const name of names) {
-        if (remaining <= 0) break;
-        const path = join(telemetryDir, name);
+      for (const file of selected) {
+        const path = join(file.dir, file.name);
         const fileStat = await lstat(path).catch(() => null);
         if (!fileStat?.isFile() || fileStat.isSymbolicLink()) continue;
         latestMtimeMs = Math.max(latestMtimeMs, fileStat.mtimeMs);
-        const text = await readBoundedText(path, Math.min(remaining, maxBytes)).catch(() => '');
-        remaining -= Math.min(maxBytes, Buffer.byteLength(text));
+        const text = await readTailText(path, maxBytes, fileStat.size).catch(() => '');
         for (const line of text.split(/\r?\n/)) if (line.trim()) lines.push(line);
       }
 
@@ -703,10 +798,24 @@ function taskRepoId(task) {
 }
 
 function receiptShaOf(task) {
-  const result = task?.result !== null && typeof task?.result === 'object' ? task.result : {};
+  const result = jsonObject(task?.result) ?? {};
   const labels = task?.labels !== null && typeof task?.labels === 'object' ? task.labels : {};
   return firstText(task?.receiptSha, task?.receipt_sha, result.sha, result.candidate_sha,
     result.receipt_sha, result.receiptSha, labels.receipt_sha, labels.receiptSha, labels.sha);
+}
+
+function ownerNeedDetails(task) {
+  const blocked = jsonObject(task?.blocked) ?? {};
+  const reasonPayload = jsonObject(blocked.reason);
+  const questionPayload = jsonObject(task?.question) ?? {};
+  const questionId = firstText(blocked.question_id, blocked.questionId,
+    reasonPayload?.question_id, questionPayload.question_id);
+  const question = firstText(blocked.question, questionPayload.prompt, questionPayload.question,
+    reasonPayload?.prompt, reasonPayload?.question);
+  const evidence = firstText(
+    typeof blocked.reason === 'string' && !reasonPayload ? blocked.reason : null,
+    reasonPayload?.evidence, questionPayload.evidence, task?.reason);
+  return { question, evidence, questionId };
 }
 
 function normalizeBoardExplorerTask(task) {
@@ -788,21 +897,46 @@ function stageVerdictStatus(value) {
   return null;
 }
 
+const FAILED_ATTEMPT_OUTCOMES = new Set(['hold', 'fail', 'failed', 'error', 'provider_error',
+  'crashed', 'timeout', 'aborted', 'uncertain', 'lease_lost', 'rework']);
+
+function telemetryFailedStages(telemetry) {
+  const failed = new Set();
+  const outcome = String(telemetry?.outcome ?? '').trim().toLowerCase();
+  if (!FAILED_ATTEMPT_OUTCOMES.has(outcome) &&
+      !/(hold|fail|error|crash|timeout|abort|uncertain|lease_lost|rework|blocked|needs_input)/.test(outcome)) return failed;
+  const add = raw => {
+    const kind = canonicalStageKind(raw);
+    if (kind) failed.add(kind);
+  };
+  for (const key of Object.keys(telemetry?.phaseFailures ?? {})) add(key);
+  for (const key of Object.keys(telemetry?.rounds?.gates ?? {})) add(key);
+  const reason = String(telemetry?.reason ?? '').toLowerCase();
+  if (/review|critic|\bl2\b/.test(reason)) failed.add('l2_critic');
+  if (/local_checks|\bl1\b/.test(reason)) failed.add('l1_local');
+  if (/tamper/.test(reason)) failed.add('tamper');
+  if (/scope/.test(reason)) failed.add('scope_fence');
+  if (/arbiter|arbitration/.test(reason)) failed.add('arbiter');
+  return failed;
+}
+
 function buildStageNodes(events, telemetry, nowMs) {
   const nodes = new Map(TREE_STAGE_ORDER.map(kind => [kind, {
     kind, status: 'pending', model: null, round: null, elapsedMs: null, reason: null,
   }]));
   const telemetryPhases = telemetry?.phasesMs ?? {};
   const telemetryHasAttempt = telemetry !== null && telemetry !== undefined;
+  const telemetryFailures = telemetryFailedStages(telemetry);
   for (const kind of ['l1_local', 'tamper', 'l2_critic', 'arbiter']) {
     if (!Object.hasOwn(telemetryPhases, kind)) continue;
     const node = nodes.get(kind);
     const elapsed = finiteNumber(telemetryPhases[kind]);
     if (elapsed !== null) {
-      node.status = 'pass';
+      node.status = telemetryFailures.has(kind) ? 'fail' : 'pass';
       node.elapsedMs = elapsed;
+      if (telemetryFailures.has(kind)) node.reason = textValue(telemetry?.reason);
     } else if (telemetryHasAttempt) {
-      node.status = 'skipped';
+      node.status = telemetryFailures.has(kind) ? 'fail' : 'skipped';
     }
   }
   const gateRound = (node, keys) => {
@@ -827,6 +961,7 @@ function buildStageNodes(events, telemetry, nowMs) {
 
   const started = new Map();
   for (const event of events) {
+    if (String(event?.kind ?? '').toLowerCase() === 'adaptive_gate_decision') continue;
     const detail = event?.detail !== null && typeof event?.detail === 'object' ? event.detail : {};
     const kind = [detail.stage, detail.kind, event.role, event.phase, event.kind]
       .map(canonicalStageKind).find(value => value !== null) ?? null;
@@ -975,10 +1110,12 @@ export function buildActiveTrees({ events = [], tasks = [], telemetryAttempts = 
   for (const raw of Array.isArray(telemetryAttempts) ? telemetryAttempts : []) {
     const compact = compactTelemetryAttempt(raw);
     if (!compact) continue;
-    const previous = telemetryByTask.get(compact.taskId);
-    const currentTs = timeValue(compact.endedAt) ?? timeValue(compact.startedAt) ?? 0;
-    const previousTs = previous ? (timeValue(previous.endedAt) ?? timeValue(previous.startedAt) ?? 0) : -1;
-    if (!previous || currentTs >= previousTs) telemetryByTask.set(compact.taskId, compact);
+    if (!telemetryByTask.has(compact.taskId)) telemetryByTask.set(compact.taskId, []);
+    telemetryByTask.get(compact.taskId).push(compact);
+  }
+  const telemetryTime = entry => timeValue(entry?.endedAt) ?? timeValue(entry?.startedAt) ?? 0;
+  for (const list of telemetryByTask.values()) {
+    list.sort((a, b) => telemetryTime(a) - telemetryTime(b));
   }
   const groups = new Map();
   for (const event of Array.isArray(events) ? events : []) {
@@ -997,6 +1134,28 @@ export function buildActiveTrees({ events = [], tasks = [], telemetryAttempts = 
     const previousMax = previous ? eventTime(previous[previous.length - 1]) : -Infinity;
     if (!previous || currentMax >= previousMax) latestGroupByTask.set(taskId, group);
   }
+  const groupIdentity = group => {
+    const withAttempt = [...(group ?? [])].reverse().find(event => textValue(event?.attempt_id));
+    const withEpoch = [...(group ?? [])].reverse().find(event => Number.isSafeInteger(event?.epoch));
+    return {
+      attemptId: textValue(withAttempt?.attempt_id),
+      epoch: Number.isSafeInteger(withEpoch?.epoch) ? withEpoch.epoch : null,
+    };
+  };
+  const telemetryForGroup = (taskId, group) => {
+    const list = telemetryByTask.get(taskId) ?? [];
+    if (!list.length) return null;
+    const latest = list[list.length - 1];
+    if (!group?.length) return latest;
+    const identity = groupIdentity(group);
+    if (!identity.attemptId && identity.epoch === null) return latest;
+    const matches = list.filter(entry => {
+      if (identity.attemptId && entry.attemptId !== identity.attemptId) return false;
+      if (identity.epoch !== null && entry.epoch !== identity.epoch) return false;
+      return true;
+    });
+    return matches.length ? matches[matches.length - 1] : null;
+  };
   const ids = new Set([...latestGroupByTask.keys(), ...telemetryByTask.keys()]);
   for (const [taskId, task] of boardById) {
     if (ACTIVE_TREE_STATES.has(String(task?.state ?? '').toLowerCase())) ids.add(taskId);
@@ -1004,7 +1163,7 @@ export function buildActiveTrees({ events = [], tasks = [], telemetryAttempts = 
   const trees = [...ids].map(taskId => buildTreeForTask(taskId, {
     boardTask: boardById.get(taskId) ?? null,
     events: latestGroupByTask.get(taskId) ?? [],
-    telemetry: telemetryByTask.get(taskId) ?? null,
+    telemetry: telemetryForGroup(taskId, latestGroupByTask.get(taskId)),
     threads,
     nowMs,
   }));
@@ -1044,14 +1203,14 @@ export function createControlRoomAggregator({
   branchDriftProvider = null,
   netHealth = null,
   telemetryProvider = null,
-  telemetryDir = process.env.DF_TELEMETRY_DIR ?? DEFAULT_TELEMETRY_DIR,
+  telemetryDir,
   modelsProvider = createModelsProvider(),
   finopsProvider = createFinopsProvider(),
   inspectProvider = async () => ({ text: '', artifacts: [] }),
   webDir = WEB_DIR,
   now = () => Date.now(),
 } = {}) {
-  const readTelemetry = telemetryProvider ?? createTelemetryProvider({ telemetryDir, now });
+  const readTelemetry = telemetryProvider ?? createTelemetryProvider({ telemetryDir, stateDirs, now });
   const effectiveStateDir = stateDir ?? stateDirs[0] ?? null;
   const effectiveFleetDir = fleetDir !== undefined ? fleetDir
     : effectiveStateDir ? join(effectiveStateDir, 'fleet') : null;
@@ -1158,14 +1317,14 @@ export function createControlRoomAggregator({
           role: key?.role ?? null, round: key?.round ?? null,
           deadline_rem_ms: key?.deadline_rem_ms ?? null,
           tokens: key?.tokens ?? null, lastEvent: key?.reason ?? null });
-      } else if (task.state === 'ready' || task.state === 'queued') {
+      } else if (task.state === 'ready' || task.state === 'queued' || task.state === 'waiting') {
         queued.push(card);
-      } else if (task.state === 'blocked' || task.state === 'awaiting_answer') {
+      } else if (task.state === 'blocked' || task.state === 'awaiting_answer' || task.state === 'hold') {
+        const need = ownerNeedDetails(task);
         needsOwner.push({ ...card,
-          question: task.blocked?.question ?? task.question ?? null,
-          evidence: task.blocked?.reason ?? task.reason ?? null,
-          cli: task.blocked?.question_id ?? task.question?.question_id
-            ? `question-gate answer ${task.blocked?.question_id ?? task.question.question_id}` : null });
+          question: need.question,
+          evidence: need.evidence,
+          cli: need.questionId ? `question-gate answer ${need.questionId}` : null });
       } else if (task.state === 'completed' || task.state === 'done') {
         recentlyCompleted.push(card);
       }
@@ -1237,13 +1396,13 @@ export function createControlRoomAggregator({
 
   const respond = async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
-    const port = httpServer?.address()?.port ?? port;
-    if (!isAllowedHost(req.headers.host, port)) {
+    const activePort = httpServer?.address()?.port ?? port;
+    if (!isAllowedHost(req.headers.host, activePort)) {
       res.writeHead(403, jsonHeaders());
       res.end(JSON.stringify({ error: 'forbidden_host' }));
       return;
     }
-    if (!isAllowedOrigin(req.headers.origin, port)) {
+    if (!isAllowedOrigin(req.headers.origin, activePort)) {
       res.writeHead(403, jsonHeaders());
       res.end(JSON.stringify({ error: 'forbidden_origin' }));
       return;

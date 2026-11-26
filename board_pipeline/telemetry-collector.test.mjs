@@ -850,3 +850,36 @@ test('ревью r2 #3: dashboard --out-dir выбирает snapshot-2026-11-23
   assert.ok(html2.includes('LATEST_SNAP_2_TITLE'));
   assert.ok(!html2.includes('OLD_SNAP_TITLE'));
 });
+
+test('collectTelemetry: Board 0.54.0 raw.message envelope is unwrapped', async () => {
+  const tasks = await loadBoardTasksFromApi({
+    url: 'http://localhost:9999/tasks',
+    fetchImpl: async () => ({ ok: true, json: async () => ({ tasks: [
+      { message: { id: 'envelope-1', channel: 'core', text: 'Wrapped card title\nbody',
+        task: { state: 'done' } } },
+      { id: 'direct-1', channel: 'core', status: 'ready' },
+    ] }) }),
+  });
+  assert.equal(tasks.length, 2);
+  const snapshot = await collectTelemetry({ boardTasks: tasks });
+  const wrapped = snapshot.tasks.find(task => task.task_id === 'envelope-1');
+  assert.ok(wrapped);
+  assert.equal(wrapped.status, 'done');
+  assert.equal(wrapped.channel, 'core');
+  assert.equal(wrapped.title, 'Wrapped card title');
+  const direct = snapshot.tasks.find(task => task.task_id === 'direct-1');
+  assert.ok(direct);
+  assert.equal(direct.status, 'ready');
+});
+
+test('collectTelemetry: review_error counts as a provider failure reason', async () => {
+  const snapshot = await collectTelemetry({
+    bbThreads: [{
+      id: 'thr-review-error', task_id: '501', provider: 'acp-devin', model: 'swe-2-high',
+      status: 'failed', error: 'review_error', duration_ms: 100,
+    }],
+  });
+  assert.equal(snapshot.models.length, 1);
+  assert.equal(snapshot.models[0].model_id, 'acp-devin/swe-2-high');
+  assert.equal(snapshot.models[0].provider_failures, 1);
+});
