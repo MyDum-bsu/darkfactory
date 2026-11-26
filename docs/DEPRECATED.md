@@ -6,12 +6,17 @@ Wave 2.0 заменяет конвейер эпохи Foreman/Playbooks униф
 
 | Модуль | Назначение в V2 | Статус |
 |---|---|---|
-| `board_pipeline/test-first-adapter.mjs` | Host-адаптер контракта Test First: красный тест-коммит / зелёный кандидат для стадий Playbooks | **Deprecated** — не использовать в новом коде |
 | `board_pipeline/playbook-router.mjs` | Маршрутизатор Playbook-стадий (executor/critic/arbiter) эпохи Foreman | **Deprecated** — не использовать в новом коде |
 | `board_pipeline/bb-stage-adapter.mjs` | Адаптер BB-стадий поверх транспорта песочниц V2 | **Deprecated** — не использовать в новом коде |
 | `board_pipeline/stage-sandbox-transport.mjs` | Аттестованный read-only транспорт Stage-станций (landlock-ro-v1 / docker-ro-v1) | **Deprecated** — не использовать в новом коде |
 
 Каждый из этих файлов помечен `@deprecated` JSDoc-заголовком. Поведение и экспорты не меняются: пометка носит документирующий характер, существующие детерминированные тесты продолжают выполняться через `npm test`.
+
+## Удалённые модули
+
+| Модуль | Назначение в V2 | Статус |
+|---|---|---|
+| `board_pipeline/test-first-adapter.mjs` | Host-адаптер контракта Test First: красный тест-коммит / зелёный кандидат для стадий Playbooks | **Удалён** — модуль и его тест `board_pipeline/test-first-adapter.test.mjs` выведены из репозитория по Owner Decision #6 и аудиту Wave 2.0 (P2-12). Обращений к модулю в действующем коде не осталось |
 
 ## Сохранённый модуль
 
