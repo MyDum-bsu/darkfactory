@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { allowedPathsFromAttempt, allowedPathsFromLabels, baseWorkerFromPolicy, buildWorkerTransport,
-  isApprovedWorker, planAdaptiveChecks, queueModeSpecInputs, resolveWorkerRuntimeKind,
-  scopeFenceReworkResult } from './run-isolated.mjs';
+import { adaptiveLocalPlanCore, allowedPathsFromAttempt, allowedPathsFromLabels, baseWorkerFromPolicy,
+  buildWorkerTransport, filterAdaptiveTelemetry, isApprovedWorker, planAdaptiveChecks,
+  queueModeSpecInputs, resolveWorkerRuntimeKind, scopeFenceReworkResult } from './run-isolated.mjs';
 import { deterministicRuntimeId } from './worker-runtime.mjs';
 import { DEFAULT_ARBITER, DEFAULT_CRITIC, PRIMARY_WORKER, resolveTriad } from './worker-selector.mjs';
 import { workerIntakePrompt } from './intake-prompt.mjs';
@@ -495,4 +495,169 @@ test('package.json test script executes all five formerly orphaned V2 suites', (
   ]) {
     assert.ok(pkg.scripts.test.split(' ').includes(file), `${file} missing from npm test`);
   }
+});
+
+// --- AUDIT-0b: fail-closed adaptive gates в adaptiveLocalPlanCore ---
+
+const adaptiveTrusted = (over = {}) => ({
+  adaptiveGates: { enabled: true,
+    telemetryStats: { lint: 5_000, 'e2e-heavy': 300_000 }, ...over.gates },
+  checks: [
+    { id: 'lint', kind: 'fast', reversible: true },
+    { id: 'e2e-heavy', kind: 'heavy', reversible: true },
+  ],
+  ...over.rest,
+});
+
+function adaptiveInputs(over = {}) {
+  const notes = [];
+  return { notes,
+    options: {
+      trusted: adaptiveTrusted(),
+      readDiffPaths: async () => ['src/index.ts'],
+      readTelemetryEntries: async () => [],
+      repoId: 'repo-1',
+      identity: { task_id: '5401', attempt_id: 'att-1', epoch: 1 },
+      emit: note => notes.push(note),
+      ...over,
+    } };
+}
+
+test('adaptiveLocalPlanCore fails closed to strict_sync when async checks would be deferred', async () => {
+  const { options, notes } = adaptiveInputs();
+  const result = await adaptiveLocalPlanCore(options);
+  assert.notEqual(result, null);
+  // Планировщик хотел отложить e2e-heavy (optimistic_async), но async post-L1
+  // раннера нет — весь профиль исполняется синхронно.
+  assert.equal(result.plan.mode, 'strict_sync');
+  assert.equal(result.plan.reason, 'async_runner_unavailable');
+  assert.deepEqual(result.plan.syncChecks, adaptiveTrusted().checks);
+  assert.deepEqual(result.plan.asyncChecks, []);
+  assert.equal(result.metadata.failClosed, 'async_runner_unavailable');
+  assert.equal(result.metadata.plannerMode, 'optimistic_async');
+  assert.deepEqual(result.metadata.deferredAsyncChecks, ['e2e-heavy']);
+  // Fail-closed решение журналируется событием adaptive_gate_decision.
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0].kind, 'adaptive_gate_decision');
+  assert.equal(notes[0].mode, 'strict_sync');
+  assert.equal(notes[0].reason, 'async_runner_unavailable');
+  assert.equal(notes[0].detail.failClosed, 'async_runner_unavailable');
+  assert.equal(notes[0].detail.plannerMode, 'optimistic_async');
+  assert.equal(notes[0].task_id, '5401');
+  // Повторный вызов детерминирован.
+  const again = await adaptiveLocalPlanCore({ ...options, emit: null });
+  assert.deepEqual(again.plan, result.plan);
+});
+
+test('adaptiveLocalPlanCore fails closed on diff read error and never plans on empty inputs', async () => {
+  let telemetryRead = false;
+  const { options } = adaptiveInputs({
+    readDiffPaths: async () => { throw new Error('git diff exploded'); },
+    readTelemetryEntries: async () => { telemetryRead = true; return []; },
+  });
+  const result = await adaptiveLocalPlanCore(options);
+  assert.equal(result.plan.mode, 'strict_sync');
+  assert.equal(result.plan.reason, 'adaptive_input_error');
+  assert.deepEqual(result.plan.syncChecks, adaptiveTrusted().checks);
+  assert.deepEqual(result.plan.asyncChecks, []);
+  assert.equal(result.metadata.failClosed, 'adaptive_input_error');
+  assert.equal(telemetryRead, false, 'после сбоя diff телеметрия не читается — план уже fail-closed');
+});
+
+test('adaptiveLocalPlanCore fails closed on telemetry read error', async () => {
+  const { options, notes } = adaptiveInputs({
+    readTelemetryEntries: async () => { throw new Error('telemetry unreadable'); },
+  });
+  const result = await adaptiveLocalPlanCore(options);
+  assert.equal(result.plan.mode, 'strict_sync');
+  assert.equal(result.plan.reason, 'adaptive_input_error');
+  assert.deepEqual(result.plan.syncChecks, adaptiveTrusted().checks);
+  assert.deepEqual(result.plan.asyncChecks, []);
+  assert.equal(notes[0].reason, 'adaptive_input_error');
+});
+
+test('adaptiveLocalPlanCore forwards highRiskPaths even when gates.thresholds is set', async () => {
+  for (const key of ['highRiskPaths', 'high_risk_paths']) {
+    const trusted = {
+      adaptiveGates: { enabled: true,
+        thresholds: { fastMaxMs: 90_000 },
+        [key]: ['migrations/'],
+        telemetryStats: { heavy: 300_000 } },
+      checks: [{ id: 'heavy', kind: 'heavy', reversible: true }],
+    };
+    const { options } = adaptiveInputs({
+      trusted,
+      readDiffPaths: async () => ['migrations/0001_init.sql'],
+    });
+    const result = await adaptiveLocalPlanCore(options);
+    assert.equal(result.plan.mode, 'strict_sync', key);
+    assert.equal(result.plan.reason, 'high_risk_path', key);
+    assert.deepEqual(result.plan.syncChecks, trusted.checks);
+    // Планировщик сам видит high-risk совпадение — не fail-closed откат async.
+    assert.equal(result.metadata.failClosed, undefined, key);
+  }
+});
+
+test('adaptiveLocalPlanCore filters open and other-repo telemetry rows before the circuit breaker', async () => {
+  const rollbacks = count => Array.from({ length: count }, () => ({ rollback: true, open: false, repo_id: 'repo-1' }));
+  // 6 закрытых rollback-записей того же repo_id — breaker trips: strict_sync по
+  // rollback_circuit_breaker, а не по async_runner_unavailable.
+  const tripped = await adaptiveLocalPlanCore(adaptiveInputs({
+    readTelemetryEntries: async () => rollbacks(6) }).options);
+  assert.equal(tripped.plan.mode, 'strict_sync');
+  assert.equal(tripped.plan.reason, 'rollback_circuit_breaker');
+  // Те же записи, но открытые или чужого repo_id, отфильтровываются: breaker
+  // не срабатывает, планировщик доходит до optimistic-планирования (которое
+  // fail-closed откатывается уже по async_runner_unavailable).
+  const filtered = await adaptiveLocalPlanCore(adaptiveInputs({
+    readTelemetryEntries: async () => [
+      ...rollbacks(6).map(entry => ({ ...entry, open: true })),
+      ...rollbacks(6).map(entry => ({ ...entry, repo_id: 'repo-2' })),
+    ] }).options);
+  assert.equal(filtered.plan.mode, 'strict_sync');
+  assert.equal(filtered.plan.reason, 'async_runner_unavailable');
+  assert.equal(filtered.metadata.plannerMode, 'optimistic_async');
+});
+
+test('filterAdaptiveTelemetry keeps closed entries of the same repo and unattributed rows', () => {
+  const entries = [
+    { open: true, rollback: true, repo_id: 'repo-1' },
+    { open: false, rollback: true, repo_id: 'repo-1' },
+    { rollback: true, repo_id: 'repo-2' },
+    { rollback: true },
+    { open: false, repo_id: 'repo-1' },
+    null,
+  ];
+  const filtered = filterAdaptiveTelemetry(entries, 'repo-1');
+  assert.deepEqual(filtered, [entries[1], entries[3], entries[4], entries[5]]);
+  assert.deepEqual(filterAdaptiveTelemetry([], 'repo-1'), []);
+  assert.deepEqual(filterAdaptiveTelemetry(null, 'repo-1'), []);
+  assert.deepEqual(filterAdaptiveTelemetry(undefined, undefined), []);
+});
+
+test('adaptiveLocalPlanCore returns null when adaptive gates are not enabled', async () => {
+  for (const trusted of [
+    {},
+    { checks: [] },
+    { adaptiveGates: { enabled: false }, checks: [] },
+    { adaptiveGates: {}, checks: [] },
+  ]) {
+    const result = await adaptiveLocalPlanCore(adaptiveInputs({ trusted }).options);
+    assert.equal(result, null);
+  }
+});
+
+test('planAdaptiveChecks forwards explicit highRiskPaths alongside thresholds', () => {
+  const plan = planAdaptiveChecks({
+    profile: { adaptiveGates: { enabled: true }, checks: [
+      { id: 'heavy', kind: 'heavy', reversible: true },
+    ] },
+    diffPaths: ['migrations/0001_init.sql'],
+    telemetryStats: { heavy: 300_000 },
+    thresholds: { enabled: true },
+    highRiskPaths: ['migrations/'],
+  });
+  assert.equal(plan.mode, 'strict_sync');
+  assert.equal(plan.reason, 'high_risk_path');
+  assert.deepEqual(plan.asyncChecks, []);
 });

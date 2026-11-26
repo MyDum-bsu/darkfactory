@@ -58,6 +58,7 @@ const ATTEMPT_OPTIONAL = [
   'prior_sha',
   'category',
   'labels',
+  'allowed_paths',
 ];
 const CONTRACT_REQUIRED = ['repo_id', 'spec_digest', 'policy_digest'];
 const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
@@ -308,6 +309,11 @@ function validateAttempt(attempt) {
   if (attempt.category !== undefined &&
       (typeof attempt.category !== 'string' || !/^[a-z][a-z0-9-]{0,47}$/.test(attempt.category))) {
     throw new Denied('invalid_category');
+  }
+  // Закреплённый scope fence попытки — строка или отсутствие: нестроковое
+  // значение не нормализуется молча в null, а отклоняется fail-closed.
+  if (attempt.allowed_paths !== undefined && typeof attempt.allowed_paths !== 'string') {
+    throw new Denied('invalid_allowed_paths');
   }
   // Предыдущий проверенный кандидат для инкрементального diff раунда 2+ —
   // доверенное значение из истории попытки, не из сдачи.
@@ -751,27 +757,50 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     if (loaded !== null) {
       let changedFiles = null;
       let changedLines = 0;
+      // AUDIT-0b: diff для auto-approve исполняется изолированно — без
+      // textconv/ext-diff/color-драйверов, fsmonitor и внешних атрибутов,
+      // с отключённой пользовательской/системной конфигурацией git: кандидат
+      // не влияет на счёт строк через .gitattributes или diff-драйвер.
+      const isolatedGitEnv = { ...process.env, GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0' };
+      const isolatedGitArgs = ['-C', binding.worktree,
+        '-c', 'core.fsmonitor=false', '-c', 'diff.external=',
+        '-c', 'core.attributesfile=/dev/null'];
+      const diffOptions = ['--no-textconv', '--no-ext-diff', '--no-color'];
+      // Бинарная строка numstat ('-\t-\t<path>') не считается нулём строк:
+      // бинарная полезная нагрузка не может обойти maxChangedLines —
+      // auto-approve отклоняется, кандидат идёт на обязательный L2.
+      let binaryDiff = false;
       try {
-        const names = await execGit('git', ['-C', binding.worktree, 'diff', '--no-renames',
-          '-z', '--name-only', binding.base_sha, binding.candidate_sha, '--'],
-          { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+        const names = await execGit('git', [...isolatedGitArgs, 'diff', '--no-renames',
+          '-z', '--name-only', ...diffOptions, binding.base_sha, binding.candidate_sha, '--'],
+          { timeout: 30_000, maxBuffer: 4 * 1024 * 1024, env: isolatedGitEnv });
         changedFiles = names.stdout.split('\0').filter(name => name.length > 0);
-        const numstat = await execGit('git', ['-C', binding.worktree, 'diff', '--no-renames',
-          '--numstat', binding.base_sha, binding.candidate_sha, '--'],
-          { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+        const numstat = await execGit('git', [...isolatedGitArgs, 'diff', '--no-renames',
+          '--numstat', ...diffOptions, binding.base_sha, binding.candidate_sha, '--'],
+          { timeout: 30_000, maxBuffer: 4 * 1024 * 1024, env: isolatedGitEnv });
         for (const line of numstat.stdout.split('\n')) {
+          if (line === '') continue;
           const [add, del] = line.split('\t');
+          if (add === '-' || del === '-') {
+            binaryDiff = true;
+            continue;
+          }
           changedLines += (Number.parseInt(add, 10) || 0) + (Number.parseInt(del, 10) || 0);
         }
       } catch (e) {
         await step('review', false, messageOf(e));
         return { status: 'hold', reason: `auto_approve_diff_failed:${messageOf(e)}` };
       }
-      const decision = evaluateAutoApprove({ policy: loaded.policy, digest: loaded.digest,
-        category: binding.category, changedFiles, changedLines,
-        l1Passed: true, tamperPassed: tamper?.ok === true });
-      if (decision.approved === true) autoApprove = decision;
-      await step('review', true, { auto_approve: decision });
+      if (binaryDiff) {
+        await step('review', true, { auto_approve: { approved: false, reason: 'binary_diff_disallowed' } });
+      } else {
+        const decision = evaluateAutoApprove({ policy: loaded.policy, digest: loaded.digest,
+          category: binding.category, changedFiles, changedLines,
+          l1Passed: true, tamperPassed: tamper?.ok === true });
+        if (decision.approved === true) autoApprove = decision;
+        await step('review', true, { auto_approve: decision });
+      }
     }
   }
   if (autoApprove !== null) {
@@ -1423,6 +1452,27 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         await step('seal', false, 'has_ui_drift');
         return { fail: 'has_ui_drift' };
       }
+      // AUDIT-0b: эскалация в обратную сторону — карточка, закреплённая без
+      // требования UI (ни attempt, ни профиль), не может получить live-метку
+      // has_ui 'true' перед seal: позднее включение L3 пересматривает допуск,
+      // а не закрывается устаревшим вердиктом.
+      if (attempt.has_ui !== true && profile.has_ui !== true &&
+          labels.has_ui === 'true') {
+        await step('seal', false, 'has_ui_drift');
+        return { fail: 'has_ui_drift' };
+      }
+      // AUDIT-0b: scope fence закреплён на попытку — live-дрейф метки
+      // allowed_paths (появление, удаление или смена значения после L2)
+      // останавливает кандидата до complete.
+      const pinnedAllowedPaths = (() => {
+        const raw = attempt.allowed_paths ?? attempt.labels?.allowed_paths ?? null;
+        return typeof raw === 'string' ? raw : null;
+      })();
+      const liveAllowedPaths = typeof labels.allowed_paths === 'string' ? labels.allowed_paths : null;
+      if (liveAllowedPaths !== pinnedAllowedPaths) {
+        await step('seal', false, 'allowed_paths_drift');
+        return { fail: 'allowed_paths_drift' };
+      }
       // fixtures_digest сверяется всегда и нормализуется как в манифесте: отсутствие
       // значения в контракте и на карточке — null, появление метки во время L2 — дрейф.
       const expectedFixtures = attempt.fixtures_digest ?? null;
@@ -1532,6 +1582,41 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         }
       }
       if (!receiptOk) return hold('invalid_arbitration_receipt');
+      // AUDIT-0b (P1-11): арбитр квитанции обязан совпасть с закреплённым
+      // арбитром попытки (триада, затем attempt, затем профиль) по provider
+      // и model — accept_with_notes от подменённого арбитра не принимается.
+      // Сверка в runner-форме, как закреплённая триада: pi/openai/… пин и
+      // openai/… квитанция описывают один spec. Для Neon-ревью арбитр обязан
+      // быть аттестованным Sol — независимо от содержимого квитанции.
+      const pinnedArbiter = attempt.triad?.arbiter ?? attempt.arbiter ?? profile.arbiter;
+      let arbiterOk = true;
+      if (pinnedArbiter !== undefined && pinnedArbiter !== null) {
+        // Пин может быть строкой 'provider/model' — той же формой, что
+        // принимает validWorkerSpec и таблица семейств: нормализация к
+        // объекту до runner-сверки, а не ложный mismatch.
+        const normalize = spec => {
+          const objectSpec = typeof spec === 'string' && spec.includes('/')
+            ? { provider: spec.slice(0, spec.indexOf('/')), model: spec.slice(spec.indexOf('/') + 1) }
+            : spec;
+          return runnerReviewSpec(objectSpec) ?? objectSpec;
+        };
+        const expected = normalize(pinnedArbiter);
+        const presented = normalize(arbitrationReceipt.arbiter);
+        arbiterOk = expected?.provider === presented?.provider &&
+          expected?.model === presented?.model;
+      }
+      if (arbiterOk && isNeonReview(profile.review)) {
+        arbiterOk = isSolArbiter(arbitrationReceipt.arbiter);
+      }
+      if (!arbiterOk) return hold('arbiter_mismatch');
+      // AUDIT-0b (P1-11/P2-2): max harm и dod_violation вычисляются
+      // независимо из находок самого вердикта — квитанция арбитра не может
+      // занизить harm>=10 или скрыть dod_violation, присутствующие в review.
+      const reviewFindings = Array.isArray(verdict.review?.findings) ? verdict.review.findings : [];
+      const blockingFindings = reviewFindings.some(finding =>
+        (typeof finding?.harm === 'number' && Number.isFinite(finding.harm) && finding.harm >= 10) ||
+        finding?.dod_violation === true);
+      if (blockingFindings) return hold('blocking_findings_present');
       const sealed = await doSeal();
       if (sealed.denied) return settle('denied', { reason: sealed.denied });
       if (sealed.fail) return hold(sealed.fail);
@@ -1545,7 +1630,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         checks: verdict.loc?.evidence ?? [],
         tamper: verdict.tamper ? 'pass' : 'na',
         visual: verdict.visual,
-        review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
+        review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual,
+          transcript_sha256: rev.transcript_sha256 },
         arbitration: arbitrationReceipt,
       }, id);
       const gateReceipts = {
@@ -1606,7 +1692,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     checks: loc.evidence,
     tamper: tamper ? 'pass' : 'na',
     visual,
-    review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual },
+    review: { verdict: rev.verdict, checkpoint: rev.checkpoint, actual,
+      transcript_sha256: rev.transcript_sha256 },
   }, id);
 
   // Полные квитанции L1-tamper и L3 остаются в локальном журнале, привязанные к

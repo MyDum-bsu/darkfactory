@@ -109,19 +109,100 @@ export function resolveWorkerRuntimeKind({ cliRuntime, policy, env } = {}) {
 // ведёт себя в точности как раньше. Fail-closed инвариант: пустой
 // синхронный набор при непустом списке проверок откатывает план на
 // strict_sync всех проверок — L1 никогда не пропускает проверку полностью.
-export function planAdaptiveChecks({ profile, diffPaths, telemetryStats, recentRollbacks, thresholds } = {}) {
+export function planAdaptiveChecks({ profile, diffPaths, telemetryStats, recentRollbacks, thresholds,
+  highRiskPaths } = {}) {
   const checks = Array.isArray(profile?.checks) ? profile.checks : [];
   if (profile?.adaptiveGates?.enabled !== true && thresholds?.enabled !== true) {
     return { enabled: false, mode: 'strict_sync', reason: 'disabled',
       syncChecks: checks, asyncChecks: [], decision: null };
   }
-  const decision = evaluateAdaptiveGate({ checks, diffPaths, telemetryStats, recentRollbacks, thresholds });
+  const decision = evaluateAdaptiveGate({ checks, diffPaths, telemetryStats, recentRollbacks, thresholds,
+    highRiskPaths });
   if (decision.syncFastChecks.length === 0 && checks.length > 0) {
     return { enabled: true, mode: 'strict_sync', reason: 'empty_sync_fallback',
       syncChecks: checks, asyncChecks: [], decision };
   }
   return { enabled: true, mode: decision.mode, reason: decision.reason,
     syncChecks: decision.syncFastChecks, asyncChecks: decision.asyncHeavyChecks, decision };
+}
+
+// Телеметрия адаптивного гейта фильтруется до оценки circuit breaker:
+// открытые (незавершённые) попытки и строки других repo_id не участвуют
+// в rolling-окне. Записи без repo_id неприписываемы и сохраняются —
+// отбрасываются только строки с явным чужим repo_id.
+export function filterAdaptiveTelemetry(entries, repoId) {
+  return (Array.isArray(entries) ? entries : []).filter(entry =>
+    entry?.open !== true &&
+    (entry?.repo_id === undefined || entry.repo_id === repoId));
+}
+
+// AUDIT-0b fail-closed планировщик адаптивных проверок с внедряемым IO:
+// детерминированно тестируемая сердцевина adaptiveLocalPlan. До появления
+// async post-L1 раннера с rollback-обработчиком любой optimistic_async план
+// откатывается на strict_sync всех проверок профиля (async_runner_unavailable),
+// а сбой чтения diff/телеметрии — fail-closed на тот же strict_sync
+// (adaptive_input_error): пустые diffPaths/recentAttempts никогда не
+// подменяют реальные входы планировщика.
+export async function adaptiveLocalPlanCore({ trusted, readDiffPaths, readTelemetryEntries,
+  repoId = null, emit = null, identity = {} } = {}) {
+  if (trusted?.adaptiveGates?.enabled !== true) return null;
+  const allChecks = Array.isArray(trusted.checks) ? trusted.checks : [];
+  const gates = trusted.adaptiveGates;
+  let inputError = null;
+  let diffPaths = [];
+  try {
+    const paths = await readDiffPaths();
+    diffPaths = Array.isArray(paths) ? paths : [];
+  } catch (error) {
+    inputError = error;
+  }
+  let telemetryEntries = [];
+  if (inputError === null) {
+    try {
+      const entries = await readTelemetryEntries();
+      telemetryEntries = Array.isArray(entries) ? entries : [];
+    } catch (error) {
+      inputError = error;
+    }
+  }
+  let plan;
+  let failClosed = null;
+  let plannerMode = null;
+  let plannerReason = null;
+  if (inputError !== null) {
+    plan = { enabled: true, mode: 'strict_sync', reason: 'adaptive_input_error',
+      syncChecks: allChecks, asyncChecks: [], decision: null };
+    failClosed = 'adaptive_input_error';
+  } else {
+    plan = planAdaptiveChecks({ profile: trusted, diffPaths,
+      telemetryStats: gates.telemetryStats ?? null,
+      recentRollbacks: filterAdaptiveTelemetry(telemetryEntries, repoId),
+      thresholds: gates.thresholds ?? gates,
+      highRiskPaths: gates.highRiskPaths ?? gates.high_risk_paths });
+    plannerMode = plan.mode;
+    plannerReason = plan.reason;
+    if (plan.mode === 'optimistic_async' || plan.asyncChecks.length > 0) {
+      plan = { ...plan, mode: 'strict_sync', reason: 'async_runner_unavailable',
+        syncChecks: allChecks, asyncChecks: [] };
+      failClosed = 'async_runner_unavailable';
+    }
+  }
+  // deferredAsyncChecks — что планировщик хотел отложить (до fail-closed
+  // отката): исполнение всегда синхронное, метаданные фиксируют намерение
+  // планировщика для наблюдаемости.
+  const deferredAsyncChecks = (plan.decision?.decisions ?? [])
+    .filter(entry => entry.disposition === 'async').map(entry => entry.id);
+  const metadata = { mode: plan.mode, reason: plan.reason,
+    syncCount: plan.syncChecks.length, asyncCount: plan.asyncChecks.length,
+    deferredAsyncChecks,
+    ...(failClosed !== null ? { failClosed, plannerMode, plannerReason } : {}) };
+  const note = { kind: 'adaptive_gate_decision', phase: 'l1_local',
+    task_id: identity.task_id, attempt_id: identity.attempt_id, epoch: identity.epoch,
+    mode: plan.mode, reason: plan.reason,
+    detail: { syncCount: metadata.syncCount, asyncCount: metadata.asyncCount,
+      ...(failClosed !== null ? { failClosed, plannerMode, plannerReason } : {}) } };
+  if (typeof emit === 'function') emit(note);
+  return { plan, metadata };
 }
 
 export function buildWorkerTransport({ kind, policy, runtime, bbTransport, worktree,
@@ -1100,46 +1181,31 @@ async function execute() {
       let diff, localEvidence, visualEvidence = null;
       // V2-9b: адаптивное разбиение проверок активируется только явным
       // adaptiveGates.enabled доверенного профиля. Входы планировщика —
-      // read-only: diff кандидата из git (сбой чтения — безопасный []) и
-      // журнальные попытки телеметрии того же root. Решение фиксируется
-      // read-only событием adaptive_gate_decision; отложенные async-проверки
-      // попадают в метаданные evidence без обхода Tamper Gate, Scope Fence
-      // и formal-проверок (formal остаются синхронными по контракту гейта).
+      // read-only: diff кандидата из git и журнальные попытки телеметрии
+      // того же root; сбой их чтения — fail-closed strict_sync всех проверок,
+      // а не план на пустых входах (AUDIT-0b). До появления async post-L1
+      // раннера optimistic_async откатывается на синхронное исполнение всех
+      // проверок. Решение фиксируется read-only событием
+      // adaptive_gate_decision; formal-проверки остаются синхронными по
+      // контракту гейта, Tamper Gate и Scope Fence не обходятся.
       const adaptiveLocalPlan = async (binding, trusted) => {
         if (trusted?.adaptiveGates?.enabled !== true) return null;
-        let diffPaths = [];
-        try {
-          const names = await rawGit('diff', '--no-renames', '-z', '--name-only',
-            route.base, binding.candidate_sha, '--');
-          diffPaths = names.split('\0').filter(name => name.length > 0);
-        } catch {
-          diffPaths = [];
-        }
-        let recentAttempts = [];
-        try {
-          const lines = await readTelemetryLines(join(root, 'telemetry.jsonl'));
-          recentAttempts = parseTelemetryLines(lines).entries;
-        } catch {
-          recentAttempts = [];
-        }
-        const gates = trusted.adaptiveGates;
-        const plan = planAdaptiveChecks({ profile: trusted, diffPaths,
-          telemetryStats: gates.telemetryStats ?? null,
-          recentRollbacks: recentAttempts,
-          thresholds: gates.thresholds ?? gates });
-        const deferredAsyncChecks = plan.asyncChecks.length === 0 ? []
-          : (plan.decision?.decisions ?? []).filter(entry => entry.disposition === 'async')
-            .map(entry => entry.id);
-        const metadata = { mode: plan.mode, reason: plan.reason,
-          syncCount: plan.syncChecks.length, asyncCount: plan.asyncChecks.length,
-          deferredAsyncChecks };
-        const note = { kind: 'adaptive_gate_decision', phase: 'l1_local',
-          task_id: attempt.task_id, attempt_id: attempt.attempt_id, epoch: attempt.epoch,
-          mode: plan.mode, reason: plan.reason,
-          detail: { syncCount: metadata.syncCount, asyncCount: metadata.asyncCount } };
-        eventBus?.emit(note);
-        console.log(JSON.stringify(note));
-        return { plan, metadata };
+        return adaptiveLocalPlanCore({ trusted,
+          readDiffPaths: async () => {
+            const names = await rawGit('diff', '--no-renames', '-z', '--name-only',
+              route.base, binding.candidate_sha, '--');
+            return names.split('\0').filter(name => name.length > 0);
+          },
+          readTelemetryEntries: async () => {
+            const lines = await readTelemetryLines(join(root, 'telemetry.jsonl'));
+            return parseTelemetryLines(lines).entries;
+          },
+          repoId: attempt.repo_id ?? route.repoId ?? null,
+          identity: { task_id: attempt.task_id, attempt_id: attempt.attempt_id, epoch: attempt.epoch },
+          emit: note => {
+            eventBus?.emit(note);
+            console.log(JSON.stringify(note));
+          } });
       };
       const result = await acceptHeld({ attempt: acceptanceAttempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', inspect),
