@@ -274,3 +274,68 @@ test('claim() refuses a card that is not ready', async t => {
   assert.equal(seen.claim, 1, 'SDK claim сделан ровно один раз');
   await port.complete(head.id, epoch, { sha: 'c'.repeat(40) });
 });
+
+test('claimReady continues past an individual 409 claim conflict and claims the next ready card', async t => {
+  const { handle, ported } = await claimedBoard(t);
+  const first = await contractTask(handle, { ...CONTRACT, queue: 'vs1' }, { text: 'raced card' });
+  const second = await contractTask(handle, { ...CONTRACT, queue: 'vs1' }, { text: 'claimable card' });
+  const realClaim = handle.tasks.claim.bind(handle.tasks);
+  const calls = [];
+  ported.tasks.claim = async (id, opts) => {
+    calls.push(id);
+    if (id === first.task.id) {
+      const error = new Error('already_claimed');
+      error.code = 'already_claimed';
+      error.statusCode = 409;
+      throw error;
+    }
+    return realClaim(id, opts);
+  };
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  const picked = await port.claimReady(FILTER);
+  assert.equal(picked.taskId, second.task.id);
+  assert.deepEqual(calls, [first.task.id, second.task.id]);
+  assert.equal((await port.lookup(first.task.id)).state, 'ready');
+  assert.equal((await port.lookup(second.task.id)).state, 'claimed');
+});
+
+test('verifyHeld preserves the held capability through transient renew failures but drops definitive loss', async t => {
+  const { handle, ported } = await claimedBoard(t);
+  const { task } = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const realClaim = handle.tasks.claim.bind(handle.tasks);
+  let renews = 0;
+  let transientFailures = 2;
+  let definitiveLoss = false;
+  ported.tasks.claim = async (id, opts) => {
+    const capability = await realClaim(id, opts);
+    return {
+      ...capability,
+      async renew(lease) {
+        renews++;
+        if (transientFailures > 0) {
+          transientFailures--;
+          const error = new Error(transientFailures === 1 ? 'temporary network timeout' : 'HTTP 503');
+          if (transientFailures === 0) error.statusCode = 503;
+          throw error;
+        }
+        if (definitiveLoss) {
+          const error = new Error('claim_lost');
+          error.code = 'claim_lost';
+          error.statusCode = 409;
+          throw error;
+        }
+        return capability.renew(lease);
+      },
+    };
+  };
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  const claimed = await port.claim(task.id);
+  await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /temporary network timeout/);
+  await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /HTTP 503/);
+  const held = await port.verifyHeld(task.id, claimed.epoch);
+  assert.equal(held.epoch, claimed.epoch);
+  assert.equal(renews, 3, 'transient failures did not delete the held capability');
+  definitiveLoss = true;
+  await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /claim_lost/);
+  await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /no native claim is held/);
+});

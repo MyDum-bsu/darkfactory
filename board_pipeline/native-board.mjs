@@ -1,6 +1,28 @@
 import { PilotDenied } from './pilot-gate.mjs';
 import { pilotProjection, pilotScopeMatches } from './pilot-projection.mjs';
 
+function boardErrorCode(error) {
+  return error?.code ?? error?.error?.code ?? error?.response?.data?.error?.code ?? null;
+}
+
+function boardErrorStatus(error) {
+  const status = error?.statusCode ?? error?.status ?? error?.response?.status;
+  if (typeof status !== 'number' && typeof status !== 'string') return null;
+  const numeric = Number(status);
+  return Number.isSafeInteger(numeric) ? numeric : null;
+}
+
+function isClaimConflict(error) {
+  const code = boardErrorCode(error);
+  return boardErrorStatus(error) === 409 ||
+    ['claim_conflict', 'claim_lost', 'already_claimed'].includes(code) ||
+    /(?:^|_)already_claimed(?:_|$)|claim_lost|claim_conflict/.test(String(error?.message ?? ''));
+}
+
+function isDefinitiveClaimLoss(error) {
+  return error instanceof PilotDenied || isClaimConflict(error) || boardErrorCode(error) === 'epoch_mismatch';
+}
+
 // The native claim token never leaves this adapter.
 export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestionOwner = false, pilot }) {
   if (pilot && (pilot.scope.channel !== channel || typeof pilot.assertOpen !== 'function')) {
@@ -66,27 +88,26 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
   // Настоящее доказательство удерживаемой аренды: native renew отвечает 409 claim_lost,
   // если эпоха истекла, освобождена или её забрал другой. Токен остаётся внутри адаптера.
   async function verifyHeld(taskId, epoch) {
-    const claim = held.get(taskId);
-    if (!claim) {
-      const error = new Error('no native claim is held for this attempt');
-      error.code = 'claim_lost';
-      throw error;
-    }
-    if (claim.epoch !== epoch) {
-      const error = new Error(`held epoch ${claim.epoch} is not the attempt epoch ${epoch}`);
-      error.code = 'epoch_mismatch';
-      throw error;
-    }
-    let renewed;
     try {
+      const claim = held.get(taskId);
+      if (!claim) {
+        const error = new Error('no native claim is held for this attempt');
+        error.code = 'claim_lost';
+        throw error;
+      }
+      if (claim.epoch !== epoch) {
+        const error = new Error(`held epoch ${claim.epoch} is not the attempt epoch ${epoch}`);
+        error.code = 'epoch_mismatch';
+        throw error;
+      }
       await allowEffect(taskId, 'claimed', epoch);
-      renewed = await claim.renew(lease);
+      const renewed = await claim.renew(lease);
+      claim.until = renewed?.until ?? claim.until;
+      return { epoch: claim.epoch, until: claim.until };
     } catch (error) {
-      held.delete(taskId);
+      if (isDefinitiveClaimLoss(error)) held.delete(taskId);
       throw error;
     }
-    claim.until = renewed?.until ?? claim.until;
-    return { epoch: claim.epoch, until: claim.until };
   }
 
   // Минимальный набор контрактных меток, без которых карточка не допускается к захвату.
@@ -225,9 +246,14 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
           // метка, профиль и контракт проверяются на нём же, его метки и возвращаются.
           const fresh = await rootOf(listed.id);
           if (fresh.task.state !== 'ready' || !admits(trusted, fresh)) continue;
-          const claim = await acquire(listed.id, token, fresh);
-          return { taskId: listed.id, ...claim, labels: fresh.labels,
-            ...(typeof fresh.text === 'string' ? { text: fresh.text } : {}) };
+          try {
+            const claim = await acquire(listed.id, token, fresh);
+            return { taskId: listed.id, ...claim, labels: fresh.labels,
+              ...(typeof fresh.text === 'string' ? { text: fresh.text } : {}) };
+          } catch (error) {
+            if (isClaimConflict(error)) continue;
+            throw error;
+          }
         }
         // Сервер сообщает курсор следующей страницы; без сдвига или без карточек очередь кончилась.
         if (!page.cursor || page.cursor === after || !page.tasks?.length) return null;
