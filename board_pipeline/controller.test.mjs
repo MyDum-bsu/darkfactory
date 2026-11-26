@@ -1607,3 +1607,175 @@ test('a terminal receipt on the interrupted checking record blocks recovery', as
   assert.equal(out.reason, 'interrupted_checking');
   assert.equal(x.effects.verify, 0);
 });
+
+// ── Core P1-6/P1-7 + worker_working_timeout: кросс-ревью регрессии ──
+
+test('a non-lease denied verification result blocks the card instead of orphaning it', async t => {
+  const x = await lab(t);
+  await x.tick();
+  x.cfg.verify = async () => ({ outcome: 'denied', reason: 'journal_subject_mismatch' });
+  x.submit('c');
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'journal_subject_mismatch');
+  assert.equal((await x.inspect()).state, 'blocked', 'карточка видимо заблокирована, не бесхозный hold');
+  const record = await x.cfg.state.load();
+  assert.equal(record.receipt?.kind, 'block');
+});
+
+test('lease-related denied verification results still become lease_lost without a block', async t => {
+  for (const reason of ['claim_not_held:409', 'claim_lost_before_review:gone', 'epoch_mismatch:2']) {
+    const x = await lab(t);
+    await x.tick();
+    x.cfg.verify = async () => ({ outcome: 'denied', reason });
+    x.submit('c');
+    const out = await x.tick();
+    assert.equal(out.phase, 'lease_lost', reason);
+    assert.notEqual((await x.inspect()).state, 'blocked', `без board.block при потерянной аренде: ${reason}`);
+  }
+});
+
+test('recoverInterruptedChecking passes a monotonic recoverySeq to verify as a controller argument', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  const seen = [];
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    seen.push(options);
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)] });
+  const out = await x.tick();
+  assert.equal(out.phase, 'done');
+  assert.deepEqual(seen, [{ recoverySeq: 1 }], 'первое восстановление — recoverySeq 1');
+  assert.equal((await x.cfg.state.load()).recoverySeq, 1, 'счётчик персистентен в записи попытки');
+});
+
+test('recoverySeq increments monotonically across interrupted rounds of one attempt', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  let captured;
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    captured = options;
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  const record = await x.cfg.state.load();
+  // Ранняя прерванная проверка уже восстанавливалась однажды (recoverySeq 1):
+  // следующее восстановление обязано увеличить счётчик, а не начать заново.
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)], recoverySeq: 1 });
+  const out = await x.tick();
+  assert.equal(out.phase, 'done');
+  assert.deepEqual(captured, { recoverySeq: 2 });
+  assert.equal((await x.cfg.state.load()).recoverySeq, 2);
+});
+
+test('a plain working-phase verify call carries no recoverySeq argument', async t => {
+  const x = await lab(t);
+  let captured = { sentinel: true };
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    captured = options;
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(captured, undefined, 'первичная проверка не несёт счётчик восстановления');
+});
+
+test('a stuck worker is stopped and the card blocked once the working wall-clock budget is exceeded', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  x.cfg.workingTimeoutMs = 5_000;
+  const stopped = [];
+  x.cfg.bb.stop = async id => {
+    stopped.push(id);
+    return { stopped: true };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working', 'свежая попытка в бюджете');
+  const record = await x.cfg.state.load();
+  assert.ok(Number.isFinite(record.workingSince), 'часы фазы working зафиксированы в записи');
+  t.mock.timers.tick(4_000);
+  assert.equal((await x.tick()).phase, 'working', 'бюджет ещё не исчерпан');
+  assert.equal(stopped.length, 0);
+  t.mock.timers.tick(2_000);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_working_timeout');
+  assert.deepEqual(stopped, ['thr_fixture'], 'зависший воркер остановлен до блока');
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('the working timeout default is ninety minutes and a submitted turn is never killed', async t => {
+  const x = await lab(t);
+  await x.tick();
+  assert.equal((await x.tick()).phase, 'working');
+  // Бюджет по умолчанию — 90 минут: часы записи отматываются детерминированно,
+  // без гонки с тридцатисекундной арендой фикстуры.
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, workingSince: Date.now() - 89 * 60 * 1000 });
+  assert.equal((await x.tick()).phase, 'working', '89 минут без хода — ещё в бюджете');
+  // Сдавшийся вовремя воркер не наказывается таймаутом ожидания: ход обрабатывается.
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+});
+
+test('the working timeout fires past the default ninety minutes for a silent worker', async t => {
+  const x = await lab(t);
+  await x.tick();
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, workingSince: Date.now() - 91 * 60 * 1000 });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_working_timeout');
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('a failing bb.stop does not cancel the working-timeout block', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  x.cfg.workingTimeoutMs = 1_000;
+  x.cfg.bb.stop = async () => { throw new Error('transport lost'); };
+  await x.tick();
+  await x.tick();
+  t.mock.timers.tick(2_000);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_working_timeout');
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('the working clock survives a restart instead of resetting on adopt', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  x.cfg.workingTimeoutMs = 10_000;
+  await x.tick();
+  await x.tick();
+  const first = await x.cfg.state.load();
+  t.mock.timers.tick(6_000);
+  // Рестарт контроллера: адаптер пустой, запись та же — часы не обнуляются.
+  x.cfg.board = nativeBoardPort(x.handle, { channel: 'pilot' });
+  assert.equal((await x.tick()).phase, 'working');
+  const resumed = await x.cfg.state.load();
+  assert.equal(resumed.workingSince, first.workingSince, 'wall-clock монотонен через рестарт');
+  t.mock.timers.tick(5_000);
+  const out = await x.tick();
+  assert.equal(out.reason, 'worker_working_timeout');
+});
+
+test('an invalid workingTimeoutMs is rejected before any effect', async t => {
+  const x = await lab(t);
+  for (const bad of [0, -1, NaN, Infinity]) {
+    x.cfg.workingTimeoutMs = bad;
+    await assert.rejects(() => x.tick(), /enrolled route/);
+    assert.equal(x.effects.spawn, 0);
+  }
+});

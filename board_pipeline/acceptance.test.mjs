@@ -1,10 +1,10 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, appendFile, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, appendFile, rm, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { accept } from './acceptance.mjs';
+import { accept, acceptHeld } from './acceptance.mjs';
 
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
@@ -302,4 +302,266 @@ test('журнал v1 с JSON null вместо записи run даёт uncert
   const res = await accept({ handoff: makeHandoff(), policy: POLICY, journal, ports });
   assert.equal(res.outcome, 'uncertain');
   assert.equal(res.reason, 'journal_run_entry_missing');
+});
+
+// ── acceptHeld: notes сдачи (P1-5) и восстановление после вытеснения (F-02) ──
+
+const HELD_TASK = '555';
+const HELD_REVIEW = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
+
+function heldPolicy() {
+  return {
+    version: '2',
+    profiles: {
+      pilot: {
+        task: HELD_TASK,
+        worker: 'thr_fixture',
+        worktree: '/tmp/wt',
+        base: SHA_BASE,
+        review: { ...HELD_REVIEW },
+      },
+    },
+  };
+}
+
+function heldAttempt(over = {}) {
+  return {
+    attempt_id: 'att-1',
+    task_id: HELD_TASK,
+    epoch: 1,
+    bb_thread_id: 'thr_fixture',
+    worktree: '/tmp/wt',
+    base_sha: SHA_BASE,
+    check_profile: 'pilot',
+    finish: 'verified',
+    ...over,
+  };
+}
+
+function heldSubmission(over = {}) {
+  return {
+    task_id: HELD_TASK,
+    epoch: 1,
+    attempt_id: 'att-1',
+    worker_thread_id: 'thr_fixture',
+    candidate_sha: SHA_A,
+    ...over,
+  };
+}
+
+function heldPorts(over = {}) {
+  const calls = { inspect: 0, local: 0, review: 0, complete: 0, block: 0, verifyHeld: 0, lookup: 0 };
+  const ports = {
+    inspect: async (binding) => {
+      calls.inspect++;
+      return { head: binding.candidate_sha, clean: true, baseAncestor: true };
+    },
+    local: async (binding) => {
+      calls.local++;
+      return { sha: binding.candidate_sha, ok: true, evidence: 'checks.json', exit: 0 };
+    },
+    tamper: async (binding) => ({
+      ok: true, sha: binding.candidate_sha, base_sha: binding.base_sha,
+      violations: [], digest: 't'.repeat(64),
+    }),
+    review: async (binding) => {
+      calls.review++;
+      return {
+        task: binding.task_id,
+        sha: binding.candidate_sha,
+        actual: { ...HELD_REVIEW },
+        verdict: 'REVIEW_OK',
+        checkpoint: 'feed80ab',
+      };
+    },
+    board: {
+      verifyHeld: async (taskId, epoch) => {
+        calls.verifyHeld++;
+        return { epoch, until: '2026-01-01T00:00:00.000Z' };
+      },
+      lookup: async () => {
+        calls.lookup++;
+        return { state: 'claimed', epoch: 1 };
+      },
+      block: async () => {
+        calls.block++;
+      },
+      complete: async () => {
+        calls.complete++;
+      },
+    },
+    ...over,
+  };
+  return { ports, calls };
+}
+
+async function runFiles(journal) {
+  return readdir(journal);
+}
+
+// Переписывает журнал запуска, оставляя только выбранные записи: имитация
+// вытеснения процесса в произвольной точке протокола приёмки.
+async function truncateRun(journal, keep) {
+  const files = await runFiles(journal);
+  assert.equal(files.length, 1);
+  const file = path.join(journal, files[0]);
+  const entries = (await readFile(file, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+  const kept = keep(entries);
+  await writeFile(file, kept.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+  return entries;
+}
+
+test('acceptHeld: валидные notes сдачи санитизируются и записываются в квитанцию', async () => {
+  const journal = await tmpJournal();
+  const { ports } = heldPorts();
+  const res = await acceptHeld({
+    attempt: heldAttempt(),
+    submission: heldSubmission({ notes: ['incidental defect in ops/ seen\nout of scope', '  another\t note  '] }),
+    policy: heldPolicy(),
+    journal,
+    ports,
+  });
+  assert.equal(res.outcome, 'verified');
+  assert.deepEqual(res.receipt.notes, ['incidental defect in ops/ seen out of scope', 'another note']);
+  const entries = await readRunFile(journal);
+  const outcome = entries.find((e) => e.kind === 'outcome');
+  assert.deepEqual(outcome.receipt.notes, ['incidental defect in ops/ seen out of scope', 'another note']);
+});
+
+test('acceptHeld: сдача без notes не несёт ключа notes в квитанции', async () => {
+  const journal = await tmpJournal();
+  const { ports } = heldPorts();
+  const res = await acceptHeld({
+    attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal, ports,
+  });
+  assert.equal(res.outcome, 'verified');
+  assert.equal('notes' in res.receipt, false);
+});
+
+test('acceptHeld: невалидные notes отклоняются до любого эффекта', async () => {
+  for (const notes of [
+    'a plain string',
+    ['x'.repeat(201)],
+    [''],
+    Array.from({ length: 11 }, (_, i) => `note ${i}`),
+    [42],
+  ]) {
+    const journal = await tmpJournal();
+    const { ports, calls } = heldPorts();
+    const res = await acceptHeld({
+      attempt: heldAttempt(), submission: heldSubmission({ notes }), policy: heldPolicy(), journal, ports,
+    });
+    assert.equal(res.outcome, 'denied', JSON.stringify(notes).slice(0, 60));
+    assert.equal(res.reason, 'submission_notes_invalid');
+    assert.equal(calls.inspect, 0);
+    assert.equal(calls.complete + calls.block, 0);
+  }
+});
+
+test('acceptHeld: невалидный recoverySeq отклоняется до любого эффекта', async () => {
+  for (const recoverySeq of [-1, 1.5, NaN, '1']) {
+    const journal = await tmpJournal();
+    const { ports, calls } = heldPorts();
+    const res = await acceptHeld({
+      attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal, ports,
+      recoverySeq,
+    });
+    assert.equal(res.outcome, 'denied', String(recoverySeq));
+    assert.equal(res.reason, 'invalid_recovery_seq');
+    assert.equal(calls.inspect, 0);
+  }
+});
+
+test('acceptHeld: recoverySeq без прошлых журналов запускает чистую проверку', async () => {
+  const journal = await tmpJournal();
+  const { ports, calls } = heldPorts();
+  const res = await acceptHeld({
+    attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal, ports,
+    recoverySeq: 3,
+  });
+  assert.equal(res.outcome, 'verified');
+  assert.equal(calls.complete, 1);
+});
+
+test('acceptHeld: терминальный исход базового журнала переиспользуется при восстановлении', async () => {
+  const journal = await tmpJournal();
+  const first = await acceptHeld({
+    attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal,
+    ports: heldPorts().ports,
+  });
+  assert.equal(first.outcome, 'verified');
+  // Восстановление после вытеснения: исход уже записан — ни один порт не дёргается.
+  const { ports, calls } = heldPorts();
+  const replay = await acceptHeld({
+    attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal, ports,
+    recoverySeq: 1,
+  });
+  assert.equal(replay.outcome, 'verified');
+  assert.equal(replay.repeated, true);
+  assert.equal(replay.run, first.run);
+  assert.equal(calls.inspect, 0);
+  assert.equal(calls.local, 0);
+  assert.equal(calls.review, 0);
+  assert.equal(calls.complete + calls.block, 0);
+});
+
+test('acceptHeld: прерванная проверка перепроверяется под свежим ключом журнала', async t => {
+  const journal = await tmpJournal();
+  const first = await acceptHeld({
+    attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal,
+    ports: heldPorts().ports,
+  });
+  assert.equal(first.outcome, 'verified');
+  // Вытеснение Spot VM до ревью: журнал обрывается на pre-effect записях,
+  // ни исхода, ни эффекта Board — та же картина, что у прерванного checking.
+  await truncateRun(journal, (entries) => entries.filter((entry) =>
+    entry.kind === 'run' ||
+    (entry.kind === 'intent' && ['verify_claim', 'inspect', 'local', 'tamper'].includes(entry.phase)) ||
+    (entry.kind === 'result' && ['verify_claim', 'inspect', 'local', 'tamper'].includes(entry.phase))));
+  const { ports, calls } = heldPorts();
+  const recovered = await acceptHeld({
+    attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal, ports,
+    recoverySeq: 1,
+  });
+  assert.equal(recovered.outcome, 'verified');
+  assert.notEqual(recovered.run, first.run, 'свежий ключ журнала отличается от вытесненного');
+  assert.equal(calls.complete, 1, 'проверка перепроведена до конца, а не uncertain');
+  assert.equal((await runFiles(journal)).length, 2, 'два журнала: прерванный и восстановленный');
+  // Повтор того же recoverySeq идемпотентен: терминальный исход восстановленного
+  // журнала возвращается без единого вызова портов.
+  const again = heldPorts();
+  const replay = await acceptHeld({
+    attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal,
+    ports: again.ports, recoverySeq: 1,
+  });
+  assert.equal(replay.outcome, 'verified');
+  assert.equal(replay.repeated, true);
+  assert.equal(again.calls.inspect, 0);
+  assert.equal(again.calls.complete + again.calls.block, 0);
+});
+
+test('acceptHeld: журнал с осевшим эффектом Board не перепроверяется вслепую', async () => {
+  const journal = await tmpJournal();
+  const first = await acceptHeld({
+    attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal,
+    ports: heldPorts().ports,
+  });
+  assert.equal(first.outcome, 'verified');
+  // Вытеснение между подтверждённым complete и записью исхода: эффект Board
+  // осел, но терминальной записи нет — повторная проверка была бы вторым эффектом.
+  await truncateRun(journal, (entries) => entries.filter((entry) =>
+    entry.kind !== 'outcome' &&
+    !(entry.kind === 'result' && entry.phase === 'complete' && entry.ok === false)));
+  const { ports, calls } = heldPorts();
+  const res = await acceptHeld({
+    attempt: heldAttempt(), submission: heldSubmission(), policy: heldPolicy(), journal, ports,
+    recoverySeq: 1,
+  });
+  assert.equal(res.outcome, 'uncertain');
+  assert.equal(res.reason, 'interrupted_run');
+  assert.equal(res.repeated, true);
+  assert.equal(res.run, first.run);
+  assert.equal(calls.inspect, 0);
+  assert.equal(calls.complete + calls.block, 0);
+  assert.equal((await runFiles(journal)).length, 1, 'свежий журнал не создаётся');
 });
