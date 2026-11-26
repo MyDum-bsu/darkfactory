@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -20,6 +20,15 @@ const exec = promisify(execFile);
 
 const CRITIC = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
 const inputJson = input => JSON.parse(Buffer.isBuffer(input) ? input.toString('utf8') : String(input));
+
+async function nodePreloadHarness(dir, name, source) {
+  const binary = join(dir, name);
+  const hook = join(dir, `${name}-hook.cjs`);
+  await symlink(process.execPath, binary);
+  await writeFile(hook, source, { mode: 0o600 });
+  const prefix = process.env.NODE_OPTIONS ? `${process.env.NODE_OPTIONS} ` : '';
+  return { binary, nodeOptions: `${prefix}--require ${hook}` };
+}
 
 test('family: строгая таблица provider/model без подстрок', () => {
   // Голый провайдер без модели не аттестуется: обязательны оба поля.
@@ -360,32 +369,30 @@ test('sandbox: docker run receives resource limits, -i and exact staged stdin', 
   const scratch = await mkdtemp(join(tmpdir(), 'review-docker-args-'));
   const oldPath = process.env.PATH;
   const oldLog = process.env.FAKE_DOCKER_LOG;
+  const oldNodeOptions = process.env.NODE_OPTIONS;
   try {
     const bin = join(scratch, 'bin');
     const source = join(scratch, 'candidate');
     const log = join(scratch, 'docker-log.jsonl');
     await mkdir(bin);
     await mkdir(source, { mode: 0o755 });
-    const fakeDocker = join(bin, 'docker');
-    await writeFile(fakeDocker, `#!/usr/bin/env node
+    const harness = await nodePreloadHarness(bin, 'docker', `
 const fs = require('fs');
-const args = process.argv.slice(2);
+const path = require('path');
+const args = [path.basename(process.argv[1] ?? ''), ...process.argv.slice(2)];
 if (args[0] === 'info') {
   process.stdout.write('["name=rootless"]\\n');
   process.exit(0);
 }
 if (args[0] === 'rm') process.exit(0);
 if (args[0] !== 'run') process.exit(2);
-let input = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', chunk => { input += chunk; });
-process.stdin.on('end', () => {
-  fs.appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify({ args, input }) + '\\n');
-  process.exit(0);
-});
-`, { mode: 0o755 });
+const input = fs.readFileSync(0, 'utf8');
+fs.appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify({ args, input }) + '\\n');
+process.exit(0);
+`);
     process.env.PATH = `${bin}:${oldPath}`;
     process.env.FAKE_DOCKER_LOG = log;
+    process.env.NODE_OPTIONS = harness.nodeOptions;
     const input = JSON.stringify({ openai: { type: 'oauth', access: 'stdin-only' } });
     const run = await runInReadOnlySandbox({ snapshot: source,
       argv: ['/bin/sh', '-c', 'cat >/tmp/.pi/agent/auth.json'], input, timeoutMs: 10_000 });
@@ -402,6 +409,8 @@ process.stdin.on('end', () => {
     process.env.PATH = oldPath;
     if (oldLog === undefined) delete process.env.FAKE_DOCKER_LOG;
     else process.env.FAKE_DOCKER_LOG = oldLog;
+    if (oldNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = oldNodeOptions;
     await rm(scratch, { recursive: true, force: true });
   }
 });
@@ -556,6 +565,7 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
   const auth = join(dir, 'auth.json');
   await writeFile(auth, '{"openai":{"token":"secret-value"}}');
   await writeFile(join(dir, 'settings.json'), '{"theme":"dark"}');
+  const candidateExists = await lstat('/candidate').then(() => true, () => false);
   const guard = new URL('./pi-guard.cjs', import.meta.url).pathname;
   const script = `
     const fs = require('fs');
@@ -602,6 +612,7 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
     probe('lsTmp', cp.spawnSync('ls', ['/tmp']));
     probe('shellOpt', cp.spawnSync('ls', ['/tmp'], { shell: true }));
     probe('cwdOut', cp.spawnSync('ls', { cwd: '/etc' }));
+    probe('cwdNoReal', cp.spawnSync('ls', { cwd: '/candidate/df-guard-no-such-cwd' }));
     probe('cwdCand', cp.spawnSync('ls', { cwd: '/candidate' }));
     // PATH не участвует: пустой PATH не должен помешать системному ls.
     probe('pinPath', cp.spawnSync('ls', [], { env: { PATH: '/nonexistent' }, timeout: 3000 }));
@@ -653,8 +664,9 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
   assert.match(out, /lsTmp:EACCES/, `явный путь /tmp для ls не заблокирован:\n${out}`);
   assert.match(out, /shellOpt:EACCES/, `shell:true не заблокирован:\n${out}`);
   assert.match(out, /cwdOut:EACCES/, `cwd вне /candidate не заблокирован:\n${out}`);
-  // /candidate нет на хосте → realpath падает → EACCES (в контейнере разрешён).
-  assert.match(out, /cwdCand:EACCES/, `cwd без realpath в /candidate не заблокирован:\n${out}`);
+  assert.match(out, /cwdNoReal:EACCES/, `cwd без realpath в /candidate не заблокирован:\n${out}`);
+  assert.match(out, candidateExists ? /cwdCand:allowed:0/ : /cwdCand:EACCES/,
+    `реальный cwd /candidate обработан неправильно:\n${out}`);
   assert.match(out, /pinPath:allowed:0/, `PATH-подмена сломала системный бинарник:\n${out}`);
   assert.match(out, /execSync:EACCES/, `execSync (шелл) не заблокирован:\n${out}`);
   assert.match(out, /fork:EACCES/, `fork не заблокирован:\n${out}`);
@@ -1066,6 +1078,7 @@ test('runner: истекающий OAuth (<10m) обновляется на хо
   const repo = await mkdtemp(join(tmpdir(), 'runner-repo-'));
   const journal = await mkdtemp(join(tmpdir(), 'runner-journal-'));
   const piRoot = await mkdtemp(join(tmpdir(), 'runner-pi-'));
+  const oldNodeOptions = process.env.NODE_OPTIONS;
   try {
     const git = async (...args) =>
       (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
@@ -1083,17 +1096,19 @@ test('runner: истекающий OAuth (<10m) обновляется на хо
     const argvLog = join(piRoot, 'pi-argv.json');
     await writeFile(authPath, JSON.stringify({ openai: expiring }));
     await mkdir(join(piRoot, 'bin'), { recursive: true });
-    const fakePi = join(piRoot, 'bin', 'pi');
-    await writeFile(fakePi, `#!/usr/bin/env node
+    const harness = await nodePreloadHarness(join(piRoot, 'bin'), 'pi', `
 const fs = require('node:fs');
-fs.writeFileSync(${JSON.stringify(argvLog)}, JSON.stringify(process.argv.slice(2)));
+const path = require('node:path');
+const argv = [path.basename(process.argv[1] ?? ''), ...process.argv.slice(2)];
+fs.writeFileSync(${JSON.stringify(argvLog)}, JSON.stringify(argv));
 fs.writeFileSync(${JSON.stringify(authPath)}, JSON.stringify({
   openai: { type: 'oauth', access: 'acc-refreshed', refresh: 'rt-rotated',
     expires: Date.now() + 7200_000, clientId: 'cid' },
 }));
-console.log('acc-refreshed');
+fs.writeSync(1, 'acc-refreshed\\n');
+process.exit(0);
 `);
-    await chmod(fakePi, 0o755);
+    process.env.NODE_OPTIONS = harness.nodeOptions;
 
     let cred = null;
     const stream = [
@@ -1118,6 +1133,8 @@ console.log('acc-refreshed');
     assert.equal(cred.refresh, 'sandbox-redacted');
     assert.deepEqual(Object.keys(cred).sort(), ['access', 'expires', 'refresh', 'type']);
   } finally {
+    if (oldNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = oldNodeOptions;
     await rm(repo, { recursive: true, force: true });
     await rm(journal, { recursive: true, force: true });
     await rm(piRoot, { recursive: true, force: true });
@@ -1157,6 +1174,7 @@ test('runner: ошибка host OAuth refresh отклоняет ревью до
   const repo = await mkdtemp(join(tmpdir(), 'runner-repo-'));
   const journal = await mkdtemp(join(tmpdir(), 'runner-journal-'));
   const piRoot = await mkdtemp(join(tmpdir(), 'runner-pi-'));
+  const oldNodeOptions = process.env.NODE_OPTIONS;
   try {
     const git = async (...args) =>
       (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
@@ -1172,9 +1190,9 @@ test('runner: ошибка host OAuth refresh отклоняет ревью до
       expires: Date.now() + 60_000, clientId: 'cid' };
     await writeFile(join(piRoot, 'auth.json'), JSON.stringify({ openai: expiring }));
     await mkdir(join(piRoot, 'bin'), { recursive: true });
-    const fakePi = join(piRoot, 'bin', 'pi');
-    await writeFile(fakePi, '#!/bin/sh\necho "invalid_grant" >&2\nexit 1\n');
-    await chmod(fakePi, 0o755);
+    const harness = await nodePreloadHarness(join(piRoot, 'bin'), 'pi',
+      'require(\'node:fs\').writeSync(2, \'invalid_grant\\n\'); process.exit(1);\n');
+    process.env.NODE_OPTIONS = harness.nodeOptions;
 
     let sandboxCalls = 0;
     const runner = isolatedPiReviewRunner({ journal, piRoot,
@@ -1189,6 +1207,8 @@ test('runner: ошибка host OAuth refresh отклоняет ревью до
     );
     assert.equal(sandboxCalls, 0);
   } finally {
+    if (oldNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = oldNodeOptions;
     await rm(repo, { recursive: true, force: true });
     await rm(journal, { recursive: true, force: true });
     await rm(piRoot, { recursive: true, force: true });
