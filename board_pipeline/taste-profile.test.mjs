@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   buildProjectContext,
@@ -11,6 +12,9 @@ import {
 } from './taste-profile.mjs';
 
 const sha256 = text => createHash('sha256').update(text, 'utf8').digest('hex');
+
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = dirname(MODULE_DIR);
 
 const PROFILE_YAML = `
 repo_id: darkfactory-board
@@ -250,4 +254,43 @@ test('buildProjectContext: long AGENTS.md excerpt is bounded', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('buildProjectContext: real darkfactory profile and owner-taste example are valid', () => {
+  const profile = loadProjectProfile(REPO_ROOT);
+  assert.equal(profile.repoId, 'darkfactory');
+  assert.deepEqual(profile.stack, ['node22-esm']);
+  assert.equal(profile.l1Profile, 'node');
+  assert.equal(profile.agentsMd, 'AGENTS.md');
+  assert.ok(profile.taste.length >= 3);
+  assert.ok(Object.keys(profile.domainSkills).length >= 3);
+
+  const globalTastePath = join(REPO_ROOT, 'docs', 'owner-taste.example.md');
+  const ctx = buildProjectContext({
+    globalTastePath,
+    repoRoot: REPO_ROOT,
+    domain: 'backend',
+    defaultSkills: ['goal-rules'],
+  });
+  assert.equal(ctx.layers.hasGlobalTaste, true);
+  assert.equal(ctx.layers.hasRepoProfile, true);
+  assert.equal(ctx.layers.hasAgentsMd, true);
+  assert.deepEqual(ctx.skills, ['goal-rules', 'test-first', 'property-testing']);
+  assert.ok(ctx.text.includes('## Owner Taste (global)'));
+  assert.ok(ctx.text.includes('Owner Taste — глобальный шаблон'));
+  assert.ok(ctx.text.includes('## Repo Taste (project profile)'));
+  assert.ok(ctx.text.includes('repo: darkfactory'));
+  assert.ok(ctx.text.includes('stack: node22-esm'));
+  assert.ok(ctx.text.includes('## Domain Skills (backend)'));
+  assert.ok(ctx.text.includes('- property-testing'));
+  assert.equal(ctx.digest, sha256(ctx.text));
+  assert.match(ctx.digest, /^[a-f0-9]{64}$/);
+  const again = buildProjectContext({
+    globalTastePath,
+    repoRoot: REPO_ROOT,
+    domain: 'backend',
+    defaultSkills: ['goal-rules'],
+  });
+  assert.equal(again.digest, ctx.digest);
+  assert.equal(again.text, ctx.text);
 });

@@ -40,6 +40,75 @@ const statusClass = status => status === 'pass' || status === 'done' || status =
   : status === 'hold' || status === 'blocked' || status === 'waiting' || status === 'pending' ? 'warn'
   : status === 'fail' || status === 'failed' ? 'bad' : '';
 
+const OWNER_ACTION_ENDPOINTS = Object.freeze({
+  answer: '/api/owner/answer',
+  unblock: '/api/owner/unblock',
+  cancel: '/api/owner/cancel',
+});
+const OWNER_TOKEN_STORAGE_KEY = 'df-control-room-owner-write-token';
+const ownerDrafts = new Map();
+const ownerPendingActions = new Set();
+let ownerTokenMemory = null;
+let ownerRememberToken = false;
+
+function storageArea(name) {
+  try {
+    const area = globalThis[name];
+    return area && typeof area.getItem === 'function' ? area : null;
+  } catch {
+    return null;
+  }
+}
+
+function storageGet(area, key) {
+  try {
+    return area?.getItem(key) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function storageSet(area, key, value) {
+  try {
+    area?.setItem(key, value);
+  } catch {}
+}
+
+function storageRemove(area, key) {
+  try {
+    area?.removeItem(key);
+  } catch {}
+}
+
+function readOwnerToken() {
+  if (ownerTokenMemory !== null) return ownerTokenMemory;
+  return storageGet(storageArea('sessionStorage'), OWNER_TOKEN_STORAGE_KEY) ??
+    storageGet(storageArea('localStorage'), OWNER_TOKEN_STORAGE_KEY) ?? '';
+}
+
+function persistOwnerToken(token, remember) {
+  ownerTokenMemory = token || null;
+  ownerRememberToken = Boolean(token && remember);
+  const session = storageArea('sessionStorage');
+  const local = storageArea('localStorage');
+  if (token) storageSet(session, OWNER_TOKEN_STORAGE_KEY, token);
+  else storageRemove(session, OWNER_TOKEN_STORAGE_KEY);
+  if (token && remember) storageSet(local, OWNER_TOKEN_STORAGE_KEY, token);
+  else storageRemove(local, OWNER_TOKEN_STORAGE_KEY);
+}
+
+function ownerDraft(taskId) {
+  const key = String(taskId ?? '');
+  if (!ownerDrafts.has(key)) ownerDrafts.set(key, { answer: '' });
+  return ownerDrafts.get(key);
+}
+
+function ownerIdempotencyKey(action, taskId) {
+  const random = globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  return `cr-${action}-${taskId}-${random}`.slice(0, 128);
+}
+
 function pill(text, cls) {
   return el('span', `pill${cls ? ` ${cls}` : ''}`, text ?? '—');
 }
@@ -358,7 +427,173 @@ function dagProgress(card) {
   return bar;
 }
 
-function card(cardData, kind, shivaLookup) {
+function ownerActionControls(cardData) {
+  const taskId = String(cardData.task_id ?? '');
+  const draft = ownerDraft(taskId);
+  const panel = el('div', 'owner-actions');
+  panel.style.marginTop = '8px';
+  panel.style.display = 'flex';
+  panel.style.flexDirection = 'column';
+  panel.style.gap = '6px';
+  panel.addEventListener('click', ev => ev.stopPropagation());
+
+  const answerInput = el('input', 'cmd owner-answer-input');
+  answerInput.type = 'text';
+  answerInput.autocomplete = 'off';
+  answerInput.placeholder = 'Ответ владельца / причина для unblock/cancel';
+  answerInput.value = draft.answer;
+  answerInput.style.width = '100%';
+  answerInput.style.boxSizing = 'border-box';
+  answerInput.style.cursor = 'text';
+  answerInput.style.color = 'var(--fg)';
+
+  const tokenInput = el('input', 'cmd owner-token-input');
+  tokenInput.type = 'password';
+  tokenInput.autocomplete = 'off';
+  tokenInput.placeholder = 'Owner write token';
+  tokenInput.value = readOwnerToken();
+  tokenInput.style.flex = '1 1 180px';
+  tokenInput.style.minWidth = '0';
+  tokenInput.style.cursor = 'text';
+  tokenInput.style.color = 'var(--fg)';
+
+  const remember = el('input');
+  remember.type = 'checkbox';
+  remember.checked = ownerRememberToken ||
+    Boolean(storageGet(storageArea('localStorage'), OWNER_TOKEN_STORAGE_KEY));
+  const rememberLabel = el('label', 'owner-remember');
+  rememberLabel.style.display = 'inline-flex';
+  rememberLabel.style.alignItems = 'center';
+  rememberLabel.style.gap = '5px';
+  rememberLabel.style.color = 'var(--dim)';
+  rememberLabel.style.fontSize = '11px';
+  rememberLabel.append(remember, el('span', null, 'remember token'));
+
+  const tokenRow = el('div', 'meta owner-token-row');
+  tokenRow.style.marginTop = '0';
+  tokenRow.append(tokenInput, rememberLabel);
+
+  const buttonRow = el('div', 'meta owner-action-buttons');
+  buttonRow.style.marginTop = '0';
+  const status = el('div', 'owner-action-status');
+  status.style.minHeight = '14px';
+  status.style.color = 'var(--dim)';
+  status.style.fontSize = '11px';
+
+  const controls = [answerInput, tokenInput, remember];
+  const setBusy = busy => {
+    for (const control of controls) control.disabled = busy;
+  };
+  const makeButton = (label, action, color) => {
+    const button = el('button', 'cmd owner-action-button', label);
+    button.type = 'button';
+    button.style.marginTop = '0';
+    button.style.cursor = 'pointer';
+    button.style.color = color;
+    button.addEventListener('click', ev => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      submit(action);
+    });
+    controls.push(button);
+    return button;
+  };
+
+  const submit = async action => {
+    const answerText = answerInput.value.trim();
+    if (action === 'answer' && !answerText) {
+      status.style.color = 'var(--warn)';
+      status.textContent = 'Введите ответ владельца';
+      answerInput.focus?.();
+      return;
+    }
+    const pendingKey = `${taskId}:${action}`;
+    if (ownerPendingActions.has(pendingKey)) {
+      status.style.color = 'var(--warn)';
+      status.textContent = `${action}: уже выполняется`;
+      return;
+    }
+    let token = tokenInput.value.trim() || readOwnerToken();
+    if (!token && typeof globalThis.prompt === 'function') {
+      const prompted = globalThis.prompt('Owner write token');
+      if (typeof prompted === 'string' && prompted.trim()) {
+        token = prompted.trim();
+        tokenInput.value = token;
+        ownerTokenMemory = token;
+      }
+    }
+    if (!token) {
+      status.style.color = 'var(--warn)';
+      status.textContent = 'owner token required';
+      tokenInput.focus?.();
+      return;
+    }
+
+    const idempotencyKey = ownerIdempotencyKey(action, taskId);
+    ownerPendingActions.add(pendingKey);
+    setBusy(true);
+    status.style.color = 'var(--dim)';
+    status.textContent = `${action}: отправка…`;
+    const payload = { taskId, idempotencyKey };
+    if (action === 'answer') payload.answer = answerText;
+    else if (answerText) payload.reason = answerText;
+    try {
+      const res = await fetch(OWNER_ACTION_ENDPOINTS[action], {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data?.ok !== true) {
+        throw new Error(data?.error ?? `HTTP ${res.status}`);
+      }
+      persistOwnerToken(token, remember.checked);
+      draft.answer = '';
+      ownerDrafts.delete(taskId);
+      answerInput.value = '';
+      status.style.color = 'var(--ok)';
+      status.textContent = `${action}: ok${data.deduplicated ? ' (deduplicated)' : ''}`;
+      refresh().catch(() => {});
+    } catch (error) {
+      status.style.color = 'var(--bad)';
+      status.textContent = `${action}: ${error?.message ?? error}`;
+    } finally {
+      ownerPendingActions.delete(pendingKey);
+      setBusy(false);
+    }
+  };
+
+  answerInput.addEventListener('input', () => { draft.answer = answerInput.value; });
+  answerInput.addEventListener('keydown', ev => {
+    ev.stopPropagation();
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      submit('answer');
+    }
+  });
+  remember.addEventListener('change', () => { ownerRememberToken = remember.checked; });
+  tokenInput.addEventListener('input', () => { ownerTokenMemory = tokenInput.value; });
+  tokenInput.addEventListener('keydown', ev => ev.stopPropagation());
+
+  panel.append(
+    el('div', 'last', 'Owner action'),
+    answerInput,
+    buttonRow,
+    tokenRow,
+    status,
+  );
+  buttonRow.append(
+    makeButton('Ответить', 'answer', 'var(--ok)'),
+    makeButton('Unblock', 'unblock', 'var(--accent)'),
+    makeButton('Cancel', 'cancel', 'var(--bad)'),
+  );
+  return panel;
+}
+
+function card(cardData, kind, shivaLookup, ownerWriteEnabled = false) {
   const node = el('div', 'card');
   const top = el('div', 'top');
   top.append(el('span', 'id', `#${cardData.task_id}`));
@@ -395,14 +630,17 @@ function card(cardData, kind, shivaLookup) {
     });
     node.append(cmd);
   }
+  if (kind === 'owner' && ownerWriteEnabled === true) {
+    node.append(ownerActionControls(cardData));
+  }
   node.addEventListener('click', () => openInspect(cardData.task_id));
   return node;
 }
 
-const list = (id, items, kind, empty, shivaLookup) => {
+const list = (id, items, kind, empty, shivaLookup, ownerWriteEnabled = false) => {
   const box = $(id);
   box.replaceChildren();
-  for (const item of items) box.append(card(item, kind, shivaLookup));
+  for (const item of items) box.append(card(item, kind, shivaLookup, ownerWriteEnabled));
   if (!items.length) box.append(el('div', 'empty', empty));
 };
 
@@ -412,7 +650,8 @@ function renderBoard(snap) {
   $('count-owner').textContent = snap.needsOwner?.length ?? 0;
   list('running', snap.running ?? [], 'running', 'Нет активных попыток');
   list('queued', snap.queued ?? [], 'queued', 'Очередь пуста');
-  list('needs-owner', snap.needsOwner ?? [], 'owner', 'Нет вопросов владельцу');
+  list('needs-owner', snap.needsOwner ?? [], 'owner', 'Нет вопросов владельцу', undefined,
+    snap.ownerWriteEnabled === true);
   const done = snap.recentlyCompleted ?? [];
   $('count-done').textContent = done.length;
   const shown = state.showAllDone ? done : done.slice(0, 10);
@@ -543,6 +782,41 @@ function quotaCard(quota) {
   return node;
 }
 
+function spendDynamicsMetric(spendDynamics) {
+  const overTarget = spendDynamics?.overTarget === true;
+  const node = metric('Spend dynamics',
+    `projected month ${eur(spendDynamics?.projectedMonthEur)} / target ${eur(spendDynamics?.targetEur)}`,
+    overTarget ? 'bad' : null);
+  node.append(el('div', 'metric-label', `avg daily ${eur(spendDynamics?.avgDailyEur)}`));
+  const trend = ['rising', 'falling', 'stable'].includes(spendDynamics?.trend)
+    ? spendDynamics.trend : 'stable';
+  const trendLine = el('div', 'metric-label');
+  trendLine.append(el('span', null, 'trend '), pill(trend,
+    trend === 'rising' ? 'warn' : trend === 'falling' ? 'ok' : null));
+  node.append(trendLine);
+  if (overTarget) node.append(el('div', 'metric-label', 'over target'));
+  return node;
+}
+
+function fmtIdleWastePct(value) {
+  if (!Number.isFinite(value)) return '—';
+  return `${Number(value).toFixed(1).replace(/\.0$/, '')}%`;
+}
+
+function deadLoadBanner(deadLoad) {
+  const vms = Array.isArray(deadLoad?.vms) ? deadLoad.vms : [];
+  const idleVmIds = vms.filter(vm => vm?.deadLoad === true)
+    .map(vm => vm?.id).filter(Boolean);
+  const idleVmText = idleVmIds.length ? idleVmIds.join(', ') : 'worker VM';
+  const threshold = Number.isFinite(deadLoad?.thresholdMinutes)
+    ? ` · threshold ${deadLoad.thresholdMinutes}min` : '';
+  const idleSince = Number.isFinite(deadLoad?.idleMinutesSinceLastTask)
+    ? ` · idle ${deadLoad.idleMinutesSinceLastTask}min` : '';
+  return el('div', 'alert bad',
+    `DEAD LOAD · idleWastePct ${fmtIdleWastePct(deadLoad?.idleWastePct)} · ` +
+    `idle VM warning: ${idleVmText} running without active/claimed tasks${idleSince}${threshold}`);
+}
+
 function renderFinops(snap) {
   const summary = $('finops-summary');
   summary.replaceChildren();
@@ -557,6 +831,7 @@ function renderFinops(snap) {
   summary.append(metric('Month spend', eur(totals.spentMonthCostEur), 'warn'));
   summary.append(metric('Today', eur(totals.spentTodayCostEur)));
   summary.append(metric('Monthly budget', eur(totals.monthlyBudgetEur)));
+  if (finops.spendDynamics) summary.append(spendDynamicsMetric(finops.spendDynamics));
   summary.append(metric('GCP credits', eur(totals.remainingCreditsEur), 'ok'));
   summary.append(metric('Credit runway', finops.creditRunway?.days == null
     ? '—' : `${finops.creditRunway.days} days`));
@@ -600,9 +875,17 @@ function renderFinops(snap) {
     return node;
   }), 'Нет AI subscriptions');
 
-  simpleCards($('finops-alerts'), (finops.alerts ?? []).map(alert =>
-    el('div', `alert ${alert.severity === 'bad' ? 'bad' : 'warn'}`,
-      `${alert.code}: ${alert.message}`)), 'Алертов нет');
+  const deadLoad = finops.deadLoad;
+  const deadLoadActive = deadLoad?.deadLoad === true ||
+    deadLoad?.deadLoadDetected === true ||
+    (Array.isArray(deadLoad?.vms) && deadLoad.vms.some(vm => vm?.deadLoad === true));
+  const alertCards = [];
+  if (deadLoadActive) alertCards.push(deadLoadBanner(deadLoad));
+  alertCards.push(...(finops.alerts ?? [])
+    .filter(alert => !(deadLoadActive && alert.code === 'dead_load_detected'))
+    .map(alert => el('div', `alert ${alert.severity === 'bad' ? 'bad' : 'warn'}`,
+      `${alert.code}: ${alert.message}`)));
+  simpleCards($('finops-alerts'), alertCards, 'Алертов нет');
 }
 
 

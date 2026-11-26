@@ -852,6 +852,24 @@ test('app.js: нет innerHTML для недоверенных данных', as
   assert.equal(src.includes('insertAdjacentHTML'), false);
 });
 
+test('app.js Control Room v2: spend/dead-load/owner-write contracts are referenced safely', async () => {
+  const src = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
+  for (const marker of [
+    'spendDynamics',
+    'deadLoad',
+    'deadLoad?.deadLoad === true',
+    'ownerWriteEnabled',
+    '/api/owner/answer',
+    '/api/owner/unblock',
+    '/api/owner/cancel',
+    'idempotencyKey',
+    "method: 'POST'",
+  ]) {
+    assert.ok(src.includes(marker), marker);
+  }
+  assert.equal(/(?:^|[^\w$])innerHTML\s*=/.test(src), false);
+});
+
 // --- df-herd ----------------------------------------------------------------------
 
 test('df-herd --once печатает кадр без ANSI-уязвимостей и выходит', async () => {
@@ -1585,17 +1603,19 @@ test('df-herd: models tab печатает корректный синтакси
 // Минимальный DOM-stub для детерминированной проверки render-логики app.js
 // в node: поведение append/classList/textContent повторяет браузерный DOM
 // (в частности, append возвращает undefined — chaining запрещён).
-function loadWebApp(source) {
+function loadWebApp(source, hookNames = ['renderProjects', 'renderStatus']) {
   const ids = new Map();
   const makeElement = tag => {
     const classes = new Set();
     const node = {
       tagName: tag, children: [], childNodes: [], textContent: '', className: '',
-      dataset: {}, style: {},
+      dataset: {}, style: {}, listeners: {},
       append(...kids) { for (const k of kids) { node.children.push(k); node.childNodes.push(k); } },
       replaceChildren() { node.children = []; node.childNodes = []; },
-      addEventListener() {},
-      removeEventListener() {},
+      addEventListener(type, fn) { (node.listeners[type] ??= []).push(fn); },
+      removeEventListener(type, fn) {
+        node.listeners[type] = (node.listeners[type] ?? []).filter(entry => entry !== fn);
+      },
       classList: {
         add: (...cls) => cls.forEach(c => classes.add(c)),
         remove: (...cls) => cls.forEach(c => classes.delete(c)),
@@ -1624,13 +1644,14 @@ function loadWebApp(source) {
     EventSource: class { close() {} },
     setInterval: () => 0,
     setTimeout, clearTimeout, URL, console, encodeURIComponent,
-    navigator: {},
+    navigator: {}, crypto: { randomUUID: () => 'uuid-fixed' },
   };
   let hooks = null;
   sandbox.__capture = value => { hooks = value; };
   vm.createContext(sandbox);
-  vm.runInContext(`${source}\n;__capture({ renderProjects, renderStatus });`, sandbox);
-  return { hooks, ids };
+  const capture = hookNames.map(name => `${JSON.stringify(name)}: ${name}`).join(', ');
+  vm.runInContext(`${source}\n;__capture({ ${capture} });`, sandbox);
+  return { hooks, ids, sandbox };
 }
 
 function projectCounts(projNode) {
@@ -1689,6 +1710,143 @@ test('app.js renderStatus: kill-switch читается из snap.killSwitch и�
   assert.equal(ids.get('chip-killswitch').classList.contains('bad'), false);
   hooks.renderStatus({ ...base, pilot: {} });
   assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: off');
+});
+
+function deepText(node) {
+  if (node == null) return '';
+  if (typeof node !== 'object') return String(node);
+  return [node.textContent ?? '', ...(node.children ?? []).map(deepText)]
+    .filter(Boolean).join(' ');
+}
+
+function nodeHasClass(node, cls) {
+  return typeof node?.className === 'string' && node.className.split(/\s+/).includes(cls);
+}
+
+function findByClass(node, cls) {
+  if (nodeHasClass(node, cls)) return node;
+  for (const child of node?.children ?? []) {
+    const found = findByClass(child, cls);
+    if (found) return found;
+  }
+  return null;
+}
+
+function collectByTag(node, tag, out = []) {
+  if (node?.tagName === tag) out.push(node);
+  for (const child of node?.children ?? []) collectByTag(child, tag, out);
+  return out;
+}
+
+function dispatchDom(node, type, event = {}) {
+  const merged = { stopPropagation() {}, preventDefault() {}, ...event };
+  for (const fn of node?.listeners?.[type] ?? []) fn(merged);
+}
+
+test('app.js renderFinops: spend dynamics summary and dead-load banner render without fragile data', async () => {
+  const source = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
+  const { hooks, ids } = loadWebApp(source, ['renderFinops']);
+  const snap = { finops: {
+    ok: true,
+    totals: { spentMonthCostEur: 12, spentTodayCostEur: 1.5,
+      monthlyBudgetEur: 25, remainingCreditsEur: 9, runningHoursMonth: 8 },
+    creditRunway: { days: 6 },
+    spendDynamics: { projectedMonthEur: 30, targetEur: 25, avgDailyEur: 1.5,
+      trend: 'rising', overTarget: true },
+    deadLoad: { deadLoad: true, idleWastePct: 42.4,
+      idleMinutesSinceLastTask: 35, thresholdMinutes: 20,
+      vms: [{ id: 'vm-idle', deadLoad: true }, { id: 'vm-active', deadLoad: false }] },
+    alerts: [{ severity: 'bad', code: 'dead_load_detected', message: 'duplicate detail' }],
+  } };
+  hooks.renderFinops(snap);
+  const summary = ids.get('finops-summary');
+  const summaryText = deepText(summary);
+  assert.ok(summaryText.includes('Spend dynamics'));
+  assert.ok(summaryText.includes('projected month €30.00 / target €25.00'));
+  assert.ok(summaryText.includes('avg daily €1.50'));
+  assert.ok(summaryText.includes('rising'));
+  assert.ok(summaryText.includes('over target'));
+  assert.ok(summary.children.some(child => nodeHasClass(child, 'metric') && nodeHasClass(child, 'bad')));
+
+  const alertText = deepText(ids.get('finops-alerts'));
+  assert.ok(alertText.includes('DEAD LOAD'));
+  assert.ok(alertText.includes('idleWastePct 42.4%'));
+  assert.ok(alertText.includes('vm-idle'));
+  assert.ok(alertText.includes('without active/claimed tasks'));
+  assert.ok(alertText.includes('idle 35min'));
+  assert.equal(alertText.includes('duplicate detail'), false);
+
+  assert.doesNotThrow(() => hooks.renderFinops({ finops: { ok: true, totals: {}, alerts: [] } }));
+  assert.equal(deepText(ids.get('finops-alerts')).includes('DEAD LOAD'), false);
+
+  hooks.renderFinops({ finops: { ok: true, totals: {},
+    deadLoad: { deadLoadDetected: true, idleWastePct: 10,
+      vms: [{ id: 'worker-1', deadLoad: true }] }, alerts: [] } });
+  const backendShapeText = deepText(ids.get('finops-alerts'));
+  assert.ok(backendShapeText.includes('DEAD LOAD'));
+  assert.ok(backendShapeText.includes('worker-1'));
+});
+
+test('app.js renderBoard: owner controls exist only when ownerWriteEnabled is true', async () => {
+  const source = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
+  const { hooks, ids } = loadWebApp(source, ['renderBoard']);
+  const task = { task_id: 'T-owner', state: 'blocked', title: 'Need owner',
+    question: 'Approve release?' };
+  const base = { running: [], queued: [], recentlyCompleted: [], needsOwner: [task] };
+
+  hooks.renderBoard(base);
+  assert.equal(findByClass(ids.get('needs-owner'), 'owner-actions'), null);
+  hooks.renderBoard({ ...base, ownerWriteEnabled: false });
+  assert.equal(findByClass(ids.get('needs-owner'), 'owner-actions'), null);
+
+  hooks.renderBoard({ ...base, ownerWriteEnabled: true });
+  const panel = findByClass(ids.get('needs-owner'), 'owner-actions');
+  assert.ok(panel);
+  const text = deepText(panel);
+  for (const marker of ['Owner action', 'Ответить', 'Unblock', 'Cancel', 'remember token']) {
+    assert.ok(text.includes(marker), marker);
+  }
+  const inputs = collectByTag(panel, 'input');
+  assert.deepEqual(inputs.map(input => input.type).sort(), ['checkbox', 'password', 'text']);
+  assert.ok(inputs.some(input => input.placeholder === 'Owner write token'));
+  assert.ok(inputs.some(input => input.placeholder.includes('Ответ владельца')));
+});
+
+test('app.js owner answer control: POSTs authenticated payload with deterministic idempotency key', async () => {
+  const source = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
+  const { hooks, ids, sandbox } = loadWebApp(source, ['renderBoard']);
+  const task = { task_id: 'T-owner', state: 'blocked', title: 'Need owner' };
+  hooks.renderBoard({ running: [], queued: [], recentlyCompleted: [],
+    needsOwner: [task], ownerWriteEnabled: true });
+  const panel = findByClass(ids.get('needs-owner'), 'owner-actions');
+  assert.ok(panel);
+  const inputs = collectByTag(panel, 'input');
+  const answerInput = inputs.find(input => input.type === 'text');
+  const tokenInput = inputs.find(input => input.type === 'password');
+  answerInput.value = 'Да, пушить';
+  tokenInput.value = 'secret-token';
+
+  const calls = [];
+  sandbox.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    if (url === '/api/snapshot') throw new Error('offline refresh');
+    return { ok: true, json: async () => ({ ok: true, deduplicated: false }) };
+  };
+  const answerButton = collectByTag(panel, 'button').find(button => button.textContent === 'Ответить');
+  assert.ok(answerButton);
+  dispatchDom(answerButton, 'click');
+  for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+
+  const post = calls.find(call => call.url === '/api/owner/answer');
+  assert.ok(post);
+  assert.equal(post.options.method, 'POST');
+  assert.equal(post.options.headers['Content-Type'], 'application/json');
+  assert.equal(post.options.headers.Authorization, 'Bearer secret-token');
+  const payload = JSON.parse(post.options.body);
+  assert.equal(payload.taskId, 'T-owner');
+  assert.equal(payload.answer, 'Да, пушить');
+  assert.equal(payload.idempotencyKey, 'cr-answer-T-owner-uuid-fixed');
+  assert.ok(deepText(panel).includes('answer: ok'));
 });
 
 // --- Authenticated Owner Write-API --------------------------------------------

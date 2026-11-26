@@ -1,0 +1,30 @@
+repo_id: darkfactory
+stack: node22-esm
+l1_profile: node
+agents_md: AGENTS.md
+taste:
+  - минимальные правки строго внутри Scope Fence, без мёртвого кода и лишних абстракций
+  - детерминированные проверки, явные квитанции и честные статусы обязательны
+  - "границы доверия fail-closed: секреты, запись, сеть и исполнение не включать молча"
+  - "UI читабелен под нагрузкой: безопасный DOM, ясные состояния, ноль визуального мусора"
+domain_skills:
+  backend:
+    - goal-rules
+    - test-first
+    - property-testing
+  ui:
+    - goal-rules
+    - three-pass-review
+  security:
+    - test-first
+    - three-pass-review
+  docs:
+    - feature-blueprint
+    - session-handoff
+  research:
+    - prod-recon
+    - materials-intake
+    - issue-register
+  ml:
+    - property-testing
+    - test-first
