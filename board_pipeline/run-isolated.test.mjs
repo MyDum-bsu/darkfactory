@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { adaptiveLocalPlanCore, allowedPathsFromAttempt, allowedPathsFromLabels, baseWorkerFromPolicy,
-  buildWorkerTransport, filterAdaptiveTelemetry, isApprovedWorker, planAdaptiveChecks,
-  queueModeSpecInputs, readSubmissionEnvelope, resolveWorkerRuntimeKind,
-  scopeFenceReworkResult } from './run-isolated.mjs';
+import { adaptiveLocalPlanCore, allowedPathsFromAttempt, allowedPathsFromLabels, ancestorOrNull,
+  baseWorkerFromPolicy, buildWorkerTransport, candidatePinRef, filterAdaptiveTelemetry,
+  HARDENED_GIT_CONFIG, hardenedGitEnv, isApprovedWorker, planAdaptiveChecks,
+  queueModeSpecInputs, readSubmissionEnvelope, resetQueueWorktree, resolveWorkerRuntimeKind,
+  scopeFenceReworkResult, shouldStopWorkerOnShutdown } from './run-isolated.mjs';
 import { deterministicRuntimeId } from './worker-runtime.mjs';
 import { DEFAULT_ARBITER, DEFAULT_CRITIC, PRIMARY_WORKER, resolveTriad } from './worker-selector.mjs';
-import { workerIntakePrompt } from './intake-prompt.mjs';
+import { arbiterIntakePrompt, workerIntakePrompt } from './intake-prompt.mjs';
 
 test('isApprovedWorker accepts SWE-2.1 implementation workers and legacy SWE-2 High', () => {
   for (const model of ['swe-2-1-medium', 'swe-2-1-high', 'swe-2-1-xhigh', 'swe-2-1-max']) {
@@ -119,8 +120,14 @@ test('scopeFenceReworkResult is typed deterministic worker feedback', () => {
   assert.deepEqual(result, scopeFenceReworkResult(['outside.mjs'], ['board_pipeline/']));
 });
 
-test('resolveWorkerRuntimeKind applies CLI, policy, env and default precedence fail-closed', () => {
-  assert.equal(resolveWorkerRuntimeKind({}), 'bb');
+test('resolveWorkerRuntimeKind applies CLI, policy, env and hc default precedence fail-closed', () => {
+  // Финальный дефолт — hc; bb остаётся только явным opt-in на любом уровне.
+  assert.equal(resolveWorkerRuntimeKind({}), 'hc');
+  assert.equal(resolveWorkerRuntimeKind({ env: {} }), 'hc');
+  assert.equal(resolveWorkerRuntimeKind({ policy: {} }), 'hc');
+  assert.equal(resolveWorkerRuntimeKind({ env: { DF_WORKER_RUNTIME: 'bb' } }), 'bb');
+  assert.equal(resolveWorkerRuntimeKind({ policy: { workerRuntime: 'bb' } }), 'bb');
+  assert.equal(resolveWorkerRuntimeKind({ cliRuntime: 'bb' }), 'bb');
   assert.equal(resolveWorkerRuntimeKind({ env: { DF_WORKER_RUNTIME: 'subproc' } }), 'subproc');
   assert.equal(resolveWorkerRuntimeKind({
     policy: { workerRuntime: 'hc' }, env: { DF_WORKER_RUNTIME: 'subproc' } }), 'hc');
@@ -128,6 +135,7 @@ test('resolveWorkerRuntimeKind applies CLI, policy, env and default precedence f
     cliRuntime: 'subproc', policy: { workerRuntime: 'hc' },
     env: { DF_WORKER_RUNTIME: 'bb' } }), 'subproc');
   assert.equal(resolveWorkerRuntimeKind({ cliRuntime: 'bb', policy: { workerRuntime: 'hc' } }), 'bb');
+  assert.equal(resolveWorkerRuntimeKind({ cliRuntime: 'hc', policy: { workerRuntime: 'bb' } }), 'hc');
   for (const bad of ['pty', '', 'HC', 42, true, null]) {
     assert.throws(() => resolveWorkerRuntimeKind({ cliRuntime: bad }), /worker_runtime_kind_invalid/);
   }
@@ -805,4 +813,181 @@ test('portable observeTurn never fabricates a new turn from an explicit stale wa
   await transport.feedback({ attempt: { ...attempt, bb_thread_id: runtimeId }, feedbackId: 'fb-stale' });
   assert.equal(await transport.observeTurn({ runtimeId, after: 1 }), undefined);
   assert.equal(await transport.observeTurn({ runtimeId, after: 0 }), undefined);
+});
+
+// --- P0/P1 cross-review regressions: runner hardening, ref pinning, shutdown gating ---
+
+test('HARDENED_GIT_CONFIG disables fsmonitor, hooks and external diff as -c pairs', () => {
+  const pairs = [];
+  for (let i = 0; i < HARDENED_GIT_CONFIG.length; i += 2) {
+    pairs.push([HARDENED_GIT_CONFIG[i], HARDENED_GIT_CONFIG[i + 1]]);
+  }
+  assert.deepEqual(pairs, [
+    ['-c', 'core.fsmonitor=false'],
+    ['-c', 'core.hooksPath=/dev/null'],
+    ['-c', 'diff.external='],
+  ]);
+  assert.ok(Object.isFrozen(HARDENED_GIT_CONFIG));
+});
+
+test('hardenedGitEnv isolates git configuration and preserves the base environment', () => {
+  const env = hardenedGitEnv({ PATH: '/usr/bin', GIT_CONFIG_GLOBAL: '/home/worker/.gitconfig',
+    GIT_CONFIG_NOSYSTEM: '0', GIT_CONFIG_COUNT: '3' });
+  assert.equal(env.GIT_CONFIG_GLOBAL, '/dev/null');
+  assert.equal(env.GIT_CONFIG_NOSYSTEM, '1');
+  assert.equal(env.PATH, '/usr/bin');
+  // Edge cases: empty and null input never throw and stay deterministic.
+  assert.deepEqual(hardenedGitEnv({}), { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+  const nulled = hardenedGitEnv(null);
+  assert.equal(nulled.GIT_CONFIG_GLOBAL, '/dev/null');
+  assert.equal(nulled.GIT_CONFIG_NOSYSTEM, '1');
+  assert.deepEqual(hardenedGitEnv({ PATH: '/bin' }), hardenedGitEnv({ PATH: '/bin' }));
+  const input = { PATH: '/bin' };
+  hardenedGitEnv(input);
+  assert.deepEqual(input, { PATH: '/bin' }, 'input object is never mutated');
+});
+
+test('ancestorOrNull returns the sha for an ancestor and null for a non-ancestor rejection', async () => {
+  const sha = 'c'.repeat(40);
+  const calls = [];
+  const okGit = async (...args) => { calls.push(args); return ''; };
+  assert.equal(await ancestorOrNull(okGit, 'base-sha', sha), sha);
+  assert.deepEqual(calls[0], ['merge-base', '--is-ancestor', 'base-sha', sha]);
+  const failGit = async () => { throw new Error('exit code 1'); };
+  assert.equal(await ancestorOrNull(failGit, 'base-sha', sha), null);
+  // Повторный вызов детерминирован и не бросает — цикл checkpoint не разгоняется.
+  assert.equal(await ancestorOrNull(failGit, 'base-sha', sha), null);
+  assert.equal(await ancestorOrNull(okGit, 'base-sha', sha), sha);
+  const undefinedGit = async () => undefined;
+  assert.equal(await ancestorOrNull(undefinedGit, 'base-sha', sha), sha);
+});
+
+test('shouldStopWorkerOnShutdown stops only terminal phases and prefers the durable record', () => {
+  for (const phase of ['done', 'hold', 'uncertain', 'lease_lost']) {
+    assert.equal(shouldStopWorkerOnShutdown({ recordPhase: phase }), true, phase);
+  }
+  for (const phase of ['claiming', 'working', 'checking', 'blocking', 'awaiting_answer', 'idle']) {
+    assert.equal(shouldStopWorkerOnShutdown({ recordPhase: phase }), false, phase);
+  }
+  // Пустые и минимальные входы: активный/неизвестный воркер не убивается.
+  assert.equal(shouldStopWorkerOnShutdown({}), false);
+  assert.equal(shouldStopWorkerOnShutdown(), false);
+  assert.equal(shouldStopWorkerOnShutdown({ recordPhase: undefined, resultPhase: undefined }), false);
+  assert.equal(shouldStopWorkerOnShutdown({ recordPhase: null, resultPhase: 'done' }), true);
+  assert.equal(shouldStopWorkerOnShutdown({ resultPhase: 'hold' }), true);
+  assert.equal(shouldStopWorkerOnShutdown({ resultPhase: 'working' }), false);
+  // Долговременная запись важнее последнего результата тика.
+  assert.equal(shouldStopWorkerOnShutdown({ recordPhase: 'working', resultPhase: 'done' }), false);
+  assert.equal(shouldStopWorkerOnShutdown({ recordPhase: 'done', resultPhase: 'working' }), true);
+});
+
+test('candidatePinRef maps done/hold records to durable verified/held refs fail-closed', () => {
+  const sha = 'a'.repeat(40);
+  assert.deepEqual(candidatePinRef({ phase: 'done', record: { sha, taskId: '9912', attemptId: 'att-1' } }),
+    { ref: 'refs/darkfactory/verified/9912/att-1', sha });
+  assert.deepEqual(candidatePinRef({ phase: 'hold', record: { sha, taskId: '9912', attemptId: 'att-1' } }),
+    { ref: 'refs/darkfactory/held/9912/att-1', sha });
+  // Числовой task id приводится к строке детерминированно.
+  assert.equal(candidatePinRef({ phase: 'done', record: { sha, taskId: 9912, attemptId: 'att-1' } }).ref,
+    'refs/darkfactory/verified/9912/att-1');
+  // Фазы без подтверждённого исхода ничего не закрепляют — uncertain не verified и не held.
+  for (const phase of ['working', 'checking', 'uncertain', 'lease_lost', 'idle', undefined, null]) {
+    assert.equal(candidatePinRef({ phase, record: { sha, taskId: '9912', attemptId: 'att-1' } }), null, String(phase));
+  }
+  // Неполный/невалидный sha никогда не попадает в ref.
+  for (const bad of ['', 'abc', 'A'.repeat(40), 'g'.repeat(40), 42, null, undefined]) {
+    assert.equal(candidatePinRef({ phase: 'done', record: { sha: bad, taskId: '1', attemptId: 'a' } }), null, String(bad));
+  }
+  // Компоненты ref строгие: traversal, вложенность, пробелы и краевые символы отклоняются.
+  for (const badId of ['../x', 'a..b', 'a/b', 'a b', '-x', '.x', 'x?', 'x*', 'a'.repeat(200), '', null, undefined]) {
+    assert.equal(candidatePinRef({ phase: 'done', record: { sha, taskId: badId, attemptId: 'att' } }), null, String(badId));
+    assert.equal(candidatePinRef({ phase: 'done', record: { sha, taskId: '1', attemptId: badId } }), null, String(badId));
+  }
+  assert.equal(candidatePinRef({ phase: 'done', record: null }), null);
+  assert.equal(candidatePinRef(), null);
+  // UUID-attempt и длинный numeric task проходят; повторный вызов детерминирован.
+  const uuidRecord = { sha, taskId: '9912', attemptId: 'aa85e3cc-0bf2-468b-a624-5d24cfcdd946' };
+  assert.deepEqual(candidatePinRef({ phase: 'done', record: uuidRecord }),
+    candidatePinRef({ phase: 'done', record: uuidRecord }));
+  assert.equal(candidatePinRef({ phase: 'done', record: uuidRecord }).ref,
+    'refs/darkfactory/verified/9912/aa85e3cc-0bf2-468b-a624-5d24cfcdd946');
+});
+
+test('resetQueueWorktree pins the durable ref strictly before resetting the queue worktree', async () => {
+  const sha = 'a'.repeat(40);
+  const base = 'b'.repeat(40);
+  for (const [phase, kind] of [['done', 'verified'], ['hold', 'held']]) {
+    const calls = [];
+    const git = async (...args) => { calls.push(args); return ''; };
+    await resetQueueWorktree({ git, base, phase, record: { sha, taskId: '9912', attemptId: 'att-1' } });
+    assert.deepEqual(calls, [
+      ['update-ref', `refs/darkfactory/${kind}/9912/att-1`, sha],
+      ['reset', '--hard', base],
+      ['clean', '-fd'],
+    ], phase);
+  }
+});
+
+test('resetQueueWorktree never resets when pinning fails, keeping the verified commit checked out', async () => {
+  const calls = [];
+  const git = async (...args) => {
+    calls.push(args);
+    if (args[0] === 'update-ref') throw new Error('ref write failed');
+    return '';
+  };
+  await assert.rejects(() => resetQueueWorktree({ git, base: 'b'.repeat(40), phase: 'done',
+    record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' } }), /ref write failed/);
+  assert.deepEqual(calls.map(args => args[0]), ['update-ref']);
+});
+
+test('resetQueueWorktree resets without pinning when the record has nothing durable to pin', async () => {
+  const base = 'b'.repeat(40);
+  for (const record of [
+    null,
+    { sha: 'not-a-sha', taskId: '9912', attemptId: 'att-1' },
+    { sha: 'a'.repeat(40) },
+  ]) {
+    const calls = [];
+    const git = async (...args) => { calls.push(args); return ''; };
+    await resetQueueWorktree({ git, base, phase: 'done', record });
+    assert.deepEqual(calls, [['reset', '--hard', base], ['clean', '-fd']]);
+  }
+  // Нетерминальная фаза никогда не закрепляет — reset идёт сразу.
+  const calls = [];
+  const git = async (...args) => { calls.push(args); return ''; };
+  await resetQueueWorktree({ git, base, phase: 'working',
+    record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' } });
+  assert.deepEqual(calls, [['reset', '--hard', base], ['clean', '-fd']]);
+});
+
+test('arbiterIntakePrompt formats per model family only when the arbiter spec is passed', () => {
+  const plain = arbiterIntakePrompt('Arbitration spec', 'extra context', undefined, undefined);
+  for (const arbiter of [
+    { provider: 'google', model: 'gemini-4-neon' },
+    { provider: 'openai', model: 'gpt-6.2-sol' },
+    { provider: 'anthropic', model: 'claude-opus-5' },
+  ]) {
+    const formatted = arbiterIntakePrompt('Arbitration spec', 'extra context', undefined, undefined, arbiter);
+    assert.notEqual(formatted, plain, arbiter.provider);
+    assert.match(formatted, /Arbitration spec/);
+    // Повторный вызов детерминирован.
+    assert.equal(arbiterIntakePrompt('Arbitration spec', 'extra context', undefined, undefined, arbiter), formatted);
+  }
+  const google = arbiterIntakePrompt('Arbitration spec', 'extra', undefined, undefined,
+    { provider: 'google', model: 'gemini-4-neon' });
+  const openai = arbiterIntakePrompt('Arbitration spec', 'extra', undefined, undefined,
+    { provider: 'openai', model: 'gpt-6.2-sol' });
+  assert.notEqual(google, openai);
+});
+
+test('run-isolated controller wiring pins recovery, memory key resolution, arbiter family and queue reset', () => {
+  const source = readFileSync(new URL('./run-isolated.mjs', import.meta.url), 'utf8');
+  assert.match(source, /recoverInterruptedChecking: true/);
+  assert.match(source, /resolveMemoryHmacKey\(\{ hmacKey: memoryCfg\.hmacKey, keyFile: memoryCfg\.keyFile \}\)/);
+  assert.match(source, /hmacKey: memoryHmacKey/);
+  assert.match(source, /runnerReviewSpec\(req\?\.arbiter\) \?\? undefined/);
+  assert.match(source, /resetQueueWorktree\(\{ git, base: route\.base, phase: result\.phase, record: closedRecord \}\)/);
+  assert.match(source, /maxBuffer: 16 \* 1024 \* 1024/);
+  assert.match(source, /shouldStopWorkerOnShutdown\(\{ recordPhase: shutdownRecord\?\.phase/);
+  assert.match(source, /ancestorOrNull\(git, route\.base, sha\)/);
 });

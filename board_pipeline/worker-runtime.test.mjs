@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import { buildExecutorCommand, buildFollowUpMessage, buildResumeCommand, createWorkerRuntime,
-  deterministicRuntimeId, isWorkerThreadId } from './worker-runtime.mjs';
+  deterministicRuntimeId, isWorkerThreadId, scrubbedWorkerChildEnv } from './worker-runtime.mjs';
 
 const SPAWN = {
   taskId: '3840', attemptId: 'attempt-1', worktree: '/tmp/worktree', promptFile: '/tmp/prompt.md',
@@ -250,7 +250,11 @@ test('runtime.resume launches an hc continuation with resume labels and a fresh 
   const specifiedId = 'df-specified-abcdef1234';
   const specified = await runtime.resume({ ...SPAWN, runtimeId: specifiedId, sessionId: 'ses-9' });
   assert.equal(specified.runtimeId, specifiedId);
-  assert.deepEqual(calls[1].argv.slice(7, 9), ['--name', specifiedId]);
+  // Возобновление под занятым именем сначала зондирует и убирает мёртвый
+  // терминал (get/kill/rm), затем перезапускает — run остаётся тем же именем.
+  const runCalls = calls.filter(call => call.argv[0] === 'run');
+  assert.equal(runCalls.length, 2);
+  assert.deepEqual(runCalls[1].argv.slice(7, 9), ['--name', specifiedId]);
 });
 
 test('subproc resume continues in the worktree after a crashed terminal turn', async () => {
@@ -388,4 +392,172 @@ test('deterministic runtime ids round-trip through hc --name and subproc session
     executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } });
   assert.equal(subSpawned.runtimeId, subId);
   assert.deepEqual(await subRuntime.observe({ runtimeId: subId }), { state: 'working' });
+});
+
+// --- P0/P1 cross-review regressions: hc crash-resume collision, env scrubbing ---
+
+test('hc resume under an existing runtimeId removes the dead terminal before re-running', async () => {
+  const { calls, exec } = hcMock(async (command, argv) => {
+    if (argv[0] === 'get') return { stdout: JSON.stringify({ state: 'finished', exit_code: 9, reason: 'exited' }) };
+    if (argv[0] === 'kill') return { stdout: JSON.stringify({ state: 'finished', exit_code: 9 }) };
+    if (argv[0] === 'rm') return { stdout: JSON.stringify({ removed: 't-dead' }) };
+    if (argv[0] === 'run') return { stdout: JSON.stringify({ address: 't-new', pid: 42 }) };
+    throw new Error(`unexpected ${argv[0]}`);
+  });
+  const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => 'resume prompt' });
+  const runtimeId = 'df-3840-d0d63638ee';
+  const resumed = await runtime.resume({ ...SPAWN, runtimeId, sessionId: 'ses-7' });
+  assert.equal(resumed.runtimeId, runtimeId);
+  assert.equal(resumed.terminalId, 't-new');
+  // Строгий порядок: зонд, идемпотентный kill, обязательный rm, затем run.
+  assert.deepEqual(calls.map(call => call.argv[0]), ['get', 'kill', 'rm', 'run']);
+  assert.deepEqual(calls[0].argv, ['get', '--json', '--', runtimeId]);
+  assert.deepEqual(calls[1].argv, ['kill', '--json', '--', runtimeId]);
+  assert.deepEqual(calls[2].argv, ['rm', '--json', '--', runtimeId]);
+  assert.deepEqual(calls[3].argv.slice(7, 9), ['--name', runtimeId]);
+  // sessionId проваливается в devin -r внутри терминала.
+  const separator = calls[3].argv.indexOf('--');
+  assert.deepEqual(calls[3].argv.slice(separator + 1), ['devin', '--model', 'swe-2-1-medium',
+    '-r', 'ses-7', '--prompt-file', '/tmp/prompt.md']);
+});
+
+test('hc resume never clobbers a live terminal under the same name', async () => {
+  for (const liveTerminal of [
+    { state: 'live', status: { state: 'working' } },
+    { state: 'live', status: { state: 'idle' } },
+    { state: 'live', status: { state: 'done' } },
+  ]) {
+    const { calls, exec } = hcMock(async (command, argv) => {
+      if (argv[0] === 'get') return { stdout: JSON.stringify(liveTerminal) };
+      if (argv[0] === 'run') return { stdout: JSON.stringify({ address: 't-x' }) };
+      if (argv[0] === 'kill') return { stdout: JSON.stringify({ state: 'finished' }) };
+      throw new Error(`unexpected ${argv[0]}`);
+    });
+    const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => 'prompt' });
+    await assert.rejects(() => runtime.resume({ ...SPAWN, runtimeId: 'df-live-0123456789' }),
+      /worker_runtime_exists/);
+    assert.equal(calls.some(call => call.argv[0] === 'run'), false, 'run must never start');
+    assert.equal(calls.some(call => call.argv[0] === 'kill'), false, 'a live worker is never killed');
+  }
+});
+
+test('hc resume proceeds without removal when no terminal exists under the runtime id', async () => {
+  const { calls, exec } = hcMock(async (command, argv) => {
+    if (argv[0] === 'get') {
+      throw Object.assign(new Error('hc get exited 3'), {
+        code: 3, stderr: '{"error":{"kind":"not_found","message":"no terminal \\"df-gone\\""}}' });
+    }
+    if (argv[0] === 'run') return { stdout: JSON.stringify({ address: 't-fresh' }) };
+    throw new Error(`unexpected ${argv[0]}`);
+  });
+  const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => 'prompt' });
+  const resumed = await runtime.resume({ ...SPAWN, runtimeId: 'df-gone-0123456789' });
+  assert.equal(resumed.terminalId, 't-fresh');
+  assert.deepEqual(calls.map(call => call.argv[0]), ['get', 'run']);
+});
+
+test('hc resume fails closed on an unconfirmed terminal probe instead of duplicating the name', async () => {
+  const { calls, exec } = hcMock(async (command, argv) => {
+    if (argv[0] === 'get') throw Object.assign(new Error('hc server unavailable'), { code: 'ETIMEDOUT' });
+    if (argv[0] === 'run') return { stdout: JSON.stringify({ address: 't-dup' }) };
+    throw new Error(`unexpected ${argv[0]}`);
+  });
+  const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => 'prompt' });
+  await assert.rejects(() => runtime.resume({ ...SPAWN, runtimeId: 'df-probe-0123456789' }),
+    /hc server unavailable/);
+  assert.deepEqual(calls.map(call => call.argv[0]), ['get']);
+});
+
+test('hc resume tolerates a kill failure on a finished terminal but requires the removal', async () => {
+  const tolerate = hcMock(async (command, argv) => {
+    if (argv[0] === 'get') return { stdout: JSON.stringify({ state: 'finished', exit_code: 1 }) };
+    if (argv[0] === 'kill') throw new Error('kill unsupported');
+    if (argv[0] === 'rm') return { stdout: JSON.stringify({ removed: 't-dead' }) };
+    if (argv[0] === 'run') return { stdout: JSON.stringify({ address: 't-new' }) };
+    throw new Error(`unexpected ${argv[0]}`);
+  });
+  const runtime = createWorkerRuntime({ kind: 'hc', exec: tolerate.exec, readFile: async () => 'prompt' });
+  const resumed = await runtime.resume({ ...SPAWN, runtimeId: 'df-dead-0123456789' });
+  assert.equal(resumed.terminalId, 't-new');
+
+  const rmFails = hcMock(async (command, argv) => {
+    if (argv[0] === 'get') return { stdout: JSON.stringify({ state: 'finished', exit_code: 1 }) };
+    if (argv[0] === 'kill') return { stdout: JSON.stringify({ state: 'finished' }) };
+    if (argv[0] === 'rm') throw new Error('rm refused');
+    if (argv[0] === 'run') return { stdout: JSON.stringify({ address: 't-dup' }) };
+    throw new Error(`unexpected ${argv[0]}`);
+  });
+  const strict = createWorkerRuntime({ kind: 'hc', exec: rmFails.exec, readFile: async () => 'prompt' });
+  await assert.rejects(() => strict.resume({ ...SPAWN, runtimeId: 'df-dead-0123456789' }), /rm refused/);
+  assert.equal(rmFails.calls.some(call => call.argv[0] === 'run'), false);
+});
+
+test('hc resume without a runtimeId mints a fresh id and never probes the dead-terminal path', async () => {
+  const { calls, exec } = hcMock(async () => ({ stdout: JSON.stringify({ address: 't-resume' }) }));
+  const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => 'prompt' });
+  await runtime.resume({ ...SPAWN });
+  assert.deepEqual(calls.map(call => call.argv[0]), ['run']);
+});
+
+test('subproc child env scrubs sensitive controller variables as defense-in-depth', async () => {
+  const launches = [];
+  const spawn = (command, argv, options) => {
+    launches.push({ command, argv, options });
+    return childProcess(8800);
+  };
+  const env = {
+    PATH: '/usr/bin', HOME: '/home/op', EDITOR: 'vi',
+    SSH_AUTH_SOCK: '/run/agent.sock', BOARD_TOKEN: 'secret-board', VB_TOKEN: 'secret-vb',
+    DF_PROJECT_MEMORY_HMAC_KEY: 'secret-hmac', DF_CONTROL_ROOM_WRITE_TOKEN: 'secret-cr',
+  };
+  const runtime = createWorkerRuntime({ kind: 'subproc', exec: async () => ({ stdout: '' }),
+    env, spawn, readFile: async () => 'prompt' });
+  await runtime.spawn({ ...SPAWN, executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } });
+  const childEnv = launches[0].options.env;
+  assert.equal(childEnv.PATH, '/usr/bin');
+  assert.equal(childEnv.HOME, '/home/op');
+  assert.equal(childEnv.EDITOR, 'vi');
+  for (const key of ['SSH_AUTH_SOCK', 'BOARD_TOKEN', 'VB_TOKEN',
+    'DF_PROJECT_MEMORY_HMAC_KEY', 'DF_CONTROL_ROOM_WRITE_TOKEN']) {
+    assert.equal(Object.hasOwn(childEnv, key), false, key);
+  }
+});
+
+test('subproc feedback continuation env is scrubbed on every launch', async () => {
+  const launches = [];
+  const children = [];
+  const spawn = (command, argv, options) => {
+    const child = childProcess(9100 + children.length);
+    children.push(child);
+    launches.push({ command, argv, options });
+    return child;
+  };
+  const runtime = createWorkerRuntime({ kind: 'subproc', exec: async () => ({ stdout: '' }),
+    env: { PATH: '/usr/bin', BOARD_TOKEN: 'secret', SSH_AUTH_SOCK: '/sock' },
+    spawn, readFile: async () => 'initial' });
+  const spawned = await runtime.spawn({ ...SPAWN,
+    executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } });
+  children[0].emit('exit', 0, null);
+  await runtime.feedback({ runtimeId: spawned.runtimeId, message: 'rework' });
+  assert.equal(launches.length, 2);
+  for (const launch of launches) {
+    assert.equal(launch.options.env.PATH, '/usr/bin');
+    assert.equal(Object.hasOwn(launch.options.env, 'BOARD_TOKEN'), false);
+    assert.equal(Object.hasOwn(launch.options.env, 'SSH_AUTH_SOCK'), false);
+  }
+});
+
+test('scrubbedWorkerChildEnv is total on empty and minimal input and deterministic on repetition', () => {
+  assert.deepEqual(scrubbedWorkerChildEnv({}), {});
+  assert.deepEqual(scrubbedWorkerChildEnv(null), {});
+  assert.deepEqual(scrubbedWorkerChildEnv(undefined), {});
+  const input = { A: '1', BOARD_TOKEN: 'x', VB_TOKEN: 'y', DF_PROJECT_MEMORY_HMAC_KEY: 'z',
+    DF_CONTROL_ROOM_WRITE_TOKEN: 'w', SSH_AUTH_SOCK: 's' };
+  const first = scrubbedWorkerChildEnv(input);
+  assert.deepEqual(first, { A: '1' });
+  assert.deepEqual(scrubbedWorkerChildEnv(input), first);
+  assert.equal(Object.hasOwn(input, 'BOARD_TOKEN'), true, 'input object is never mutated');
+  // Одноимённые lowercase/похожие ключи не затрагиваются — точное совпадение.
+  const near = { board_token: 'keep', BOARD_TOKEN2: 'keep', DF_PROJECT_MEMORY_HMAC_KEY_FILE: 'keep' };
+  assert.deepEqual(scrubbedWorkerChildEnv(near), near);
 });

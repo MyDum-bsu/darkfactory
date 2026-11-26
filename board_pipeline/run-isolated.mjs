@@ -34,8 +34,8 @@ import { checkScopeFence, parseAllowedPaths } from './scope-fence.mjs';
 import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
   resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
 import { createProjectMemoryWriter, DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS,
-  extractPostReviewMemoryUpdates, memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir,
-  resolveProjectMemory, writeTrustedReviewReceipt } from './project-memory.mjs';
+  extractPostReviewMemoryUpdates, memoryPolicyConfig, pinProjectMemory, resolveMemoryHmacKey,
+  resolveMemoryStoreDir, resolveProjectMemory, writeTrustedReviewReceipt } from './project-memory.mjs';
 import { createTelemetryRecorder, parseTelemetryLines, readTelemetryLines, threadUsage } from './telemetry.mjs';
 import { evaluateAdaptiveGate } from './adaptive-gates.mjs';
 import { aggregateScorecard } from './model-scorecard.mjs';
@@ -95,9 +95,11 @@ async function readOperatorInputs(paths) {
 const sha256Utf8 = value => createHash('sha256').update(Buffer.from(value, 'utf8')).digest('hex');
 
 export function resolveWorkerRuntimeKind({ cliRuntime, policy, env } = {}) {
+  // Дефолт — herdr-core (hc); bb остаётся явным opt-in через --runtime bb,
+  // policy.workerRuntime='bb' или DF_WORKER_RUNTIME=bb.
   const kind = cliRuntime !== undefined ? cliRuntime
     : policy?.workerRuntime !== undefined ? policy.workerRuntime
-      : env?.DF_WORKER_RUNTIME !== undefined ? env.DF_WORKER_RUNTIME : 'bb';
+      : env?.DF_WORKER_RUNTIME !== undefined ? env.DF_WORKER_RUNTIME : 'hc';
   if (!['bb', 'hc', 'subproc'].includes(kind)) throw new Error('worker_runtime_kind_invalid');
   return kind;
 }
@@ -421,6 +423,66 @@ export function scopeFenceReworkResult(violations, allowedPaths) {
   };
 }
 
+// Ужесточение git на worker-writable worktree: конфигурация репозитория и
+// пользовательский/системный gitconfig никогда не исполняют код от имени
+// доверенного контроллера — ни fsmonitor, ни hooks, ни external diff.
+export const HARDENED_GIT_CONFIG = Object.freeze([
+  '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=',
+]);
+
+export function hardenedGitEnv(base = process.env) {
+  return { ...(base ?? {}), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+}
+
+// merge-base --is-ancestor завершается ненулевым кодом для не-предка: это
+// данные (нет стабильной точки), а не сбой — иначе выброс внутри capture
+// зацикливает попытку на одном и том же вопросе владельца.
+export async function ancestorOrNull(git, base, sha) {
+  try {
+    await git('merge-base', '--is-ancestor', base, sha);
+  } catch {
+    return null;
+  }
+  return sha;
+}
+
+// Активный in-flight воркер не убивается при graceful shutdown/SIGTERM и по
+// истечении pilot wait: остановка допустима только в терминальной фазе.
+export function shouldStopWorkerOnShutdown({ recordPhase, resultPhase } = {}) {
+  return TERMINAL_PHASES.has(recordPhase ?? resultPhase);
+}
+
+const REF_COMPONENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const refComponent = value => {
+  const text = typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value;
+  return typeof text === 'string' && REF_COMPONENT_RE.test(text) && !text.includes('..') ? text : null;
+};
+
+// Долговременный ref закрытой попытки: verified-кандидат закрепляется под
+// refs/darkfactory/verified/<task_id>/<attempt_id>, held — под /held/. Без
+// компонентов или полного sha закреплять нечего — null, а не частичный ref.
+export function candidatePinRef({ phase, record } = {}) {
+  const kind = phase === 'done' ? 'verified' : phase === 'hold' ? 'held' : null;
+  if (kind === null) return null;
+  const sha = record?.sha;
+  if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/.test(sha)) return null;
+  const taskId = refComponent(record?.taskId);
+  const attemptId = refComponent(record?.attemptId);
+  if (taskId === null || attemptId === null) return null;
+  return { ref: `refs/darkfactory/${kind}/${taskId}/${attemptId}`, sha };
+}
+
+// Queue-режим: durable ref выписывается строго ДО reset --hard на base —
+// проверенный/удержанный candidate_sha никогда не осиротеет при сбросе
+// worktree. Сбой закрепления пробрасывается и останавливает сброс: потерять
+// verified-коммит хуже, чем остановить демон с нетронутым деревом.
+export async function resetQueueWorktree({ git, base, phase, record } = {}) {
+  const pin = candidatePinRef({ phase, record });
+  if (pin !== null) await git('update-ref', pin.ref, pin.sha);
+  await git('reset', '--hard', base);
+  await git('clean', '-fd');
+}
+
 async function ownerAnswerSource(cfg, principal, tree, inbox) {
   if (cfg === undefined) return undefined;
   if (cfg?.exclusiveBoardOwner !== true || !isAbsolute(cfg.inbox ?? '') ||
@@ -688,6 +750,16 @@ async function execute() {
   // закреплённый срез; запись в память из контекста воркера запрещена.
   const memoryCfg = memoryPolicyConfig(p.projectMemory);
   const memoryStoreDir = ab ? null : resolveMemoryStoreDir({ policy: p.projectMemory });
+  // HMAC-ключ рецептов памяти резолвется без plaintext в policy JSON: явный
+  // ключ > DF_PROJECT_MEMORY_HMAC_KEY > приватный key-файл 0600. Доверенный
+  // каталог без любого источника ключа — fail-closed отказ на старте, а не
+  // поздний сбой writer при первой записи.
+  const memoryKeyNeeded = memoryStoreDir !== null &&
+    (memoryCfg.trustedReceiptDir !== undefined || memoryCfg.hmacKey !== undefined ||
+      memoryCfg.keyFile !== undefined);
+  const memoryHmacKey = memoryKeyNeeded
+    ? await resolveMemoryHmacKey({ hmacKey: memoryCfg.hmacKey, keyFile: memoryCfg.keyFile })
+    : undefined;
   const currentProjectMemory = async () => memoryStoreDir === null ? null : resolveProjectMemory({
     storeDir: memoryStoreDir, projectId: p.bb.project, worktree: tree,
     maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS });
@@ -699,12 +771,11 @@ async function execute() {
     const slice = await pinnedProjectMemory(key);
     return slice && slice.enabled !== false ? slice : undefined;
   };
-  const projectMemoryWriter = memoryStoreDir !== null &&
-      (memoryCfg.trustedReceiptDir !== undefined || memoryCfg.hmacKey !== undefined)
+  const projectMemoryWriter = memoryStoreDir !== null && memoryHmacKey !== undefined
     ? createProjectMemoryWriter({
         storeDir: memoryStoreDir,
         trustedReceiptDir: memoryCfg.trustedReceiptDir,
-        hmacKey: memoryCfg.hmacKey,
+        hmacKey: memoryHmacKey,
         worktree: tree,
         maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS,
         ...(memoryCfg.maxEntriesPerSection !== undefined
@@ -793,7 +864,11 @@ async function execute() {
     }
   };
   const record = join(root, 'attempt.json');
-  const rawGit = async (...args) => (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout;
+  // Каждый git-вызов доверенного контроллера на worker-writable дереве
+  // ужесточён: явный maxBuffer на большие diff scope-fence/адаптивных гейтов,
+  // отключённые hooks/fsmonitor/external diff и изолированная конфигурация.
+  const rawGit = async (...args) => (await exec('git', ['-C', tree, ...HARDENED_GIT_CONFIG, ...args],
+    { timeout: 10000, maxBuffer: 16 * 1024 * 1024, env: hardenedGitEnv() })).stdout;
   const git = async (...args) => (await rawGit(...args)).trim();
   const authorize = async (state, taskId) => {
     await assertPinned();
@@ -1033,8 +1108,7 @@ async function execute() {
         await git('branch', '--show-current') !== p.profiles[route.checkProfile].branch ||
         await git('status', '--porcelain=v1', '--untracked-files=all')) return null;
     const sha = await git('rev-parse', 'HEAD');
-    await git('merge-base', '--is-ancestor', route.base, sha);
-    return sha;
+    return ancestorOrNull(git, route.base, sha);
   }
   const questionGate = ownerAnswers && { ...ownerAnswers,
     capture: ({ attempt, turnSeq }) => stableCheckpoint(attempt.bb_thread_id, turnSeq),
@@ -1412,7 +1486,7 @@ async function execute() {
         const memResult = await recordPostReviewMemory({
           writer: projectMemoryWriter,
           trustedReceiptDir: memoryCfg.trustedReceiptDir,
-          hmacKey: memoryCfg.hmacKey,
+          hmacKey: memoryHmacKey,
           projectId: p.bb.project,
           worktree: tree,
           result,
@@ -1448,10 +1522,14 @@ async function execute() {
     await beforeEffect?.();
     const specInputs = queueModeSpecInputs({ route, attempt: req,
       operatorBrief: pinned.inputs.get(brief).toString('utf8'), reviewSpec });
+    // Промпт арбитра форматируется под семейство фактического арбитра триады
+    // (тот же нормализованный спек, что исполнит раннер): без пятого аргумента
+    // семейственные правила промпта не применялись вообще.
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
       prompt: arbiterIntakePrompt(specInputs.reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
         await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined,
-        await activeProjectMemory(`${req.task_id}:${req.attempt_id}:${req.epoch}`)) });
+        await activeProjectMemory(`${req.task_id}:${req.attempt_id}:${req.epoch}`),
+        runnerReviewSpec(req?.arbiter) ?? undefined) });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
     telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
     telemetry.recordArbitration();
@@ -1462,7 +1540,7 @@ async function execute() {
   let recheck = values['recheck-rejected-handoff'];
   const tick = guardedEffect(assertOpen, advanceWithProjection);
   const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
-    release: releasePort, recheckRejectedHandoff: recheck, eventBus,
+    release: releasePort, recheckRejectedHandoff: recheck, eventBus, recoverInterruptedChecking: true,
     workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter,
       baseWorker: baseWorkerFromPolicy(p),
       ...(ab ? { selectWorker: () => [{ provider: p.bb.provider, model: p.bb.model }] } : {}), arbitrate,
@@ -1561,8 +1639,7 @@ async function execute() {
             // Иначе сводка следующей карточки унаследует счётчики предыдущей.
             await finishTelemetry();
             try {
-              await git('reset', '--hard', route.base);
-              await git('clean', '-fd');
+              await resetQueueWorktree({ git, base: route.base, phase: result.phase, record: closedRecord });
             } catch (error) {
               process.exitCode = 1;
               console.error(`queue worktree reset failed: ${String(error?.message ?? error).split('\n')[0]}`);
@@ -1598,7 +1675,11 @@ async function execute() {
   } finally {
     try {
       const shutdownRecord = await state.load().catch(() => null);
-      await stopWorkerThread(shutdownRecord?.threadId ?? liveThreadId);
+      // Активный in-flight воркер переживает graceful shutdown/SIGTERM и
+      // истёкший pilot wait: принудительная остановка — только терминальных фаз.
+      if (shouldStopWorkerOnShutdown({ recordPhase: shutdownRecord?.phase, resultPhase: lastResult?.phase })) {
+        await stopWorkerThread(shutdownRecord?.threadId ?? liveThreadId);
+      }
       // Закрытая карточка с историей REWORK — источник уроков (#1263).
       if (['done', 'hold'].includes(lastResult?.phase)) await distillClosedAttempt();
       await finishTelemetry();
