@@ -281,3 +281,49 @@ test('mixed pipeline: allow segment + critical segment blocks', () => {
   expectBlock('rm -rf node_modules && echo ok && git push -f', 'critical');
   expectBlock('git status; docker system prune -a', 'critical');
 });
+
+test('AUDIT-0c: command substitution внутри двойных кавычек блокируется', () => {
+  expectBlock('echo "$(rm -rf /)"', 'critical');
+  expectBlock('echo "`rm -rf /`"', 'critical');
+  expectAllow('echo "\\$(rm -rf /)"');
+  expectAllow('echo "\\`rm -rf /\\`"');
+  expectAllow("echo '$(rm -rf /)'");
+  expectAllow("echo '`rm -rf /`'");
+});
+
+test('AUDIT-0c: ведущие редиректы не прячут команду в argv[0]', () => {
+  for (const cmd of [
+    '>> /tmp/x rm -rf /',
+    '2>> /tmp/x rm -rf /',
+    '1>> /tmp/x rm -rf /',
+    '&> /tmp/x rm -rf /',
+    '<<< x rm -rf /',
+  ]) {
+    expectBlock(cmd, 'critical');
+  }
+});
+
+test('AUDIT-0c: path traversal в REGEN_DIRS и rm -r по корню блокируются', () => {
+  expectBlock('rm -rf ../../../tmp', 'ordinary');
+  expectBlock('rm -rf ../build', 'ordinary');
+  expectBlock('rm -r /', 'critical');
+  expectBlock('rm -R ~', 'critical');
+});
+
+test('AUDIT-0c: проверяются все -exec/-execdir/-ok/-okdir clauses в find', () => {
+  expectBlock('find . -exec true \\; -exec rm -rf / \\;', 'critical');
+  expectBlock('find . -exec true \\; -execdir rm -rf / \\;', 'critical');
+  expectBlock('find . -exec true \\; -ok rm -rf / \\;', 'critical');
+  expectBlock('find . -exec true \\; -okdir rm -rf / \\;', 'critical');
+});
+
+test('AUDIT-0c: chmod/chown --recursive по корню блокируются', () => {
+  expectBlock('chmod --recursive 777 /', 'critical');
+  expectBlock('chown --recursive root:root /', 'critical');
+});
+
+test('AUDIT-0c: benign regeneration deletes remain allowed', () => {
+  expectAllow('rm -rf node_modules');
+  expectAllow('rm -rf dist');
+  expectAllow('rm -rf build/.cache');
+});
