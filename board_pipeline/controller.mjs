@@ -134,7 +134,10 @@ function attemptOf(record, route) {
     if (record.contract.has_ui !== undefined) attempt.has_ui = record.contract.has_ui;
     if (record.contract.category !== undefined) attempt.category = record.contract.category;
     if (record.contract.allowed_paths !== undefined) attempt.allowed_paths = record.contract.allowed_paths;
-    if (record.contract.labels !== undefined) attempt.labels = record.contract.labels;
+    if (record.contract.labels !== undefined) {
+      attempt.labels = Object.fromEntries(Object.entries(record.contract.labels)
+        .filter(([key]) => key !== 'allowed_paths'));
+    }
     if (typeof record.contract.specText === 'string') attempt.specText = record.contract.specText;
   }
   return attempt;

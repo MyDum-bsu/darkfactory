@@ -301,9 +301,9 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
         return undefined;
       }
       const observedTurn = Number.isSafeInteger(observed.turn) ? observed.turn : null;
-      const monotonicTurn = observedTurn !== null && observedTurn > after ? observedTurn : null;
-      if (monotonicTurn === null && activity.seenActive !== true && after !== 0) return undefined;
-      const turnSeq = monotonicTurn ?? after + 1;
+      if (observedTurn !== null && observedTurn <= after) return undefined;
+      if (observedTurn === null && activity.seenActive !== true && after !== 0) return undefined;
+      const turnSeq = observedTurn ?? after + 1;
       activity.seenActive = false;
       const completed = observed.state === 'done' || observed.state === 'idle' ||
         (observed.state === 'exited' && observed.exitCode === 0);
@@ -1062,6 +1062,15 @@ async function execute() {
     const specInputs = queueModeSpecInputs({ route, attempt,
       operatorBrief: pinned.inputs.get(brief).toString('utf8'), reviewSpec });
     const acceptanceAttempt = { ...attempt };
+    if (acceptanceAttempt.labels !== null && typeof acceptanceAttempt.labels === 'object' &&
+        !Array.isArray(acceptanceAttempt.labels)) {
+      if (acceptanceAttempt.allowed_paths === undefined &&
+          typeof acceptanceAttempt.labels.allowed_paths === 'string') {
+        acceptanceAttempt.allowed_paths = acceptanceAttempt.labels.allowed_paths;
+      }
+      acceptanceAttempt.labels = Object.fromEntries(Object.entries(acceptanceAttempt.labels)
+        .filter(([key]) => key !== 'allowed_paths'));
+    }
     delete acceptanceAttempt.specText;
     const reviewSpecText = reviewText(specInputs.reviewSpec);
     const reviewRules = [decisionSlice && decisionsPromptBlock(decisionSlice),

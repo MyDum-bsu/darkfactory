@@ -1367,7 +1367,8 @@ test('queue mode pins allowed_paths into the contract and verification attempt',
   await x.tick();
   const attempt = x.effects.attempts.at(-1);
   assert.equal(attempt.allowed_paths, scoped);
-  assert.equal(attempt.labels.allowed_paths, scoped);
+  assert.equal(attempt.labels.allowed_paths, undefined);
+  assert.deepEqual(attempt.labels, {});
 
   const empty = await queueLab(t, { labels: { ...CONTRACT, allowed_paths: '' } });
   await empty.tick();

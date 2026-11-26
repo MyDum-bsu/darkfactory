@@ -784,3 +784,25 @@ test('readSubmissionEnvelope returns typed invalid handoffs for malformed, overs
   const valid = await readSubmissionEnvelope(deps());
   assert.deepEqual(valid.submission, { candidate_sha: 'c'.repeat(40) });
 });
+
+test('portable observeTurn never fabricates a new turn from an explicit stale watermark', async () => {
+  const observations = [{ state: 'idle', turn: 1 }, { state: 'idle', turn: 0 }];
+  const feedbackInputs = [];
+  const runtime = {
+    probeAvailability: async () => ({ status: 'available' }),
+    spawn: async input => ({ runtimeId: input.runtimeId }),
+    feedback: async input => {
+      feedbackInputs.push(input);
+      return { delivered: true, turn: 1, started: true };
+    },
+    observe: async () => observations.shift() ?? { state: 'idle', turn: 1 },
+  };
+  const transport = buildWorkerTransport({ kind: 'hc',
+    policy: { bb: { provider: 'acp-devin', model: 'swe-2-1-medium' }, route: {} },
+    runtime, bbTransport: {}, prepareSpawn: async () => '/tmp/prompt', prepareFeedback: async () => 'rework' });
+  const attempt = { task_id: '6242', epoch: 1, attempt_id: 'attempt-stale-turn' };
+  const runtimeId = deterministicRuntimeId('hc', attempt.task_id, attempt.attempt_id);
+  await transport.feedback({ attempt: { ...attempt, bb_thread_id: runtimeId }, feedbackId: 'fb-stale' });
+  assert.equal(await transport.observeTurn({ runtimeId, after: 1 }), undefined);
+  assert.equal(await transport.observeTurn({ runtimeId, after: 0 }), undefined);
+});
