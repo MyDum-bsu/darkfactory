@@ -1887,6 +1887,9 @@ test('enqueue: метка allowed_paths валидируется до вызов
   const valid = await buildEnqueuePlan({ ...baseValues(),
     label: ['allowed_paths=src,ops/x, board_pipeline/model-registry.mjs'] });
   assert.equal(valid.labels.allowed_paths, 'src,ops/x, board_pipeline/model-registry.mjs');
+  const directoryPrefix = await buildEnqueuePlan({ ...baseValues(),
+    label: ['allowed_paths=src/,ops/x'] });
+  assert.equal(directoryPrefix.labels.allowed_paths, 'src/,ops/x');
   const edge = `a/${'x'.repeat(254)}`;
   assert.equal(edge.length, 256);
   const edgePlan = await buildEnqueuePlan({ ...baseValues(),
@@ -1895,7 +1898,8 @@ test('enqueue: метка allowed_paths валидируется до вызов
   // Отказы: traversal, абсолютный путь, home, пустой сегмент, пустое
   // значение, обратный слэш, внутренние управляющие символы — до вызова vb.
   for (const bad of ['../x', 'a/../b', 'src/../../etc', '/etc/passwd', '~/secret',
-    'src,,ops', 'src,', ',src', '', 'a\\b', 'a\nb', 'x\0y', 'a\tb']) {
+    'src,,ops', 'src,', ',src', '', 'a\\b', 'a\nb', 'x\0y', 'a\tb',
+    'a//b', './src', '.', 'C:/windows']) {
     await assert.rejects(() => buildEnqueuePlan({ ...baseValues(),
       label: [`allowed_paths=${bad}`] }), /allowed_paths_invalid/, JSON.stringify(bad));
   }

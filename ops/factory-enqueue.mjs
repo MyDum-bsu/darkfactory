@@ -27,6 +27,7 @@ import { parseArgs, promisify } from 'node:util';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
 import { resolveL1Profile } from '../board_pipeline/l1-profiles.mjs';
 import { assertNoBranchDrift } from '../board_pipeline/branch-drift.mjs';
+import { parseAllowedPaths } from '../board_pipeline/scope-fence.mjs';
 
 const execFileAsync = promisify(execFile);
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -42,11 +43,14 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 function validateAllowedPathsLabel(value) {
   if (typeof value !== 'string' || value.length === 0) fail('allowed_paths_invalid');
   if (value.length > ALLOWED_PATHS_LIMIT) fail('allowed_paths_too_long');
+  try {
+    parseAllowedPaths(value);
+  } catch {
+    fail('allowed_paths_invalid');
+  }
   for (const entry of value.split(',')) {
     const trimmed = entry.trim();
-    if (trimmed === '' || trimmed.startsWith('/') || trimmed.startsWith('~') ||
-        trimmed.includes('\\') || CONTROL_CHARS.test(trimmed) ||
-        trimmed.split('/').some(segment => segment === '..')) {
+    if (trimmed.startsWith('~') || CONTROL_CHARS.test(trimmed)) {
       fail('allowed_paths_invalid');
     }
   }
