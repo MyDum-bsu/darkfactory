@@ -50,26 +50,29 @@ async function fixture(t) {
   return { root, worktree, state, handoffDir, ops, policy, writePolicy, values, profile };
 }
 
-const runtimeValue = plan => {
-  const indexes = plan.argv.flatMap((arg, index) => arg === '--runtime' ? [index] : []);
-  assert.equal(indexes.length, 1);
-  return plan.argv[indexes[0] + 1];
-};
+const runtimeArgvIndexes = plan =>
+  plan.argv.flatMap((arg, index) => arg === '--runtime' ? [index] : []);
+const runtimeValue = plan => plan.env.DF_WORKER_RUNTIME;
 
 test('default runtime is explicitly hc and explicit/policy/env resolution is fail-closed', async t => {
   const f = await fixture(t);
   const plan = await buildRunPlan(f.values(), { env: {} });
   assert.equal(runtimeValue(plan), 'hc');
+  assert.deepEqual(runtimeArgvIndexes(plan), []);
 
   const envPlan = await buildRunPlan(f.values(), { env: { DF_WORKER_RUNTIME: 'bb' } });
   assert.equal(runtimeValue(envPlan), 'bb');
+  assert.deepEqual(runtimeArgvIndexes(envPlan), []);
 
   await f.writePolicy({ workerRuntime: 'subproc' });
   const policyPlan = await buildRunPlan(f.values(), { env: { DF_WORKER_RUNTIME: 'bb' } });
   assert.equal(runtimeValue(policyPlan), 'subproc');
+  assert.deepEqual(runtimeArgvIndexes(policyPlan), []);
 
   const explicitPlan = await buildRunPlan(f.values({ runtime: 'hc' }), { env: { DF_WORKER_RUNTIME: 'bb' } });
   assert.equal(runtimeValue(explicitPlan), 'hc');
+  assert.equal(runtimeArgvIndexes(explicitPlan).length, 1);
+  assert.equal(explicitPlan.argv[runtimeArgvIndexes(explicitPlan)[0] + 1], 'hc');
 
   await f.writePolicy({ workerRuntime: null });
   await assert.rejects(() => buildRunPlan(f.values(), { env: {} }), /worker_runtime_kind_invalid/);
@@ -87,9 +90,12 @@ test('runFactory dry-run forwards exactly one runtime selection to the controlle
     '--policy', f.policy, '--state', f.state, '--dry-run'];
   const defaulted = await runFactory(args, { git, env: {} });
   assert.equal(runtimeValue(defaulted.plan), 'hc');
+  assert.deepEqual(runtimeArgvIndexes(defaulted.plan), []);
   const explicit = await runFactory([...args.slice(0, -1), '--runtime', 'subproc', '--dry-run'],
     { git, env: {} });
   assert.equal(runtimeValue(explicit.plan), 'subproc');
+  assert.equal(runtimeArgvIndexes(explicit.plan).length, 1);
+  assert.equal(explicit.plan.argv[runtimeArgvIndexes(explicit.plan)[0] + 1], 'subproc');
 });
 
 test('node_modules mount targets stay strict: nested canonical targets pass, traversal and controls fail', async t => {

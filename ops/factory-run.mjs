@@ -161,7 +161,8 @@ function candidateNodeModulesTarget(to) {
 
 const PASSTHROUGH_BOOL = ['stop-on-idle', 'daemon', 'allow-live-pilot',
   'recheck-rejected-handoff'];
-const PASSTHROUGH_VALUE = ['switch', 'interval-ms', 'event-socket'];
+const PASSTHROUGH_VALUE = ['switch', 'interval-ms', 'runtime', 'event-socket'];
+const WORKER_RUNTIME_ENV = 'DF_WORKER_RUNTIME';
 const LEDGER_PATH_ENV = 'DF_DECISION_LEDGER_PATH';
 const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 
@@ -238,7 +239,7 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   // запуск не наследует молчаливый legacy-дефолт bb контроллера.
   const runtime = values.runtime !== undefined ? values.runtime
     : policy.workerRuntime !== undefined ? policy.workerRuntime
-      : env.DF_WORKER_RUNTIME !== undefined ? env.DF_WORKER_RUNTIME
+      : env[WORKER_RUNTIME_ENV] !== undefined ? env[WORKER_RUNTIME_ENV]
         : 'hc';
   if (!['bb', 'hc', 'subproc'].includes(runtime)) fail('worker_runtime_kind_invalid');
 
@@ -616,9 +617,11 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
 
   // CLI-override без конфликта с политикой передаётся контроллеру через
   // тот же env-канал (DF_DECISION_LEDGER_PATH / DF_PROJECT_MEMORY_DIR):
-  // проверенный путь и есть используемый путь. В план попадают только
+  // проверенный путь и есть используемый путь. Разрешённый runtime тоже
+  // закрепляется env-override: implicit default не меняет argv контракт
+  // контроллера и не наследует его legacy-дефолт bb. В план попадают только
   // переопределения — унаследованное окружение (токены, ключи) не печатается.
-  const envOverrides = {};
+  const envOverrides = { [WORKER_RUNTIME_ENV]: runtime };
   if (values['ledger-path'] !== undefined) envOverrides[LEDGER_PATH_ENV] = values['ledger-path'];
   if (values['memory-dir'] !== undefined) envOverrides[MEMORY_DIR_ENV] = values['memory-dir'];
 
@@ -630,7 +633,6 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   for (const flag of PASSTHROUGH_VALUE) {
     if (values[flag] !== undefined) argv.push(`--${flag}`, values[flag]);
   }
-  argv.push('--runtime', runtime);
   // Только ЯВНЫЙ выбор оператора передаётся контроллеру как --l1-profile:
   // резолвленный здесь дефолт репозитория не пробрасывается — контроллер
   // считал бы его явным, и явный l1Profile рецепта конфликтовал бы с

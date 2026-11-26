@@ -341,15 +341,34 @@ export function selectIdleHcTerminals(terminals, { pinnedThreads = [], selfThrea
     id: terminal?.name,
     status: hcTerminalStatus(terminal),
   }));
-  const selected = selectIdleThreads(normalized, { pinnedThreads, selfThreadId });
-  const byName = new Map(rows.filter(t => typeof t?.name === 'string').map(t => [t.name, t]));
-  return {
-    stoppable: selected.stoppable.map(({ id }) => {
-      const source = byName.get(id);
-      return { id, ...(typeof source?.address === 'string' && source.address ? { address: source.address } : {}) };
-    }),
-    skipped: selected.skipped,
-  };
+  // Address — свойство конкретной live-строки, а не имени вообще: finished-
+  // записи с тем же именем не должны перезаписывать цель kill. Два live-
+  // терминала с одним runtime id — двусмысленность, поэтому оба защищаются.
+  const liveCounts = new Map();
+  for (const terminal of normalized) {
+    if (terminal?.state === 'live' && WORKER_SESSION_ID.test(terminal.id ?? '')) {
+      liveCounts.set(terminal.id, (liveCounts.get(terminal.id) ?? 0) + 1);
+    }
+  }
+  const stoppable = [];
+  const skipped = [];
+  for (const terminal of normalized) {
+    const selected = selectIdleThreads([terminal], { pinnedThreads, selfThreadId });
+    if (selected.stoppable.length === 0) {
+      skipped.push(...selected.skipped);
+      continue;
+    }
+    const [{ id }] = selected.stoppable;
+    if ((liveCounts.get(id) ?? 0) !== 1) {
+      skipped.push({ id, reason: 'duplicate_live_name' });
+      continue;
+    }
+    stoppable.push({
+      id,
+      ...(typeof terminal?.address === 'string' && terminal.address ? { address: terminal.address } : {}),
+    });
+  }
+  return { stoppable, skipped };
 }
 
 // --- Журнал -----------------------------------------------------------------

@@ -372,6 +372,26 @@ test('hc idle selection uses runtime names, protects ambiguous/live work and kee
   assert.equal(skipped.some(s => s.id === 'operator-shell'), false);
 });
 
+test('hc kill address stays with the matched live row when finished rows reuse a name', () => {
+  const id = 'df-10286-af4c3b8f7d';
+  const { stoppable, skipped } = selectIdleHcTerminals([
+    { address: 't-live', name: id, state: 'live', status: 'idle' },
+    { address: 't-finished', name: id, state: 'finished', status: 'idle' },
+  ]);
+  assert.deepEqual(stoppable, [{ id, address: 't-live' }]);
+  assert.deepEqual(skipped, [{ id, reason: 'status:finished' }]);
+
+  const duplicates = selectIdleHcTerminals([
+    { address: 't-first', name: id, state: 'live', status: 'idle' },
+    { address: 't-second', name: id, state: 'live', status: 'idle' },
+  ]);
+  assert.deepEqual(duplicates.stoppable, []);
+  assert.deepEqual(duplicates.skipped, [
+    { id, reason: 'duplicate_live_name' },
+    { id, reason: 'duplicate_live_name' },
+  ]);
+});
+
 // --- Журнал JSONL 0600 ----------------------------------------------------------
 
 test('journal is JSONL with 0600 file in a 0700 dir, appended across opens', async () => {
