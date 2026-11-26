@@ -148,7 +148,8 @@ function attemptOf(record, route) {
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
 export async function advance({ route, state, board, bb, submissions, verify, authorize,
-  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger, eventBus }) {
+  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger, eventBus,
+  recoverInterruptedChecking = false }) {
   checkRoute(route);
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const hazards = mutants ?? {};
@@ -484,8 +485,34 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     }
     return visible();
   }
-  if (IN_FLIGHT.has(record.phase)) return reconcileInFlight();
-  if (record.phase !== 'working' && !recheck) throw new Error('Unknown attempt state');
+  // Охраняемое восстановление прерванной проверки (opt-in recoverInterruptedChecking,
+  // по умолчанию выключено — строгий uncertain сохраняется): Spot VM может быть
+  // вытеснена между записью checking и завершением verify(). Повтор verify()
+  // допустим, только когда Board всё ещё доказывает наш захват на той же epoch
+  // и нет терминальной квитанции результата; расхождение state/epoch или сбой
+  // lookup — строгий uncertain, как раньше.
+  const interruptedCheckingRecoverable = async () => {
+    // Повтор ровно один раз на раунд проверки: маркер checkingRecovered
+    // ставится при восстановлении и сбрасывается новым раундом checking.
+    if (record.checkingRecovered === true) return false;
+    if (typeof record.sha !== 'string' || !shaRE.test(record.sha)) return false;
+    // Терминальная квитанция означает завершённую обработку результата —
+    // повтор verify() был бы вторым внешним эффектом.
+    const receiptKind = record.receipt?.kind;
+    if (receiptKind !== undefined && !['spawn', 'feedback', 'resume'].includes(receiptKind)) return false;
+    const live = await board.lookup(record.taskId ?? route.taskId).catch(() => null);
+    return live?.state === 'claimed' && live?.epoch === record.epoch;
+  };
+  let recoveredChecking = false;
+  if (IN_FLIGHT.has(record.phase)) {
+    if (record.phase === 'checking' && recoverInterruptedChecking === true &&
+        await interruptedCheckingRecoverable()) {
+      recoveredChecking = true;
+    } else {
+      return reconcileInFlight();
+    }
+  }
+  if (record.phase !== 'working' && !recheck && !recoveredChecking) throw new Error('Unknown attempt state');
 
   // After process restart the adapter can recover the same held capability. It cannot re-claim.
   try {
@@ -499,33 +526,53 @@ export async function advance({ route, state, board, bb, submissions, verify, au
 
   const attempt = attemptOf(record, route);
   const after = record.turnSeq ?? 0;
-  const observation = await submissions.read(attempt, after);
-  // GUARD:NoWatermarkRegression — ход не новее watermark никогда не засчитывается
-  // за ответ на уже отправленный feedback.
-  if (!observation || !Number.isSafeInteger(observation.turnSeq) ||
-      (!hazards.staleTurnWatermark && observation.turnSeq <= after)) return visible();
-  const { submission, turnSeq } = observation;
-  // A legacy record remembers its checked SHA, but not which BB turn produced it.
-  if (!after && record.seenShas.length && (!submission || record.seenShas.includes(submission.candidate_sha))) {
-    return visible();
-  }
-  const workerCrashed = observation.state === 'exited' && observation.exitCode !== 0 &&
-    (submission === undefined || submission === null);
-  if (workerCrashed) {
-    const crashResumes = Number.isSafeInteger(record.crashResumes) ? record.crashResumes : 0;
-    if (crashResumes < 2 && typeof bb.resume === 'function') {
-      let resumeFailed = false;
-      let resumed;
-      try {
-        resumed = await bb.resume({ attempt, turnSeq, reason: 'worker_crashed', crashResumes });
-      } catch {
-        resumeFailed = true;
-      }
-      if (!resumeFailed && resumed?.resumed !== false && resumed?.confirmed !== false &&
-          (resumed?.threadId === undefined || resumed.threadId === attempt.bb_thread_id)) {
-        await save({ phase: 'working', turnSeq, crashResumes: crashResumes + 1,
-          receipt: { kind: 'resume', confirmed: 'started' } });
-        return visible();
+  let submission;
+  let turnSeq;
+  if (recoveredChecking) {
+    // Конверт уже прошёл проверку на исходном тике и зафиксирован в записи:
+    // verify() повторяется по реконструированному конверту того же кандидата,
+    // без повторного чтения хода воркера (терминал мог не пережить вытеснение).
+    turnSeq = record.turnSeq;
+    submission = { task_id: attempt.task_id, epoch: attempt.epoch,
+      attempt_id: attempt.attempt_id, worker_thread_id: attempt.bb_thread_id,
+      candidate_sha: record.sha };
+    await save({ checkingRecovered: true });
+  } else {
+    const observation = await submissions.read(attempt, after);
+    // GUARD:NoWatermarkRegression — ход не новее watermark никогда не засчитывается
+    // за ответ на уже отправленный feedback.
+    if (!observation || !Number.isSafeInteger(observation.turnSeq) ||
+        (!hazards.staleTurnWatermark && observation.turnSeq <= after)) return visible();
+    submission = observation.submission;
+    turnSeq = observation.turnSeq;
+    // A legacy record remembers its checked SHA, but not which BB turn produced it.
+    // Запись после crash-resume — не legacy: watermark там сброшен осознанно,
+    // и ход свежего терминала обязан обрабатываться обычным путём.
+    if (!after && !(record.crashResumes > 0) && record.seenShas.length &&
+        (!submission || record.seenShas.includes(submission.candidate_sha))) {
+      return visible();
+    }
+    const workerCrashed = observation.state === 'exited' && observation.exitCode !== 0 &&
+      (submission === undefined || submission === null);
+    if (workerCrashed) {
+      const crashResumes = Number.isSafeInteger(record.crashResumes) ? record.crashResumes : 0;
+      if (crashResumes < 2 && typeof bb.resume === 'function') {
+        let resumeFailed = false;
+        let resumed;
+        try {
+          resumed = await bb.resume({ attempt, turnSeq, reason: 'worker_crashed', crashResumes });
+        } catch {
+          resumeFailed = true;
+        }
+        if (!resumeFailed && resumed?.resumed !== false && resumed?.confirmed !== false &&
+            (resumed?.threadId === undefined || resumed.threadId === attempt.bb_thread_id)) {
+          // Свежий возобновлённый терминал нумерует ходы заново с 1: watermark
+          // упавшего терминала masked бы ход 1 (observeTurn(after=1) ждал бы ход
+          // 2, который никогда не наступит) — сброс до 0 при подтверждённом resume.
+          await save({ phase: 'working', turnSeq: 0, crashResumes: crashResumes + 1,
+            receipt: { kind: 'resume', confirmed: 'started' } });
+          return visible();
+        }
       }
     }
   }
@@ -583,7 +630,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     } : { prompt: 'Передать проверенный кандидат в стадию допуска к выпуску?',
       evidence: 'Проверки и seal пройдены. Ответ не запускает выпуск.' }) });
   if (submission === undefined) {
-    return stopWith(after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
+    // После crash-resume watermark сброшен до 0, но воркер уже производил ходы:
+    // причина различается по crashResumes, а не только по after.
+    return stopWith(after || (record.crashResumes ?? 0) > 0
+      ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
   }
   if (submission === null || typeof submission !== 'object' || Array.isArray(submission)) {
     return stopWith('invalid_or_stale_submission');
@@ -604,10 +654,13 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   if (typeof submission.candidate_sha !== 'string' || !shaRE.test(submission.candidate_sha)) {
     return stopWith('invalid_or_stale_submission');
   }
-  if (record.seenShas.includes(submission.candidate_sha)) return stopWith('worker_turn_finished_without_new_handoff');
-
-  await save({ phase: 'checking', reason: undefined, sha: submission.candidate_sha, turnSeq,
-    seenShas: [...record.seenShas, submission.candidate_sha] });
+  if (!recoveredChecking) {
+    if (record.seenShas.includes(submission.candidate_sha)) return stopWith('worker_turn_finished_without_new_handoff');
+    // Новый раунд проверки сбрасывает маркер восстановления: охраняемый повтор
+    // verify() допустим один раз на каждый прерванный раунд, а не один раз на попытку.
+    await save({ phase: 'checking', reason: undefined, sha: submission.candidate_sha, turnSeq,
+      seenShas: [...record.seenShas, submission.candidate_sha], checkingRecovered: false });
+  }
   if (release && route.finish === 'deployed') {
     try { prepared = await release.prepare(submission.candidate_sha); }
     catch (cause) { return stopWith(cause instanceof ReleaseDenied ? cause.code : 'release_prepare_failed'); }

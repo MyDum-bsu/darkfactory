@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildEnqueuePlan, enqueueOutput, runEnqueue } from './factory-enqueue.mjs';
+import { buildEnqueuePlan, computeSpecDigest, enqueueOutput, runEnqueue } from './factory-enqueue.mjs';
 import { buildRunPlan, ensureFilemodeGuard, forbiddenModelViolation,
   modelViolation, runFactory } from './factory-run.mjs';
 
@@ -1912,4 +1912,45 @@ test('enqueue: метка allowed_paths валидируется до вызов
   // allowed_paths проходит без изменений.
   const other = await buildEnqueuePlan({ ...baseValues(), label: ['domain=billing'] });
   assert.equal(other.labels.domain, 'billing');
+});
+
+test('enqueue: --text без --brief и --spec-digest закрепляет sha256 текста автоматически', async () => {
+  // Оператор не обязан вручную хэшировать текст: без явного --spec-digest
+  // и без --brief дайджест вычисляется из фактического текста карточки,
+  // иначе run-isolated молча опустил бы спеку из промпта воркера.
+  const text = 'multi-line spec\nsecond line\n';
+  const plan = await buildEnqueuePlan({ ...baseValues(), title: undefined,
+    text, 'spec-digest': undefined });
+  assert.equal(plan.labels.spec_digest, sha256Text(text));
+  assert.equal(plan.argv[5], text);
+  // Пустой/пробельный текст — по-прежнему отказ title_or_text_required.
+  await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), title: undefined,
+    text: '   ', 'spec-digest': undefined }), /title_or_text_required/);
+  // computeSpecDigest — тот же sha256 utf8, что сверяет контроллер.
+  assert.equal(computeSpecDigest(text), sha256Text(text));
+  assert.equal(computeSpecDigest(''), sha256Text(''));
+  assert.throws(() => computeSpecDigest(undefined), /spec_digest_invalid/);
+});
+
+test('enqueue: --text первичен над --brief для spec_digest без явного дайджеста', async () => {
+  const dir = await tempdir();
+  try {
+    const brief = join(dir, 'brief.md');
+    await writeFile(brief, 'brief body\n');
+    // Регрессия #WAVE2-1: текст карточки — это --text, поэтому и дайджест
+    // обязан закреплять --text; хэш brief молча отрывал спеку от воркера.
+    const plan = await buildEnqueuePlan({ ...baseValues(), title: undefined,
+      text: 'explicit text', 'spec-digest': undefined, brief });
+    assert.equal(plan.argv[5], 'explicit text');
+    assert.equal(plan.labels.spec_digest, sha256Text('explicit text'));
+    // Явный --spec-digest — осознанное закрепление оператора: валидный
+    // дайджест принимается как раньше, невалидный отклоняется до вызова vb.
+    const pinned = await buildEnqueuePlan({ ...baseValues(), title: undefined,
+      text: 'explicit text', 'spec-digest': HEX, brief: undefined });
+    assert.equal(pinned.labels.spec_digest, HEX);
+    await assert.rejects(() => buildEnqueuePlan({ ...baseValues(), title: undefined,
+      text: 'explicit text', 'spec-digest': 'zz', brief: undefined }), /spec_digest_invalid/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
