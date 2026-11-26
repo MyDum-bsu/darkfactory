@@ -218,3 +218,186 @@ test('invalid input is rejected fail-closed and closed ledger refuses operations
   assert.throws(() => ledger.queryRelevantDecisions({}), /^Error: unified_ledger_closed$/);
   assert.throws(() => ledger.proposeDecision(proposal()), /^Error: unified_ledger_closed$/);
 });
+
+test('listPendingProposals returns only pending proposals oldest first', () => {
+  const ledger = openUnifiedLedger(':memory:');
+  try {
+    assert.deepEqual(ledger.listPendingProposals(), []);
+    const first = ledger.proposeDecision(proposal({ topic: 'first-in-queue' }));
+    const second = ledger.proposeDecision(proposal({ topic: 'second-in-queue' }));
+    const third = ledger.proposeDecision(proposal({ topic: 'third-in-queue' }));
+    let pending = ledger.listPendingProposals();
+    assert.deepEqual(pending.map(row => row.topic), ['first-in-queue', 'second-in-queue', 'third-in-queue']);
+    assert.ok(pending.every(row => row.status === 'pending'));
+    // created_at упорядочен по неубыванию — детерминированная очередь на аппрув.
+    for (let i = 1; i < pending.length; i += 1) {
+      assert.ok(pending[i - 1].created_at <= pending[i].created_at);
+    }
+    // Одобренные и отклонённые предложения выпадают из очереди навсегда.
+    ledger.approveProposal(first.proposal_id, { approvedBy: 'owner' });
+    ledger.rejectProposal(second.proposal_id, { rejectedBy: 'owner' });
+    pending = ledger.listPendingProposals();
+    assert.deepEqual(pending.map(row => row.topic), ['third-in-queue']);
+    ledger.approveProposal(third.proposal_id, { approvedBy: 'owner' });
+    assert.deepEqual(ledger.listPendingProposals(), []);
+  } finally { ledger.close(); }
+});
+
+test('rejectProposal is atomic across concurrent connections: approve+reject cannot split-brain', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'unified-ledger-race-'));
+  try {
+    const dbPath = join(dir, 'ledger.sqlite');
+    const setup = openUnifiedLedger(dbPath);
+    const prop = setup.proposeDecision(proposal());
+    setup.close();
+
+    // Два независимых подключения к одному файлу: оба видели предложение
+    // pending, но только первый терминальный переход побеждает.
+    const ledgerA = openUnifiedLedger(dbPath);
+    const ledgerB = openUnifiedLedger(dbPath);
+    const approved = ledgerA.approveProposal(prop.proposal_id, { approvedBy: 'owner' });
+    assert.equal(approved.status, 'active');
+    assert.throws(() => ledgerB.rejectProposal(prop.proposal_id, { rejectedBy: 'owner' }),
+      /^Error: unified_ledger_proposal_not_pending$/);
+    // Состояние не расщеплено: предложение approved, решение active.
+    const final = openUnifiedLedger(dbPath);
+    assert.equal(final.listPendingProposals().length, 0);
+    const rows = final.queryRelevantDecisions({});
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, approved.id);
+    // И обратная гонка: reject побеждает — approve невозможен.
+    const second = final.proposeDecision(proposal({ topic: 'race two' }));
+    final.close();
+    const ledgerC = openUnifiedLedger(dbPath);
+    const ledgerD = openUnifiedLedger(dbPath);
+    ledgerC.rejectProposal(second.proposal_id, { rejectedBy: 'owner', reason: 'no' });
+    assert.throws(() => ledgerD.approveProposal(second.proposal_id, { approvedBy: 'owner' }),
+      /^Error: unified_ledger_proposal_not_pending$/);
+    assert.equal(ledgerD.queryRelevantDecisions({ query: 'race two' }).length, 0);
+    ledgerA.close();
+    ledgerB.close();
+    ledgerC.close();
+    ledgerD.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('ledger uses WAL journal mode on file-backed databases', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'unified-ledger-wal-'));
+  try {
+    const dbPath = join(dir, 'ledger.sqlite');
+    const ledger = openUnifiedLedger(dbPath);
+    ledger.close();
+    const { DatabaseSync } = await import('node:sqlite');
+    const raw = new DatabaseSync(dbPath);
+    assert.equal(raw.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+    const index = raw.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_decisions_status_scope_created'").get();
+    assert.equal(index.name, 'idx_decisions_status_scope_created');
+    raw.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('exportMarkdown supports project alias and optional areas array', () => {
+  const ledger = openUnifiedLedger(':memory:');
+  try {
+    for (const [scope, topic] of [
+      ['global', 'g-topic'],
+      ['project:proj_x', 'x-topic'],
+      ['area:finops', 'finops-topic'],
+    ]) {
+      const prop = ledger.proposeDecision(proposal({ scope, topic }));
+      ledger.approveProposal(prop.proposal_id, { approvedBy: 'owner' });
+    }
+    const byAlias = ledger.exportMarkdown({ project: 'proj_x' });
+    const byLegacy = ledger.exportMarkdown({ projectId: 'proj_x' });
+    assert.equal(byAlias.markdown, byLegacy.markdown);
+    assert.equal(byAlias.digest, byLegacy.digest);
+    assert.equal(byAlias.total, 2);
+    assert.ok(!byAlias.markdown.includes('finops-topic'));
+
+    const withAreas = ledger.exportMarkdown({ project: 'proj_x', areas: ['finops'] });
+    assert.equal(withAreas.total, 3);
+    assert.ok(withAreas.markdown.includes('finops-topic'));
+    assert.ok(withAreas.markdown.includes('## area:finops'));
+    assert.equal(withAreas.ids.length, 3);
+    // areas с префиксом area: тоже принимаются.
+    const prefixed = ledger.exportMarkdown({ project: 'proj_x', areas: ['area:finops'] });
+    assert.equal(prefixed.markdown, withAreas.markdown);
+    // Противоречивые project/projectId отклоняются fail-closed.
+    assert.throws(() => ledger.exportMarkdown({ project: 'proj_x', projectId: 'proj_y' }),
+      /^Error: unified_ledger_input_invalid$/);
+  } finally { ledger.close(); }
+});
+
+test('exportMarkdown truncates strictly on whole decision entry boundaries', () => {
+  const ledger = openUnifiedLedger(':memory:');
+  try {
+    const ids = [];
+    for (let i = 0; i < 6; i += 1) {
+      const prop = ledger.proposeDecision(proposal({
+        topic: `topic number ${i}`,
+        decision: `decision body ${i} with some additional payload text`,
+      }));
+      const active = ledger.approveProposal(prop.proposal_id, { approvedBy: 'owner' });
+      ids.push(active.id);
+    }
+    const full = ledger.exportMarkdown({});
+    assert.equal(full.truncated, false);
+    assert.deepEqual(full.ids, ids);
+    assert.equal(full.total, 6);
+    // Подбираем бюджет, в который помещается строго часть записей.
+    const fullLength = full.markdown.length;
+    const budget = Math.floor(fullLength / 2);
+    const cut = ledger.exportMarkdown({ maxChars: budget });
+    assert.equal(cut.truncated, true);
+    assert.ok(cut.markdown.length <= budget);
+    assert.ok(cut.ids.length < 6);
+    assert.ok(cut.ids.length >= 1);
+    assert.equal(cut.total, 6);
+    // ids — ровно те записи, что попали в markdown, в исходном порядке.
+    assert.deepEqual(cut.ids, ids.slice(0, cut.ids.length));
+    for (const id of cut.ids) {
+      assert.ok(cut.markdown.includes(id), `included id ${id} must be in markdown`);
+    }
+    for (const id of ids.slice(cut.ids.length)) {
+      assert.ok(!cut.markdown.includes(id), `omitted id ${id} must not leak into markdown`);
+    }
+    // Каждая показанная запись завершена целиком: нет среза посередине —
+    // перед маркером последняя строка записи всегда заканчиваетcя меткой approved.
+    const marker = `_Truncated: showing ${cut.ids.length} of 6 decision entries._`;
+    assert.ok(cut.markdown.includes(marker));
+    assert.ok(cut.markdown.endsWith('_\n'));
+    const bodyBeforeMarker = cut.markdown.slice(0, cut.markdown.indexOf(marker));
+    const lastLine = bodyBeforeMarker.trimEnd().split('\n').at(-1);
+    assert.match(lastLine, /— approved by owner at \S+$/);
+    // Детерминизм усечения.
+    const again = ledger.exportMarkdown({ maxChars: budget });
+    assert.equal(again.markdown, cut.markdown);
+    assert.equal(again.digest, cut.digest);
+    assert.deepEqual(again.ids, cut.ids);
+  } finally { ledger.close(); }
+});
+
+test('exportMarkdown degenerate tiny budget keeps header and marker without mid-entry slices', () => {
+  const ledger = openUnifiedLedger(':memory:');
+  try {
+    const prop = ledger.proposeDecision(proposal({
+      topic: 'wide topic',
+      decision: 'very long decision body '.repeat(30).trim(),
+    }));
+    ledger.approveProposal(prop.proposal_id, { approvedBy: 'owner' });
+    const tiny = ledger.exportMarkdown({ maxChars: 120 });
+    assert.equal(tiny.truncated, true);
+    assert.equal(tiny.ids.length, 0);
+    assert.equal(tiny.total, 1);
+    assert.ok(tiny.markdown.length <= 120);
+    assert.ok(tiny.markdown.startsWith('# Owner Decision Ledger'));
+    assert.ok(tiny.markdown.includes('_Truncated: showing 0 of 1 decision entries._'));
+    // Запись не срезана посередине — её просто нет в выводе.
+    assert.ok(!tiny.markdown.includes('very long decision body'));
+  } finally { ledger.close(); }
+});
