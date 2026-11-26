@@ -23,6 +23,14 @@ export const ROUTING_MODES = Object.freeze(['economy', 'balanced', 'sprint']);
 export const REGISTRY_ROLES = Object.freeze([
   'lead', 'coder_default', 'coder_heavy', 'reviewer', 'arbiter', 'ux_critic']);
 export const ELIGIBLE_STATUSES = Object.freeze(['promo_free', 'active', 'standby']);
+// Провайдеры, исполняемые L2 read-only раннером критика/арбитра: у раннера
+// есть egress-endpoint без coding-харнесса. ACP-харнессы (acp-devin,
+// acp-zcode-start, codex-acp, bb) требуют интерактивной сессии с правами
+// записи и в read-only sandbox не запускаются — кандидат reviewer/arbiter
+// с таким provider неисполняем, даже если семейство и квота подходят.
+export const L2_RUNNABLE_PROVIDERS = Object.freeze(
+  ['google', 'openai', 'anthropic', 'deepseek', 'pi', 'opencode-go']);
+const L2_RUNNABLE_SET = new Set(L2_RUNNABLE_PROVIDERS);
 
 const ROLE_SET = new Set(REGISTRY_ROLES);
 const FAMILY_SET = new Set(MODEL_FAMILIES);
@@ -327,6 +335,29 @@ function publicEntry(entry, status, index, rank, quota) {
   });
 }
 
+// Механический мост инвариантов worker-selector в реестр: запись каталога
+// (или публичный элемент цепочки с теми же полями provider/model)
+// исполняема L2 read-only раннером тогда и только тогда, когда её
+// provider входит в строгий позитивный список L2_RUNNABLE_PROVIDERS.
+// Сопоставление точное, без нормализации регистра: неканоническая форма
+// ('Google') fail-closed неисполняема, как и нестроковый/отсутствующий
+// provider или не-объект.
+export function isL2RunnableEntry(entry) {
+  if (!isRecord(entry) || typeof entry.provider !== 'string') return false;
+  return L2_RUNNABLE_SET.has(entry.provider);
+}
+
+// Закреплённая пара дефолтного контура (review-policy NEON_CRITIC /
+// SOL_ARBITER): модель сопоставляется по финальному сегменту, чтобы обе
+// формы записи — прямой провайдер ('google', 'gemini-4-neon') и вложение
+// харнесса ('pi', 'openai/gpt-6.2-sol') — узнавались одинаково.
+const finalModelSegment = model => typeof model === 'string'
+  ? model.slice(model.lastIndexOf('/') + 1) : '';
+const isNeonEntry = entry => entry?.family === 'google' &&
+  finalModelSegment(entry?.model) === 'gemini-4-neon';
+const isSolEntry = entry => entry?.family === 'openai' &&
+  finalModelSegment(entry?.model) === 'gpt-6.2-sol';
+
 export function resolveRoleChain(registry, role, {
   mode,
   excludeFamilies = [],
@@ -378,10 +409,18 @@ function selection(chain) {
   });
 }
 
-export function resolveTriad(registry, { mode, now = new Date(), quotas } = {}) {
+export function resolveTriad(registry, { mode, now = new Date(), quotas, strictL2 = false } = {}) {
   const activeMode = mode ?? registry.policy.mode;
-  const chainFor = (role, excludeFamilies = []) => resolveRoleChain(registry, role, {
-    mode: activeMode, now, quotas, excludeFamilies });
+  const chainFor = (role, excludeFamilies = []) => {
+    const chain = resolveRoleChain(registry, role, {
+      mode: activeMode, now, quotas, excludeFamilies });
+    // strictL2: reviewer и arbiter исполняются read-only L2 раннером —
+    // кандидаты ACP-харнессов (acp-devin/claude-*, codex-acp, bb) в этом
+    // sandbox не запускаются и отфильтровываются механически, как в
+    // worker-selector. Дефолт false сохраняет прежний контракт резолва.
+    return strictL2 && (role === 'reviewer' || role === 'arbiter')
+      ? chain.filter(isL2RunnableEntry) : chain;
+  };
   const coderChain = chainFor('coder_default');
 
   // Лексикографический backtracking по уже отсортированным предпочтениям:
@@ -425,6 +464,19 @@ export function resolveTriad(registry, { mode, now = new Date(), quotas } = {}) 
   const coderCandidate = chosen.coder;
   const reviewerCandidate = chosen.reviewer;
 
+  // Закреплённая пара дефолтного контура: при reviewer Neon арбитр Sol
+  // идёт первым в цепочке арбитра, если он вообще допустим (прошёл
+  // фильтры статуса, квоты, стоимости и кросс-семейных исключений), —
+  // независимо от общего порядка кандидатов режима.
+  if (strictL2 && reviewerCandidate && isNeonEntry(reviewerCandidate) &&
+      chosen.arbiterChain.length > 1) {
+    const solIndex = chosen.arbiterChain.findIndex(isSolEntry);
+    if (solIndex > 0) {
+      chosen.arbiterChain = [chosen.arbiterChain[solIndex],
+        ...chosen.arbiterChain.filter((_, index) => index !== solIndex)];
+    }
+  }
+
   return Object.freeze({
     coder: coderCandidate ? selection([coderCandidate,
       ...coderChain.filter(entry => entry.id !== coderCandidate.id)]) : null,
@@ -433,6 +485,25 @@ export function resolveTriad(registry, { mode, now = new Date(), quotas } = {}) 
     arbiter: selection(chosen.arbiterChain),
     lead: selection(leadChain),
     ux_critic: selection(uxChain),
+  });
+}
+
+// Мост реестра в пайплайн: единый источник истины для routing.allowlist
+// run-isolated.mjs/factory-run.mjs. worker — цепочка coder_default без
+// L2-фильтра (воркер исполняется полным харнессом bb/hc, а не read-only
+// раннером); critic/arbiter — цепочки reviewer/arbiter, механически
+// отфильтрованные isL2RunnableEntry: ACP-харнессы в L2 не запускаются.
+// Кросс-семейные исключения здесь не применяются: конкретную тройку
+// выбирает рантайм-селектор из этого пула, а мост даёт допустимые пули
+// ролей в канонической форме { provider, model }.
+export function toPipelineAllowlist(registry, { mode, now = new Date(), quotas } = {}) {
+  const activeMode = mode ?? registry.policy.mode;
+  const chain = role => resolveRoleChain(registry, role, { mode: activeMode, now, quotas });
+  const spec = entry => Object.freeze({ provider: entry.provider, model: entry.model });
+  return Object.freeze({
+    worker: Object.freeze(chain('coder_default').map(spec)),
+    critic: Object.freeze(chain('reviewer').filter(isL2RunnableEntry).map(spec)),
+    arbiter: Object.freeze(chain('arbiter').filter(isL2RunnableEntry).map(spec)),
   });
 }
 

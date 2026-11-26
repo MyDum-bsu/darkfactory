@@ -15,7 +15,7 @@
 //     --policy FILE --state DIR [--worktree DIR] [--memory-dir DIR] \
 //     [--ledger-path FILE] [--stop-on-idle] [--daemon] [--switch V] \
 //     [--interval-ms N] [--allow-live-pilot] [--recheck-rejected-handoff] \
-//     [--runtime bb|hc|subproc] [--dry-run] [--json]
+//     [--runtime bb|hc|subproc] [--event-socket FILE] [--dry-run] [--json]
 import { execFile, spawn } from 'node:child_process';
 import { lstat, readdir, realpath, readFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
@@ -140,9 +140,27 @@ async function nestedPolicyFile(path, treeAliases) {
   return real;
 }
 
+// Цель маунта node_modules внутри /candidate: канонический путь строго
+// в /candidate с финальным сегментом 'node_modules' — multi-repo раскладка
+// JS/TS проектов (/candidate/node_modules корня репозитория,
+// /candidate/tracker/web/node_modules и /candidate/web/node_modules
+// вложенных пакетов). Сегменты '..'/'.', пустые сегменты ('//') и
+// завершающий '/' — не каноническая форма и отклоняются; сам /candidate
+// и пути вне него не проходят.
+function candidateNodeModulesTarget(to) {
+  if (typeof to !== 'string' || !to.startsWith('/candidate/') || to.endsWith('/')) {
+    return false;
+  }
+  const segments = to.split('/').slice(1);
+  if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) {
+    return false;
+  }
+  return segments.at(-1) === 'node_modules';
+}
+
 const PASSTHROUGH_BOOL = ['stop-on-idle', 'daemon', 'allow-live-pilot',
   'recheck-rejected-handoff'];
-const PASSTHROUGH_VALUE = ['switch', 'interval-ms', 'runtime'];
+const PASSTHROUGH_VALUE = ['switch', 'interval-ms', 'runtime', 'event-socket'];
 const LEDGER_PATH_ENV = 'DF_DECISION_LEDGER_PATH';
 const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 
@@ -335,10 +353,11 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
       if (!st.isDirectory()) fail('path_not_dir');
       // Allowlist пар (from, to) sandboxExtras: /deps — только источник
       // site-packages; системные каталоги — только тождественное from;
-      // node_modules — только в /candidate/tracker/web/node_modules.
+      // node_modules — каноническая цель строго внутри /candidate с
+      // финальным сегментом node_modules (multi-repo JS/TS раскладка).
       if (!((to === '/deps' && basename(from) === 'site-packages') ||
             (HOST_SYSTEM_DIRS.has(to) && from === to) ||
-            (to === '/candidate/tracker/web/node_modules' &&
+            (candidateNodeModulesTarget(to) &&
              basename(from) === 'node_modules'))) {
         fail('mount_outside_allowlist');
       }
@@ -410,6 +429,28 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     // отклоняет каталог/спецфайл при проверке стоп-файла (isFile()).
     if (swSt !== null && !swSt.isFile()) fail('path_not_file');
     if (treeAliases.some(t => inside(t, daemonSwitch))) fail('path_inside_worktree');
+  }
+  // --event-socket — операторский путь Unix-сокета Control Room: как и
+  // стоп-файл демона, сам сокет может ещё не существовать (его создаёт
+  // агрегатор), но родительский каталог обязан быть каноническим
+  // абсолютным путём вне worktree в обе стороны, а существующий
+  // сокет-путь не должен быть симлинком — иначе проверенный путь и
+  // используемый контроллером разошлись бы.
+  if (values['event-socket'] !== undefined) {
+    const socket = values['event-socket'];
+    if (typeof socket !== 'string' || !isAbsolute(socket)) fail('path_not_absolute');
+    if (socket !== posix.normalize(socket) || socket.endsWith('/')) {
+      fail('non_canonical_or_symlink_path');
+    }
+    const socketDir = dirname(socket);
+    const socketDirReal = await realpath(socketDir).catch(() => fail('path_missing'));
+    if (socketDirReal !== socketDir) fail('non_canonical_or_symlink_path');
+    if (treeAliases.some(t => inside(t, socketDirReal) || inside(socketDirReal, t))) {
+      fail('path_inside_worktree');
+    }
+    const socketSt = await lstat(socket).catch(err =>
+      err?.code === 'ENOENT' ? null : fail('non_canonical_or_symlink_path'));
+    if (socketSt?.isSymbolicLink()) fail('non_canonical_or_symlink_path');
   }
   const ledgerReal = ledger !== null
     ? await canonicalOutside(ledger, treeAliases, 'file')
@@ -650,6 +691,7 @@ export async function runFactory(argv, deps = {}) {
     'allow-live-pilot': { type: 'boolean' },
     'recheck-rejected-handoff': { type: 'boolean' },
     'l1-profile': { type: 'string' }, runtime: { type: 'string' },
+    'event-socket': { type: 'string' },
     'dry-run': { type: 'boolean' }, json: { type: 'boolean' } } });
   const plan = await buildRunPlan(values, { env: deps.env ?? process.env });
   if (values['dry-run']) {
