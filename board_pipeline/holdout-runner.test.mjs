@@ -82,25 +82,48 @@ test('offline holdout docker argv is array-safe, read-only and digest-bound', as
     argv: ['node', 'ui-check.mjs'], cwd: '/candidate/tracker/web' });
   assert.ok(argv.includes('--network=none'));
   assert.ok(argv.includes('--read-only'));
+  assert.ok(argv.includes('--memory=2g'));
+  assert.ok(argv.includes('--pids-limit=256'));
+  assert.ok(argv.includes('--cpus=2'));
   assert.ok(argv.includes(`type=bind,src=${outside},dst=/holdouts,readonly`));
   assert.equal(argv.at(-1), 'ui-check.mjs');
+  const name = argv[argv.indexOf('--name') + 1];
+  assert.match(name, /^df-holdout-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  const second = buildHoldoutDockerArgv({ holdoutDir: outside, image: IMAGE, argv: ['node'] });
+  assert.notEqual(second[second.indexOf('--name') + 1], name);
+  const customName = 'df-holdout-00112233-4455-6677-8899-aabbccddeeff';
+  const custom = buildHoldoutDockerArgv({ holdoutDir: outside, image: IMAGE, argv: ['node'],
+    memory: '512m', pidsLimit: 64, cpus: 1.5, name: customName });
+  assert.ok(custom.includes('--memory=512m'));
+  assert.ok(custom.includes('--pids-limit=64'));
+  assert.ok(custom.includes('--cpus=1.5'));
+  assert.equal(custom[custom.indexOf('--name') + 1], customName);
   assert.throws(() => buildHoldoutDockerArgv({ holdoutDir: outside, image: IMAGE,
     argv: ['node'], cwd: '/candidate-evil' }), /holdout_recipe_invalid/);
   assert.throws(() => buildHoldoutDockerArgv({ holdoutDir: '/tmp/h,readonly=false', image: IMAGE,
     argv: ['node'] }), /holdout_dir_invalid/);
+  for (const overrides of [
+    { memory: '0g' }, { memory: '2g;echo-evil' }, { pidsLimit: 0 }, { pidsLimit: 1.5 },
+    { cpus: 0 }, { cpus: Number.NaN }, { cpus: 65 }, { name: 'evil' },
+  ]) {
+    assert.throws(() => buildHoldoutDockerArgv({ holdoutDir: outside, image: IMAGE,
+      argv: ['node'], ...overrides }), /holdout_recipe_invalid/, JSON.stringify(overrides));
+  }
 
   const calls = [];
-  const injected = async (file, args) => {
-    calls.push([file, args]);
+  const injected = async (file, args, options) => {
+    calls.push([file, args, options]);
     return { stdout: 'ok', stderr: '' };
   };
   const result = await runHoldoutL3({ holdoutDir: outside, worktree, image: IMAGE,
     argv: ['node', 'ui-check.mjs'], execDocker: injected });
   assert.equal(result.ok, true);
   assert.match(result.holdout_digest, /^[a-f0-9]{64}$/);
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
   assert.equal(calls[0][0], 'docker');
   assert.deepEqual(calls[0][1], result.docker_argv);
+  const runName = result.docker_argv[result.docker_argv.indexOf('--name') + 1];
+  assert.deepEqual(calls[1], ['docker', ['rm', '-f', runName], { timeout: 30_000, maxBuffer: 1024 * 1024 }]);
 
   const failing = await runHoldoutL3({ holdoutDir: outside, worktree, image: IMAGE,
     argv: ['node', 'ui-check.mjs'], execDocker: async () => { throw Object.assign(new Error('exit'), {
@@ -122,6 +145,37 @@ test('offline holdout docker argv is array-safe, read-only and digest-bound', as
   assert.equal(exitZeroFailure.exit, 0);
   assert.equal(exitZeroFailure.feedback.verdict, 'REWORK');
   assert.equal(exitZeroFailure.ok, false, 'structured failure dominates a zero process exit');
+});
+
+test('holdout docker finally cleanup removes the unique named container on timeout and does not mask results', async t => {
+  const { worktree, outside } = await fixture(t);
+  await writeScenario(outside, { id: 's', assertions: { unstyledControls: 0 } });
+
+  const calls = [];
+  const timeoutError = Object.assign(new Error('timeout'), {
+    code: null, killed: true, signal: 'SIGTERM', stdout: '', stderr: '' });
+  const timedOut = await runHoldoutL3({ holdoutDir: outside, worktree, image: IMAGE,
+    argv: ['node', 'ui-check.mjs'], execDocker: async (file, args, options) => {
+      calls.push([file, args, options]);
+      if (args[0] === 'run') throw timeoutError;
+      return { stdout: '', stderr: '' };
+    } });
+  assert.equal(timedOut.ok, false);
+  assert.equal(timedOut.exit, null);
+  assert.equal(timedOut.feedback.verdict, 'REWORK');
+  assert.equal(timedOut.feedback.failures[0].failed_assertion_category, 'execution-failure');
+  assert.equal(calls.length, 2);
+  const runArgs = calls[0][1];
+  const name = runArgs[runArgs.indexOf('--name') + 1];
+  assert.match(name, /^df-holdout-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.deepEqual(calls[1], ['docker', ['rm', '-f', name], { timeout: 30_000, maxBuffer: 1024 * 1024 }]);
+
+  const successful = await runHoldoutL3({ holdoutDir: outside, worktree, image: IMAGE,
+    argv: ['node', 'ui-check.mjs'], execDocker: async (file, args) => {
+      if (args[0] === 'rm') throw new Error('cleanup unavailable');
+      return { stdout: 'ok', stderr: '' };
+    } });
+  assert.equal(successful.ok, true, 'best-effort cleanup failure must not mask the holdout result');
 });
 
 test('sanitizeHoldoutFeedback emits only structured symptoms with zero source, secret, ANSI or path leaks', () => {
