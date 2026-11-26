@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$HC_CAPTURE"
+printf 'plain\033[31mRED\033[0m\n\033]0;evil-title\aafter-osc\n\033]8;;http://evil\033\\link-text\033]8;;\033\\end\ncsi\033[4:3mUNDER\033[0m\n'

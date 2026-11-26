@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" >> "${HERDR_TEST_GIT_ARGS:?HERDR_TEST_GIT_ARGS is required}"
+if [[ $# -eq 4 && "${1}" == '-C' && "${3}" == 'rev-parse' && "${4}" == 'HEAD' ]]; then
+  printf '%s\n' '1111111111111111111111111111111111111111'
+  exit 0
+fi
+exit 2

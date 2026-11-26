@@ -47,12 +47,19 @@ function windowLabel(windowKey) {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-// Accepts ISO-8601 strings or epoch-milliseconds numbers. Anything else is
-// treated as absent (null) rather than guessed: a wrong reset time is worse
-// than none.
+// Accepts ISO-8601 strings or epoch timestamps as numbers. Anything else
+// is treated as absent (null) rather than guessed: a wrong reset time is
+// worse than none.
+//
+// Numeric epoch timestamps come in two unit flavors upstream. Values below
+// 1e12 are epoch SECONDS (1e12 ms is 2001-09-09, so any millisecond epoch
+// relevant to a quota window is far above the threshold, and any second
+// epoch far below it). Treating seconds as milliseconds collapses the
+// reset time to 1970, which then renders as an already-expired window.
 function parseResetTimeMs(value) {
   if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-    return Math.floor(value);
+    const ms = value < 1e12 ? value * 1000 : value;
+    return Math.floor(ms);
   }
   if (typeof value === 'string' && value.trim()) {
     const parsed = Date.parse(value);
