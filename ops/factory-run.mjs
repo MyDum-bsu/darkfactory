@@ -148,7 +148,8 @@ async function nestedPolicyFile(path, treeAliases) {
 // завершающий '/' — не каноническая форма и отклоняются; сам /candidate
 // и пути вне него не проходят.
 function candidateNodeModulesTarget(to) {
-  if (typeof to !== 'string' || !to.startsWith('/candidate/') || to.endsWith('/')) {
+  if (typeof to !== 'string' || !to.startsWith('/candidate/') || to.endsWith('/') ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(to)) {
     return false;
   }
   const segments = to.split('/').slice(1);
@@ -160,7 +161,7 @@ function candidateNodeModulesTarget(to) {
 
 const PASSTHROUGH_BOOL = ['stop-on-idle', 'daemon', 'allow-live-pilot',
   'recheck-rejected-handoff'];
-const PASSTHROUGH_VALUE = ['switch', 'interval-ms', 'runtime', 'event-socket'];
+const PASSTHROUGH_VALUE = ['switch', 'interval-ms', 'event-socket'];
 const LEDGER_PATH_ENV = 'DF_DECISION_LEDGER_PATH';
 const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 
@@ -232,6 +233,14 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     fail('cli_spec_mismatch_policy_bb');
   }
   assertModelMatrix({ cli: values, policy });
+
+  // Без явного выбора оператора/политики фабрика работает на hc: тонкий
+  // запуск не наследует молчаливый legacy-дефолт bb контроллера.
+  const runtime = values.runtime !== undefined ? values.runtime
+    : policy.workerRuntime !== undefined ? policy.workerRuntime
+      : env.DF_WORKER_RUNTIME !== undefined ? env.DF_WORKER_RUNTIME
+        : 'hc';
+  if (!['bb', 'hc', 'subproc'].includes(runtime)) fail('worker_runtime_kind_invalid');
 
   // l1Profile — инвариант всех профилей политики (как матрица моделей):
   // неизвестное имя в любом profiles.* отклоняется fail-closed до
@@ -621,6 +630,7 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
   for (const flag of PASSTHROUGH_VALUE) {
     if (values[flag] !== undefined) argv.push(`--${flag}`, values[flag]);
   }
+  argv.push('--runtime', runtime);
   // Только ЯВНЫЙ выбор оператора передаётся контроллеру как --l1-profile:
   // резолвленный здесь дефолт репозитория не пробрасывается — контроллер
   // считал бы его явным, и явный l1Profile рецепта конфликтовал бы с

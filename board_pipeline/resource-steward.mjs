@@ -40,6 +40,8 @@ export const DEFAULT_MOUNTS = Object.freeze(['/']);
 export const TMP_ALLOW_RULES = Object.freeze([
   { pattern: /^df-/, dirOnly: false },
   { pattern: /^pytest-of-/, dirOnly: true },
+  { pattern: /^board-(check|review|visual|arbiter)-/, dirOnly: true },
+  { pattern: /^neon-review-/, dirOnly: true },
 ]);
 
 // Кэши pip/npm/uv: фиксированные корни, привязка к XDG_CACHE_HOME для тестов
@@ -318,6 +320,38 @@ export function parseBbThreadList(stdout) {
   return Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.threads) ? parsed.threads : []);
 }
 
+// hc ls --json: ListResult с terminals или массив совместимости. Имя терминала —
+// детерминированный runtime id воркера; address остаётся уникальной целью kill.
+export function parseHcTerminalList(stdout) {
+  const parsed = JSON.parse(stdout);
+  if (parsed && parsed.ok === false) throw new Error(parsed?.error?.message ?? 'hc ls failed');
+  return Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.terminals) ? parsed.terminals : []);
+}
+
+const hcTerminalStatus = terminal => {
+  if (terminal?.state !== 'live') return terminal?.state ?? 'unknown';
+  const status = typeof terminal?.status === 'string' ? terminal.status : terminal?.status?.state;
+  return typeof status === 'string' && status ? status : 'running';
+};
+
+export function selectIdleHcTerminals(terminals, { pinnedThreads = [], selfThreadId } = {}) {
+  const rows = Array.isArray(terminals) ? terminals : [];
+  const normalized = rows.map(terminal => ({
+    ...terminal,
+    id: terminal?.name,
+    status: hcTerminalStatus(terminal),
+  }));
+  const selected = selectIdleThreads(normalized, { pinnedThreads, selfThreadId });
+  const byName = new Map(rows.filter(t => typeof t?.name === 'string').map(t => [t.name, t]));
+  return {
+    stoppable: selected.stoppable.map(({ id }) => {
+      const source = byName.get(id);
+      return { id, ...(typeof source?.address === 'string' && source.address ? { address: source.address } : {}) };
+    }),
+    skipped: selected.skipped,
+  };
+}
+
 // --- Журнал -----------------------------------------------------------------
 
 // Журнал: JSONL, каталог 0700, файл 0600, каждая строка — валидный JSON с ts.
@@ -398,6 +432,8 @@ export async function runSteward(options) {
     dockerEnabled = true,
     execDocker,
     execBb,
+    execHc,
+    runtime = 'auto',
     pinnedThreads = [],
     selfThreadId = process.env.BB_THREAD_ID,
     escalate,
@@ -408,6 +444,7 @@ export async function runSteward(options) {
     memInfoImpl = readMemAvailable,
   } = options;
 
+  if (!['auto', 'bb', 'hc'].includes(runtime)) throw new Error('worker_runtime_kind_invalid');
   if (!Array.isArray(mounts) || mounts.length === 0) throw new Error('at least one mount is required');
   if (!isAbsolute(tmpRoot)) throw new Error('tmpRoot must be an absolute path');
   if (!validDays(tmpDays) || !validDays(cacheDays)) throw new Error('tmpDays/cacheDays must be within (0, 365]');
@@ -510,7 +547,7 @@ export async function runSteward(options) {
       if (evaluateRam(ramBytes)) {
         summary.ram.low = true;
         await journal({ event: 'ram_low', thresholdGiB: RAM_MIN_GIB });
-        if (typeof execBb === 'function') {
+        const inspectBb = async () => {
           const listed = await execBb(['thread', 'list', '--json']);
           // runCommand не бросает исключений: ненулевой код — честная ошибка, а не пустой список.
           if (listed.code !== 0) {
@@ -518,32 +555,69 @@ export async function runSteward(options) {
           }
           const threads = parseBbThreadList(listed.stdout);
           const { stoppable, skipped } = selectIdleThreads(threads, { pinnedThreads, selfThreadId });
-          summary.ram.skipped = skipped;
-          await journal({ event: 'ram_plan', stopCount: stoppable.length, skippedCount: skipped.length });
+          return { kind: 'bb', stoppable, skipped, stop: entry => execBb(['thread', 'stop', entry.id]) };
+        };
+        const inspectHc = async () => {
+          const listed = await execHc(['ls', '--json']);
+          if (listed.code !== 0) {
+            throw new Error(`hc ls: ${String(listed.stderr ?? '').slice(-200) || `exit code ${listed.code}`}`);
+          }
+          const terminals = parseHcTerminalList(listed.stdout);
+          const { stoppable, skipped } = selectIdleHcTerminals(terminals, { pinnedThreads, selfThreadId });
+          return {
+            kind: 'hc', stoppable, skipped,
+            stop: entry => execHc(['kill', '--json', '--', entry.address ?? entry.id]),
+          };
+        };
+
+        let shedding = null;
+        let hcFailure = null;
+        if (runtime !== 'bb' && typeof execHc === 'function') {
+          try {
+            shedding = await inspectHc();
+          } catch (error) {
+            hcFailure = error;
+            if (runtime === 'hc') throw error;
+            await journal({ event: 'ram_runtime_fallback', from: 'hc', to: 'bb', error: error.message });
+          }
+        }
+        if (!shedding && runtime !== 'hc' && typeof execBb === 'function') {
+          shedding = await inspectBb();
+        }
+
+        if (shedding) {
+          summary.ram.runtime = shedding.kind;
+          summary.ram.skipped = shedding.skipped;
+          await journal({
+            event: 'ram_plan', runtime: shedding.kind,
+            stopCount: shedding.stoppable.length, skippedCount: shedding.skipped.length,
+          });
           if (dryRun) {
-            summary.ram.plannedStops = stoppable.map(s => s.id);
+            summary.ram.plannedStops = shedding.stoppable.map(s => s.id);
           } else {
-            for (const { id } of stoppable) {
+            for (const entry of shedding.stoppable) {
+              const { id } = entry;
               let outcome;
               try {
-                outcome = await execBb(['thread', 'stop', id]);
+                outcome = await shedding.stop(entry);
               } catch (error) {
                 outcome = { code: -1, stderr: error.message };
               }
               // Ненулевой код возврата stop — не засчитанный стоп: ошибка, тик продолжается.
               if (outcome.code !== 0) {
                 const reason = String(outcome.stderr ?? '').slice(-200) || `exit code ${outcome.code}`;
-                await journal({ event: 'ram_stop_error', threadId: id, code: outcome.code, error: reason });
+                await journal({ event: 'ram_stop_error', runtime: shedding.kind, threadId: id, code: outcome.code, error: reason });
                 summary.ram.errors++;
                 errors.push(`stop ${id}: ${reason}`);
                 continue;
               }
-              await journal({ event: 'ram_stop', threadId: id, code: outcome.code });
+              await journal({ event: 'ram_stop', runtime: shedding.kind, threadId: id, code: outcome.code });
               summary.ram.stopped++;
             }
           }
         } else {
-          summary.ram.skipped.push({ reason: 'no_bb_executor' });
+          if (hcFailure) throw hcFailure;
+          summary.ram.skipped.push({ reason: runtime === 'hc' ? 'no_hc_executor' : 'no_bb_executor' });
         }
       }
     } catch (error) {
@@ -563,7 +637,7 @@ export async function runSteward(options) {
 
 const USAGE = `usage: node resource-steward.mjs [--dry-run] [--journal <path>] [--mount <path>]...
        [--tmp-days <n>] [--cache-days <n>] [--escalate-cmd <executable>]
-       [--no-docker] [--bb <path>]`;
+       [--no-docker] [--runtime auto|bb|hc] [--bb <path>] [--hc <path>]`;
 
 const nextValue = (argv, index, flag) => {
   const value = argv[index];
@@ -582,7 +656,13 @@ export function parseArgv(argv) {
       case '--cache-days': flags.cacheDays = Number(nextValue(argv, ++i, '--cache-days')); break;
       case '--escalate-cmd': flags.escalateCmd = nextValue(argv, ++i, '--escalate-cmd'); break;
       case '--no-docker': flags.dockerEnabled = false; break;
+      case '--runtime': {
+        flags.runtime = nextValue(argv, ++i, '--runtime');
+        if (!['auto', 'bb', 'hc'].includes(flags.runtime)) throw new Error(`worker_runtime_kind_invalid\n${USAGE}`);
+        break;
+      }
       case '--bb': flags.bbPath = nextValue(argv, ++i, '--bb'); break;
+      case '--hc': flags.hcPath = nextValue(argv, ++i, '--hc'); break;
       default: throw new Error(`unknown flag ${argv[i]}\n${USAGE}`);
     }
   }
@@ -643,6 +723,8 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
       dockerEnabled: flags.dockerEnabled,
       execDocker: runCommand('docker', 120_000),
       execBb: runCommand(flags.bbPath ?? 'bb', 30_000),
+      execHc: runCommand(flags.hcPath ?? 'hc', 30_000),
+      runtime: flags.runtime ?? 'auto',
       escalate: flags.escalateCmd ? escalateViaCommand(flags.escalateCmd) : undefined,
     });
     console.log(JSON.stringify(summary));
