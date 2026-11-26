@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import {
+  normalizeTimestamp,
   openSessionArchive,
   parseAgyTranscript,
   parsePiTranscript,
@@ -213,7 +215,8 @@ test('parseAgyTranscript: normalized records, fail-open on corrupt lines', () =>
   assert.deepEqual(rows.map(row => row.seq), [0, 1, 4, 5]);
   assert.deepEqual(rows.map(row => row.role), ['user', 'assistant', 'system', 'user']);
   assert.equal(rows[0].content, 'привет, настрой архив');
-  assert.equal(rows[0].createdAt, '2025-01-01T10:00:00Z');
+  // ISO-вход нормализуется в каноническую UTC-форму toISOString() с миллисекундами.
+  assert.equal(rows[0].createdAt, '2025-01-01T10:00:00.000Z');
   assert.equal(rows[1].content, 'готово, архив настроен');
   // Блочный content склеивается переводом строки.
   assert.equal(rows[3].content, 'первая часть\nвторая часть');
@@ -325,4 +328,178 @@ test('sanitizeFtsQuery: pure token extraction, always safe for MATCH', () => {
   assert.equal(sanitizeFtsQuery('настройка базы'), '"настройка" OR "базы"');
   assert.equal(sanitizeFtsQuery('---'), '');
   assert.equal(sanitizeFtsQuery(42), '');
+});
+
+test('normalizeTimestamp: epoch seconds/ms detection and canonical UTC ISO output', () => {
+  // 1735689600 — epoch seconds; 1735689600000 — те же сутки в миллисекундах.
+  assert.equal(normalizeTimestamp(1735689600), '2025-01-01T00:00:00.000Z');
+  assert.equal(normalizeTimestamp(1735689600000), '2025-01-01T00:00:00.000Z');
+  // Числовые строки проходят ту же epoch-эвристику.
+  assert.equal(normalizeTimestamp('1735689600'), '2025-01-01T00:00:00.000Z');
+  // Валидные даты нормализуются в UTC ISO независимо от исходной формы:
+  // «Z» без миллисекунд и смещения часовых поясов — в единую каноническую форму.
+  assert.equal(normalizeTimestamp('2025-01-01T10:00:00Z'), '2025-01-01T10:00:00.000Z');
+  assert.equal(normalizeTimestamp('2025-01-01T13:00:00+03:00'), '2025-01-01T10:00:00.000Z');
+  assert.equal(normalizeTimestamp('2025-01-01T10:00:00.000Z'), '2025-01-01T10:00:00.000Z');
+  // Невалидная строка сохраняется как есть (fail-open), пустой ввод — null.
+  assert.equal(normalizeTimestamp('not a date at all'), 'not a date at all');
+  assert.equal(normalizeTimestamp(''), null);
+  assert.equal(normalizeTimestamp('   '), null);
+  assert.equal(normalizeTimestamp(null), null);
+  assert.equal(normalizeTimestamp(undefined), null);
+  assert.equal(normalizeTimestamp(-5), null);
+  assert.equal(normalizeTimestamp(NaN), null);
+  assert.equal(normalizeTimestamp({}), null);
+});
+
+test('ingestSession: re-ingest without optional metadata preserves title/project/cwd', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'session-archive-meta-'));
+  try {
+    const dbPath = join(dir, 'archive.db');
+    const archive = openSessionArchive(dbPath);
+    archive.ingestSession(sessionFixture());
+    // Повторный инжест транскрипта без title/project/cwd (обрезанная выгрузка).
+    archive.ingestSession({
+      sessionId: 'sess-1',
+      host: 'cloud-hub',
+      harness: 'agy',
+      messages: sessionFixture().messages,
+    });
+    archive.close();
+
+    const raw = new DatabaseSync(dbPath);
+    const row = raw.prepare('SELECT * FROM sessions WHERE session_id = ?').get('sess-1');
+    assert.equal(row.title, 'Тестовая сессия');
+    assert.equal(row.project, 'darkfactory');
+    assert.equal(row.cwd, '/home/user/repo');
+    assert.equal(row.summary, 'краткое резюме');
+    // started_at тоже переживает повторный инжест и нормализован в каноническую форму.
+    assert.equal(row.started_at, '2025-01-01T10:00:00.000Z');
+    raw.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('openSessionArchive: db file is chmod 0600 and journal_mode is WAL', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'session-archive-perms-'));
+  try {
+    const dbPath = join(dir, 'archive.db');
+    const archive = openSessionArchive(dbPath);
+    archive.ingestSession(sessionFixture());
+    archive.close();
+
+    const info = await stat(dbPath);
+    assert.equal(info.mode & 0o777, 0o600, 'archive db must be owner-only');
+
+    const raw = new DatabaseSync(dbPath);
+    assert.equal(raw.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+    raw.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('search: since/until accurate across mixed timestamp formats', async () => {
+  const archive = openSessionArchive(':memory:');
+  archive.ingestSession(sessionFixture({
+    sessionId: 'mixed-1',
+    messages: [
+      // epoch seconds (число) = 2025-01-01T00:00:00Z
+      { seq: 0, role: 'user', content: 'database epoch seconds entry', createdAt: 1735689600 },
+      // ISO со смещением +03:00 = 2025-01-01T02:00:00Z UTC
+      { seq: 1, role: 'user', content: 'database offset entry', createdAt: '2025-01-01T05:00:00+03:00' },
+      // epoch milliseconds как числовая строка = 2025-01-01T06:00:00Z
+      { seq: 2, role: 'user', content: 'database numeric string entry', createdAt: '1735711200000' },
+    ],
+  }));
+
+  const all = await archive.search({ query: 'database', mode: 'fts' });
+  assert.equal(all.length, 3);
+  // Все метки приведены к канонической UTC ISO-форме с миллисекундами.
+  assert.deepEqual(all.map(row => row.createdAt).sort(), [
+    '2025-01-01T00:00:00.000Z',
+    '2025-01-01T02:00:00.000Z',
+    '2025-01-01T06:00:00.000Z',
+  ]);
+
+  // Лексикографические фильтры корректны независимо от исходного формата меток.
+  const since = await archive.search({ query: 'database', since: '2025-01-01T01:00:00Z' });
+  assert.deepEqual(since.map(row => row.seq).sort(), [1, 2]);
+  const until = await archive.search({ query: 'database', until: '2025-01-01T01:00:00Z' });
+  assert.deepEqual(until.map(row => row.seq), [0]);
+  // since/until тоже принимают epoch seconds.
+  const epochRange = await archive.search({ query: 'database', since: 1735687200, until: 1735689600 });
+  assert.deepEqual(epochRange.map(row => row.seq), [0]);
+  archive.close();
+});
+
+test('search: all-zero queryVector is rejected fail-closed', async () => {
+  const archive = openSessionArchive(':memory:', { embedder: mockEmbedder });
+  archive.ingestSession(sessionFixture());
+  await assert.rejects(
+    () => archive.search({ query: 'database', mode: 'hybrid', queryVector: [0, 0, 0] }),
+    /session_archive_vector_zero/,
+  );
+  // Ненулевой вектор по-прежнему принимается.
+  const [vector] = await mockEmbedder(['database']);
+  const rows = await archive.search({ query: 'database', mode: 'hybrid', queryVector: vector });
+  assert.ok(Array.isArray(rows));
+  archive.close();
+});
+
+test('search: queryModel filters vector leg by embedding model', async () => {
+  const archive = openSessionArchive(':memory:', { embedder: mockEmbedder });
+  archive.ingestSession(sessionFixture({
+    sessionId: 'models-1',
+    messages: [
+      { seq: 0, role: 'assistant', content: 'optimized sql indexes for latency tuning', createdAt: '2025-01-01T10:00:00Z' },
+    ],
+  }));
+  await archive.embedPending({ model: 'model-a' });
+  // «why is the database slow» не пересекается по словам — только векторное плечо.
+  const query = 'why is the database slow';
+
+  const wrongModel = await archive.search({ query, mode: 'hybrid', queryModel: 'model-b' });
+  assert.deepEqual(wrongModel, []);
+
+  const rightModel = await archive.search({ query, mode: 'hybrid', queryModel: 'model-a' });
+  assert.ok(rightModel.length >= 1);
+  assert.equal(rightModel[0].seq, 0);
+  assert.equal(rightModel[0].matchSource, 'vector');
+
+  // Без queryModel — все embedding'и участвуют, поведение прежнее.
+  const unfiltered = await archive.search({ query, mode: 'hybrid' });
+  assert.ok(unfiltered.length >= 1);
+
+  await assert.rejects(() => archive.search({ query, mode: 'hybrid', queryModel: '' }),
+    /session_archive_search_invalid/);
+  await assert.rejects(() => archive.search({ query, mode: 'hybrid', queryModel: 42 }),
+    /session_archive_search_invalid/);
+  archive.close();
+});
+
+test('search: streaming top-K stays correct when embeddings exceed the pool cap', async () => {
+  const archive = openSessionArchive(':memory:', { embedder: mockEmbedder });
+  // 45 embedding'ов при poolSize 40 (limit 5): bounded top-K вытесняет худшие,
+  // лучшее совпадение — последняя вставленная строка — не теряется.
+  const messages = [];
+  for (let i = 0; i < 44; i += 1) {
+    messages.push({ seq: i, role: 'assistant', content: `css button render alignment note ${i}`, createdAt: '2025-01-01T10:00:00Z' });
+  }
+  messages.push({ seq: 44, role: 'assistant', content: 'optimized sql indexes for latency tuning', createdAt: '2025-01-01T10:00:00Z' });
+  archive.ingestSession(sessionFixture({ sessionId: 'bulk-1', messages }));
+  for (let round = 0; round < 3; round += 1) {
+    await archive.embedPending({ batchSize: 32, model: 'test-embedder' });
+  }
+  assert.equal(archive.stats().embeddings, 45);
+
+  const hybrid = await archive.search({ query: 'why is the database slow', mode: 'hybrid', limit: 5 });
+  assert.ok(hybrid.length >= 1);
+  assert.equal(hybrid[0].seq, 44);
+  assert.equal(hybrid[0].matchSource, 'vector');
+  // Детерминизм: повторный прогон — тот же порядок и score.
+  const again = await archive.search({ query: 'why is the database slow', mode: 'hybrid', limit: 5 });
+  assert.deepEqual(again.map(row => [row.seq, row.score]), hybrid.map(row => [row.seq, row.score]));
+  archive.close();
 });

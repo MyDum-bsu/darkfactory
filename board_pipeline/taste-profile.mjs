@@ -114,11 +114,14 @@ export function loadProjectProfile(repoRoot, { profileRelPath = DEFAULT_PROFILE_
   if (raw.l1_profile !== undefined && !validString(raw.l1_profile, 256)) {
     throw fail('taste_profile_invalid', 'l1_profile');
   }
+  let agentsMd = null;
   if (raw.agents_md !== undefined) {
     if (!validString(raw.agents_md, 512)) throw fail('taste_profile_invalid', 'agents_md');
+    agentsMd = raw.agents_md.trim();
     // Указатель на AGENTS.md проверяется на traversal при загрузке профиля,
     // даже если файл ещё не читался: отказ-закрытая валидация контракта.
-    if (isAbsolute(raw.agents_md) || raw.agents_md.split(/[\\/]/).includes('..')) {
+    // Проверяется trim()'нутое значение — то, что реально пойдёт в resolve.
+    if (isAbsolute(agentsMd) || agentsMd.split(/[\\/]/).includes('..')) {
       throw fail('taste_profile_path_traversal', 'agents_md');
     }
   }
@@ -131,10 +134,10 @@ export function loadProjectProfile(repoRoot, { profileRelPath = DEFAULT_PROFILE_
     }
   }
   return Object.freeze({
-    repoId: raw.repo_id ?? null,
+    repoId: raw.repo_id === undefined ? null : raw.repo_id.trim(),
     stack: Object.freeze(toStringList(raw.stack, 'stack')),
-    l1Profile: raw.l1_profile ?? null,
-    agentsMd: raw.agents_md ?? null,
+    l1Profile: raw.l1_profile === undefined ? null : raw.l1_profile.trim(),
+    agentsMd,
     taste: Object.freeze(toStringList(raw.taste, 'taste')),
     domainSkills: Object.freeze(domainSkills),
     path: canonical,
@@ -174,7 +177,31 @@ export function pickDomainSkills({ profile = null, domain = null, defaultSkills 
   return Object.freeze(ordered);
 }
 
-// Ограниченное чтение начала файла без загрузки целиком в память.
+// Конец буфера не должен разрезать многобайтовую UTF-8 последовательность:
+// неполный хвост (lead byte без всех continuation bytes) отбрасывается,
+// иначе декодер подставит U+FFFD и сломает кириллический текст на границе.
+function utf8SafeEnd(buffer, length) {
+  if (length === 0) return 0;
+  let continuation = 0;
+  while (continuation < 3 && continuation < length &&
+      (buffer[length - 1 - continuation] & 0xC0) === 0x80) {
+    continuation += 1;
+  }
+  const leadIndex = length - 1 - continuation;
+  const lead = buffer[leadIndex];
+  if ((lead & 0x80) === 0) return length; // хвост — ASCII, граница чистая
+  let expected = 0;
+  if ((lead & 0xE0) === 0xC0) expected = 2;
+  else if ((lead & 0xF0) === 0xE0) expected = 3;
+  else if ((lead & 0xF8) === 0xF0) expected = 4;
+  if (expected === 0) return leadIndex; // битый lead byte — отбросить
+  return length - leadIndex === expected ? length : leadIndex;
+}
+
+// Ограниченное чтение начала файла без загрузки целиком в память. readSync
+// вправе вернуть меньше запрошенного (короткие чтения, гонка усечения файла),
+// поэтому чтение циклично до заполнения или EOF, а декодируются только
+// реально прочитанные байты — без хвостовых NUL из недозаполненного буфера.
 function readBounded(path, maxBytes) {
   let fd;
   try {
@@ -182,8 +209,13 @@ function readBounded(path, maxBytes) {
     const size = Math.min(fstatSync(fd).size, maxBytes);
     if (size === 0) return '';
     const buffer = Buffer.alloc(size);
-    readSync(fd, buffer, 0, size, 0);
-    return buffer.toString('utf8');
+    let offset = 0;
+    while (offset < size) {
+      const bytesRead = readSync(fd, buffer, offset, size - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return buffer.toString('utf8', 0, utf8SafeEnd(buffer, offset));
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
@@ -199,9 +231,57 @@ function readOptionalFile(path, maxBytes) {
   }
 }
 
+// Усечение секции по границе строки (fallback — граница слова): бюджетные
+// обрезки не разрывают строки посередине, когда это можно избежать.
+function cutAtBoundary(text, cap) {
+  if (text.length <= cap) return text;
+  const slice = text.slice(0, cap);
+  const lastNewline = slice.lastIndexOf('\n');
+  if (lastNewline > 0) return slice.slice(0, lastNewline);
+  const lastSpace = slice.lastIndexOf(' ');
+  if (lastSpace > 0) return slice.slice(0, lastSpace);
+  return slice;
+}
+
+export const TRUNCATION_MARKER = '\n…[truncated]';
+
+// Сборка секций в пределах maxChars с per-section бюджетными кепами: каждая
+// секция получает равную долю оставшегося бюджета, неизрасходованный остаток
+// меньших секций перетекает дальше. Превышающая долю секция обрезается по
+// границе строки, поэтому одна гигантская секция не вытесняет остальные.
+// Итог всегда завершается явным маркером усечения и никогда не превышает
+// maxChars; при вырожденно малом бюджете (меньше маркера) — пустой текст.
+function assembleSections(sections, maxChars) {
+  const full = sections.join('\n\n');
+  if (full.length <= maxChars) return { text: full, truncated: false };
+  const marker = TRUNCATION_MARKER;
+  if (maxChars <= marker.length) return { text: '', truncated: true };
+  const parts = [];
+  let used = 0; // длина parts, соединённых '\n\n'
+  for (let i = 0; i < sections.length; i += 1) {
+    const sep = parts.length === 0 ? 0 : 2;
+    const remaining = maxChars - marker.length - used - sep;
+    if (remaining < 1) break;
+    const share = Math.max(1, Math.floor(remaining / (sections.length - i)));
+    const section = sections[i];
+    if (section.length <= share) {
+      parts.push(section);
+      used += sep + section.length;
+      continue;
+    }
+    const cut = cutAtBoundary(section, share);
+    if (cut.length > 0) {
+      parts.push(cut);
+      used += sep + cut.length;
+    }
+  }
+  return { text: parts.join('\n\n') + marker, truncated: true };
+}
+
 // Сборка компактного projectContext: фиксированный порядок секций делает
-// текст и digest детерминированными при неизменных входах. Жёсткое усечение
-// до maxChars гарантирует бюджет промпта независимо от состава слоёв.
+// текст и digest детерминированными при неизменных входах. Бюджет maxChars
+// гарантируется per-section кепами с явным маркером усечения вместо среза
+// посередине текста.
 export function buildProjectContext({ globalTastePath = null, repoRoot, domain = null,
   maxChars = DEFAULT_MAX_CHARS, defaultSkills = [], agentsExcerptChars = AGENTS_EXCERPT_CHARS } = {}) {
   if (!Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > 1024 * 1024) {
@@ -254,9 +334,7 @@ export function buildProjectContext({ globalTastePath = null, repoRoot, domain =
     sections.push(`${title}\n${skills.map(skill => `- ${skill}`).join('\n')}`);
   }
 
-  const full = sections.join('\n\n');
-  const truncated = full.length > maxChars;
-  const text = truncated ? full.slice(0, maxChars) : full;
+  const { text, truncated } = assembleSections(sections, maxChars);
   return Object.freeze({
     text,
     digest: sha256(text),

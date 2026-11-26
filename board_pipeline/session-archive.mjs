@@ -7,6 +7,7 @@
 // путей и не ходит в сеть — входы приходят только из доверенного вызывающего.
 
 import { createHash } from 'node:crypto';
+import { chmodSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
 export const SESSION_ARCHIVE_SCHEMA_VERSION = 1;
@@ -43,16 +44,37 @@ function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-// Нормализация временной метки в ISO-строку для лексикографически корректных
-// сравнений диапазонов: число трактуется как epoch milliseconds, строка
-// сохраняется как есть (ISO-8601 уже сортируется лексикографически).
+// Эвристика epoch-времени: валидные epoch milliseconds современных дат
+// всегда >= 1e12 (2001-09-09), поэтому меньшие числа — epoch seconds.
+const EPOCH_SECONDS_CEILING = 1e12;
+const NUMERIC_STRING = /^\d+(\.\d+)?$/;
+
+function epochToIso(numeric) {
+  const ms = numeric < EPOCH_SECONDS_CEILING ? numeric * 1000 : numeric;
+  if (!Number.isFinite(ms)) return null;
+  const date = new Date(ms);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+// Нормализация временной метки в каноническую UTC ISO-8601 форму
+// new Date(...).toISOString() для лексикографически корректных сравнений
+// диапазонов since/until в SQL: смешанные формы («Z» без миллисекунд,
+// смещения часовых поясов, epoch) иначе сортируются неправильно. Числа и
+// числовые строки трактуются как epoch: < 1e12 — секунды, иначе
+// миллисекунды. Невалидная непустая строка сохраняется как есть (fail-open
+// для мусорных транскриптов), пустой/неподходящий ввод — null.
 export function normalizeTimestamp(value) {
   if (value === undefined || value === null) return null;
-  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
-    return new Date(value).toISOString();
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value < 0) return null;
+    return epochToIso(value);
   }
-  if (typeof value === 'string' && value.trim()) return value.trim();
-  return null;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (NUMERIC_STRING.test(trimmed)) return epochToIso(Number(trimmed));
+  const parsed = new Date(trimmed);
+  return Number.isNaN(parsed.getTime()) ? trimmed : parsed.toISOString();
 }
 
 function normalizeRole(value) {
@@ -198,6 +220,9 @@ function validateVector(vector, dims = null) {
     throw fail('session_archive_vector_invalid');
   }
   if (dims !== null && vector.length !== dims) throw fail('session_archive_vector_dims');
+  // Нулевой вектор не имеет направления: косинусная близость не определена,
+  // поэтому он отклоняется fail-closed и у запроса, и у embedder'а.
+  if (vector.every(value => value === 0)) throw fail('session_archive_vector_zero');
   return vector;
 }
 
@@ -268,8 +293,18 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
   }
   const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA journal_mode = WAL;');
+  db.exec('PRAGMA busy_timeout = 5000;');
   db.exec('PRAGMA foreign_keys = ON;');
   db.exec(SCHEMA);
+  if (dbPath !== ':memory:') {
+    // Архив содержит транскрипты сессий — права только владельцу. Best effort:
+    // на не-POSIX ФС chmod может не поддерживаться, тогда пропускаем.
+    try {
+      chmodSync(dbPath, 0o600);
+    } catch {
+      // не-POSIX платформа или ФС без chmod — best effort по контракту
+    }
+  }
 
   const upsertSession = db.prepare(`
     INSERT INTO sessions (session_id, host, harness, project, cwd, title, started_at, updated_at, summary, message_count)
@@ -277,9 +312,9 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     ON CONFLICT(session_id) DO UPDATE SET
       host = excluded.host,
       harness = excluded.harness,
-      project = excluded.project,
-      cwd = excluded.cwd,
-      title = excluded.title,
+      project = COALESCE(excluded.project, sessions.project),
+      cwd = COALESCE(excluded.cwd, sessions.cwd),
+      title = COALESCE(excluded.title, sessions.title),
       started_at = COALESCE(excluded.started_at, sessions.started_at),
       updated_at = COALESCE(excluded.updated_at, sessions.updated_at),
       summary = COALESCE(excluded.summary, sessions.summary)
@@ -311,7 +346,7 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     }
     const sessionId = input.sessionId.trim();
     const messages = (input.messages ?? []).map(validateMessage);
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       upsertSession.run(
         sessionId,
@@ -381,7 +416,36 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     return db.prepare(sql).all(matchQuery, ...filters.params, poolSize);
   };
 
-  const vectorRows = (filters, dims) => {
+  // Порядок top-K: близость по убыванию, ничьи детерминированно по message_id.
+  const compareScored = (a, b) =>
+    b.similarity - a.similarity || a.row.message_id - b.row.message_id;
+
+  // Вставка в ограниченный массив top-K размером не более cap: бинарный поиск
+  // позиции, худший элемент выталкивается. Память ограничена cap записями
+  // независимо от числа embedding'ов в архиве.
+  const insertBounded = (top, entry, cap) => {
+    if (top.length >= cap && compareScored(entry, top[top.length - 1]) >= 0) return;
+    let lo = 0;
+    let hi = top.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (compareScored(entry, top[mid]) < 0) hi = mid;
+      else lo = mid + 1;
+    }
+    top.splice(lo, 0, entry);
+    if (top.length > cap) top.pop();
+  };
+
+  // Потоковое сканирование embedding'ов через iterate(): в памяти никогда не
+  // материализуется полная таблица — только bounded top-K. Парсинг vector_json
+  // fail-open (битая строка пропускается), размерность и модель фильтруются.
+  const vectorTopK = (filters, vector, poolSize, queryModel) => {
+    const clauses = ['e.dims = ?'];
+    const params = [vector.length];
+    if (queryModel !== null) {
+      clauses.push('e.model = ?');
+      params.push(queryModel);
+    }
     const sql = `
       SELECT m.id AS message_id, m.session_id, m.seq, m.role, m.created_at,
              substr(m.content, 1, 160) AS snippet,
@@ -390,9 +454,21 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
       FROM message_embeddings e
       JOIN messages m ON m.id = e.message_id
       JOIN sessions s ON s.session_id = m.session_id
-      WHERE e.dims = ?${filters.clause}
+      WHERE ${clauses.join(' AND ')}${filters.clause}
     `;
-    return db.prepare(sql).all(dims, ...filters.params);
+    const stmt = db.prepare(sql);
+    const top = [];
+    for (const row of stmt.iterate(...params, ...filters.params)) {
+      let stored;
+      try {
+        stored = JSON.parse(row.vector_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(stored) || stored.length !== vector.length) continue;
+      insertBounded(top, { row, similarity: cosineSimilarity(vector, stored) }, poolSize);
+    }
+    return top;
   };
 
   const resolveQueryVector = async ({ query, queryVector }) => {
@@ -417,11 +493,14 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
       limit = DEFAULT_SEARCH_LIMIT,
       mode = 'auto',
       queryVector = null,
+      queryModel = null,
     } = input;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000 ||
-        !SEARCH_MODES.includes(mode) || typeof query !== 'string') {
+        !SEARCH_MODES.includes(mode) || typeof query !== 'string' ||
+        (queryModel !== null && (typeof queryModel !== 'string' || !queryModel.trim()))) {
       throw fail('session_archive_search_invalid');
     }
+    const embedModel = queryModel === null ? null : queryModel.trim();
     const filters = metadataFilters(input);
     const poolSize = Math.max(limit * 4, 40);
     const matchQuery = sanitizeFtsQuery(query);
@@ -444,22 +523,11 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     const ftsRank = new Map(ftsRows.map((row, index) => [row.message_id, { rank: index + 1, row }]));
 
     // Векторное плечо: косинусная близость к нормализованным embedding'ам
-    // той же размерности, что и вектор запроса.
+    // той же размерности, что и вектор запроса, с потоковым bounded top-K.
     let vectorRank = new Map();
     if (effective === 'hybrid' && vector !== null) {
-      const scored = [];
-      for (const row of vectorRows(filters, vector.length)) {
-        let stored;
-        try {
-          stored = JSON.parse(row.vector_json);
-        } catch {
-          continue;
-        }
-        if (!Array.isArray(stored) || stored.length !== vector.length) continue;
-        scored.push({ row, similarity: cosineSimilarity(vector, stored) });
-      }
-      scored.sort((a, b) => b.similarity - a.similarity || a.row.message_id - b.row.message_id);
-      vectorRank = new Map(scored.slice(0, poolSize)
+      const top = vectorTopK(filters, vector, poolSize, embedModel);
+      vectorRank = new Map(top
         .map((entry, index) => [entry.row.message_id, { rank: index + 1, row: entry.row, similarity: entry.similarity }]));
     }
 
@@ -532,7 +600,7 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     }
     const dims = validateVector(vectors[0]).length;
     const at = new Date().toISOString();
-    db.exec('BEGIN');
+    db.exec('BEGIN IMMEDIATE');
     try {
       for (let i = 0; i < rows.length; i += 1) {
         const vector = normalizeVector(validateVector(vectors[i], dims));

@@ -294,3 +294,94 @@ test('buildProjectContext: real darkfactory profile and owner-taste example are 
   assert.equal(again.digest, ctx.digest);
   assert.equal(again.text, ctx.text);
 });
+
+test('loadProjectProfile: yaml scalar strings are trimmed', async () => {
+  const { dir, repoRoot } = await fixture({ withProfile: false });
+  try {
+    await writeFile(join(repoRoot, '.darkfactory', 'project-profile.yaml'),
+      'repo_id: "  spaced-repo  "\nl1_profile: "  strict  "\nagents_md: "  AGENTS.md  "\n');
+    await writeFile(join(repoRoot, 'AGENTS.md'), AGENTS_MD);
+    const profile = loadProjectProfile(repoRoot);
+    assert.equal(profile.repoId, 'spaced-repo');
+    assert.equal(profile.l1Profile, 'strict');
+    assert.equal(profile.agentsMd, 'AGENTS.md');
+    // trim()'нутый agents_md резолвится в реальный файл.
+    const ctx = buildProjectContext({ repoRoot });
+    assert.equal(ctx.layers.hasAgentsMd, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('readBounded: truncated UTF-8 multi-byte sequences never decode to replacement chars', async () => {
+  const { dir, repoRoot } = await fixture({ withProfile: false, withTaste: false });
+  try {
+    // Файл, где кириллическая «а» (0xD0 0xB0) стоит строго на границе
+    // бюджета чтения 256KiB: первый байт попадает в буфер, второй — нет.
+    const budget = 256 * 1024;
+    const padding = 'x'.repeat(budget - 1);
+    const globalTastePath = join(dir, 'big-taste.md');
+    await writeFile(globalTastePath, `${padding}а хвост за границей`);
+    const ctx = buildProjectContext({ globalTastePath, repoRoot, maxChars: 1024 * 1024 });
+    assert.equal(ctx.truncated, false);
+    assert.ok(!ctx.text.includes('�'), 'no U+FFFD replacement characters');
+    assert.ok(!ctx.text.includes('\0'), 'no NUL bytes from short reads');
+    // Текст обрывается на последнем полном символе — padding без «а».
+    assert.ok(ctx.text.endsWith('x'.repeat(64)));
+    assert.ok(!ctx.text.includes('хвост'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('buildProjectContext: per-section budget caps keep small sections and cut at line boundaries', async () => {
+  const { dir, repoRoot } = await fixture();
+  try {
+    // Гигантский owner-taste из различимых пронумерованных строк.
+    const lines = [];
+    for (let i = 0; i < 500; i += 1) lines.push(`taste-line-${String(i).padStart(4, '0')}`);
+    const globalTastePath = join(dir, 'owner-taste.md');
+    await writeFile(globalTastePath, `${lines.join('\n')}\n`);
+
+    const ctx = buildProjectContext({
+      globalTastePath, repoRoot, domain: 'backend', defaultSkills: ['goal-rules'], maxChars: 600,
+    });
+    assert.equal(ctx.truncated, true);
+    assert.ok(ctx.text.length <= 600);
+    // Явный маркер усечения вместо среза посередине текста.
+    assert.ok(ctx.text.endsWith('…[truncated]'));
+    // Маленькие секции не вытеснены гигантской первой секцией.
+    assert.ok(ctx.text.includes('## Repo Taste (project profile)'));
+    assert.ok(ctx.text.includes('## Domain Skills (backend)'));
+    assert.ok(ctx.text.includes('- sqlite-mastery'));
+    // Гигантская секция обрезана по границе строки: каждая показанная
+    // taste-line присутствует целиком, частичных строк нет.
+    const partial = ctx.text.split('\n').some(line =>
+      line.startsWith('taste-line-') && !/^taste-line-\d{4}$/.test(line));
+    assert.equal(partial, false);
+    assert.ok(ctx.text.includes('taste-line-0000'));
+    // Детерминизм усечения.
+    const again = buildProjectContext({
+      globalTastePath, repoRoot, domain: 'backend', defaultSkills: ['goal-rules'], maxChars: 600,
+    });
+    assert.equal(again.text, ctx.text);
+    assert.equal(again.digest, ctx.digest);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('buildProjectContext: degenerate tiny maxChars degrades to empty bounded output', async () => {
+  const { dir, repoRoot, globalTastePath } = await fixture();
+  try {
+    // Бюджет меньше самого маркера усечения: вывод пуст, но никогда не
+    // превышает maxChars и не срезает текст посередине.
+    const ctx = buildProjectContext({ globalTastePath, repoRoot, maxChars: 5 });
+    assert.equal(ctx.truncated, true);
+    assert.equal(ctx.text, '');
+    assert.ok(ctx.text.length <= 5);
+    assert.equal(ctx.digest, sha256(''));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

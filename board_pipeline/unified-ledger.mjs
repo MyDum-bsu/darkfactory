@@ -57,6 +57,8 @@ export function openUnifiedLedger(dbPath) {
   const db = new DatabaseSync(dbPath);
   let open = true;
 
+  db.exec('PRAGMA journal_mode = WAL;');
+  db.exec('PRAGMA busy_timeout = 5000;');
   db.exec(`
     CREATE TABLE IF NOT EXISTS decisions (
       id TEXT PRIMARY KEY,
@@ -84,6 +86,8 @@ export function openUnifiedLedger(dbPath) {
       rejection_reason TEXT,
       created_at TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_decisions_status_scope_created
+      ON decisions(status, scope, created_at);
   `);
 
   const ensureOpen = () => { if (!open) throw err('unified_ledger_closed'); };
@@ -161,18 +165,41 @@ export function openUnifiedLedger(dbPath) {
   }
 
   // Reject a pending proposal. Rejected proposals never enter `decisions` and
-  // can no longer be approved — the status transition is one-way.
+  // can no longer be approved — the status transition is one-way. The update
+  // is atomic: BEGIN IMMEDIATE plus a status-guarded UPDATE verified by the
+  // changes count, so a concurrent approve+reject cannot split-brain the
+  // proposal into two terminal states.
   function rejectProposal(proposalId, { rejectedBy, reason } = {}) {
     ensureOpen();
     const rejector = validateActor(rejectedBy, 'unified_ledger_input_invalid');
     if (typeof proposalId !== 'string' || proposalId === '') throw err('unified_ledger_proposal_not_found');
-    const proposal = getProposal(proposalId);
-    if (proposal === undefined) throw err('unified_ledger_proposal_not_found');
-    if (proposal.status !== 'pending') throw err('unified_ledger_proposal_not_pending');
     const cleanReason = validateText(reason, 'reason');
-    db.prepare('UPDATE decision_proposals SET status = ?, rejected_by = ?, rejection_reason = ? WHERE proposal_id = ?')
-      .run('rejected', rejector, cleanReason, proposalId);
-    return getProposal(proposalId);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const proposal = getProposal(proposalId);
+      if (proposal === undefined) throw err('unified_ledger_proposal_not_found');
+      if (proposal.status !== 'pending') throw err('unified_ledger_proposal_not_pending');
+      const result = db.prepare(
+        `UPDATE decision_proposals SET status = ?, rejected_by = ?, rejection_reason = ?
+         WHERE proposal_id = ? AND status = 'pending'`)
+        .run('rejected', rejector, cleanReason, proposalId);
+      if (Number(result.changes) !== 1) throw err('unified_ledger_proposal_not_pending');
+      db.exec('COMMIT');
+      return getProposal(proposalId);
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  // Pending proposals in deterministic submission order, oldest first. This
+  // is the owner-facing approval queue; approved/rejected proposals never
+  // reappear here.
+  function listPendingProposals() {
+    ensureOpen();
+    return db.prepare(
+      `SELECT * FROM decision_proposals WHERE status = 'pending'
+       ORDER BY created_at ASC, rowid ASC`).all();
   }
 
   // Read-only view for leads/workers: ONLY `active` decisions whose scope is
@@ -212,14 +239,22 @@ export function openUnifiedLedger(dbPath) {
   }
 
   // Deterministic Markdown rendering of active decisions relevant to a project
-  // (global + project scope) plus its sha256 digest. The digest pins exactly
-  // the emitted text so prompt injection can verify what was shown. Output is
-  // bounded by maxChars: whole entries are included while they fit alongside
-  // the truncation notice; a degenerate tiny budget falls back to a hard cut.
-  function exportMarkdown({ projectId, maxChars = DEFAULT_MAX_CHARS } = {}) {
+  // (global + project scope + optional area scopes) plus its sha256 digest.
+  // The digest pins exactly the emitted text so prompt injection can verify
+  // what was shown. Output is bounded by maxChars: truncation happens strictly
+  // on whole decision entry boundaries — entries are included in order while
+  // they fit alongside the truncation marker, and the marker explicitly states
+  // how many of the total entries are shown. A entry is never sliced
+  // mid-sentence; when nothing fits, only the header and the marker remain.
+  // `ids` lists exactly the decision ids present in the emitted markdown.
+  function exportMarkdown({ project, projectId, areas, maxChars = DEFAULT_MAX_CHARS } = {}) {
     ensureOpen();
     if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw err('unified_ledger_input_invalid');
-    const rows = queryRelevantDecisions({ projectId, limit: Number.MAX_SAFE_INTEGER });
+    if (project !== undefined && projectId !== undefined && project !== projectId) {
+      throw err('unified_ledger_input_invalid');
+    }
+    const effectiveProject = project !== undefined ? project : projectId;
+    const rows = queryRelevantDecisions({ projectId: effectiveProject, areas, limit: Number.MAX_SAFE_INTEGER });
     const header = '# Owner Decision Ledger\n';
     const byScope = new Map();
     for (const row of rows) {
@@ -231,43 +266,47 @@ export function openUnifiedLedger(dbPath) {
       if (b === 'global') return 1;
       return a < b ? -1 : 1;
     });
-    const blocks = [];
+    // Атомарная единица усечения — целиком одна запись решения; заголовок
+    // scope-секции приклеен к первой записи секции, чтобы никогда не
+    // оставаться без единой записи.
+    const units = [];
     for (const scope of scopeOrder) {
-      const entries = byScope.get(scope).map(row => [
-        `- **${inline(row.topic)}**: ${inline(row.decision)}`,
-        row.rationale ? `  - Rationale: ${inline(row.rationale)}` : null,
-        row.applicability ? `  - Applicability: ${inline(row.applicability)}` : null,
-        `  - ID: \`${row.id}\` — approved by ${inline(row.approved_by)} at ${row.approved_at}`,
-      ].filter(line => line !== null).join('\n')).join('\n');
-      blocks.push({ scope, text: `\n## ${scope}\n\n${entries}\n` });
+      const scopeRows = byScope.get(scope);
+      scopeRows.forEach((row, index) => {
+        const entry = [
+          `- **${inline(row.topic)}**: ${inline(row.decision)}`,
+          row.rationale ? `  - Rationale: ${inline(row.rationale)}` : null,
+          row.applicability ? `  - Applicability: ${inline(row.applicability)}` : null,
+          `  - ID: \`${row.id}\` — approved by ${inline(row.approved_by)} at ${row.approved_at}`,
+        ].filter(line => line !== null).join('\n');
+        units.push({ id: row.id, text: `${index === 0 ? `\n## ${scope}\n\n` : ''}${entry}\n` });
+      });
     }
-    const full = header + blocks.map(block => block.text).join('');
+    const full = header + units.map(unit => unit.text).join('');
     let markdown = full;
     let truncated = false;
+    let ids = units.map(unit => unit.id);
     if (full.length > maxChars) {
       truncated = true;
+      // Длина маркера зависит от числа показанных записей; резервируется
+      // максимальная длина (total — верхняя граница shown), поэтому итог
+      // никогда не превышает maxChars.
+      const noticeFor = shown => `\n_Truncated: showing ${shown} of ${rows.length} decision entries._\n`;
+      const reserved = noticeFor(rows.length).length;
       const included = [];
-      let idsCount = 0;
-      for (const block of blocks) {
-        const shown = included.length + 1;
-        const notice = `\n\n_Truncated: showing ${shown} of ${blocks.length} scope sections._\n`;
-        if ((header + included.join('') + block.text + notice).length <= maxChars) {
-          included.push(block.text);
-          idsCount += 1;
-        } else {
-          break;
-        }
+      const includedIds = [];
+      for (const unit of units) {
+        const candidate = header + included.join('') + unit.text;
+        if (candidate.length + reserved > maxChars) break;
+        included.push(unit.text);
+        includedIds.push(unit.id);
       }
-      if (included.length === 0) {
-        markdown = full.slice(0, maxChars);
-      } else {
-        const notice = `\n\n_Truncated: showing ${idsCount} of ${blocks.length} scope sections._\n`;
-        markdown = header + included.join('') + notice;
-        if (markdown.length > maxChars) markdown = markdown.slice(0, maxChars);
-      }
+      const notice = noticeFor(included.length);
+      markdown = header + included.join('') + notice;
+      ids = includedIds;
     }
     const digest = createHash('sha256').update(markdown).digest('hex');
-    return { markdown, digest, truncated, total: rows.length };
+    return { markdown, digest, truncated, total: rows.length, ids };
   }
 
   function close() {
@@ -276,6 +315,6 @@ export function openUnifiedLedger(dbPath) {
     db.close();
   }
 
-  return { proposeDecision, approveProposal, rejectProposal, queryRelevantDecisions,
-    exportMarkdown, close };
+  return { proposeDecision, approveProposal, rejectProposal, listPendingProposals,
+    queryRelevantDecisions, exportMarkdown, close };
 }
