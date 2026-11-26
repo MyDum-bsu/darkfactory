@@ -19,15 +19,29 @@ const isTest = name => typeof name === 'string' && TEST_FILE.test(name);
 // Граница слева не допускает '.': вызов RegExp.test() не является тест-кейсом.
 const TEST_DEF = /(?:^|[^\w$.])(?:it|test|describe)\s*\(|(?:^|[^\w$])def\s+test_/;
 // Маркеры отключения/фокусировки тестов на добавленной строке.
-const SKIP_MARK = /\b(?:it|test|describe|context|xit|xtest)\s*\.\s*(?:skip|only)\s*\(|\.only\s*\(|@pytest\.mark\.(?:skip|skipif|xfail)|@?unittest\.skip|@skip\b/;
+// xit/fit-семейство — только глобальные вызовы: граница слева не допускает
+// '.', иначе метод вида model.fit() ложно считается фокусировкой теста.
+const SKIP_MARK = /(?:^|[^\w$.])(?:xit|xtest|xdescribe|fit|fdescribe)\s*\(|\b(?:it|test|describe|context)\s*\.\s*(?:skip|only|todo)\s*\(|\.only\s*\(|\.todo\s*\(|\bt\s*\.\s*skip\s*\(|\bpytest\s*\.\s*skip\s*\(|\{[^{}]*\b(?:skip|only)\s*:\s*true\b[^{}]*\}|\b(?:skip|only)\s*:\s*true\b|@pytest\.mark\.(?:skip|skipif|xfail)|@?unittest\.skip|@[s]kip\b/;
+const STRONG_TEST_DEF = /(?:^|[^\w$.])(?:it|test|describe)\s*\(.*(?:=>|function\b|,)|(?:^|[^\w$])def\s+test_[A-Za-z0-9_]*\s*\(/;
+const JS_TEST_DEF_OPEN = /(?:^|[^\w$.])(?:it|test|describe)\s*\((.*)$/;
+const PY_TEST_DEF_OPEN = /(?:^|[^\w$])def\s+test_[A-Za-z0-9_]*\s*\(/;
+const isPlausibleTestDef = (text) => {
+  if (PY_TEST_DEF_OPEN.test(text)) return true;
+  const open = JS_TEST_DEF_OPEN.exec(text);
+  if (!open) return false;
+  const rest = open[1];
+  return rest.trim() === '' || /^\s*["'`]/.test(rest) || rest.includes(',') ||
+    rest.includes('=>') || /\bfunction\b/.test(rest);
+};
 // Проверки/утверждения: удаление без замены — ослабление гейта.
 const ASSERT_MARK = /\bassert\b|\bexpect\s*\(|\.assert\w*\s*\(/;
 // Строка-комментарий не является действующей проверкой.
-const COMMENT_MARK = /^\s*(?:\/\/|#|\*|<!--)/;
+const COMMENT_MARK = /^\s*(?:\/\/|\/\*|#|\*|<!--)/;
 // Содержательная проверка: сравнение, исключение или предикат expect(...).to*.
 const STRONG_ASSERT = /\bassert[\w.]*\s*\([^)]*(?:==|!=|>=|<=|>|<|\b(?:not\s+)?in\b|\b(?:raise|throws?|error)\w*\b)|\bassert[\w.]*(?:equal|strict|throws?|raises?|match|regex|contain|instance|true|false|close)\w*\s*\(|\bexpect\s*\([^)]*\)\s*\.\s*to\w+/i;
 // Тривиальное утверждение на месте содержательного — ослабление, а не проверка.
 const TRIVIAL_ASSERT = /\bassert\s*\(\s*(?:true|1)\s*\)|\bassert\s+True\b|\bexpect\s*\(\s*true\s*\)|\.assertTrue\s*\(\s*True/;
+const ASSERT_TAUTOLOGY = /\|\|\s*(?:true|1)\b|\b(?:true|1)\b\s*\|\||\bor\s+True\b/;
 // Сравнение с числовым порогом внутри проверки: `>= 10`, `=== 5`, `< 0.5`.
 const CMP_BOUND = /(===|!==|==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)/g;
 // Файлы, из которых запускаются проверки.
@@ -36,7 +50,6 @@ const PACKAGE_JSON = /(^|\/)package\.json$/;
 // Подмена результата проверки: принудительный нулевой код или «… || true».
 const EXIT_OK = /\bexit\s+0\b|\|\|\s*(?:true|:)\b/;
 const RUNS_TESTS = /test|jest|mocha|vitest|pytest|tap\b|ava\b/;
-const RUNNER_WORDS = /test|jest|mocha|vitest|pytest|tap|ava/g;
 const NOOP_SCRIPT = /^\s*(?:true|:|exit\s+0\b|echo\b)/;
 
 const SECRET_RULES = [
@@ -66,6 +79,27 @@ const operandKey = (text, index) => {
     }
   }
   return left.slice(cut + sepLen).replace(/\s+/g, '');
+};
+
+const stripBlockCommented = (text, inBlock) => {
+  let out = '';
+  let state = inBlock;
+  for (let i = 0; i < text.length; i++) {
+    if (state) {
+      if (text[i] === '*' && text[i + 1] === '/') {
+        state = false;
+        i++;
+      }
+      continue;
+    }
+    if (text[i] === '/' && text[i + 1] === '*') {
+      state = true;
+      i++;
+      continue;
+    }
+    out += text[i];
+  }
+  return { text: out, state };
 };
 
 // Метаданные изменений из `git diff-tree -r -z --no-commit-id -M base cand`:
@@ -116,12 +150,15 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
   const violations = [];
   const asserts = new Map();
   const bounds = new Map();
+  const testDefs = new Map();
   let oldName = null;
   let file = null;
   let inHunk = false;
   let testHunk = false;
   let oldLine = 0;
   let newLine = 0;
+  let oldBlockComment = false;
+  let newBlockComment = false;
 
   const push = (kind, line, detail, target = file) => violations.push({ kind, file: target, line, detail });
   const tallyFor = (map, name) => {
@@ -134,6 +171,13 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
     bounds.set(file, tally);
     return tally;
   };
+  const testDefTally = (name) => {
+    const tally = testDefs.get(name) ?? { removed: [], added: [] };
+    testDefs.set(name, tally);
+    return tally;
+  };
+  const isTestDef = (text) => isPlausibleTestDef(text) && !COMMENT_MARK.test(text) &&
+    (testHunk || STRONG_TEST_DEF.test(text));
   // Комментарии не считаются ни удалённой, ни добавленной проверкой.
   const isAssert = (text) => ASSERT_MARK.test(text) && !COMMENT_MARK.test(text);
 
@@ -142,6 +186,8 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       oldName = null;
       file = null;
       inHunk = false;
+      oldBlockComment = false;
+      newBlockComment = false;
       continue;
     }
     if (!inHunk && raw.startsWith('rename to ')) {
@@ -171,9 +217,12 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
     // '\ No newline at end of file' — служебная строка, не содержимое файла.
     if (raw.startsWith('\\')) continue;
     if (raw.startsWith('-')) {
-      const text = raw.slice(1);
-      if (!allowTestDeletion && TEST_DEF.test(text)) {
-        push('test_deleted', oldLine, 'removed test case');
+      const rawText = raw.slice(1);
+      const scanned = stripBlockCommented(rawText, oldBlockComment);
+      oldBlockComment = scanned.state;
+      const text = scanned.text;
+      if (!allowTestDeletion && isTestDef(text)) {
+        testDefTally(file).removed.push({ line: oldLine, text });
       }
       if (testHunk && isAssert(text)) {
         const tally = tallyFor(asserts, file);
@@ -187,17 +236,41 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       }
       oldLine++;
     } else if (raw.startsWith('+')) {
-      const text = raw.slice(1);
-      if (SKIP_MARK.test(text)) {
+      const rawText = raw.slice(1);
+      const scanned = stripBlockCommented(rawText, newBlockComment);
+      newBlockComment = scanned.state;
+      const text = scanned.text;
+      if (!allowTestDeletion && isTestDef(text)) {
+        testDefTally(file).added.push({ line: newLine, text });
+      }
+      // Skip/only-маркеры осмысленны только в тестовых hunks: в обычном коде
+      // '{ skip: true }' — конфиг, а '.fit()' — метод, а не маркер теста.
+      // Строка-комментарий не является действующим маркером (как и проверкой).
+      if (testHunk && SKIP_MARK.test(text) && !COMMENT_MARK.test(text)) {
         push('test_skipped', newLine, 'added test skip/only marker');
+      }
+      if (testHunk) {
+        const blockOpen = rawText.indexOf('/*');
+        if (blockOpen >= 0 && rawText.indexOf('*/', blockOpen + 2) < 0) {
+          push('assertion_weakened', newLine, 'unclosed block comment added in test');
+        }
+        if (COMMENT_MARK.test(rawText) && (TEST_DEF.test(rawText) || ASSERT_MARK.test(rawText))) {
+          push('assertion_weakened', newLine, 'test or assertion commented out');
+        }
+        if (/\breturn\s*(?:;|$)/.test(text)) {
+          push('assertion_weakened', newLine, 'early return added in test');
+        }
       }
       if (testHunk && TRIVIAL_ASSERT.test(text)) {
         push('assertion_weakened', newLine, 'trivial assertion added');
       }
-      for (const [rule, label] of SECRET_RULES) {
-        if (rule.test(text)) push('secret_leak', newLine, label);
+      if (testHunk && isAssert(text) && ASSERT_TAUTOLOGY.test(text)) {
+        push('assertion_weakened', newLine, 'tautological assertion added');
       }
-      if (RUNNER_FILE.test(file) && EXIT_OK.test(text)) {
+      for (const [rule, label] of SECRET_RULES) {
+        if (rule.test(rawText)) push('secret_leak', newLine, label);
+      }
+      if (RUNNER_FILE.test(file) && EXIT_OK.test(rawText)) {
         push('gate_bypass', newLine, 'added forced success in check runner');
       }
       if (testHunk && isAssert(text)) {
@@ -212,11 +285,26 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       }
       newLine++;
     } else {
+      const text = raw.startsWith(' ') ? raw.slice(1) : raw;
+      oldBlockComment = stripBlockCommented(text, oldBlockComment).state;
+      newBlockComment = stripBlockCommented(text, newBlockComment).state;
       oldLine++;
       newLine++;
     }
   }
 
+  for (const [name, tally] of testDefs) {
+    if (tally.removed.length > tally.added.length) {
+      for (const removed of tally.removed) {
+        violations.push({
+          kind: 'test_deleted',
+          file: name,
+          line: removed.line,
+          detail: 'removed test case',
+        });
+      }
+    }
+  }
   for (const [name, tally] of asserts) {
     if (tally.removed.length > tally.added.length) {
       violations.push({
@@ -304,6 +392,165 @@ async function gitShow(worktree, sha, path) {
   }
 }
 
+const TEST_RUNNER_EXECUTABLES = new Set(['jest', 'mocha', 'vitest', 'pytest', 'tap', 'ava']);
+
+function stripJsComments(text) {
+  return String(text).replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
+}
+
+function splitShellWords(command) {
+  const tokens = [];
+  let cur = '';
+  let inWord = false;
+  const pushWord = () => {
+    if (inWord) tokens.push(cur);
+    cur = '';
+    inWord = false;
+  };
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (/\s/.test(c)) { pushWord(); continue; }
+    if (c === ';' || c === '&' || c === '|') {
+      pushWord();
+      if ((c === '&' || c === '|') && command[i + 1] === c) {
+        tokens.push(c + c);
+        i++;
+      } else {
+        tokens.push(c);
+      }
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      inWord = true;
+      for (i++; i < command.length && command[i] !== c; i++) {
+        if (c === '"' && command[i] === '\\' && i + 1 < command.length) {
+          cur += command[++i];
+        } else {
+          cur += command[i];
+        }
+      }
+      continue;
+    }
+    if (c === '\\') {
+      cur += command[++i] ?? '';
+      inWord = true;
+      continue;
+    }
+    cur += c;
+    inWord = true;
+  }
+  pushWord();
+  return tokens.filter((token) => token !== '');
+}
+
+function shellSegments(command) {
+  const segments = [];
+  let current = [];
+  for (const token of splitShellWords(command)) {
+    if (token === ';' || token === '&' || token === '|' || token === '&&' || token === '||') {
+      if (current.length) segments.push(current);
+      current = [];
+    } else {
+      current.push(token);
+    }
+  }
+  if (current.length) segments.push(current);
+  return segments;
+}
+
+function cleanScriptArgv(words) {
+  const argv = [];
+  for (let i = 0; i < words.length; i++) {
+    const redir = /^(?:\d*(<<<|<<|>>|<|>)|(&>>?))(.*)$/.exec(words[i]);
+    if (redir) {
+      if (!redir[3]) i++;
+      continue;
+    }
+    argv.push(words[i]);
+  }
+  while (argv.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[0])) argv.shift();
+  return argv;
+}
+
+const executableName = (word) => String(word ?? '').split(/[\/\\]/).pop()
+  .replace(/\.exe$/i, '').replace(/\.js$/i, '');
+
+function runnerSignatures(command) {
+  const signatures = new Set();
+  for (const segment of shellSegments(command)) {
+    const argv = cleanScriptArgv(segment);
+    if (!argv.length) continue;
+    const exe = executableName(argv[0]);
+    const rest = argv.slice(1);
+    if (TEST_RUNNER_EXECUTABLES.has(exe)) signatures.add(exe);
+    if (!TEST_RUNNER_EXECUTABLES.has(exe) &&
+        !['node', 'nodejs', 'npx', 'bunx', 'npm', 'pnpm', 'yarn', 'bun'].includes(exe) &&
+        !/^python(?:[\d.]*)$/.test(exe) && RUNS_TESTS.test(exe)) {
+      signatures.add(`exec:${argv[0]}`);
+    }
+    const hasNodeTest = (exe === 'node' || exe === 'nodejs') &&
+      rest.some((word) => word === '--test' || word.startsWith('--test='));
+    if (hasNodeTest) signatures.add('test');
+    if (exe === 'node' || exe === 'nodejs') {
+      const positional = [];
+      for (let i = 0; i < rest.length; i++) {
+        const word = rest[i];
+        if (['-e', '--eval', '-r', '--require', '--loader', '--experimental-loader'].includes(word)) {
+          i++;
+          continue;
+        }
+        if (word.startsWith('-')) continue;
+        positional.push(word);
+      }
+      const scriptToken = positional[0];
+      const script = executableName(scriptToken);
+      if (TEST_RUNNER_EXECUTABLES.has(script)) signatures.add(script);
+      else if (scriptToken && !hasNodeTest) signatures.add(`node:${scriptToken}`);
+    }
+    if (/^python(?:[\d.]*)$/.test(exe)) {
+      const moduleIndex = rest.findIndex((word) => word === '-m');
+      const moduleName = moduleIndex >= 0 ? rest[moduleIndex + 1] : rest.find((word) => !word.startsWith('-'));
+      if (TEST_RUNNER_EXECUTABLES.has(executableName(moduleName))) signatures.add(executableName(moduleName));
+    }
+    if (exe === 'npx' || exe === 'bunx') {
+      const nested = executableName(rest.find((word) => !word.startsWith('-')));
+      if (TEST_RUNNER_EXECUTABLES.has(nested)) signatures.add(nested);
+    }
+    if (['npm', 'pnpm', 'yarn', 'bun'].includes(exe)) {
+      const words = rest.filter((word) => !word.startsWith('-'));
+      if (words[0] === 'test' || (words[0] === 'run' && words[1] === 'test')) {
+        signatures.add(`${exe}:test`);
+      }
+      const execIndex = words[0] === 'exec' ? 1 : -1;
+      const nested = executableName(execIndex >= 0 ? words[execIndex] : null);
+      if (TEST_RUNNER_EXECUTABLES.has(nested)) signatures.add(nested);
+    }
+  }
+  return signatures;
+}
+
+function commentOnlyNodeEval(command) {
+  const segments = shellSegments(command).filter((segment) => segment.length);
+  if (segments.length !== 1) return false;
+  const argv = cleanScriptArgv(segments[0]);
+  const exe = executableName(argv[0]);
+  if (exe !== 'node' && exe !== 'nodejs') return false;
+  let payload = null;
+  for (let i = 1; i < argv.length; i++) {
+    if (argv[i] === '-e' || argv[i] === '--eval') {
+      payload = argv[i + 1] ?? '';
+      break;
+    }
+    if (argv[i].startsWith('--eval=')) {
+      payload = argv[i].slice('--eval='.length);
+      break;
+    }
+  }
+  if (payload === null) return false;
+  const compact = stripJsComments(payload).trim().replace(/;+\s*$/, '');
+  return compact === '' || ['true', '0', 'null', 'undefined'].includes(compact);
+}
+
 // Семантика package.json: удалённый/пустой/ослабленный scripts.test — обход гейта.
 // Строковый разбор не ловит scripts.test на одной строке с metadata.test;
 // здесь сравниваются распарсенные объекты base и candidate.
@@ -325,11 +572,14 @@ async function packageJsonViolations(worktree, baseSha, candidateSha, path) {
   if (typeof candTest !== 'string' || !candTest.trim()) {
     return push('scripts.test removed');
   }
-  if (NOOP_SCRIPT.test(candTest) || !RUNS_TESTS.test(candTest)) {
+  const visibleCandTest = stripJsComments(candTest);
+  if (NOOP_SCRIPT.test(visibleCandTest) || commentOnlyNodeEval(candTest) ||
+      !RUNS_TESTS.test(visibleCandTest)) {
     return push('scripts.test no longer runs tests');
   }
-  const runners = (cmd) => new Set((cmd.match(RUNNER_WORDS) ?? []).map((w) => w));
-  const lost = [...runners(baseTest)].filter((w) => !runners(candTest).has(w));
+  const baseRunners = runnerSignatures(baseTest);
+  const candRunners = runnerSignatures(candTest);
+  const lost = [...baseRunners].filter((w) => !candRunners.has(w));
   if (lost.length > 0) {
     return push(`test runner weakened: dropped ${lost.join(',')}`);
   }
@@ -348,7 +598,7 @@ export async function tamperGate(binding, profile = {}) {
     gitIsolated(worktree,
       ['diff-tree', '-r', '-z', '--no-commit-id', '-M', base_sha, candidate_sha]),
     gitIsolated(worktree,
-      ['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--unified=0',
+      ['diff', '--text', '--no-color', '--no-ext-diff', '--no-textconv', '--unified=0',
         `${base_sha}..${candidate_sha}`]),
   ]);
   const violations = [

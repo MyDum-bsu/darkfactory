@@ -98,9 +98,38 @@ function lexCommands(line, state, depth) {
     if (c === '\\') { cur += line[++i] ?? ''; inWord = true; continue; }
     if (c === "'" || c === '"') {
       const close = findQuoteClose(line, i, c);
-      if (close < 0) { cur += line.slice(i + 1); inWord = true; break; }
-      cur += line.slice(i + 1, close);
+      const end = close < 0 ? line.length : close;
+      if (c === "'") {
+        cur += line.slice(i + 1, end);
+      } else {
+        for (let j = i + 1; j < end; j++) {
+          const q = line[j];
+          if (q === '\\') {
+            cur += q + (line[j + 1] ?? '');
+            j++;
+            continue;
+          }
+          if (q === '`') {
+            const subClose = findBacktickClose(line, j);
+            if (subClose > j && subClose < end) {
+              subs.push(line.slice(j + 1, subClose));
+              j = subClose;
+              continue;
+            }
+          }
+          if (q === '$' && line[j + 1] === '(') {
+            const subClose = findParenClose(line, j + 1);
+            if (subClose > j + 1 && subClose < end) {
+              subs.push(line.slice(j + 2, subClose));
+              j = subClose;
+              continue;
+            }
+          }
+          cur += q;
+        }
+      }
       inWord = true;
+      if (close < 0) break;
       i = close;
       continue;
     }
@@ -130,7 +159,31 @@ function lexCommands(line, state, depth) {
       }
       cur += c; inWord = true; continue;
     }
-    if (c === ';' || c === '\n' || c === '&') { pushSegment(); continue; }
+    if (c === ';' || c === '\n' || c === '&') {
+      // '&' в fd-дублировании '>&'/'<&' (2>&1, 0<&1) — часть оператора
+      // редиректа внутри слова, а не разделитель команд: иначе разбор
+      // '2>&1 rm -rf /' дробится на ['2>'] и ['1', 'rm', ...], пряча argv[0].
+      // '&>'/'&>>' (redirect both) сюда НЕ входят: в POSIX-sh это background +
+      // пустая команда с редиректом — консервативно остаётся разделителем.
+      if (c === '&' && (line[i - 1] === '>' || line[i - 1] === '<')) {
+        cur += c;
+        inWord = true;
+        continue;
+      }
+      pushSegment();
+      continue;
+    }
+    // '<'/'>' — операторы редиректа даже в середине слова: 'rm -rf />x' в
+    // shell — rm с целью '/' и редиректом '>x', а не целью '/>x'. Без границы
+    // слова цель склеивается с оператором и прячется от проверок путей.
+    // Цифры перед оператором — fd-префикс (2>), серия операторов не
+    // прерывается (>>, <<<); прочее слово завершается перед оператором.
+    if (c === '<' || c === '>') {
+      if (inWord && cur && !/^\d*[<>]*$/.test(cur)) pushWord();
+      cur += c;
+      inWord = true;
+      continue;
+    }
     if (/\s/.test(c)) { pushWord(); continue; }
     cur += c;
     inWord = true;
@@ -145,10 +198,28 @@ function lexCommands(line, state, depth) {
   return { segments };
 }
 
-function findQuoteClose(line, start, quote) {
+function findQuoteClose(line, start, quote, depth = 0) {
   // Кавычка внутри одинарных — литеральна; внутри двойных \" экранируется.
+  // $(...) и `...` внутри двойных кавычек разбираются как единая подстановка:
+  // кавычки внутри неё открывают собственный контекст и НЕ закрывают внешнюю
+  // строку (bash: echo "$(rm -rf "/")" — валидная вложенность).
+  if (depth > 64) throw new Error('nesting too deep');
   for (let i = start + 1; i < line.length; i++) {
-    if (quote === '"' && line[i] === '\\') { i++; continue; }
+    if (quote === '"') {
+      if (line[i] === '\\') { i++; continue; }
+      if (line[i] === '$' && line[i + 1] === '(') {
+        const close = findParenClose(line, i + 1, depth + 1);
+        if (close < 0) return -1;
+        i = close;
+        continue;
+      }
+      if (line[i] === '`') {
+        const close = findBacktickClose(line, i);
+        if (close < 0) return -1;
+        i = close;
+        continue;
+      }
+    }
     if (line[i] === quote) return i;
   }
   return -1;
@@ -161,12 +232,13 @@ function findBacktickClose(line, start) {
   return -1;
 }
 
-function findParenClose(line, start) {
+function findParenClose(line, start, nestDepth = 0) {
+  if (nestDepth > 64) throw new Error('nesting too deep');
   let depth = 0;
   for (let i = start; i < line.length; i++) {
     const c = line[i];
     if (c === "'" || c === '"') {
-      const close = findQuoteClose(line, i, c);
+      const close = findQuoteClose(line, i, c, nestDepth + 1);
       if (close < 0) return -1;
       i = close;
       continue;
@@ -180,19 +252,27 @@ function findParenClose(line, start) {
   return -1;
 }
 
-// Токены сегмента → argv: отбрасывание редиректов (> >> < <<<) с их
+// Токены сегмента → argv: отбрасывание редиректов (> >> < <<< &>) с их
 // аргументами и VAR=value присваиваний в начале.
 function tokenize(words) {
   const argv = [];
+  let beforeCommand = true;
   for (let i = 0; i < words.length; i++) {
     const w = words[i];
-    if (/^\d*(<<<|>>?|<)/.test(w)) {
-      // '>' '<' '>>' съедают следующее слово (имя файла); '<<<' — нет:
-      // содержимое herestring анализируется в analyze и остаётся аргументом.
-      if (/^\d*(<|>)$/.test(w) || /^\d*<{1,2}$/.test(w)) i++;
+    const redir = /^(?:\d*(<<<|<<|>>|<|>)|(&>>?))(.*)$/.exec(w);
+    if (redir) {
+      const op = redir[1] ?? redir[2];
+      // Ведущий редирект съедает цель до определения argv[0]. После команды
+      // цель herestring остаётся входным потоком (важно для xargs).
+      // Голый '&' после '>'/'<' — fd-дублирование с ОТДЕЛЬНОЙ целью (2>& 1 —
+      // валидный shell): цель — следующее слово, как у редиректа без неё.
+      const rest = redir[3] === '&' ? '' : redir[3];
+      if (!rest && (beforeCommand || op !== '<<<')) i++;
+      if (rest && op === '<<<' && !beforeCommand) argv.push(rest);
       continue;
     }
     argv.push(w);
+    if (!ASSIGNMENT.test(w)) beforeCommand = false;
   }
   while (argv.length && ASSIGNMENT.test(argv[0])) argv.shift();
   return argv;
@@ -382,15 +462,17 @@ function ruleRm(args) {
     targets.push(w);
   }
   if (!flags.has('r') && !flags.has('R')) return null;
-  if (!flags.has('f')) return null;
   if (!targets.length) return null;
   const norm = t => t.replace(/\/+$/, '') || '/';
   if (targets.some(t => BLOCKED_FS_ROOTS.has(norm(t)) || t === '-')) {
     return hit(CRITICAL, 'rm_root', 'rm -rf по корню/домашней/текущей директории');
   }
+  if (!flags.has('f')) return null;
   // REGEN_DIRS — только относительные/проектные цели: rm -rf /tmp и
   // ~/build — системные/домашние пути, allow по basename не работает.
-  if (targets.every(t => !/^[\/~$]/.test(t) && REGEN_DIRS.has(norm(t).split('/').pop()))) {
+  if (targets.every(t => !/^[\/~$]/.test(t) &&
+      !norm(t).split('/').includes('..') &&
+      REGEN_DIRS.has(norm(t).split('/').pop()))) {
     return hit('allow', 'rm_regen', 'rm -rf по регенерируемой директории');
   }
   return hit(ORDINARY, 'rm_rf', 'rm -rf по не регенерируемой директории');
@@ -451,8 +533,9 @@ function ruleMkfs(args, cmd) {
 
 function ruleChmod(args, cmd) {
   if (cmd !== 'chmod' && cmd !== 'chown' && cmd !== 'chgrp') return null;
-  const flags = args.slice(1).filter(w => w.startsWith('-')).join('');
-  if (!flags.includes('R')) return null;
+  const optionWords = args.slice(1).filter(w => w.startsWith('-'));
+  const flags = optionWords.join('');
+  if (!flags.includes('R') && !optionWords.includes('--recursive')) return null;
   const operands = args.slice(1).filter(w => !w.startsWith('-'));
   const targets = cmd === 'chmod' ? operands.slice(1) : operands.slice(1);
   const modeOrSpec = operands[0] ?? '';
@@ -524,19 +607,22 @@ function ruleShutdown(args, cmd) {
 }
 
 function ruleFind(args) {
+  const result = { innerArgvs: [] };
   if (args.includes('-delete')) {
-    return hit(ORDINARY, 'find_delete', 'find -delete удаляет найденные файлы');
+    result.hit = hit(ORDINARY, 'find_delete', 'find -delete удаляет найденные файлы');
   }
-  const execIdx = args.findIndex(w => w === '-exec' || w === '-execdir' || w === '-ok' || w === '-okdir');
-  if (execIdx >= 0 && execIdx + 1 < args.length) {
+  for (let execIdx = 0; execIdx < args.length; execIdx++) {
+    if (!['-exec', '-execdir', '-ok', '-okdir'].includes(args[execIdx])) continue;
     // find ... -exec rm -rf {} \; — вложенная команда до ';' или '+'.
     const innerArgv = [];
-    for (let i = execIdx + 1; i < args.length && args[i] !== ';' && args[i] !== '+'; i++) {
-      innerArgv.push(args[i]);
+    let end = execIdx + 1;
+    for (; end < args.length && args[end] !== ';' && args[end] !== '+'; end++) {
+      innerArgv.push(args[end]);
     }
-    return { innerArgv };
+    if (innerArgv.length) result.innerArgvs.push(innerArgv);
+    execIdx = end;
   }
-  return null;
+  return result.hit || result.innerArgvs.length ? result : null;
 }
 
 // --- движок ------------------------------------------------------------------
@@ -601,8 +687,8 @@ function analyze(segments, state) {
     else if (cmd === 'docker') raise(ruleDocker(unwrapped));
     else if (cmd === 'find') {
       const h = ruleFind(unwrapped);
-      if (h?.innerArgv) analyzeArgv(h.innerArgv);
-      else raise(h);
+      raise(h?.hit);
+      for (const innerArgv of h?.innerArgvs ?? []) analyzeArgv(innerArgv);
     } else {
       raise(ruleMkfs(unwrapped, cmd));
       raise(ruleChmod(unwrapped, cmd));
