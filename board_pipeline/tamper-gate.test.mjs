@@ -553,6 +553,35 @@ test('AUDIT-0c regression: .fit()-метод и конфиг skip вне тес�
   assert.deepEqual(res.violations, []);
 });
 
+test('WAVE2-5a: удаление тест-файла с assert — test_file_deleted и assertion_weakened по умолчанию', async () => {
+  const res = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {\n  assert(x === 1);\n});\n' },
+    candidate: { 'tests/app.test.js': null },
+  });
+  assert.equal(res.ok, false);
+  const kinds = res.violations.map((v) => v.kind);
+  assert.ok(kinds.includes('test_file_deleted'), JSON.stringify(res.violations));
+  assert.ok(kinds.includes('assertion_weakened'), JSON.stringify(res.violations));
+});
+
+test('WAVE2-5a: удаление тест-файла с assert проходит чисто при allowTestDeletion: true', async () => {
+  const res = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {\n  assert(x === 1);\n  assert(y >= 2);\n});\n' },
+    candidate: { 'tests/app.test.js': null },
+  }, { allowTestDeletion: true });
+  assert.equal(res.ok, true, JSON.stringify(res.violations));
+  assert.equal(res.violations.length, 0, JSON.stringify(res.violations));
+});
+
+test('WAVE2-5a: ослабление assert в изменённом (не удалённом) тест-файле отклоняется даже при allowTestDeletion: true', async () => {
+  const res = await gate({
+    base: { 'tests/app.test.js': 'assert(x === 1);\nassert(y === 2);\nexport const z = 1;\n' },
+    candidate: { 'tests/app.test.js': 'export const z = 1;\n' },
+  }, { allowTestDeletion: true });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
+});
+
 test('AUDIT-0c regression: .fit()/.xit() методы в тестовом файле — не фокусировка', async () => {
   const res = await gate({
     base: { 'tests/ml.test.js': 'test("a", () => {});\n' },

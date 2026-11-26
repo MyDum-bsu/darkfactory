@@ -155,6 +155,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
   let file = null;
   let inHunk = false;
   let testHunk = false;
+  let isDeletedFile = false;
   let oldLine = 0;
   let newLine = 0;
   let oldBlockComment = false;
@@ -186,6 +187,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       oldName = null;
       file = null;
       inHunk = false;
+      isDeletedFile = false;
       oldBlockComment = false;
       newBlockComment = false;
       continue;
@@ -200,7 +202,8 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
     }
     if (!inHunk && raw.startsWith('+++ ')) {
       const newName = raw.slice(4).trim();
-      file = newName === '/dev/null'
+      isDeletedFile = newName === '/dev/null';
+      file = isDeletedFile
         ? (typeof oldName === 'string' && oldName.startsWith('a/') ? oldName.slice(2) : oldName)
         : newName.replace(/^b\//, '');
       continue;
@@ -224,7 +227,9 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       if (!allowTestDeletion && isTestDef(text)) {
         testDefTally(file).removed.push({ line: oldLine, text });
       }
-      if (testHunk && isAssert(text)) {
+      // При явном допуске удаления тестов удаляемый файл целиком уходит по
+      // решению оператора: его проверки не «ослабляются», а перестают существовать.
+      if (testHunk && isAssert(text) && !(allowTestDeletion && isDeletedFile)) {
         const tally = tallyFor(asserts, file);
         tally.removed.push(oldLine);
         if (STRONG_ASSERT.test(text)) tally.strongRemoved++;
