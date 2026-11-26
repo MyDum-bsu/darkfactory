@@ -3,10 +3,13 @@
 // HTTP/SSE сервера на 127.0.0.1:<port> (дефолт 44110, --port /
 // DF_CONTROL_ROOM_PORT, 0 для ephemeral).
 //
-// СТРОГО READ-ONLY: только GET/HEAD (POST/PUT/PATCH/DELETE → 405), ноль
+// READ-ONLY ПО УМОЛЧАНИЮ: только GET/HEAD (POST/PUT/PATCH/DELETE → 405), ноль
 // mutating-запросов в Board, ноль записи в worktree/state. Host/Origin
 // guard против DNS-rebinding/CSRF, строгий CSP, все недоверенные строки
-// санитизируются.
+// санитизируются. Единственное исключение — Authenticated Owner Write-API
+// (POST /api/owner/answer|unblock|cancel): fail-closed, активно только при
+// заданном ownerWriteToken И ownerActions port; constant-time Bearer check,
+// строгий Origin/Host guard, тело ≤ 16 KiB, idempotency dedup.
 //
 // Агрегация по ключу (project, task_id, attempt_id, epoch):
 //   - push-события Unix socket + хвост events.ndjson (ring-buffer ≤ 2000);
@@ -18,6 +21,7 @@
 // Только Node stdlib.
 
 import { execFile } from 'node:child_process';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { lstat, mkdir, readFile, readdir, stat, unlink } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
@@ -53,6 +57,56 @@ const MAX_BODY_BYTES = 0; // тело не читается никогда (GET/
 const jsonHeaders = extra => ({
   'Content-Type': 'application/json; charset=utf-8',
   ...SECURITY_HEADERS, ...extra });
+
+// --- Authenticated Owner Write-API (fail-closed) ------------------------------
+//
+// Интерактивные действия владельца из Herdr Desktop/Mobile (и будущего
+// Telegram/Iva-моста). Write API существует только когда заданы И
+// ownerWriteToken, И ownerActions port — иначе любой POST /api/owner/*
+// отвечает 403 write_api_disabled, сохраняя read-only дефолт. Bearer-токен
+// сравнивается через SHA-256 + timingSafeEqual (constant-time, без утечки
+// длины). Idempotency-дедупликация по (endpoint, taskId, idempotencyKey):
+// повторный double-click или параллельная отправка из Herdr+Telegram
+// возвращает закэшированный ответ без повторного вызова ownerActions.
+export const OWNER_WRITE_MAX_BODY_BYTES = 16 * 1024;
+export const OWNER_IDEMPOTENCY_TTL_MS = 600_000;
+export const OWNER_IDEMPOTENCY_MAX_ENTRIES = 256;
+const OWNER_TASK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const OWNER_ENDPOINTS = new Map([
+  ['/api/owner/answer', 'answer'],
+  ['/api/owner/unblock', 'unblock'],
+  ['/api/owner/cancel', 'cancel'],
+]);
+
+function bearerTokenEqual(presented, expected) {
+  if (typeof presented !== 'string' || typeof expected !== 'string' ||
+      !presented || !expected) return false;
+  // SHA-256 выравнивает длину обеих сторон: timingSafeEqual не раскрывает
+  // ни длину токена, ни позицию первого несовпадения.
+  const a = createHash('sha256').update(presented, 'utf8').digest();
+  const b = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
+// Тело читается с жёстким потолком; при переполнении поток дочитывается
+// (соединение остаётся корректным), но запрос отклоняется 413.
+function readRequestBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let overflow = false;
+    req.on('data', chunk => {
+      size += chunk.length;
+      if (size > limit) { overflow = true; chunks.length = 0; return; }
+      if (!overflow) chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (overflow) reject(new Error('body_too_large'));
+      else resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', reject);
+  });
+}
 
 // --- провайдеры по умолчанию (read-only) -------------------------------------
 
@@ -1209,6 +1263,8 @@ export function createControlRoomAggregator({
   inspectProvider = async () => ({ text: '', artifacts: [] }),
   webDir = WEB_DIR,
   now = () => Date.now(),
+  ownerWriteToken = null,
+  ownerActions = null,
 } = {}) {
   const readTelemetry = telemetryProvider ?? createTelemetryProvider({ telemetryDir, stateDirs, now });
   const effectiveStateDir = stateDir ?? stateDirs[0] ?? null;
@@ -1222,6 +1278,10 @@ export function createControlRoomAggregator({
   let sockServer = null;
   let lastSeq = 0;
   let reconcileNeeded = false;
+  // Bounded idempotency cache Owner Write-API: key (action|taskId|key) →
+  // { at, response }. TTL + FIFO-eviction; кэшируются только успешные ответы.
+  const ownerIdempotencyCache = new Map();
+  const ownerWriteEnabled = Boolean(ownerWriteToken && ownerActions);
 
   const attemptKey = e => [e.project ?? '', e.task_id ?? '', e.attempt_id ?? '',
     e.epoch ?? ''].join('|');
@@ -1364,6 +1424,7 @@ export function createControlRoomAggregator({
     return {
       ts: new Date(now()).toISOString(),
       reconcile: reconciled,
+      ownerWriteEnabled,
       ...columns(tasks),
       boardStatus: board.boardStatus,
       health: { board: board.boardStatus },
@@ -1394,6 +1455,109 @@ export function createControlRoomAggregator({
     return STATIC.get(name);
   };
 
+  // Authenticated Owner Write-API: строгий fail-closed порядок проверок —
+  // disabled → auth → content-type → body → payload → idempotency → вызов
+  // ownerActions. Проверки Host/Origin уже выполнены в respond для всех
+  // запросов. Ни один сбой не вызывает ownerActions частично.
+  const handleOwnerWrite = async (req, res, pathname) => {
+    const action = OWNER_ENDPOINTS.get(pathname);
+    const reply = (status, body) => {
+      res.writeHead(status, jsonHeaders());
+      res.end(JSON.stringify(body));
+    };
+    const portMethod = ownerActions !== null && typeof ownerActions === 'object'
+      ? ownerActions[action] : null;
+    if (!ownerWriteToken || typeof ownerWriteToken !== 'string' ||
+        typeof portMethod !== 'function') {
+      reply(403, { ok: false, error: 'write_api_disabled' });
+      return;
+    }
+    const auth = req.headers.authorization;
+    const presented = typeof auth === 'string' && auth.startsWith('Bearer ')
+      ? auth.slice('Bearer '.length) : null;
+    if (!bearerTokenEqual(presented, ownerWriteToken)) {
+      reply(401, { ok: false, error: 'unauthorized' });
+      return;
+    }
+    const contentType = req.headers['content-type'];
+    if (typeof contentType !== 'string' ||
+        !contentType.toLowerCase().startsWith('application/json')) {
+      reply(415, { ok: false, error: 'unsupported_media_type' });
+      return;
+    }
+    let bodyText;
+    try {
+      bodyText = await readRequestBody(req, OWNER_WRITE_MAX_BODY_BYTES);
+    } catch {
+      reply(413, { ok: false, error: 'body_too_large' });
+      return;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      reply(400, { ok: false, error: 'invalid_json' });
+      return;
+    }
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+      reply(400, { ok: false, error: 'invalid_payload' });
+      return;
+    }
+    const taskId = payload.taskId;
+    if (typeof taskId !== 'string' || !OWNER_TASK_ID_RE.test(taskId)) {
+      reply(400, { ok: false, error: 'invalid_task_id' });
+      return;
+    }
+    if (action === 'answer' &&
+        (typeof payload.answer !== 'string' || !payload.answer.trim())) {
+      reply(400, { ok: false, error: 'invalid_answer' });
+      return;
+    }
+    if (payload.idempotencyKey !== undefined &&
+        (typeof payload.idempotencyKey !== 'string' || !payload.idempotencyKey ||
+          payload.idempotencyKey.length > 128)) {
+      reply(400, { ok: false, error: 'invalid_idempotency_key' });
+      return;
+    }
+
+    const idemKey = typeof payload.idempotencyKey === 'string' && payload.idempotencyKey
+      ? `${action}|${taskId}|${payload.idempotencyKey}` : null;
+    if (idemKey) {
+      const at = now();
+      for (const [key, entry] of ownerIdempotencyCache) {
+        if (at - entry.at > OWNER_IDEMPOTENCY_TTL_MS) ownerIdempotencyCache.delete(key);
+      }
+      const hit = ownerIdempotencyCache.get(idemKey);
+      if (hit) {
+        reply(200, { ...hit.response, deduplicated: true });
+        return;
+      }
+    }
+
+    const actionPayload = {};
+    if (payload.answer !== undefined) actionPayload.answer = payload.answer;
+    if (payload.choice !== undefined) actionPayload.choice = payload.choice;
+    if (payload.reason !== undefined) actionPayload.reason = payload.reason;
+    if (payload.idempotencyKey !== undefined) actionPayload.idempotencyKey = payload.idempotencyKey;
+    let result;
+    try {
+      result = await portMethod(taskId, actionPayload);
+    } catch (error) {
+      reply(502, { ok: false, error: 'action_failed',
+        message: sanitizeTerminalText(String(error?.message ?? error ?? 'action failed')) });
+      return;
+    }
+    const responseBody = { ok: true, action, taskId, result: result ?? null,
+      deduplicated: false };
+    if (idemKey) {
+      ownerIdempotencyCache.set(idemKey, { at: now(), response: responseBody });
+      while (ownerIdempotencyCache.size > OWNER_IDEMPOTENCY_MAX_ENTRIES) {
+        ownerIdempotencyCache.delete(ownerIdempotencyCache.keys().next().value);
+      }
+    }
+    reply(200, responseBody);
+  };
+
   const respond = async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const activePort = httpServer?.address()?.port ?? port;
@@ -1405,6 +1569,10 @@ export function createControlRoomAggregator({
     if (!isAllowedOrigin(req.headers.origin, activePort)) {
       res.writeHead(403, jsonHeaders());
       res.end(JSON.stringify({ error: 'forbidden_origin' }));
+      return;
+    }
+    if (req.method === 'POST' && OWNER_ENDPOINTS.has(url.pathname)) {
+      await handleOwnerWrite(req, res, url.pathname);
       return;
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -1549,7 +1717,8 @@ async function cli(argv) {
     'resources-budget': { type: 'string' },
     'worker-usage': { type: 'string' },
     'telemetry-dir': { type: 'string' },
-    'fleet-dir': { type: 'string' } } });
+    'fleet-dir': { type: 'string' },
+    'owner-write-token': { type: 'string' } } });
   const port = values.port !== undefined ? Number(values.port)
     : Number(process.env.DF_CONTROL_ROOM_PORT ?? DEFAULT_PORT);
   const socketPath = values.socket !== undefined ? values.socket
@@ -1590,7 +1759,12 @@ async function cli(argv) {
     finopsProvider: createFinopsProvider({
       budgetPath: values['resources-budget'],
       workerUsagePath: values['worker-usage'],
-      workerStatePath: cloudStatePath }) });
+      workerStatePath: cloudStatePath }),
+    // Owner Write-API: токен доступен из CLI/env, но ownerActions port — это
+    // программный мост (Herdr Desktop/Mobile, Telegram/Iva); без живого порта
+    // write API остаётся fail-closed write_api_disabled даже с токеном.
+    ownerWriteToken: values['owner-write-token'] ??
+      process.env.DF_CONTROL_ROOM_WRITE_TOKEN ?? null });
   const { port: actual } = await aggregator.start();
   console.log(JSON.stringify({ control_room: 'listening', host: '127.0.0.1', port: actual,
     socket: socketPath, boardApi: observeBoard.boardUrl, boardChannels: channels,

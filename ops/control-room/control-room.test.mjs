@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, rm, writeFile, readFile, readdir } from 'node:fs/promises';
-import { get } from 'node:http';
+import { get, request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1689,4 +1689,226 @@ test('app.js renderStatus: kill-switch читается из snap.killSwitch и�
   assert.equal(ids.get('chip-killswitch').classList.contains('bad'), false);
   hooks.renderStatus({ ...base, pilot: {} });
   assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: off');
+});
+
+// --- Authenticated Owner Write-API --------------------------------------------
+
+const httpPost = (url, { headers = {}, body = '' } = {}) => new Promise((resolve, reject) => {
+  const u = new URL(url);
+  const req = request({ hostname: u.hostname, port: u.port, path: u.pathname,
+    method: 'POST', headers: { Host: u.host, ...headers } }, res => {
+    let data = '';
+    res.on('data', c => { data += c; });
+    res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+  });
+  req.on('error', reject);
+  req.write(body);
+  req.end();
+});
+
+const WRITE_TOKEN = 'owner-secret-token';
+const jsonPost = (base, path, payload, { token = WRITE_TOKEN, headers = {} } = {}) =>
+  httpPost(`${base}${path}`, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...headers,
+    },
+    body: typeof payload === 'string' ? payload : JSON.stringify(payload),
+  });
+
+function makeOwnerActions(calls = []) {
+  return {
+    answer: async (taskId, payload) => { calls.push(['answer', taskId, payload]); return { recorded: true }; },
+    unblock: async (taskId, payload) => { calls.push(['unblock', taskId, payload]); return { recorded: true }; },
+    cancel: async (taskId, payload) => { calls.push(['cancel', taskId, payload]); return { recorded: true }; },
+  };
+}
+
+test('owner write-api: disabled by default and partial config → 403 write_api_disabled', async () => {
+  const valid = { taskId: 'T1', answer: 'да' };
+  // Нет ни токена, ни порта — read-only дефолт.
+  await withServer({}, async (server, base) => {
+    const res = await jsonPost(base, '/api/owner/answer', valid);
+    assert.equal(res.status, 403);
+    assert.equal(JSON.parse(res.body).error, 'write_api_disabled');
+    const snap = JSON.parse((await httpGet(`${base}/api/snapshot`)).body);
+    assert.equal(snap.ownerWriteEnabled, false);
+  });
+  // Токен без ownerActions port.
+  await withServer({ ownerWriteToken: WRITE_TOKEN }, async (server, base) => {
+    const res = await jsonPost(base, '/api/owner/answer', valid);
+    assert.equal(res.status, 403);
+    assert.equal(JSON.parse(res.body).error, 'write_api_disabled');
+    const snap = JSON.parse((await httpGet(`${base}/api/snapshot`)).body);
+    assert.equal(snap.ownerWriteEnabled, false);
+  });
+  // Порт без токена.
+  await withServer({ ownerActions: makeOwnerActions() }, async (server, base) => {
+    const res = await jsonPost(base, '/api/owner/answer', valid);
+    assert.equal(res.status, 403);
+    assert.equal(JSON.parse(res.body).error, 'write_api_disabled');
+  });
+  // Пустой токен — тоже disabled.
+  await withServer({ ownerWriteToken: '', ownerActions: makeOwnerActions() }, async (server, base) => {
+    const res = await jsonPost(base, '/api/owner/answer', valid);
+    assert.equal(res.status, 403);
+    assert.equal(JSON.parse(res.body).error, 'write_api_disabled');
+  });
+});
+
+test('owner write-api: missing/wrong Bearer token → 401, handler не вызывается', async () => {
+  const calls = [];
+  await withServer({ ownerWriteToken: WRITE_TOKEN, ownerActions: makeOwnerActions(calls) },
+    async (server, base) => {
+      const noAuth = await jsonPost(base, '/api/owner/answer', { taskId: 'T1', answer: 'x' }, { token: null });
+      assert.equal(noAuth.status, 401);
+      assert.equal(JSON.parse(noAuth.body).error, 'unauthorized');
+      const wrong = await jsonPost(base, '/api/owner/answer', { taskId: 'T1', answer: 'x' }, { token: 'wrong' });
+      assert.equal(wrong.status, 401);
+      const wrongLen = await jsonPost(base, '/api/owner/answer', { taskId: 'T1', answer: 'x' },
+        { token: WRITE_TOKEN + '-suffix' });
+      assert.equal(wrongLen.status, 401);
+      const malformed = await httpPost(`${base}/api/owner/answer`, {
+        headers: { 'Content-Type': 'application/json', Authorization: 'Basic abc' },
+        body: JSON.stringify({ taskId: 'T1', answer: 'x' }) });
+      assert.equal(malformed.status, 401);
+      assert.equal(calls.length, 0);
+      const snap = JSON.parse((await httpGet(`${base}/api/snapshot`)).body);
+      assert.equal(snap.ownerWriteEnabled, true);
+    });
+});
+
+test('owner write-api: чужой Origin/Host → 403 до проверки токена', async () => {
+  const calls = [];
+  await withServer({ ownerWriteToken: WRITE_TOKEN, ownerActions: makeOwnerActions(calls) },
+    async (server, base) => {
+      const badOrigin = await jsonPost(base, '/api/owner/answer', { taskId: 'T1', answer: 'x' },
+        { headers: { Origin: 'https://evil.example.com' } });
+      assert.equal(badOrigin.status, 403);
+      assert.equal(JSON.parse(badOrigin.body).error, 'forbidden_origin');
+      const badHost = await jsonPost(base, '/api/owner/answer', { taskId: 'T1', answer: 'x' },
+        { headers: { Host: 'evil.example.com:80' } });
+      assert.equal(badHost.status, 403);
+      assert.equal(JSON.parse(badHost.body).error, 'forbidden_host');
+      assert.equal(calls.length, 0);
+    });
+});
+
+test('owner write-api: invalid payload/content-type/body → 400/415/413', async () => {
+  const calls = [];
+  await withServer({ ownerWriteToken: WRITE_TOKEN, ownerActions: makeOwnerActions(calls) },
+    async (server, base) => {
+      // Не-JSON content-type.
+      const plain = await httpPost(`${base}/api/owner/answer`, {
+        headers: { 'Content-Type': 'text/plain', Authorization: `Bearer ${WRITE_TOKEN}` },
+        body: '{}' });
+      assert.equal(plain.status, 415);
+      // Битый JSON.
+      const broken = await jsonPost(base, '/api/owner/answer', '{not json');
+      assert.equal(broken.status, 400);
+      assert.equal(JSON.parse(broken.body).error, 'invalid_json');
+      // Пустой/невалидный taskId.
+      for (const taskId of ['', 'bad id!', 'a'.repeat(65), 42, null]) {
+        const res = await jsonPost(base, '/api/owner/answer', { taskId, answer: 'x' });
+        assert.equal(res.status, 400, JSON.stringify(taskId));
+        assert.equal(JSON.parse(res.body).error, 'invalid_task_id');
+      }
+      // Пустой/отсутствующий answer для /answer.
+      for (const answer of ['', '   ', 42, undefined]) {
+        const res = await jsonPost(base, '/api/owner/answer', { taskId: 'T1', answer });
+        assert.equal(res.status, 400, JSON.stringify(answer));
+        assert.equal(JSON.parse(res.body).error, 'invalid_answer');
+      }
+      // Тело не object.
+      const arr = await jsonPost(base, '/api/owner/answer', '[1,2]');
+      assert.equal(arr.status, 400);
+      // Тело > 16 KiB.
+      const fat = await jsonPost(base, '/api/owner/answer',
+        { taskId: 'T1', answer: 'x'.repeat(17 * 1024) });
+      assert.equal(fat.status, 413);
+      assert.equal(JSON.parse(fat.body).error, 'body_too_large');
+      assert.equal(calls.length, 0);
+    });
+});
+
+test('owner write-api: валидные answer/unblock/cancel → 200, port вызван с payload', async () => {
+  const calls = [];
+  await withServer({ ownerWriteToken: WRITE_TOKEN, ownerActions: makeOwnerActions(calls) },
+    async (server, base) => {
+      const answer = await jsonPost(base, '/api/owner/answer',
+        { taskId: 'T1', answer: 'Да, пушить', choice: 'approve' });
+      assert.equal(answer.status, 200);
+      const answerBody = JSON.parse(answer.body);
+      assert.equal(answerBody.ok, true);
+      assert.equal(answerBody.action, 'answer');
+      assert.equal(answerBody.taskId, 'T1');
+      assert.equal(answerBody.deduplicated, false);
+      assert.equal(answerBody.result.recorded, true);
+
+      const unblock = await jsonPost(base, '/api/owner/unblock', { taskId: 'T2', reason: 'fixed' });
+      assert.equal(unblock.status, 200);
+      assert.equal(JSON.parse(unblock.body).action, 'unblock');
+
+      const cancel = await jsonPost(base, '/api/owner/cancel', { taskId: 'T3', reason: 'неактуально' });
+      assert.equal(cancel.status, 200);
+      assert.equal(JSON.parse(cancel.body).action, 'cancel');
+
+      assert.deepEqual(calls.map(c => c[0]), ['answer', 'unblock', 'cancel']);
+      assert.equal(calls[0][1], 'T1');
+      assert.equal(calls[0][2].answer, 'Да, пушить');
+      assert.equal(calls[0][2].choice, 'approve');
+      assert.equal(calls[2][2].reason, 'неактуально');
+    });
+});
+
+test('owner write-api: idempotencyKey dedup — handler вызван один раз, replay deduplicated', async () => {
+  const calls = [];
+  await withServer({ ownerWriteToken: WRITE_TOKEN, ownerActions: makeOwnerActions(calls) },
+    async (server, base) => {
+      const payload = { taskId: 'T1', answer: 'да', idempotencyKey: 'herdr-click-1' };
+      const first = await jsonPost(base, '/api/owner/answer', payload);
+      assert.equal(first.status, 200);
+      assert.equal(JSON.parse(first.body).deduplicated, false);
+      // Double-click / параллельная отправка Herdr+Telegram: тот же ключ.
+      const second = await jsonPost(base, '/api/owner/answer', payload);
+      assert.equal(second.status, 200);
+      const replay = JSON.parse(second.body);
+      assert.equal(replay.deduplicated, true);
+      assert.equal(replay.ok, true);
+      assert.equal(replay.taskId, 'T1');
+      assert.equal(calls.length, 1, 'ownerActions не вызывается повторно');
+      // Другой ключ — новое действие. Другой endpoint — тоже новое действие.
+      await jsonPost(base, '/api/owner/answer', { ...payload, idempotencyKey: 'herdr-click-2' });
+      await jsonPost(base, '/api/owner/cancel', { taskId: 'T1', idempotencyKey: 'herdr-click-1' });
+      assert.equal(calls.length, 3);
+      // Без idempotencyKey дедупликации нет — каждый POST идёт в port.
+      await jsonPost(base, '/api/owner/answer', { taskId: 'T1', answer: 'да' });
+      await jsonPost(base, '/api/owner/answer', { taskId: 'T1', answer: 'да' });
+      assert.equal(calls.length, 5);
+    });
+});
+
+test('owner write-api: ошибка port → 502, ответ не кэшируется; read-only API жив', async () => {
+  const failing = {
+    answer: async () => { throw new Error('board unreachable'); },
+    unblock: async () => ({}), cancel: async () => ({}),
+  };
+  await withServer({ ownerWriteToken: WRITE_TOKEN, ownerActions: failing },
+    async (server, base) => {
+      const res = await jsonPost(base, '/api/owner/answer',
+        { taskId: 'T1', answer: 'да', idempotencyKey: 'k-1' });
+      assert.equal(res.status, 502);
+      assert.equal(JSON.parse(res.body).error, 'action_failed');
+      // Сбой не кэшируется: повтор с тем же ключом — новая попытка (снова 502).
+      const retry = await jsonPost(base, '/api/owner/answer',
+        { taskId: 'T1', answer: 'да', idempotencyKey: 'k-1' });
+      assert.equal(retry.status, 502);
+      assert.equal(JSON.parse(retry.body).deduplicated, undefined);
+      // Read-only поверхность не затронута.
+      const snap = await httpGet(`${base}/api/snapshot`);
+      assert.equal(snap.status, 200);
+      const mutation = await httpRequest(`${base}/api/snapshot`, {}, 'POST');
+      assert.equal(mutation.status, 405);
+    });
 });
