@@ -217,3 +217,120 @@ workspace_links: {}
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('finops: expired credits excluded and localized thousands decimals parse accurately', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-credits-num-'));
+  try {
+    const budget = join(dir, 'budget.yaml');
+    await writeFile(budget, `version: 1
+monthly_budgets:
+  cloud_eur: 40
+cloud_credits:
+  - id: active
+    remaining_eur: 100
+    expires: 2999-01-01
+  - id: expired
+    remaining_eur: 50
+    expires: 2020-01-01
+compute_vms: []
+workspace_links: {}
+`);
+    const snap = await createFinopsProvider({ budgetPath: budget })();
+    assert.equal(snap.ok, true);
+    assert.equal(snap.totals.remainingCreditsEur, 100);
+    assert.equal(snap.creditRunway.remainingCreditsEur, 100);
+    assert.equal(snap.cloudCredits.length, 2);
+
+    const localized = join(dir, 'localized.yaml');
+    await writeFile(localized, `version: 1
+monthly_budget_eur: "1,200"
+compute_vms:
+  - id: worker-a
+    hourly_cost_usd: "1,006.02"
+    metered: true
+  - id: worker-b
+    hourly_cost_usd: "1.006,02"
+    metered: true
+compute_price_eur_per_usd: 1
+workspace_links: {}
+`);
+    const parsed = await createFinopsProvider({ budgetPath: localized })();
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.totals.monthlyBudgetEur, 1200);
+    assert.equal(parsed.computeVms[0].hourlyCostUsd, 1006.02);
+    assert.equal(parsed.computeVms[1].hourlyCostUsd, 1006.02);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('finops: nested usage.vms is metered, malformed numbers and negative rates are rejected', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-nested-negative-'));
+  try {
+    const budget = join(dir, 'budget.yaml');
+    const usage = join(dir, 'usage.json');
+    await writeFile(budget, `version: 1
+compute_vms:
+  - id: metered-worker
+    hourly_cost_usd: 0.10
+    metered: true
+  - id: nested-worker
+    hourly_cost_usd: 0.20
+  - id: negative-worker
+    hourly_cost_usd: -0.10
+    metered: true
+  - id: malformed-worker
+    hourly_cost_usd: "12,34,567"
+    metered: true
+workspace_links: {}
+`);
+    await writeFile(usage, JSON.stringify({ vms: {
+      'metered-worker': { runningMinutesMonth: 60 },
+      'nested-worker': { runningMinutesMonth: 120 },
+      'negative-worker': { runningMinutesMonth: 30 },
+      'malformed-worker': { runningMinutesMonth: 10 },
+    } }));
+    const snap = await createFinopsProvider({ budgetPath: budget, workerUsagePath: usage })();
+    assert.equal(snap.ok, true);
+    assert.equal(snap.computeVms.find(vm => vm.id === 'nested-worker').runningMinutesMonth, 120);
+    assert.equal(snap.totals.runningMinutesMonth, 220);
+    assert.equal(snap.computeVms.find(vm => vm.id === 'negative-worker').hourlyCostUsd, null);
+    assert.equal(snap.computeVms.find(vm => vm.id === 'malformed-worker').hourlyCostUsd, null);
+    assert.equal(snap.alerts.filter(alert => alert.code === 'invalid_config_value').length >= 2, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('finops: freshest usage journal wins and worker usage reads are capped at 256 KiB', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-journal-cap-'));
+  try {
+    const budget = join(dir, 'budget.yaml');
+    const state = join(dir, 'state.json');
+    const usage = join(dir, 'usage.json');
+    await writeFile(budget, `version: 1
+compute_vms:
+  - id: worker-a
+    hourly_cost_usd: 0.10
+    metered: true
+workspace_links: {}
+`);
+    await writeFile(state, JSON.stringify({
+      updatedAt: '2026-01-01T00:00:00.000Z', runningMinutesMonth: 10 }));
+    await writeFile(usage, JSON.stringify({
+      updatedAt: '2026-01-02T00:00:00.000Z', runningMinutesMonth: 20 }));
+    const usageFresh = await createFinopsProvider({ budgetPath: budget, workerStatePath: state, workerUsagePath: usage })();
+    assert.equal(usageFresh.totals.runningMinutesMonth, 20);
+
+    await writeFile(state, JSON.stringify({
+      updatedAt: '2026-01-03T00:00:00.000Z', runningMinutesMonth: 30 }));
+    const stateFresh = await createFinopsProvider({ budgetPath: budget, workerStatePath: state, workerUsagePath: usage })();
+    assert.equal(stateFresh.totals.runningMinutesMonth, 30);
+
+    await writeFile(usage, `{"runningMinutesMonth":600,"padding":"${'x'.repeat(263000)}"}`);
+    const capped = await createFinopsProvider({ budgetPath: budget, workerStatePath: join(dir, 'missing-state.json'), workerUsagePath: usage })();
+    assert.equal(capped.totals.runningMinutesMonth, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

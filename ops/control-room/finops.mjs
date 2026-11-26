@@ -19,10 +19,31 @@ const isRecord = value => value !== null && typeof value === 'object' && !Array.
 const num = value => {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value === 'string' && value.trim() !== '') {
-    const n = Number(value.replace(/[€$\s]/g, '').replace(',', '.'));
+    let normalized = value.trim().replace(/[€$\s]/g, '');
+    const commas = normalized.match(/,/g)?.length ?? 0;
+    const dots = normalized.match(/\./g)?.length ?? 0;
+    if (commas && dots) {
+      normalized = normalized.lastIndexOf(',') > normalized.lastIndexOf('.')
+        ? normalized.replace(/\./g, '').replace(',', '.')
+        : normalized.replace(/,/g, '');
+    } else if (commas === 1) {
+      const parts = normalized.split(',');
+      normalized = parts[1].length === 3 && /^\d+$/.test(parts[1])
+        ? normalized.replace(',', '')
+        : normalized.replace(',', '.');
+    } else if (commas > 1) {
+      if (!/^-?\d{1,3}(,\d{3})+$/.test(normalized)) return null;
+      normalized = normalized.replace(/,/g, '');
+    }
+    if (!/^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(normalized)) return null;
+    const n = Number(normalized);
     return Number.isFinite(n) ? n : null;
   }
   return null;
+};
+const nonNegativeNum = value => {
+  const n = num(value);
+  return n !== null && n >= 0 ? n : null;
 };
 const text = value => typeof value === 'string' && value.trim() ? clean(value.trim()) : null;
 const iso = value => {
@@ -74,7 +95,7 @@ async function readWorkerUsage(path) {
   if (!path) return null;
   try {
     const lst = await lstat(path);
-    if (lst.isSymbolicLink() || !lst.isFile()) return null;
+    if (lst.isSymbolicLink() || !lst.isFile() || lst.size > 256 * 1024) return null;
     const parsed = JSON.parse(await readFile(path, 'utf8'));
     return isRecord(parsed) ? parsed : null;
   } catch {
@@ -153,7 +174,7 @@ function usageFor(vm, usage, { allowRootUsage = true } = {}) {
   const key = text(vm.usage_key ?? vm.id);
   const nested = isRecord(usage.vms) && key ? usage.vms[key] : null;
   const explicitRoot = key === text(usage.vmId);
-  const metered = meteredVm(vm) || explicitRoot;
+  const metered = meteredVm(vm) || explicitRoot || isRecord(nested);
   if (!metered) return null;
   // Плоский корневой usage относится к одной машине. При нескольких metered
   // VM он применяется только к явно названной (vmId/вложенный ключ); иначе
@@ -169,6 +190,45 @@ function usageFor(vm, usage, { allowRootUsage = true } = {}) {
   };
 }
 
+function journalTimeMs(value) {
+  const raw = value?.updatedAt ?? value?.updated_at;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (typeof raw === 'string' && raw.trim()) {
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function mergeUsageJournals(stateJournal, usageJournal) {
+  const journals = [stateJournal, usageJournal].filter(isRecord);
+  if (!journals.length) return null;
+  if (journals.length === 1) return journals[0];
+  const stateMs = journalTimeMs(stateJournal);
+  const usageMs = journalTimeMs(usageJournal);
+  const stateIsFresher = (stateMs ?? -Infinity) > (usageMs ?? -Infinity);
+  const older = stateIsFresher ? usageJournal : stateJournal;
+  const fresher = stateIsFresher ? stateJournal : usageJournal;
+  const olderMs = stateIsFresher ? usageMs : stateMs;
+  const fresherMs = stateIsFresher ? stateMs : usageMs;
+  const merged = { ...older, ...fresher };
+  if (isRecord(older.vms) && isRecord(fresher.vms)) {
+    const vms = { ...older.vms };
+    for (const [id, freshEntry] of Object.entries(fresher.vms)) {
+      const oldEntry = vms[id];
+      if (isRecord(oldEntry) && isRecord(freshEntry)) {
+        const oldAt = journalTimeMs(oldEntry) ?? olderMs ?? -Infinity;
+        const freshAt = journalTimeMs(freshEntry) ?? fresherMs ?? -Infinity;
+        vms[id] = freshAt >= oldAt ? freshEntry : oldEntry;
+      } else {
+        vms[id] = freshEntry;
+      }
+    }
+    merged.vms = vms;
+  }
+  return merged;
+}
+
 function daysInMonth(at) {
   const d = new Date(at);
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
@@ -176,7 +236,7 @@ function daysInMonth(at) {
 
 function normalize(raw, usage, sourcePath, at) {
   const alerts = [];
-  const usdToEur = num(raw.usd_to_eur ?? raw.fx?.usd_to_eur) ?? 0.92;
+  const usdToEur = nonNegativeNum(raw.usd_to_eur ?? raw.fx?.usd_to_eur) ?? 0.92;
   const monthlyBudgetEur = num(raw.monthly_budget_eur ?? raw.budgets?.monthly_eur) ?? null;
   const utilizationThresholdPct = num(raw.underutilized_below_pct ??
     raw.budgets?.utilization_alert_below_pct) ?? 5;
@@ -199,8 +259,16 @@ function normalize(raw, usage, sourcePath, at) {
   const meteredCount = vmEntries.filter(meteredVm).length;
   const computeVms = vmEntries.map((entry, index) => {
     const id = text(entry.id) ?? `vm-${index + 1}`;
-    const hourlyUsd = num(entry.hourly_cost_usd ?? entry.hourlyCostUsd);
-    const hourlyEur = num(entry.hourly_cost_eur ?? entry.hourlyCostEur) ??
+    const rawHourlyUsd = entry.hourly_cost_usd ?? entry.hourlyCostUsd;
+    const rawHourlyEur = entry.hourly_cost_eur ?? entry.hourlyCostEur;
+    const hourlyUsd = nonNegativeNum(rawHourlyUsd);
+    const parsedHourlyEur = nonNegativeNum(rawHourlyEur);
+    if ((rawHourlyUsd != null && hourlyUsd === null) ||
+        (rawHourlyEur != null && parsedHourlyEur === null)) {
+      alerts.push({ severity: 'warn', code: 'invalid_config_value', resourceId: id,
+        message: `${id}: negative or malformed hourly rate rejected` });
+    }
+    const hourlyEur = parsedHourlyEur ??
       (hourlyUsd == null ? 0 : hourlyUsd * usdToEur);
     const live = usageFor({ ...entry, id }, usage,
       { allowRootUsage: meteredCount <= 1 });
@@ -272,7 +340,9 @@ function normalize(raw, usage, sourcePath, at) {
   const elapsedDays = Math.max(1, new Date(at).getUTCDate());
   const projectedMonthCostEur = spentMonthCostEur / elapsedDays * dim;
   const dailyBurnEur = projectedMonthCostEur / dim;
-  const remainingCreditsEur = cloudCredits.reduce((sum, credit) =>
+  const activeCredits = cloudCredits.filter(credit =>
+    !credit.expires || Date.parse(credit.expires) >= at);
+  const remainingCreditsEur = activeCredits.reduce((sum, credit) =>
     sum + (credit.remainingEur ?? 0), 0);
 
   for (const credit of cloudCredits) {
@@ -344,8 +414,7 @@ export function createFinopsProvider({ budgetPath, workerUsagePath, workerStateP
       const [raw, usageJournal, stateJournal] = await Promise.all([
         readYamlFile(resolved), readWorkerUsage(usagePath),
         readWorkerUsage(workerStatePath)]);
-      const usage = usageJournal || stateJournal
-        ? { ...(stateJournal ?? {}), ...(usageJournal ?? {}) } : null;
+      const usage = mergeUsageJournals(stateJournal, usageJournal);
       return normalize(raw, usage, resolved, at);
     } catch (error) {
       return { ok: false, error: clean(error?.message ?? error ?? 'finops read failed') };

@@ -22,40 +22,72 @@ export const SECURITY_HEADERS = Object.freeze({
   'Cross-Origin-Resource-Policy': 'same-origin',
 });
 
-const hostOnly = host => {
-  if (typeof host !== 'string' || !host) return '';
-  // host без порта или в форме [ipv6]:port / name:port.
-  if (host.startsWith('[')) return host.slice(0, host.indexOf(']') + 1);
-  const idx = host.lastIndexOf(':');
-  return idx > 0 ? host.slice(0, idx) : host;
+const LOCALHOST_SUBDOMAIN_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)*\.localhost$/;
+
+const validLocalhostSubdomain = name => {
+  if (!LOCALHOST_SUBDOMAIN_RE.test(name) || name.length > 253) return false;
+  return name.split('.').every(label => label.length <= 63 &&
+    !label.startsWith('-') && !label.endsWith('-'));
 };
 
-const portOf = host => {
-  if (typeof host !== 'string') return null;
-  const idx = host.lastIndexOf(':');
-  if (idx < 0 || host.endsWith(']')) return null;
-  const port = Number(host.slice(idx + 1));
-  return Number.isSafeInteger(port) ? port : null;
+const parseHost = host => {
+  if (typeof host !== 'string' || !host) return null;
+  const value = host.toLowerCase();
+  let name = null;
+  let portText = null;
+  if (value.startsWith('[')) {
+    const close = value.indexOf(']');
+    if (close < 0) return null;
+    name = value.slice(0, close + 1);
+    const rest = value.slice(close + 1);
+    if (rest) {
+      if (!rest.startsWith(':')) return null;
+      portText = rest.slice(1);
+    }
+  } else {
+    const colons = value.match(/:/g)?.length ?? 0;
+    if (colons === 0) {
+      name = value;
+    } else if (colons === 1) {
+      const idx = value.indexOf(':');
+      name = value.slice(0, idx);
+      portText = value.slice(idx + 1);
+    } else if (value === '::1') {
+      name = value;
+    } else {
+      return null;
+    }
+  }
+  if (!name) return null;
+  let parsedPort = null;
+  if (portText !== null) {
+    if (!/^\d+$/.test(portText)) return null;
+    parsedPort = Number(portText);
+    if (!Number.isSafeInteger(parsedPort) || parsedPort > 65535) return null;
+  }
+  return { name, port: parsedPort };
 };
 
 // Host заголовок обязан быть loopback и (если порт задан) совпадать с
 // портом сервера — иначе DNS-rebinding на чужой порт тоже пройдёт.
-export function isAllowedHost(host, port) {
-  const name = hostOnly(host).toLowerCase();
-  if (!name) return false;
-  const allowed = LOOPBACK_HOSTS.has(name) || name.endsWith('.localhost');
+export function isAllowedHost(host, port, defaultPort = 80) {
+  const parsed = parseHost(host);
+  if (!parsed) return false;
+  const name = parsed.name === '[::1]' ? '::1' : parsed.name;
+  const allowed = LOOPBACK_HOSTS.has(name) || validLocalhostSubdomain(name);
   if (!allowed) return false;
-  const p = portOf(host);
-  return p === null || (Number.isSafeInteger(port) ? p === port : true);
+  if (!Number.isSafeInteger(port)) return true;
+  return (parsed.port ?? defaultPort) === port;
 }
 
 // Origin заголовок (CSRF-защита для будущих мутаций и для защиты от
 // drive-by форм): отсутствие Origin допустимо (curl/SSE), заданный —
 // обязан быть loopback на нашем порту.
 export function isAllowedOrigin(origin, port) {
-  if (origin === undefined || origin === null || origin === '' || origin === 'null') {
+  if (origin === undefined || origin === null || origin === '') {
     return true;
   }
+  if (origin === 'null') return false;
   let parsed;
   try {
     parsed = new URL(origin);
@@ -63,7 +95,10 @@ export function isAllowedOrigin(origin, port) {
     return false;
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-  return isAllowedHost(parsed.host, port);
+  if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+    return false;
+  }
+  return isAllowedHost(parsed.host, port, parsed.protocol === 'https:' ? 443 : 80);
 }
 
 // Вырезание всех ANSI/CSI/OSC escape-последовательностей и опасных control

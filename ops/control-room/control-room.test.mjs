@@ -17,7 +17,7 @@ import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
 import { createNetHealthMonitor } from './net-health.mjs';
 import { createControlRoomAggregator, createBoardObserver,
   createBranchDriftProvider, createModelsProvider, createTelemetryProvider,
-  buildFleetTelemetry, normalizeFleetHost, RING_LIMIT } from './aggregator.mjs';
+  buildActiveTrees, buildFleetTelemetry, normalizeFleetHost, RING_LIMIT } from './aggregator.mjs';
 import { createFinopsProvider } from './finops.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -65,12 +65,29 @@ test('host: допускается loopback, чужие hostname/порт отв
   assert.equal(isAllowedHost(undefined, 44110), false);
   // Другой порт — rebinding на соседний сервис.
   assert.equal(isAllowedHost('127.0.0.1:9999', 44110), false);
+  assert.equal(isAllowedHost('[::1]:44110', 44110), true);
+  assert.equal(isAllowedHost('::1', 80), true);
+  assert.equal(isAllowedHost('localhost:abc', 44110), false);
+  assert.equal(isAllowedHost('localhost:44110garbage', 44110), false);
+  assert.equal(isAllowedHost('[::1]garbage', 44110), false);
+  assert.equal(isAllowedHost('[::1]:abc', 44110), false);
+  assert.equal(isAllowedHost('.localhost', 44110), false);
+  assert.equal(isAllowedHost('bad_host.localhost:44110', 44110), false);
+  assert.equal(isAllowedHost('-bad.localhost:44110', 44110), false);
 });
 
 test('origin: отсутствие допустимо, чужой origin отвергается', () => {
   assert.equal(isAllowedOrigin(undefined, 44110), true);
-  assert.equal(isAllowedOrigin('null', 44110), true);
+  assert.equal(isAllowedOrigin('', 44110), true);
+  assert.equal(isAllowedOrigin('null', 44110), false);
   assert.equal(isAllowedOrigin('http://127.0.0.1:44110', 44110), true);
+  assert.equal(isAllowedOrigin('http://[::1]:44110', 44110), true);
+  assert.equal(isAllowedOrigin('http://localhost', 44110), false);
+  assert.equal(isAllowedOrigin('http://localhost', 80), true);
+  assert.equal(isAllowedOrigin('https://localhost', 443), true);
+  assert.equal(isAllowedOrigin('https://localhost', 44110), false);
+  assert.equal(isAllowedOrigin('http://localhost:44110/path', 44110), false);
+  assert.equal(isAllowedOrigin('http://user@localhost:44110', 44110), false);
   assert.equal(isAllowedOrigin('https://evil.example.com', 44110), false);
   assert.equal(isAllowedOrigin('file:///tmp/x', 44110), false);
   assert.equal(isAllowedOrigin('javascript:alert(1)', 44110), false);
@@ -142,6 +159,57 @@ test('net-health: stale cloud journal → status stale', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('net-health: default fetcher forwards HEAD options and cancels response body', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let cancelled = 0;
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return { status: 200, body: { cancel: async () => { cancelled += 1; } } };
+  };
+  try {
+    const monitor = createNetHealthMonitor({
+      probes: [{ name: 'llm', url: 'http://probe.example' }], now: () => 0 });
+    await monitor.snapshot();
+    for (let i = 0; i < 20 && cancelled === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].opts.method, 'HEAD');
+    assert.equal(calls[0].opts.redirect, 'manual');
+    assert.ok(calls[0].opts.signal);
+    assert.equal(cancelled, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('net-health: concurrent refreshes are deduplicated per probe name', async () => {
+  const calls = [];
+  let release;
+  const monitor = createNetHealthMonitor({
+    probes: [{ name: 'llm', url: 'http://probe.example' }],
+    fetchImpl: (url, opts) => new Promise(resolve => {
+      calls.push({ url, opts });
+      release = resolve;
+    }),
+    now: () => 0 });
+  const first = monitor.snapshot();
+  const second = monitor.snapshot();
+  await Promise.all([first, second]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].opts.method, 'HEAD');
+  release({ status: 200 });
+  for (let i = 0; i < 20; i++) {
+    const snap = await monitor.snapshot();
+    if (snap.probes[0].status === 'ok') break;
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  const settled = await monitor.snapshot();
+  assert.equal(settled.probes[0].status, 'ok');
+  assert.equal(calls.length, 1);
 });
 
 // --- aggregator -----------------------------------------------------------------
@@ -310,6 +378,84 @@ test('aggregator V2-8: activeTrees hierarchy, boardExplorer groups and repoSlots
   assert.equal(readyIdea.repoId, 'repo-beta');
   assert.equal(readyIdea.receiptSha, 'a'.repeat(40));
   assert.equal(df.tasks.find(task => task.id === 'T1').updatedAt, '2026-01-01T00:59:00.000Z');
+});
+
+test('activeTrees: failed terminal attempts do not turn elapsed gates into passes; adaptive decisions do not run stages', () => {
+  const telemetry = (overrides) => ({
+    task_id: 'TH', attempt_id: 'att-hold', epoch: 1,
+    started_at: '2026-01-01T00:00:00.000Z', ended_at: '2026-01-01T00:10:00.000Z',
+    phases_ms: { l1_local: 1000, tamper: 500, l2_critic: 2000, total: 3500 },
+    rounds: { total: 1, rework: 0, pass: 0, arbitration: 0, open: 0, gates: {} },
+    ...overrides,
+  });
+  const trees = buildActiveTrees({
+    now: () => Date.parse('2026-01-01T01:00:00.000Z'),
+    tasks: [
+      { task_id: 'TH', state: 'hold', title: 'hold' },
+      { task_id: 'TM', state: 'hold', title: 'metadata failure' },
+      { task_id: 'TO', state: 'hold', title: 'object phase failure' },
+      { task_id: 'TA', state: 'claimed', title: 'adaptive' },
+    ],
+    telemetryAttempts: [
+      telemetry({ outcome: 'hold', reason: 'review_error: critic crashed',
+        rounds: { total: 1, rework: 0, pass: 0, arbitration: 0, open: 0, gates: { l2: 1 } } }),
+      telemetry({ task_id: 'TM', attempt_id: 'att-meta', outcome: 'fail', reason: null,
+        phase_failures: ['l2_critic'] }),
+      telemetry({ task_id: 'TO', attempt_id: 'att-object', outcome: 'review_error', reason: null,
+        phases_ms: { l2_critic: { ms: 2000, fail: true }, total: 2000 } }),
+    ],
+    events: [{ task_id: 'TA', attempt_id: 'att-adaptive', epoch: 1,
+      kind: 'adaptive_gate_decision', phase: 'l1_local', ts: '2026-01-01T00:30:00.000Z' }],
+  });
+  const stage = (tree, kind) => tree.stages.find(item => item.kind === kind);
+  const hold = trees.find(tree => tree.taskId === 'TH');
+  assert.equal(stage(hold, 'l1_local').status, 'pass');
+  assert.equal(stage(hold, 'tamper').status, 'pass');
+  assert.equal(stage(hold, 'l2_critic').status, 'fail');
+  assert.match(stage(hold, 'l2_critic').reason, /review_error/);
+  const metadata = trees.find(tree => tree.taskId === 'TM');
+  assert.equal(stage(metadata, 'l2_critic').status, 'fail');
+  const objectFailure = trees.find(tree => tree.taskId === 'TO');
+  assert.equal(stage(objectFailure, 'l2_critic').status, 'fail');
+  assert.equal(stage(objectFailure, 'l2_critic').elapsedMs, 2000);
+  const adaptive = trees.find(tree => tree.taskId === 'TA');
+  assert.equal(stage(adaptive, 'l1_local').status, 'pending');
+});
+
+test('activeTrees: telemetry is matched to live events by attempt and epoch', () => {
+  const attempt = (taskId, attemptId, epoch, cost) => ({
+    task_id: taskId, attempt_id: attemptId, epoch, outcome: 'done', open: false,
+    cost_usd: cost,
+    started_at: '2026-01-01T00:00:00.000Z', ended_at: '2026-01-01T00:10:00.000Z',
+    phases_ms: { l2_critic: 1000, total: 2000 },
+    rounds: { total: 4, rework: 3, pass: 1, arbitration: 0, open: 0, gates: {} },
+  });
+  const trees = buildActiveTrees({
+    now: () => Date.parse('2026-01-01T01:00:00.000Z'),
+    tasks: [
+      { task_id: 'TMIX', state: 'claimed', title: 'new attempt' },
+      { task_id: 'TMATCH', state: 'claimed', title: 'same attempt' },
+    ],
+    telemetryAttempts: [
+      attempt('TMIX', 'att-old', 1, 9),
+      attempt('TMATCH', 'att-current', 1, 2.5),
+    ],
+    events: [
+      { task_id: 'TMIX', attempt_id: 'att-new', epoch: 2, kind: 'phase', phase: 'working',
+        ts: '2026-01-01T00:30:00.000Z' },
+      { task_id: 'TMATCH', attempt_id: 'att-current', epoch: 1, kind: 'phase', phase: 'working',
+        ts: '2026-01-01T00:31:00.000Z' },
+    ],
+  });
+  const mixed = trees.find(tree => tree.taskId === 'TMIX');
+  assert.equal(mixed.status, 'running');
+  assert.equal(mixed.estCostUsd, null);
+  assert.notEqual(mixed.rounds, 4);
+  assert.equal(mixed.stages.find(stage => stage.kind === 'l2_critic').status, 'pending');
+  const matching = trees.find(tree => tree.taskId === 'TMATCH');
+  assert.equal(matching.status, 'done');
+  assert.equal(matching.estCostUsd, 2.5);
+  assert.equal(matching.rounds, 4);
 });
 
 test('aggregator V2-8: additive snapshot preserves existing keys', async () => {
@@ -518,6 +664,75 @@ test('aggregator telemetry: file reads are bounded without crashing on large cor
     assert.equal(await provider(), null);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('aggregator telemetry: reads the tail of telemetry*.jsonl and ignores daemon/lessons journals', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-tail-'));
+  try {
+    const record = task => JSON.stringify({
+      schema: 1, kind: 'attempt_summary', task_id: task, attempt_id: `att-${task}`,
+      outcome: 'done', open: false,
+      phases_ms: { total: 10 }, rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0, gates: {} },
+      models: { worker: { provider: 'acp-devin', model: 'swe-2-high' } },
+    });
+    const tailLine = `${record('TAIL')}\n`;
+    await writeFile(join(dir, 'telemetry.jsonl'), `${'x'.repeat(2048)}\n${tailLine}`);
+    await writeFile(join(dir, 'daemon.jsonl'), `${record('DAEMON')}\n`);
+    await writeFile(join(dir, 'lessons.jsonl'), `${record('LESSON')}\n`);
+    const telemetry = await createTelemetryProvider({
+      telemetryDir: dir, maxBytes: Buffer.byteLength(tailLine) })();
+    assert.ok(telemetry);
+    assert.equal(telemetry.runs, 1);
+    assert.equal(telemetry.attempts.length, 1);
+    assert.equal(telemetry.attempts[0].taskId, 'TAIL');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('aggregator telemetry: missing telemetryDir falls back to stateDirs', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-state-'));
+  try {
+    await writeFile(join(dir, 'telemetry.jsonl'), JSON.stringify({
+      schema: 1, kind: 'attempt_summary', task_id: 'STATE', attempt_id: 'state-1',
+      outcome: 'done', open: false,
+      phases_ms: { total: 10 }, rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0, gates: {} },
+      models: { worker: { provider: 'acp-devin', model: 'swe-2-high' } },
+    }) + '\n');
+    const telemetry = await createTelemetryProvider({
+      telemetryDir: join(dir, 'missing'), stateDirs: [dir] })();
+    assert.ok(telemetry);
+    assert.equal(telemetry.runs, 1);
+    assert.equal(telemetry.attempts[0].taskId, 'STATE');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('aggregator telemetry: implicit default does not crowd out stateDirs, explicit valid dir remains authoritative', async () => {
+  const primary = await mkdtemp(join(tmpdir(), 'cr-telemetry-primary-'));
+  const state = await mkdtemp(join(tmpdir(), 'cr-telemetry-slot-'));
+  const previous = process.env.DF_TELEMETRY_DIR;
+  try {
+    const record = (task, attempt) => JSON.stringify({
+      schema: 1, kind: 'attempt_summary', task_id: task, attempt_id: attempt,
+      outcome: 'done', open: false,
+      phases_ms: { total: 10 }, rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0, gates: {} },
+      models: { worker: { provider: 'acp-devin', model: 'swe-2-high' } },
+    }) + '\n';
+    await writeFile(join(primary, 'telemetry.jsonl'), record('PRIMARY', 'primary-1'));
+    await writeFile(join(state, 'telemetry.jsonl'), record('STATE', 'state-1'));
+    process.env.DF_TELEMETRY_DIR = primary;
+    const implicit = await createTelemetryProvider({ stateDirs: [state] })();
+    assert.deepEqual(implicit.attempts.map(attempt => attempt.taskId).sort(), ['PRIMARY', 'STATE']);
+    const explicit = await createTelemetryProvider({ telemetryDir: primary, stateDirs: [state] })();
+    assert.deepEqual(explicit.attempts.map(attempt => attempt.taskId), ['PRIMARY']);
+  } finally {
+    if (previous === undefined) delete process.env.DF_TELEMETRY_DIR;
+    else process.env.DF_TELEMETRY_DIR = previous;
+    await rm(primary, { recursive: true, force: true });
+    await rm(state, { recursive: true, force: true });
   }
 });
 
@@ -739,6 +954,61 @@ test('createBoardObserver: Board 0.54.0 /api/board/tasks формат → кол
     assert.equal(snap.needsOwner[0].cli.includes('Q1'), true);
     assert.equal(snap.recentlyCompleted.length, 1);
   });
+});
+
+test('createBoardObserver: cursor pagination, JSON result receipt, waiting queue and hold question parsing', async () => {
+  const sha = 'c'.repeat(40);
+  const question = {
+    schema: 'darkfactory.question.v1', question_id: 'Q-cursor', prompt: 'Approve release?',
+    evidence: 'candidate evidence',
+  };
+  const urls = [];
+  const fetchImpl = async url => {
+    urls.push(url);
+    const first = !url.includes('after=');
+    return { ok: true, status: 200, json: async () => first
+      ? { tasks: [{ message: { id: 'w1', channel: 'darkfactory', text: 'Waiting card',
+          task: { state: 'waiting', result: JSON.stringify({ candidate_sha: sha }) } } }],
+        cursor: 'cursor-1' }
+      : { tasks: [{ message: { id: 'h1', channel: 'darkfactory', text: 'Held card',
+          task: { state: 'hold', blocked: { kind: 'needs_input', reason: JSON.stringify(question) } } } }],
+        cursor: null } };
+  };
+  const observer = createBoardObserver({ boardUrl: 'http://board',
+    channels: ['darkfactory'], fetchImpl });
+  const result = await observer.fetchTasks();
+  assert.equal(result.ok, true);
+  assert.equal(result.tasks.length, 2);
+  assert.equal(result.tasks[0].receiptSha, sha);
+  assert.deepEqual(urls, [
+    'http://board/api/board/tasks?channel=darkfactory&limit=500',
+    'http://board/api/board/tasks?channel=darkfactory&limit=500&after=cursor-1',
+  ]);
+  await withServer({ boardTasksProvider: observer.fetchTasks }, async (server, base) => {
+    const snap = JSON.parse((await httpGet(`${base}/api/snapshot`)).body);
+    assert.equal(snap.queued.length, 1);
+    assert.equal(snap.queued[0].task_id, 'w1');
+    assert.equal(snap.needsOwner.length, 1);
+    assert.equal(snap.needsOwner[0].task_id, 'h1');
+    assert.equal(snap.needsOwner[0].question, 'Approve release?');
+    assert.equal(snap.needsOwner[0].evidence, 'candidate evidence');
+    assert.equal(snap.needsOwner[0].cli, 'question-gate answer Q-cursor');
+  });
+});
+
+test('createBoardObserver: endless distinct cursors terminate at the bounded page limit', async () => {
+  let pages = 0;
+  const observer = createBoardObserver({ boardUrl: 'http://board', channels: ['darkfactory'],
+    fetchImpl: async () => {
+      pages += 1;
+      return { ok: true, status: 200, json: async () => ({
+        tasks: [{ message: { id: `p${pages}`, channel: 'darkfactory', task: { state: 'ready' } } }],
+        cursor: `cursor-${pages}` }) };
+    } });
+  const result = await observer.fetchTasks();
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'board_pagination_exceeded');
+  assert.equal(pages, 100);
 });
 
 test('createBoardObserver: дедупликация по message.id между каналами', async () => {

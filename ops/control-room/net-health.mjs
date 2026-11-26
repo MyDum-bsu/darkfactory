@@ -26,9 +26,10 @@ export function createNetHealthMonitor({
   cloudStaleMs = CLOUD_STALE_MS,
   now = () => Date.now(),
 } = {}) {
-  const fetcher = fetchImpl ?? (url => fetch(url, {
+  const fetcher = fetchImpl ?? ((url, opts = {}) => fetch(url, { ...opts,
     signal: AbortSignal.timeout(4000), redirect: 'manual' }));
   const cache = new Map();
+  const inFlight = new Set();
 
   const classify = response => {
     if (response.status === 403) return 'blocked';
@@ -39,7 +40,9 @@ export function createNetHealthMonitor({
   const probeOnce = async probe => {
     try {
       const response = await fetcher(probe.url, { method: 'HEAD' });
-      return { status: classify(response), http: response.status };
+      const result = { status: classify(response), http: response.status };
+      response.body?.cancel?.().catch(() => {});
+      return result;
     } catch (error) {
       if (error?.status || error?.response?.status) {
         const status = error.status ?? error.response.status;
@@ -50,17 +53,21 @@ export function createNetHealthMonitor({
   };
 
   const refresh = probe => {
+    if (inFlight.has(probe.name)) return;
+    inFlight.add(probe.name);
     probeOnce(probe).then(result => {
       cache.set(probe.name, { ...result, checkedAt: now(), error: null });
     }).catch(() => {
       cache.set(probe.name, { status: 'dead', http: null, checkedAt: now() });
+    }).finally(() => {
+      inFlight.delete(probe.name);
     });
   };
 
   const probeSnapshot = () => probes.map(probe => {
     const entry = cache.get(probe.name);
     const stale = !entry || now() - entry.checkedAt > ttlMs;
-    if (stale) queueMicrotask(() => refresh(probe));
+    if (stale) refresh(probe);
     return { name: probe.name,
       status: entry?.status ?? 'pending',
       http: entry?.http ?? null,

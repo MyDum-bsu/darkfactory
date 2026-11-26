@@ -40,7 +40,7 @@ const FAILURE_STATUSES = new Set([
   'error', 'failed', 'crashed', 'provider_error', 'timeout', 'aborted',
 ]);
 const PROVIDER_FAILURE_REASON_RE =
-  /(provider|timeout|rate_limit|quota|unavailable|crash|spawn_failed|review_failed|critic_failed|arbiter_failed|model_error|api_error)/i;
+  /(provider|timeout|rate_limit|quota|unavailable|crash|spawn_failed|review_failed|review_error|critic_failed|arbiter_failed|model_error|api_error)/i;
 const SAFE_DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T_-][0-9]{2}-[0-9]{2}-[0-9]{2})?$/;
 const SAFE_FILENAME_RE = /^[A-Za-z0-9._-]+$/;
 const SNAPSHOT_FILE_RE = /^snapshot-(\d{4}-\d{2}-\d{2}(?:[T_-]\d{2}-\d{2}-\d{2})?)(?:-(\d+))?\.json$/;
@@ -142,31 +142,32 @@ function extractTaskId(raw) {
 
 function extractBoardTask(raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const taskId = extractTaskId(raw);
+  const msg = raw?.message && typeof raw.message === 'object' ? raw.message : raw;
+  const taskId = extractTaskId(msg);
   if (!taskId) return null;
 
-  const nested = raw.task !== null && typeof raw.task === 'object' && !Array.isArray(raw.task) ? raw.task : null;
-  const status = normalizeStatus(nested?.state ?? raw.status ?? raw.state);
-  const channel = normalizeChannel(raw.channel ?? raw.project ?? raw.labels?.channel ?? raw.labels?.repo_id);
-  const titleRaw = raw.title ?? nested?.title ?? (typeof raw.text === 'string' ? raw.text.split('\n')[0] : null);
+  const nested = msg.task !== null && typeof msg.task === 'object' && !Array.isArray(msg.task) ? msg.task : null;
+  const status = normalizeStatus(nested?.state ?? msg.status ?? msg.state);
+  const channel = normalizeChannel(msg.channel ?? msg.project ?? msg.labels?.channel ?? msg.labels?.repo_id);
+  const titleRaw = msg.title ?? nested?.title ?? (typeof msg.text === 'string' ? msg.text.split('\n')[0] : null);
   const title = typeof titleRaw === 'string' && titleRaw.trim() ? titleRaw.trim() : null;
 
-  const wallClock = finiteNonNeg(raw.wall_clock_ms ?? raw.wallClockMs ?? nested?.wall_clock_ms) ??
+  const wallClock = finiteNonNeg(msg.wall_clock_ms ?? msg.wallClockMs ?? nested?.wall_clock_ms) ??
     parseIsoDurationMs(
-      raw.started_at ?? raw.created_at ?? raw.createdAt,
-      raw.completed_at ?? raw.closed_at ?? raw.ended_at ?? raw.completedAt ?? raw.closedAt,
+      msg.started_at ?? msg.created_at ?? msg.createdAt,
+      msg.completed_at ?? msg.closed_at ?? msg.ended_at ?? msg.completedAt ?? msg.closedAt,
     );
 
-  const explicitRework = finiteNonNeg(raw.rework_rounds ?? raw.reworkRounds ?? nested?.rework_rounds);
+  const explicitRework = finiteNonNeg(msg.rework_rounds ?? msg.reworkRounds ?? nested?.rework_rounds);
   const models = [];
-  if (Array.isArray(raw.models)) {
-    for (const item of raw.models) {
+  if (Array.isArray(msg.models)) {
+    for (const item of msg.models) {
       const spec = normalizeModelSpec(item);
       if (spec) models.push(spec);
     }
   }
-  const usage = normalizeUsage(raw.tokens ?? raw.usage);
-  const cost = normalizeCost(raw);
+  const usage = normalizeUsage(msg.tokens ?? msg.usage);
+  const cost = normalizeCost(msg);
 
   return {
     task_id: taskId,
