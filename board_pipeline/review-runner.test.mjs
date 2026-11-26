@@ -19,6 +19,7 @@ import { acceptHeld } from './acceptance.mjs';
 const exec = promisify(execFile);
 
 const CRITIC = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
+const inputJson = input => JSON.parse(Buffer.isBuffer(input) ? input.toString('utf8') : String(input));
 
 test('family: строгая таблица provider/model без подстрок', () => {
   // Голый провайдер без модели не аттестуется: обязательны оба поля.
@@ -355,6 +356,56 @@ test('sandbox: реальный негативный тест системной
   }
 });
 
+test('sandbox: docker run receives resource limits, -i and exact staged stdin', async () => {
+  const scratch = await mkdtemp(join(tmpdir(), 'review-docker-args-'));
+  const oldPath = process.env.PATH;
+  const oldLog = process.env.FAKE_DOCKER_LOG;
+  try {
+    const bin = join(scratch, 'bin');
+    const source = join(scratch, 'candidate');
+    const log = join(scratch, 'docker-log.jsonl');
+    await mkdir(bin);
+    await mkdir(source, { mode: 0o755 });
+    const fakeDocker = join(bin, 'docker');
+    await writeFile(fakeDocker, `#!/usr/bin/env node
+const fs = require('fs');
+const args = process.argv.slice(2);
+if (args[0] === 'info') {
+  process.stdout.write('["name=rootless"]\\n');
+  process.exit(0);
+}
+if (args[0] === 'rm') process.exit(0);
+if (args[0] !== 'run') process.exit(2);
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('end', () => {
+  fs.appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify({ args, input }) + '\\n');
+  process.exit(0);
+});
+`, { mode: 0o755 });
+    process.env.PATH = `${bin}:${oldPath}`;
+    process.env.FAKE_DOCKER_LOG = log;
+    const input = JSON.stringify({ openai: { type: 'oauth', access: 'stdin-only' } });
+    const run = await runInReadOnlySandbox({ snapshot: source,
+      argv: ['/bin/sh', '-c', 'cat >/tmp/.pi/agent/auth.json'], input, timeoutMs: 10_000 });
+    assert.equal(run.code, 0);
+    const entries = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(entries.length, 1);
+    for (const flag of ['--pids-limit=256', '--memory=2g', '--memory-swap=2g', '--cpus=2', '-i']) {
+      assert.ok(entries[0].args.includes(flag), `missing ${flag}`);
+    }
+    assert.equal(entries[0].input, input);
+    await assert.rejects(runInReadOnlySandbox({ snapshot: source,
+      argv: ['/bin/sh'], input: 42 }), (e) => e.reason === 'sandbox_request_invalid');
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldLog === undefined) delete process.env.FAKE_DOCKER_LOG;
+    else process.env.FAKE_DOCKER_LOG = oldLog;
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
 test('fingerprint: изменение байтов уже модифицированного файла ловится', async () => {
   const repo = await mkdtemp(join(tmpdir(), 'fp-repo-'));
   try {
@@ -465,6 +516,40 @@ test('runner: verdict без subject_digest при заданном binding — 
   }
 });
 
+test('runner: Round 2+ diff failure throws ReviewDenied, not ReferenceError', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'runner-round-repo-'));
+  const journal = await mkdtemp(join(tmpdir(), 'runner-round-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'runner-round-pi-'));
+  try {
+    const git = async (...args) =>
+      (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
+    await git('init', '-q', '-b', 'pilot');
+    await git('config', 'user.email', 't@l');
+    await git('config', 'user.name', 't');
+    await writeFile(join(repo, 'a.txt'), 'x\n');
+    await git('add', 'a.txt');
+    await git('commit', '-qm', 'cand');
+    const sha = await git('rev-parse', 'HEAD');
+    let sandboxCalls = 0;
+    const runner = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async () => {
+        sandboxCalls++;
+        return { code: 0, stdout: '', stderr: '' };
+      } });
+    await assert.rejects(
+      runner({ task_id: '1', candidate_sha: sha, worktree: repo,
+        executor: 'acp-devin/swe-2-high', review_round: 2,
+        prior_sha: 'e'.repeat(40) }, { review: CRITIC }),
+      (e) => e instanceof ReviewDenied && !(e instanceof ReferenceError) &&
+        typeof e.reason === 'string' && e.reason.startsWith('review_round_diff_failed:'));
+    assert.equal(sandboxCalls, 0);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+  }
+});
+
 test('guard: auth.json стёрт при загрузке и отдаётся только креденшельному стеку', async () => {
   const dir = join(tmpdir(), '.pi', 'agent');
   await mkdir(dir, { recursive: true });
@@ -492,6 +577,15 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
     catch (e) { console.log('piDir:' + e.code); }
     try { fs.readFileSync('/etc/passwd'); console.log('etc:allowed'); }
     catch (e) { console.log('etc:' + e.code); }
+    try { fs.readFileSync(new URL('file:///tmp/.%70i/agent/settings.json')); console.log('encodedUrl:allowed'); }
+    catch (e) { console.log('encodedUrl:' + e.code); }
+    try { fs.readFileSync(new URL('https://example.invalid/tmp/.pi/agent/settings.json')); console.log('nonFileUrl:allowed'); }
+    catch (e) { console.log('nonFileUrl:' + e.code); }
+    try { fs.copyFileSync('/etc/passwd', '/tmp/.pi/agent/settings.json'); console.log('copySync:allowed'); }
+    catch (e) { console.log('copySync:' + e.code); }
+    const copyProbe = fs.promises.copyFile('/etc/passwd', '/pi-cfg/copied-auth')
+      .then(() => console.log('copyAsync:allowed'))
+      .catch(e => console.log('copyAsync:' + e.code));
     // child_process: внешние бинарники закрыты, read-only утилиты — нет.
     const cp = require('child_process');
     // spawnSync не бросает, а возвращает result с error — как реальный сбой.
@@ -500,23 +594,27 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
     probe('sh', cp.spawnSync('sh', ['-c', 'echo hi']));
     probe('curl', cp.spawnSync('curl', ['-s', 'x'], { timeout: 3000 }));
     probe('findExec', cp.spawnSync('find', ['/tmp', '-exec', 'ls', ';']));
-    probe('findOk', cp.spawnSync('find', ['/tmp/.pi', '-name', 'x*'], { timeout: 3000 }));
+    probe('findOk', cp.spawnSync('find', [], { timeout: 3000 }));
+    probe('rgPiCfg', cp.spawnSync('rg', ['.', '/pi-cfg/auth.json']));
+    probe('rgPre', cp.spawnSync('rg', ['--pre=sh', 'foo', '/candidate']));
+    probe('findFollow', cp.spawnSync('find', ['-L', '/candidate']));
+    probe('lsPiCfg', cp.spawnSync('ls', ['/pi-cfg']));
+    probe('lsTmp', cp.spawnSync('ls', ['/tmp']));
     probe('shellOpt', cp.spawnSync('ls', ['/tmp'], { shell: true }));
     probe('cwdOut', cp.spawnSync('ls', { cwd: '/etc' }));
     probe('cwdCand', cp.spawnSync('ls', { cwd: '/candidate' }));
     // PATH не участвует: пустой PATH не должен помешать системному ls.
-    probe('pinPath', cp.spawnSync('ls', ['/tmp'], { env: { PATH: '/nonexistent' }, timeout: 3000 }));
+    probe('pinPath', cp.spawnSync('ls', [], { env: { PATH: '/nonexistent' }, timeout: 3000 }));
     try { cp.execSync('ls /tmp'); console.log('execSync:allowed'); }
     catch (e) { console.log('execSync:' + e.code); }
     try { const f = cp.fork('/tmp/evil.js'); f.on('error', e => console.log('fork:' + e.code)); }
     catch (e) { console.log('fork:' + e.code); }
     probe('candPath', cp.spawnSync('/candidate/evil.sh'));
-    probe('sysPath', cp.spawnSync('/usr/bin/ls', ['/tmp'], { timeout: 3000 }));
+    probe('sysPath', cp.spawnSync('/usr/bin/ls', [], { timeout: 3000 }));
     probe('tmpPath', cp.spawnSync('/tmp/ls'));
     try { cp.execFileSync('sh', ['-c', 'echo hi']); console.log('execSh:allowed'); }
     catch (e) { console.log('execSh:' + e.code); }
-    try { cp.spawnSync('ls', ['/tmp'], { timeout: 3000 }); console.log('ls:allowed'); }
-    catch (e) { console.log('ls:' + e.code); }
+    probe('ls', cp.spawnSync('ls', [], { timeout: 3000 }));
     cp.exec('ls /tmp', (e) => console.log('exec:' + (e ? e.code : 'allowed')));
     const net = require('net');
     // Приватный endpoint отклоняется ДО allowlist — даже явно разрешённый.
@@ -529,7 +627,7 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
       s.on('error', e => { console.log(host + ':' + port + '=' + e.code); next(); });
       s.on('connect', () => { console.log(host + ':' + port + '=ALLOWED'); next(); });
     };
-    next();
+    copyProbe.then(next);
   `;
   const run = await exec(process.execPath, ['-e', script],
     { timeout: 15_000, env: { ...process.env, PI_ALLOW_CONNECT: '127.0.0.1:9' } });
@@ -540,10 +638,19 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
   assert.match(out, /cfg:EACCES/);
   assert.match(out, /piDir:EACCES/);
   assert.match(out, /etc:allowed/);
+  assert.match(out, /encodedUrl:EACCES/, `percent-encoded URL обошёл guard:\n${out}`);
+  assert.match(out, /nonFileUrl:EACCES/, `non-file URL обошёл guard:\n${out}`);
+  assert.match(out, /copySync:EACCES/, `copyFileSync в /tmp/.pi не заблокирован:\n${out}`);
+  assert.match(out, /copyAsync:EACCES/, `promises.copyFile в /pi-cfg не заблокирован:\n${out}`);
   assert.match(out, /sh:EACCES/, `sh внутри песочницы не заблокирован:\n${out}`);
   assert.match(out, /curl:EACCES/);
   assert.match(out, /findExec:EACCES/, `find -exec не заблокирован:\n${out}`);
   assert.match(out, /findOk:allowed:0/, `чистый find должен работать:\n${out}`);
+  assert.match(out, /rgPiCfg:EACCES/, `rg смог прочитать /pi-cfg/auth.json:\n${out}`);
+  assert.match(out, /rgPre:EACCES/, `rg --pre не заблокирован:\n${out}`);
+  assert.match(out, /findFollow:EACCES/, `find -L не заблокирован:\n${out}`);
+  assert.match(out, /lsPiCfg:EACCES/, `ls /pi-cfg не заблокирован:\n${out}`);
+  assert.match(out, /lsTmp:EACCES/, `явный путь /tmp для ls не заблокирован:\n${out}`);
   assert.match(out, /shellOpt:EACCES/, `shell:true не заблокирован:\n${out}`);
   assert.match(out, /cwdOut:EACCES/, `cwd вне /candidate не заблокирован:\n${out}`);
   // /candidate нет на хосте → realpath падает → EACCES (в контейнере разрешён).
@@ -926,10 +1033,12 @@ test('runner: в контейнер уходит кред без refresh и бе
     const runner = isolatedPiReviewRunner({ journal, piRoot,
       sandbox: async (opts) => {
         seen = opts;
-        // scratch живёт только внутри вызова — читаем кред на месте.
+        // scratch живёт только внутри вызова — /pi-cfg не должен нести auth.json.
         const cfg = opts.mounts.find((m) => m.dst === '/pi-cfg');
-        const { readFile } = await import('node:fs/promises');
-        cred = JSON.parse(await readFile(join(cfg.src, 'auth.json'), 'utf8')).openai;
+        await assert.rejects(readFile(join(cfg.src, 'auth.json'), 'utf8'), { code: 'ENOENT' });
+        const payload = inputJson(opts.input);
+        assert.deepEqual(Object.keys(payload), ['openai']);
+        cred = payload.openai;
         return { code: 0, stdout: stream, stderr: '' };
       } });
     await runner({ task_id: '1', candidate_sha: sha, worktree: repo,
@@ -937,6 +1046,13 @@ test('runner: в контейнер уходит кред без refresh и бе
 
     assert.equal(cred.refresh, 'sandbox-redacted');
     assert.equal(cred.access, 'acc-token');
+    assert.deepEqual(cred, { type: 'oauth', access: 'acc-token', expires: oauth.expires,
+      refresh: 'sandbox-redacted' });
+    const preamble = seen.argv[2];
+    assert.match(preamble, /cat > \/tmp\/\.pi\/agent\/auth\.json/);
+    assert.match(preamble, /chmod 600 \/tmp\/\.pi\/agent\/auth\.json/);
+    assert.match(preamble, /exec \/pi-ro\/bin\/pi "\$@" <\/dev\/null/);
+    assert.match(preamble, /exec node \/model-proxy\/client\.cjs \/bin\/sh -c/);
     assert.ok(!String(seen.env.PI_ALLOW_CONNECT).includes('auth.openai.com'),
       `в allow попал auth.openai.com: ${seen.env.PI_ALLOW_CONNECT}`);
   } finally {
@@ -987,18 +1103,20 @@ console.log('acc-refreshed');
     const runner = isolatedPiReviewRunner({ journal, piRoot,
       sandbox: async (opts) => {
         const cfg = opts.mounts.find((m) => m.dst === '/pi-cfg');
-        const { readFile } = await import('node:fs/promises');
-        cred = JSON.parse(await readFile(join(cfg.src, 'auth.json'), 'utf8')).openai;
+        await assert.rejects(readFile(join(cfg.src, 'auth.json'), 'utf8'), { code: 'ENOENT' });
+        const payload = inputJson(opts.input);
+        assert.deepEqual(Object.keys(payload), ['openai']);
+        cred = payload.openai;
         return { code: 0, stdout: stream, stderr: '' };
       } });
     await runner({ task_id: '1', candidate_sha: sha, worktree: repo,
       executor: 'acp-devin/swe-2-high' }, { review: CRITIC });
 
-    const { readFile } = await import('node:fs/promises');
     const seenArgv = JSON.parse(await readFile(argvLog, 'utf8'));
     assert.deepEqual(seenArgv, ['auth', 'print-bearer-token', '--provider', 'openai', '--min-expiry', '10m']);
     assert.equal(cred.access, 'acc-refreshed');
     assert.equal(cred.refresh, 'sandbox-redacted');
+    assert.deepEqual(Object.keys(cred).sort(), ['access', 'expires', 'refresh', 'type']);
   } finally {
     await rm(repo, { recursive: true, force: true });
     await rm(journal, { recursive: true, force: true });
@@ -1009,8 +1127,9 @@ console.log('acc-refreshed');
 test('Sol arbiter authenticates model effort and subject without mounting the OAuth refresh token', async t => {
   const piRoot = await mkdtemp(join(tmpdir(), 'arbiter-pi-'));
   t.after(() => rm(piRoot, { recursive: true, force: true }));
-  await writeFile(join(piRoot, 'auth.json'), JSON.stringify({ openai: { type: 'oauth', access: 'short-lived',
-    refresh: 'host-only-refresh', expires: Date.now() + 3_600_000 } }));
+  const hostAuth = { type: 'oauth', access: 'short-lived',
+    refresh: 'host-only-refresh', expires: Date.now() + 3_600_000 };
+  await writeFile(join(piRoot, 'auth.json'), JSON.stringify({ openai: hostAuth }));
   const subject_digest = 'a'.repeat(64);
   const decision = { subject_digest, decision: 'directed_rework', directive: 'Correct sum.' };
   const req = { task_id: '9', epoch: 1, attempt_id: 'abc', subject_digest, arbiter: CRITIC };
@@ -1018,8 +1137,11 @@ test('Sol arbiter authenticates model effort and subject without mounting the OA
       [{ ...decision, subject_digest: 'b'.repeat(64) }, 'medium', 'arbiter_subject_mismatch']]) {
     const runner = isolatedArbiterRunner({ piRoot, sandbox: async opts => {
       const source = opts.mounts.find(m => m.dst === '/pi-cfg').src;
-      const auth = await readFile(join(source, 'auth.json'), 'utf8');
-      assert.doesNotMatch(auth, /host-only-refresh/);
+      await assert.rejects(readFile(join(source, 'auth.json'), 'utf8'), { code: 'ENOENT' });
+      const payload = inputJson(opts.input);
+      assert.deepEqual(Object.keys(payload), ['openai']);
+      assert.deepEqual(payload.openai, { type: 'oauth', access: 'short-lived',
+        expires: hostAuth.expires, refresh: 'sandbox-redacted' });
       assert.equal(opts.argv[opts.argv.indexOf('--thinking') + 1], 'medium');
       assert.ok(opts.argv.includes('--no-mcp'));
       const reply = msg({ thinkingLevel: effort, content: [{ type: 'text', text: JSON.stringify(body) }] });

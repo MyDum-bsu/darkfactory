@@ -18,6 +18,24 @@ import { sumUsages } from './telemetry.mjs';
 import { createStreamLoopGuard } from './loop-detector.mjs';
 
 const exec = promisify(execFile);
+
+function execWithInput(file, args, options, input) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(file, args, options, (error, stdout, stderr) => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
+    child.stdin?.on('error', () => { /* контейнер мог завершиться до EOF stdin */ });
+    if (input !== undefined) child.stdin?.write(input);
+    child.stdin?.end();
+  });
+}
+
 const SHA = /^[a-f0-9]{40}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const CHECKPOINT = /^[0-9a-f]{8,64}$/;
@@ -27,7 +45,7 @@ export const REVIEW_IMAGE =
   'node@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9';
 
 // В контейнер критика монтируются только каталоги кода ~/.pi/agent:
-// sessions/, subagents/ и auth.json исключены — секрет едет копией в tmpfs.
+// sessions/, subagents/ и auth.json исключены — секрет едет stdin в tmpfs.
 const PROXY_BOOTSTRAP = new URL('./model-proxy-client.cjs', import.meta.url).pathname;
 
 const READ_ONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
@@ -586,8 +604,9 @@ export function assertToolsAllowed(toolsAdded) {
 
 // Both snapshot tools and model clients have an isolated network namespace.
 export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAGE,
-  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate', beforeEffect, signal }) {
-  if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length) {
+  env = {}, mounts = [], timeoutMs = 120_000, workdir = '/candidate', input, beforeEffect, signal }) {
+  if (!isAbsolute(snapshot ?? '') || !Array.isArray(argv) || !argv.length ||
+      (input !== undefined && typeof input !== 'string' && !Buffer.isBuffer(input))) {
     throw new ReviewDenied('sandbox_request_invalid');
   }
   if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
@@ -599,7 +618,9 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   }
   const name = `board-review-${randomUUID()}`;
   const args = ['run', '--rm', '--name', name, '--pull=never', '--read-only', '--network=none',
-    '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0'];
+    '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=0:0',
+    '--pids-limit=256', '--memory=2g', '--memory-swap=2g', '--cpus=2'];
+  if (input !== undefined) args.push('-i');
   args.push('--tmpfs=/tmp:rw,nosuid,nodev,size=64m', '-e', 'HOME=/tmp',
     '--mount', `type=bind,src=${snapshot},dst=/candidate,readonly`);
   for (const { src, dst } of mounts) {
@@ -638,7 +659,7 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
   signal?.addEventListener?.('abort', onAbort, { once: true });
   try {
-    const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
+    const run = await execWithInput('docker', args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, input);
     stdout = run.stdout;
     stderr = run.stderr;
   } catch (error) {
@@ -854,17 +875,19 @@ export async function l2ReviewWithTransientRetry({ review, retry = review, bindi
   }
 }
 
-function runModelInReadOnlySandbox({ allow, argv, env = {}, mounts = [], ...options }) {
+function runModelInReadOnlySandbox({ allow, argv, env = {}, mounts = [], input, selfProxied = false,
+  ...options }) {
   const { NODE_OPTIONS, ...bootEnv } = env;
   if (NODE_OPTIONS) bootEnv.DF_CHILD_NODE_OPTIONS = NODE_OPTIONS;
+  const proxiedArgv = selfProxied ? argv : ['node', '/model-proxy/client.cjs', ...argv];
   return withModelProxy({ allow, beforeConnect: options.beforeEffect }, socket => runInReadOnlySandbox({ ...options,
-    argv: ['node', '/model-proxy/client.cjs', ...argv], env: bootEnv,
+    argv: proxiedArgv, env: bootEnv, input,
     mounts: [...mounts, { src: PROXY_BOOTSTRAP, dst: '/model-proxy/client.cjs' },
       { src: socket, dst: '/model-proxy/upstream.sock' }] }));
 }
 
 function piSandbox(opts) {
-  return runModelInReadOnlySandbox(opts);
+  return runModelInReadOnlySandbox({ ...opts, selfProxied: true });
 }
 
 async function sandboxPiCredential(piRoot, provider, kind, beforeEffect) {
@@ -948,7 +971,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
             { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
           await writeFile(roundFile, patch, { mode: 0o600 });
         } catch (cause) {
-          throw new ReviewDenied(`review_round_diff_failed:${messageOf(cause)}`);
+          throw new ReviewDenied(`review_round_diff_failed:${String(cause?.message ?? cause)}`);
         }
       }
 
@@ -958,14 +981,13 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       const fpBefore = await worktreeFingerprint(binding.worktree);
 
       // Монтирования критика: только каталоги кода ~/.pi/agent — ни sessions/,
-      // ни auth.json на диске контейнера. Конфиги собираются в /pi-cfg и
-      // копируются в tmpfs /tmp/.pi/agent: auth.json содержит ТОЛЬКО запись
-      // одного провайдера критика и уничтожается pi-guard после первого чтения.
+      // ни auth.json в /pi-cfg. Конфиги собираются в /pi-cfg и копируются в
+      // tmpfs /tmp/.pi/agent: auth.json содержит ТОЛЬКО запись одного
+      // провайдера критика, едет stdin и уничтожается pi-guard после первого чтения.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
       const credential = await sandboxPiCredential(piRoot, critic.provider, 'review', beforeEffect);
-      await writeFile(join(cfgDir, 'auth.json'),
-        JSON.stringify({ [critic.provider]: credential }), { mode: 0o600 });
+      const authInput = JSON.stringify({ [critic.provider]: credential });
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
@@ -1010,13 +1032,14 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       // Каталоги pi — симлинки на read-only монтирования кода; конфиги
       // копируются в tmpfs (pi кладёт <name>.lock рядом), guard — в /tmp.
       const piArgv = ['/bin/sh', '-c',
-        'mkdir -p /tmp/.pi/agent /tmp/session; ' +
+        'set -eu; mkdir -p /tmp/.pi/agent /tmp/session; umask 077; ' +
+        'cat > /tmp/.pi/agent/auth.json; chmod 600 /tmp/.pi/agent/auth.json; ' +
         'for f in bin install npm; do ' +
         '[ -e "/pi-ro/$f" ] && ln -s "/pi-ro/$f" "/tmp/.pi/agent/$f"; done; ' +
-        'for f in auth.json settings.json models.json models-store.json; do ' +
+        'for f in settings.json models.json models-store.json; do ' +
         '[ -e "/pi-cfg/$f" ] && cp "/pi-cfg/$f" "/tmp/.pi/agent/$f"; done; ' +
         'cp /pi-guard/pi-guard.cjs /tmp/pi-guard.cjs; ' +
-        'exec /pi-ro/bin/pi "$@"', 'pi',
+        'exec node /model-proxy/client.cjs /bin/sh -c \'exec /pi-ro/bin/pi \"$@\" </dev/null\' pi "$@"', 'pi',
         '--print', '--mode', 'json',
         '--provider', critic.provider, '--model', critic.model,
         '--thinking', critic.reasoningLevel,
@@ -1025,7 +1048,7 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
         '--session-dir', '/tmp/session', instruction];
 
       const run = await sandbox({ snapshot: source, argv: piArgv, image, env, mounts, allow, timeoutMs,
-        beforeEffect, signal });
+        input: authInput, beforeEffect, signal });
       const dirtyExit = run.code !== 0;
       if (dirtyExit) {
         // Сырой вывод — только в приватный журнал (0600), не в причину Board.
@@ -1241,12 +1264,11 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
     }
     const scratch = await mkdtemp(join(tmpdir(), 'board-arbiter-'));
     try {
-      // auth только одного провайдера арбитра — как у критика, копией в tmpfs.
+      // auth только одного провайдера арбитра — как у критика, через stdin в tmpfs.
       const cfgDir = join(scratch, 'pi-cfg');
       await mkdir(cfgDir, { mode: 0o700 });
       const credential = await sandboxPiCredential(piRoot, arbiter.provider, 'arbiter', beforeEffect);
-      await writeFile(join(cfgDir, 'auth.json'),
-        JSON.stringify({ [arbiter.provider]: credential }), { mode: 0o600 });
+      const authInput = JSON.stringify({ [arbiter.provider]: credential });
       for (const file of PI_CONFIG_FILES) {
         const src = join(piRoot, file);
         if (await lstat(src).catch(() => null)) {
@@ -1288,13 +1310,14 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
       ].join('\n');
 
       const piArgv = ['/bin/sh', '-c',
-        'mkdir -p /tmp/.pi/agent /tmp/session; ' +
+        'set -eu; mkdir -p /tmp/.pi/agent /tmp/session; umask 077; ' +
+        'cat > /tmp/.pi/agent/auth.json; chmod 600 /tmp/.pi/agent/auth.json; ' +
         'for f in bin install npm; do ' +
         '[ -e "/pi-ro/$f" ] && ln -s "/pi-ro/$f" "/tmp/.pi/agent/$f"; done; ' +
-        'for f in auth.json settings.json models.json models-store.json; do ' +
+        'for f in settings.json models.json models-store.json; do ' +
         '[ -e "/pi-cfg/$f" ] && cp "/pi-cfg/$f" "/tmp/.pi/agent/$f"; done; ' +
         'cp /pi-guard/pi-guard.cjs /tmp/pi-guard.cjs; ' +
-        'exec /pi-ro/bin/pi "$@"', 'pi',
+        'exec node /model-proxy/client.cjs /bin/sh -c \'exec /pi-ro/bin/pi \"$@\" </dev/null\' pi "$@"', 'pi',
         '--print', '--mode', 'json',
         '--provider', arbiter.provider, '--model', arbiter.model,
         '--thinking', effort,
@@ -1304,7 +1327,8 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
 
       const snapshot = join(scratch, 'empty');
       await mkdir(snapshot);
-      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, allow, timeoutMs, beforeEffect });
+      const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, allow, timeoutMs,
+        input: authInput, beforeEffect });
       if (run.code !== 0) {
         throw new ReviewDenied(`arbiter_runner_exit:${run.code ?? 'timeout'}`);
       }

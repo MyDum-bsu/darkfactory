@@ -9,6 +9,7 @@ import { hostAgyTransport } from './agy-transport.mjs';
 import { agyStreamFixture, commitFile, neonFixture } from './review-test-fixture.mjs';
 import agyStream from './agy-stream.cjs';
 import { NEON_ISOLATION } from './review-policy.mjs';
+import { ReviewDenied } from './review-runner.mjs';
 import { PilotDenied } from './pilot-gate.mjs';
 
 const subject_digest = 'a'.repeat(64);
@@ -53,6 +54,21 @@ test('Neon ReviewPort separates offline snapshot and Agy model-only request', as
   assert.equal(receipt.snapshot_reads, 1);
   assert.deepEqual(receipt.attestation, { model: 'agy_stream_init', effort: 'agy_cli_request' });
   assert.match(receipt.transcript_sha256, /^[a-f0-9]{64}$/);
+});
+
+test('Neon Round 2+ diff failure throws ReviewDenied, not ReferenceError', async t => {
+  const { journal, binding, profile } = await fixture(t);
+  let transportCalls = 0;
+  const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot,
+    transport: async () => {
+      transportCalls++;
+      throw new Error('transport must not be called');
+    } });
+  await assert.rejects(
+    run({ ...binding, review_round: 2, prior_sha: 'e'.repeat(40) }, profile),
+    (e) => e instanceof ReviewDenied && !(e instanceof ReferenceError) &&
+      typeof e.reason === 'string' && e.reason.startsWith('review_round_diff_failed:'));
+  assert.equal(transportCalls, 0);
 });
 
 test('Neon never retries unavailable, mismatched or tool-using attempts', async t => {

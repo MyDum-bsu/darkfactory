@@ -144,7 +144,7 @@ async function prepareSnapshot(binding, scratch, sandbox, beforeEffect, signal, 
       await writeFile(join(staged, 'round.patch'), round, { mode: 0o400 });
       names.push('round.patch');
     } catch (cause) {
-      throw new ReviewDenied(`review_round_diff_failed:${messageOf(cause)}`);
+      throw new ReviewDenied(`review_round_diff_failed:${String(cause?.message ?? cause)}`);
     }
   }
   await writeFile(join(staged, 'diff.patch'), diff, { mode: 0o400 });

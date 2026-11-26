@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { buildUiVisualL3Profile, evaluateSatisfactionReport, offlineVisualRunner } from './runtime.mjs';
+import { buildUiVisualL3Profile, evaluateSatisfactionReport, offlineDockerRunner, offlineVisualRunner } from './runtime.mjs';
 
 const IMAGE = `sha256:${'a'.repeat(64)}`;
 const PNG_1X1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
@@ -74,6 +74,31 @@ test('buildUiVisualL3Profile rejects live tracker DB, host paths and conflicting
   assert.throws(() => buildUiVisualL3Profile({ image: 'node:latest', argv: ['node'] }), /operator check profile/);
 });
 
+test('offline docker runner applies resource limits and bounds the /tmp tmpfs', async t => {
+  const { root, repo, sha } = await repoFixture(t);
+  const journal = join(root, 'journal');
+  await mkdir(journal);
+  const calls = [];
+  const execDocker = async (file, args) => {
+    calls.push([file, [...args]]);
+    if (args[0] === 'info') return { stdout: '["name=rootless"]', stderr: '' };
+    if (args[0] === 'run') return { stdout: 'checks ok', stderr: '' };
+    if (args[0] === 'rm') return { stdout: '', stderr: '' };
+    throw new Error(`unexpected docker call ${args.join(' ')}`);
+  };
+  const result = await offlineDockerRunner(journal, { execDocker })(
+    { task_id: '5029', worktree: repo, candidate_sha: sha },
+    { check: { image: IMAGE, argv: ['true'], cwd: '.', timeoutMs: 1000 } });
+  assert.equal(result.ok, true);
+  const run = calls.find(([, args]) => args[0] === 'run')?.[1];
+  assert.ok(run, 'docker run happened');
+  for (const flag of ['--pids-limit=256', '--memory=2g', '--memory-swap=2g', '--cpus=2']) {
+    assert.ok(run.includes(flag), `offline docker run missing ${flag}`);
+  }
+  assert.match(run.find(arg => arg.startsWith('--tmpfs=/tmp:')) ?? '', /size=256m/,
+    'offline /tmp tmpfs is not bounded to 256m');
+});
+
 test('offline visual runner mounts validated holdouts read-only through injected Docker runner', async t => {
   const { root, repo, sha } = await repoFixture(t);
   const journal = join(root, 'journal');
@@ -107,6 +132,11 @@ test('offline visual runner mounts validated holdouts read-only through injected
   assert.ok(run, 'docker run happened');
   assert.ok(run.includes(`type=bind,src=${holdouts},dst=/holdouts,readonly`));
   const flat = run.join('\n');
+  for (const flag of ['--pids-limit=256', '--memory=2g', '--memory-swap=2g', '--cpus=2']) {
+    assert.ok(run.includes(flag), `visual docker run missing ${flag}`);
+  }
+  assert.match(run.find(arg => arg.startsWith('--tmpfs=/tmp:')) ?? '', /size=/,
+    'visual /tmp tmpfs is not size-bounded');
   assert.ok(flat.includes('MO_TRACKER_DB=/tmp/mo-tracker-synthetic/tracker.db'));
   assert.equal(flat.includes('tracker/data/tracker.db'), false);
 

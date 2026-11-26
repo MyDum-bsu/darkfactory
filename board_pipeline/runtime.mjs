@@ -377,20 +377,21 @@ export function offlineDockerRunner(journal, { beforeEffect, execDocker } = {}) 
       const extras = await sandboxExtras(effective, source);
       const args = ['run', '--rm', '--name', name, '--pull=never', '--network=none', '--read-only',
         '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
-        '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777', '-e', 'HOME=/tmp',
+        '--pids-limit=256', '--memory=2g', '--memory-swap=2g', '--cpus=2',
+        '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,size=256m', '-e', 'HOME=/tmp',
         '--mount', `type=bind,src=${source},dst=/candidate,readonly`, ...extras,
         '--workdir', posix.join('/candidate', cwd), image, ...argv];
       let output;
       let exit = 0;
       await beforeEffect?.();
       try {
-        const run = await exec('docker', args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
+        const run = await dockerExec('docker', args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
         output = `${run.stdout}${run.stderr}`;
       } catch (error) {
         exit = typeof error.code === 'number' ? error.code : null;
         output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
       } finally {
-        await cleanupContainer(name);
+        await cleanupContainer(name, dockerExec);
       }
       const file = `checks-${handoff.task_id}-${handoff.candidate_sha}-${randomUUID()}.log`;
       await writeFile(join(journal, file), output, { flag: 'wx', mode: 0o600 });
@@ -551,6 +552,7 @@ export function offlineVisualRunner(journal, { beforeEffect, execDocker } = {}) 
       // `docker exec tar`, пока контейнер жив и tmpfs смонтирован.
       const args = ['run', '-d', '--name', name, '--pull=never', '--network=none', '--read-only',
         '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
+        '--pids-limit=256', '--memory=2g', '--memory-swap=2g', '--cpus=2',
         '--ulimit', `fsize=${ARTIFACT_MAX_FILE_BYTES}:${ARTIFACT_MAX_FILE_BYTES}`,
         '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,size=64m', '-e', 'HOME=/tmp',
         '--tmpfs=/artifacts:rw,nosuid,nodev,noexec,mode=1777,' +

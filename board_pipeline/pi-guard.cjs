@@ -14,6 +14,7 @@ const net = require('net');
 const http = require('http');
 const https = require('https');
 const { EventEmitter } = require('events');
+const { fileURLToPath } = require('url');
 
 // Исходники fs фиксируются до обёрток — гард сам пользуется ими без рекурсии.
 const origReadFileSync = fs.readFileSync.bind(fs);
@@ -70,8 +71,20 @@ const eacces = (target, syscall = 'open') => {
 function pathOf(arg) {
   if (typeof arg === 'string') return arg;
   if (Buffer.isBuffer(arg)) return arg.toString('utf8');
-  if (arg instanceof URL) return arg.pathname;
+  if (arg instanceof URL) {
+    try {
+      return fileURLToPath(arg);
+    } catch {
+      return '/pi-cfg/.pi-guard-invalid-url';
+    }
+  }
   return null;
+}
+
+function pathValues(arg) {
+  if (Array.isArray(arg)) return arg.flatMap(item => pathValues(item));
+  const value = pathOf(arg);
+  return value === null ? [] : [value];
 }
 
 // Внутренний код pi работает в /pi-ro; туловые вызовы идут из /tools/-частей
@@ -179,9 +192,10 @@ function deny(p, args, { asyncCb = false, promise = false } = {}) {
 function guardFn(obj, key, opts = {}) {
   const original = obj[key];
   if (typeof original !== 'function') return;
+  const pathArgs = opts.pathArgs ?? [0];
   obj[key] = function (...args) {
-    const p = pathOf(args[0]);
-    if (p !== null && path.resolve(p) === AUTH) {
+    const first = pathOf(args[0]);
+    if (first !== null && path.resolve(first) === AUTH) {
       // Файла на диске нет: байты из памяти отдаём только креденшельному коду
       // pi (имя функции И строго /pi-ro в стеке, без /tools/ и /candidate).
       if (authBytes !== null && isCredentialRead()) {
@@ -197,8 +211,8 @@ function guardFn(obj, key, opts = {}) {
           if (typeof cb === 'function') process.nextTick(cb, null, fakeAuthStat());
           return undefined;
         }
-        if (key === 'realpath' || key === 'realpathSync') {
-          if (key.endsWith('Sync')) return AUTH;
+        if (key === 'realpath' || key === 'realpathSync' || key === 'realpathSyncNative') {
+          if (key.endsWith('Sync') || key.endsWith('SyncNative')) return AUTH;
           const cb = args.at(-1);
           if (typeof cb === 'function') return process.nextTick(cb, null, AUTH);
           return Promise.resolve(AUTH);
@@ -210,26 +224,83 @@ function guardFn(obj, key, opts = {}) {
         }
         return serveAuth(original, args, opts);
       }
-      return deny(p, args, opts);
+      return deny(first, args, opts);
     }
-    if (fsForbidden(p)) return deny(p, args, opts);
+    for (const index of pathArgs) {
+      for (const p of pathValues(args[index])) {
+        if (fsForbidden(p)) return deny(p, args, opts);
+      }
+    }
+    return original.apply(this, args);
+  };
+}
+
+function globStaticRoot(pattern) {
+  const magic = pattern.search(/[*?{}[\]]/);
+  const before = magic === -1 ? pattern : pattern.slice(0, magic);
+  const slash = before.lastIndexOf('/');
+  return slash === -1 ? '' : (before.slice(0, slash) || '/');
+}
+
+function globReachesSecret(pattern, cwdNorm, dot) {
+  const root = path.resolve(cwdNorm, globStaticRoot(pattern) || '.');
+  const protectedRoots = [PI_HOME, '/pi-cfg'];
+  const broad = /[*?{}[\]]/.test(pattern) || dot === true;
+  return broad && protectedRoots.some(target =>
+    root === target || target.startsWith(root === '/' ? '/' : root + '/'));
+}
+
+// glob принимает patterns и options.cwd: обе части проверяются до перечисления,
+// включая рекурсивную форму, способную дойти до /tmp/.pi или /pi-cfg.
+function guardGlobFn(obj, key, opts = {}) {
+  const original = obj[key];
+  if (typeof original !== 'function') return;
+  obj[key] = function (...args) {
+    const options = args[1] !== null && typeof args[1] === 'object' ? args[1] : {};
+    const cwd = pathOf(options.cwd) ?? process.cwd();
+    const cwdNorm = path.resolve(cwd);
+    if (fsForbidden(cwdNorm)) return deny(cwdNorm, args, opts);
+    const patterns = Array.isArray(args[0]) ? args[0] : [args[0]];
+    for (const raw of patterns) {
+      if (typeof raw !== 'string') continue;
+      const pattern = raw.replace(/^!+/, '');
+      const norm = path.resolve(cwdNorm, pattern);
+      if (fsForbidden(norm) || globReachesSecret(norm, cwdNorm, options.dot)) {
+        return deny(norm, args, opts);
+      }
+    }
     return original.apply(this, args);
   };
 }
 
 for (const key of ['readFile', 'open', 'readdir', 'stat', 'lstat', 'realpath',
-  'access', 'opendir', 'exists']) {
+  'access', 'opendir', 'exists', 'readlink']) {
   guardFn(fs, key, { asyncCb: true });
 }
+guardFn(fs, 'copyFile', { asyncCb: true, pathArgs: [0, 1] });
+guardFn(fs, 'cp', { asyncCb: true, pathArgs: [0, 1] });
+guardFn(fs, 'openAsBlob', { promise: true });
+guardGlobFn(fs, 'glob', { asyncCb: true });
 for (const key of ['readFileSync', 'openSync', 'readdirSync', 'statSync', 'lstatSync',
-  'realpathSync', 'accessSync', 'opendirSync', 'existsSync', 'createReadStream']) {
-  guardFn(fs, key);
+  'realpathSync', 'accessSync', 'opendirSync', 'existsSync', 'createReadStream',
+  'copyFileSync', 'cpSync', 'readlinkSync']) {
+  guardFn(fs, key, key === 'copyFileSync' || key === 'cpSync' ? { pathArgs: [0, 1] } : {});
+}
+guardGlobFn(fs, 'globSync');
+if (typeof origRealpathNativeSync === 'function') {
+  const native = { realpathSyncNative: origRealpathNativeSync };
+  guardFn(native, 'realpathSyncNative');
+  try { fs.realpathSync.native = native.realpathSyncNative; } catch { /* function object sealed */ }
 }
 if (fs.promises) {
   for (const key of ['readFile', 'open', 'readdir', 'stat', 'lstat', 'realpath',
-    'access', 'opendir']) {
+    'access', 'opendir', 'readlink']) {
     guardFn(fs.promises, key, { promise: true });
   }
+  guardFn(fs.promises, 'copyFile', { promise: true, pathArgs: [0, 1] });
+  guardFn(fs.promises, 'cp', { promise: true, pathArgs: [0, 1] });
+  guardFn(fs.promises, 'openAsBlob', { promise: true });
+  guardGlobFn(fs.promises, 'glob', { promise: true });
 }
 
 const allowEndpoints = new Set((process.env.PI_ALLOW_CONNECT ?? '')
@@ -374,6 +445,25 @@ const CHILD_PATHS = new Set(['/usr/bin/rg', '/usr/bin/grep', '/bin/grep',
 // find способен исполнять внешние команды — такие флаги закрыты.
 const FIND_DENY = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete',
   '-fls', '-fprint', '-fprint0', '-fprintf']);
+const FIND_FOLLOW_DENY = new Set(['-H', '-L', '-follow']);
+const RG_DENY_LONG = new Set(['pre', 'pre-glob', 'follow', 'ignore-file', 'file']);
+const GREP_DENY_LONG = new Set(['file', 'exclude-from', 'dereference-recursive']);
+const LONG_VALUE = {
+  rg: new Set(['after-context', 'before-context', 'context', 'colors', 'encoding', 'engine',
+    'field-context-separator', 'field-match-separator', 'glob', 'iglob', 'max-columns',
+    'max-count', 'max-depth', 'max-filesize', 'path-separator', 'regexp', 'replace',
+    'sort', 'sortr', 'threads', 'type', 'type-not', 'type-add']),
+  grep: new Set(['after-context', 'before-context', 'context', 'binary-files',
+    'devices', 'directories', 'exclude', 'exclude-dir', 'include', 'label',
+    'max-count', 'regexp']),
+  ls: new Set(['block-size', 'format', 'hide', 'indicator-style',
+    'quoting-style', 'sort', 'time', 'time-style', 'width', 'tabsize']),
+};
+const SHORT_VALUE = {
+  rg: new Set(['A', 'B', 'C', 'E', 'e', 'g', 'j', 'm', 'M', 't', 'T']),
+  grep: new Set(['A', 'B', 'C', 'D', 'd', 'e', 'm']),
+  ls: new Set(['I', 'T', 'w']),
+};
 
 // Базовые имена резолвятся в точный системный путь, чтобы PATH не участвовал
 // в выборе бинарника: злонамеренный PATH в окружении не подсунет свой `ls`.
@@ -385,10 +475,125 @@ function resolveChild(file) {
   return `/bin/${f}`;
 }
 
+function scanSearchArgs(cmd, argv) {
+  const positional = [];
+  let patternSupplied = false;
+  let filesMode = false;
+  let options = true;
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (options && token === '--') {
+      options = false;
+      continue;
+    }
+    if (options && token.startsWith('--')) {
+      const name = token.slice(2).split('=', 1)[0];
+      if ((cmd === 'rg' && RG_DENY_LONG.has(name)) ||
+          (cmd === 'grep' && GREP_DENY_LONG.has(name))) return null;
+      if (cmd === 'rg' && name === 'files') filesMode = true;
+      if (name === 'regexp') patternSupplied = true;
+      if (LONG_VALUE[cmd].has(name) && !token.includes('=')) i++;
+      continue;
+    }
+    if (options && token.length > 1 && token.startsWith('-')) {
+      const body = token.slice(1);
+      for (let j = 0; j < body.length; j++) {
+        const flag = body[j];
+        if (cmd === 'rg' && (flag === 'f' || flag === 'L')) return null;
+        if (cmd === 'grep' && (flag === 'f' || flag === 'R')) return null;
+        if (flag === 'e') patternSupplied = true;
+        if (SHORT_VALUE[cmd].has(flag)) {
+          if (j === body.length - 1) i++;
+          break;
+        }
+      }
+      continue;
+    }
+    positional.push(token);
+  }
+  if (filesMode) return positional;
+  return patternSupplied ? positional : positional.slice(1);
+}
+
+function scanLsArgs(argv) {
+  const positional = [];
+  let options = true;
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (options && token === '--') {
+      options = false;
+      continue;
+    }
+    if (options && token.startsWith('--')) {
+      const name = token.slice(2).split('=', 1)[0];
+      if (LONG_VALUE.ls.has(name) && !token.includes('=')) i++;
+      continue;
+    }
+    if (options && token.length > 1 && token.startsWith('-')) {
+      const body = token.slice(1);
+      for (let j = 0; j < body.length; j++) {
+        if (SHORT_VALUE.ls.has(body[j])) {
+          if (j === body.length - 1) i++;
+          break;
+        }
+      }
+      continue;
+    }
+    positional.push(token);
+  }
+  return positional;
+}
+
+function scanFindArgs(argv) {
+  const paths = [];
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === '-P' || token === '--') continue;
+    if (token.startsWith('-O') && token.length > 2) continue;
+    if (token === '-D' || token === '-O') {
+      i++;
+      continue;
+    }
+    if (token.startsWith('-') || token === '!' || token === '(' || token === ')' || token === ',') break;
+    paths.push(token);
+  }
+  return paths;
+}
+
+function childCwd(rest) {
+  const opt = rest.find(a => a !== null && typeof a === 'object' && !Array.isArray(a));
+  return typeof opt?.cwd === 'string' ? opt.cwd : '/candidate';
+}
+
+function childPathAllowed(raw, cwd) {
+  if (typeof raw !== 'string' || raw === '' || raw.includes('\0')) return false;
+  if (raw.split('/').includes('..')) return false;
+  const resolved = path.resolve(cwd, raw);
+  const inCandidate = resolved === '/candidate' || resolved.startsWith('/candidate/');
+  const inReview = resolved === '/review' || resolved.startsWith('/review/');
+  if (!inCandidate && !inReview) return false;
+  return !inCandidate || noSymlinkInCandidate(resolved);
+}
+
 function argsAllowed(file, rest) {
-  if (path.basename(String(file ?? '')) !== 'find') return true;
+  const cmd = path.basename(String(file ?? ''));
   const argv = Array.isArray(rest[0]) ? rest[0] : [];
-  return !argv.some(a => FIND_DENY.has(String(a)));
+  if (!argv.every(a => typeof a === 'string')) return false;
+  let paths;
+  if (cmd === 'find') {
+    if (argv.some(a => FIND_DENY.has(a) || FIND_FOLLOW_DENY.has(a) ||
+        a === '-samefile' || a === '-files0-from' || a.startsWith('-newer'))) return false;
+    paths = scanFindArgs(argv);
+  } else if (cmd === 'rg' || cmd === 'grep') {
+    paths = scanSearchArgs(cmd, argv);
+    if (paths === null) return false;
+  } else if (cmd === 'ls') {
+    paths = scanLsArgs(argv);
+  } else {
+    return false;
+  }
+  const cwd = childCwd(rest);
+  return paths.every(p => childPathAllowed(p, cwd));
 }
 
 // Проверка каждого компонента пути под /candidate: симлинк не должен
@@ -448,7 +653,7 @@ function guardChild(key, sync) {
     const resolved = resolveChild(file);
     const cleanRest = cwdOptions(rest);
     const blocked = key === 'exec' || key === 'execSync' || key === 'fork' ||
-      resolved === null || !argsAllowed(file, rest) || cleanRest === null;
+      resolved === null || cleanRest === null || !argsAllowed(resolved ?? file, cleanRest ?? rest);
     if (blocked) {
       if (DEBUG) {
         process.stderr.write(`[guard] deny ${key} ${file}\n`);
