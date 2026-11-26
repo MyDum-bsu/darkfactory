@@ -33,10 +33,15 @@ export const L1_PROFILES = freeze({
 
 export const DEFAULT_L1_PROFILE = 'node';
 
-// Репозитории, которым дефолтно нужен Python-стек проверок.
+// Дефолтные L1-профили активных репозиториев флота: python-стек для
+// репозиториев с Python-проверками, node — для остальных зарегистрированных.
 export const REPO_DEFAULT_L1_PROFILES = freeze({
   optimization: 'python-node',
   autoresearcher: 'python-node',
+  'music-restoration': 'python-node',
+  'moml-course': 'python-node',
+  darkfactory: 'node',
+  'bsu-cabinet-skill': 'node',
 });
 
 export function defaultL1ProfileForRepo(repoId) {

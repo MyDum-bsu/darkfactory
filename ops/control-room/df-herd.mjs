@@ -264,7 +264,7 @@ function renderModels(snap, { width = 100 } = {}) {
   lines.push('', fitAnsi(`${C.bold}MODEL REGISTRY${C.reset}`, width));
   lines.push(fitAnsi(`${C.dim}${modelHeader(width)}${C.reset}`, width));
   for (const model of models.models ?? []) lines.push(modelRow(model, width));
-  lines.push('', fitAnsi(`${C.dim}CLI: df-models set <role> <model> · df-models mode economy|balanced|sprint${C.reset}`, width));
+  lines.push('', fitAnsi(`${C.dim}CLI: df-models set <id> <status> · df-models mode economy|balanced|sprint${C.reset}`, width));
   return { lines, selectable: [] };
 }
 
@@ -376,7 +376,7 @@ async function main(argv) {
 
   if (values.once) {
     const snap = await fetchJson(`${base}/api/snapshot`);
-    const { text } = render(snap, { width, tab: initialTab });
+    const { text } = render(snap, { width, tab: initialTab, projectFilter: values.project ?? null });
     process.stdout.write(`${text}\n`);
     return;
   }

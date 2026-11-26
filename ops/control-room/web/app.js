@@ -302,8 +302,9 @@ function renderStatus(snap) {
   const slotWarnings = snap.repoSlots?.multiWriterWarnings?.length ?? 0;
   chip('chip-slots', `слоты ${activeByRepo || running}/repo≤1`,
     slotWarnings ? 'bad' : (activeByRepo || running) ? 'ok' : null);
-  chip('chip-killswitch', snap.killSwitch ? 'KILL-SWITCH' : 'kill-switch: off',
-    snap.killSwitch ? 'bad' : null);
+  const ks = Boolean(snap.killSwitch ?? snap.pilot?.killSwitch);
+  chip('chip-killswitch', ks ? 'KILL-SWITCH' : 'kill-switch: off',
+    ks ? 'bad' : null);
   chip('chip-disk', `disk ${fmtBytes(host.disk?.freeBytes)}`,
     host.disk && host.disk.freeBytes < 8 * (1 << 30) ? 'warn' : null);
   chip('chip-ram', `RAM ${fmtBytes(host.mem?.freeBytes)}/${fmtBytes(host.mem?.totalBytes)}`);
@@ -428,8 +429,15 @@ function renderProjects(snap) {
   for (const t of [...(snap.running ?? []), ...(snap.queued ?? []),
       ...(snap.needsOwner ?? []), ...(snap.recentlyCompleted ?? [])]) {
     const proj = t.labels?.project ?? t.labels?.repo_id ?? 'default';
-    if (!byProject.has(proj)) byProject.set(proj, {});
-    byProject.get(proj)[t.state] = (byProject.get(proj)[t.state] ?? 0) + 1;
+    if (!byProject.has(proj)) byProject.set(proj, { Lead: 0, Worker: 0, 'Stage/Critic': 0, Arbiter: 0 });
+    const counts = byProject.get(proj);
+    // Состояние Board (ready/claimed/blocked/completed) и фаза контроллера
+    // (working/checking/claiming) — разные оси одной карточки: воркер и
+    // критик считаются по фазе попытки, lead и блокировки — по состоянию.
+    if (t.phase === 'working' || t.state === 'working') counts.Worker += 1;
+    else if (t.phase === 'checking' || t.state === 'checking') counts['Stage/Critic'] += 1;
+    else if (t.phase === 'claiming' || t.state === 'claimed') counts.Lead += 1;
+    else if (t.state === 'blocked') counts.Arbiter += 1;
   }
   if (!byProject.size) {
     box.append(el('span', 'empty', 'Проекты: нет активных'));
@@ -438,10 +446,10 @@ function renderProjects(snap) {
   for (const [name, counts] of byProject) {
     const proj = el('div', 'proj');
     proj.append(el('span', 'name', name));
-    for (const [role, n] of Object.entries({ Lead: counts.claimed ?? 0,
-        Worker: counts.working ?? 0, 'Stage/Critic': counts.checking ?? 0,
-        Arbiter: counts.blocked ?? 0 })) {
-      proj.append(el('span', 'role', `${role} `)).append(el('b', null, String(n)));
+    for (const [role, n] of Object.entries(counts)) {
+      // DOM append возвращает undefined: chaining `.append(...).append(...)`
+      // падает в браузере до первой цифры — оба узла добавляются одним вызовом.
+      proj.append(el('span', 'role', `${role} `), el('b', null, String(n)));
     }
     box.append(proj);
   }
