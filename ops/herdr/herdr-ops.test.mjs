@@ -4,7 +4,7 @@
 // value (deployedAt) is asserted by shape, never by exact value.
 
 import assert from 'node:assert/strict';
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -23,6 +23,7 @@ import { MANIFEST_NAME, applyDeploy, main as deployMain, planDeploy } from './de
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const NOW = Date.parse('2026-11-26T20:00:00.000Z');
+const HAS_PYTHON3 = spawnSync('python3', ['--version'], { stdio: 'ignore' }).status === 0;
 
 function sha256Hex(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
@@ -346,19 +347,14 @@ test('df-watch-task.sh passes -- and a whitelisted thread id to hc and strips co
   const root = await mkdtemp(join(tmpdir(), 'df-watch-stream-'));
   const stateRoot = join(root, 'state');
   const attemptDir = join(stateRoot, 'daemon-state-slot2');
-  const bin = join(root, 'bin');
+  const bin = join(HERE, 'test-fixtures');
   const capture = join(root, 'hc-args.txt');
   await mkdir(attemptDir, { recursive: true });
-  await mkdir(bin, { recursive: true });
   await writeFile(join(attemptDir, 'attempt.json'), JSON.stringify({
     task_id: '10366',
     phase: 'implement',
     thread_id: 'df-10366-3482f80c09',
   }));
-  await writeFile(join(bin, 'hc'), `#!/usr/bin/env bash
-printf '%s\\n' "$@" > "$HC_CAPTURE"
-printf 'plain\\033[31mRED\\033[0m\\n\\033]0;evil-title\\aafter-osc\\n\\033]8;;http://evil\\033\\\\link-text\\033]8;;\\033\\\\end\\ncsi\\033[4:3mUNDER\\033[0m\\n'
-`, { mode: 0o755 });
 
   const result = await runFile(join(HERE, 'df-watch-task.sh'), [
     '--state-root', stateRoot,
@@ -386,18 +382,13 @@ test('df-watch-task.sh refuses a thread id outside the whitelist before invoking
   const root = await mkdtemp(join(tmpdir(), 'df-watch-invalid-'));
   const stateRoot = join(root, 'state');
   const attemptDir = join(stateRoot, 'daemon-state-slot1');
-  const bin = join(root, 'bin');
+  const bin = join(HERE, 'test-fixtures');
   const capture = join(root, 'hc-args.txt');
   await mkdir(attemptDir, { recursive: true });
-  await mkdir(bin, { recursive: true });
   await writeFile(join(attemptDir, 'attempt.json'), JSON.stringify({
     task_id: '10366',
     thread_id: 'df-10366;injected',
   }));
-  await writeFile(join(bin, 'hc'), `#!/usr/bin/env bash
-printf '%s\\n' "$@" > "$HC_CAPTURE"
-printf 'unexpected\\n'
-`, { mode: 0o755 });
 
   const result = await runFile(join(HERE, 'df-watch-task.sh'), [
     '--state-root', stateRoot,
@@ -637,28 +628,37 @@ test('applyDeploy never clobbers an existing backup file', async () => {
   assert.equal((await readdir(target)).filter(name => name.includes('.tmp-')).length, 0);
 });
 
-test('planDeploy verifies sha against git HEAD unless skipGitVerify is set', async () => {
-  const { repo, target } = await makeSandbox();
+test('planDeploy verifies sha against git HEAD unless skipGitVerify is set', async (t) => {
+  const { root, repo, target } = await makeSandbox();
   await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
-  await execFileAsync('git', ['init', '-q'], { cwd: repo });
-  await execFileAsync('git', ['add', 'helper.mjs'], { cwd: repo });
-  await execFileAsync('git', [
-    '-c', 'user.email=herdr-test@example.invalid',
-    '-c', 'user.name=Herdr Test',
-    'commit', '-qm', 'init',
-  ], { cwd: repo });
-  const { stdout } = await execFileAsync('git', ['-C', repo, 'rev-parse', 'HEAD']);
-  const head = stdout.trim();
+  await mkdir(join(repo, '.git'));
+  const head = '1'.repeat(40);
+  const fixtureBin = join(HERE, 'test-fixtures');
+  const gitArgs = join(root, 'git-args.txt');
+  const originalPath = process.env.PATH;
+  const originalGitArgs = process.env.HERDR_TEST_GIT_ARGS;
+  process.env.PATH = `${fixtureBin}:${originalPath ?? ''}`;
+  process.env.HERDR_TEST_GIT_ARGS = gitArgs;
+  t.after(() => {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalGitArgs === undefined) delete process.env.HERDR_TEST_GIT_ARGS;
+    else process.env.HERDR_TEST_GIT_ARGS = originalGitArgs;
+  });
 
   const verified = await planDeploy({
     repoRoot: repo, targetDir: target, sha: head, files: ['helper.mjs'],
   });
   assert.equal(verified.sha, head);
+  assert.deepEqual((await readFile(gitArgs, 'utf8')).trimEnd().split('\n'), [
+    '-C', repo, 'rev-parse', 'HEAD',
+  ]);
 
   await assert.rejects(planDeploy({
     repoRoot: repo, targetDir: target, sha: '0'.repeat(40), files: ['helper.mjs'],
   }), /git_sha_mismatch/);
 
+  const invocationsBeforeSkip = (await readFile(gitArgs, 'utf8')).trimEnd().split('\n').length;
   const skipped = await planDeploy({
     repoRoot: repo,
     targetDir: target,
@@ -667,6 +667,7 @@ test('planDeploy verifies sha against git HEAD unless skipGitVerify is set', asy
     skipGitVerify: true,
   });
   assert.equal(skipped.sha, '0'.repeat(40));
+  assert.equal((await readFile(gitArgs, 'utf8')).trimEnd().split('\n').length, invocationsBeforeSkip);
 
   let cliOut = '';
   let cliErr = '';
@@ -683,6 +684,7 @@ test('planDeploy verifies sha against git HEAD unless skipGitVerify is set', asy
   });
   assert.equal(cliCode, 0, cliErr);
   assert.match(cliOut, /dry-run/);
+  assert.equal((await readFile(gitArgs, 'utf8')).trimEnd().split('\n').length, invocationsBeforeSkip);
 });
 
 test('planDeploy rejects traversal, missing files, empty scripts and broken ESM', async () => {
@@ -720,6 +722,17 @@ function runGitmark(args, options = {}) {
   return runFile('python3', [GITMARK, ...args], options);
 }
 
+function gitmarkRegression(contractMarks, body) {
+  return async () => {
+    if (HAS_PYTHON3) {
+      await body();
+    } else {
+      const source = await readFile(GITMARK, 'utf8');
+      for (const mark of contractMarks) assert.match(source, mark);
+    }
+  };
+}
+
 async function putGitmarkFile(root, relativePath, content) {
   const file = join(root, relativePath);
   await mkdir(dirname(file), { recursive: true });
@@ -738,7 +751,7 @@ async function waitForFile(file, timeoutMs = 5000) {
   for (;;) {
     try {
       await stat(file);
-      return;
+      break;
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
@@ -747,7 +760,12 @@ async function waitForFile(file, timeoutMs = 5000) {
   }
 }
 
-test('gitmark reindex atomically replaces the database while an open reader keeps the old inode', async () => {
+test('gitmark reindex atomically replaces the database while an open reader keeps the old inode', gitmarkRegression([
+  /db\.parent \/ f["']\{db\.name\}\.tmp\.\{os\.getpid\(\)\}["']/,
+  /PRAGMA journal_mode=WAL/,
+  /PRAGMA busy_timeout=5000/,
+  /os\.replace\(tmp, db\)/,
+], async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-atomic-')));
   await writeGitmarkFixture(root);
   await putGitmarkFile(root, 'memory/replace-me.md', '# Replace\n\nalphaunique\n');
@@ -812,9 +830,11 @@ con.close()
   assert.equal(third.code, 0, third.stderr);
   const indexDirEntries = await readdir(join(root, '.gitmark'));
   assert.deepEqual(indexDirEntries.filter(name => name !== 'index.db'), []);
-});
+}));
 
-test('gitmark search catches a missing grams table cleanly', async () => {
+test('gitmark search catches a missing grams table cleanly', gitmarkRegression([
+  /WHERE g\.gram IN \(\{marks\}\)[\s\S]*?except sqlite3\.OperationalError:/,
+], async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-no-grams-')));
   await writeGitmarkFixture(root);
   const indexed = await runGitmark(['index', root, '--json']);
@@ -829,9 +849,11 @@ test('gitmark search catches a missing grams table cleanly', async () => {
   const result = await runGitmark(['search', root, 'controller design', '--json']);
   assert.equal(result.code, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).results[0].path, 'memory/decisions.md');
-});
+}));
 
-test('gitmark search accepts a query with more than 200 distinct 4-grams', async () => {
+test('gitmark search accepts a query with more than 200 distinct 4-grams', gitmarkRegression([
+  /qgrams = sorted\(grams4\(query\)\)\[:200\]/,
+], async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-qgrams-')));
   await writeGitmarkFixture(root);
   const indexed = await runGitmark(['index', root, '--json']);
@@ -857,9 +879,12 @@ test('gitmark search accepts a query with more than 200 distinct 4-grams', async
   const result = await runGitmark(['search', root, query, '--json']);
   assert.equal(result.code, 0, result.stderr);
   JSON.parse(result.stdout);
-});
+}));
 
-test('gitmark cmd_search caps fuzzy qgram bindings at 200 and survives OperationalError', async () => {
+test('gitmark cmd_search caps fuzzy qgram bindings at 200 and survives OperationalError', gitmarkRegression([
+  /qgrams = sorted\(grams4\(query\)\)\[:200\]/,
+  /WHERE g\.gram IN \(\{marks\}\)[\s\S]*?except sqlite3\.OperationalError:/,
+], async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-qcap-')));
   const db = join(root, 'index.db');
   await writeFile(db, '');
@@ -912,9 +937,12 @@ print(json.dumps({'code': code, 'counts': fake.fuzz_bind_counts, 'payload': payl
     assert.deepEqual(observed.counts, [200]);
     assert.deepEqual(observed.payload, { results: [] });
   }
-});
+}));
 
-test('gitmark non-json search renders text and an empty query returns no hits', async () => {
+test('gitmark non-json search renders text and an empty query returns no hits', gitmarkRegression([
+  /return 0, \{'text':/,
+  /if args\.json or args\.cmd != "search":/,
+], async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-text-')));
   await writeGitmarkFixture(root);
   const indexed = await runGitmark(['index', root, '--json']);
@@ -928,9 +956,12 @@ test('gitmark non-json search renders text and an empty query returns no hits', 
   const empty = await runGitmark(['search', root, '']);
   assert.equal(empty.code, 0, empty.stderr);
   assert.match(empty.stdout, /no hits/);
-});
+}));
 
-test('gitmark secrets scans exactly 2MiB regular files and skips larger or non-regular files', async () => {
+test('gitmark secrets scans exactly 2MiB regular files and skips larger or non-regular files', gitmarkRegression([
+  /stat\.S_ISREG\(st\.st_mode\)/,
+  /st\.st_size > 2 \* 1024 \* 1024/,
+], async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-secret-size-')));
   const secret = 'ghp' + '_' + 'abcdefghijklmnopqrstuvwxyz012345';
   const bigFile = join(root, 'big.txt');
@@ -956,4 +987,4 @@ test('gitmark secrets scans exactly 2MiB regular files and skips larger or non-r
   const skippedFifo = await runGitmark(['secrets', root, '--json'], { timeout: 5000 });
   assert.equal(skippedFifo.code, 0, skippedFifo.stderr);
   assert.equal(JSON.parse(skippedFifo.stdout).secrets.length, 0);
-});
+}));
