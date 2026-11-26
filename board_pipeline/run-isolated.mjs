@@ -36,7 +36,8 @@ import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
 import { createProjectMemoryWriter, DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS,
   extractPostReviewMemoryUpdates, memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir,
   resolveProjectMemory, writeTrustedReviewReceipt } from './project-memory.mjs';
-import { createTelemetryRecorder, readTelemetryLines, threadUsage } from './telemetry.mjs';
+import { createTelemetryRecorder, parseTelemetryLines, readTelemetryLines, threadUsage } from './telemetry.mjs';
+import { evaluateAdaptiveGate } from './adaptive-gates.mjs';
 import { aggregateScorecard } from './model-scorecard.mjs';
 import { appendLessons, DEFAULT_MIN_REWORK_ROUNDS, distillReworkLessons,
   loadLessons, validateDistilledLessons } from './rework-distiller.mjs';
@@ -90,6 +91,28 @@ export function resolveWorkerRuntimeKind({ cliRuntime, policy, env } = {}) {
   return kind;
 }
 
+// V2-9b Adaptive 2-Tier Verification Gates: чистый планировщик разбиения
+// проверок доверенного профиля на синхронные (L1 Docker) и отложенные
+// async. Без явного включения (profile.adaptiveGates.enabled или
+// thresholds.enabled) — строгий pass-through: каждый существующий профиль
+// ведёт себя в точности как раньше. Fail-closed инвариант: пустой
+// синхронный набор при непустом списке проверок откатывает план на
+// strict_sync всех проверок — L1 никогда не пропускает проверку полностью.
+export function planAdaptiveChecks({ profile, diffPaths, telemetryStats, recentRollbacks, thresholds } = {}) {
+  const checks = Array.isArray(profile?.checks) ? profile.checks : [];
+  if (profile?.adaptiveGates?.enabled !== true && thresholds?.enabled !== true) {
+    return { enabled: false, mode: 'strict_sync', reason: 'disabled',
+      syncChecks: checks, asyncChecks: [], decision: null };
+  }
+  const decision = evaluateAdaptiveGate({ checks, diffPaths, telemetryStats, recentRollbacks, thresholds });
+  if (decision.syncFastChecks.length === 0 && checks.length > 0) {
+    return { enabled: true, mode: 'strict_sync', reason: 'empty_sync_fallback',
+      syncChecks: checks, asyncChecks: [], decision };
+  }
+  return { enabled: true, mode: decision.mode, reason: decision.reason,
+    syncChecks: decision.syncFastChecks, asyncChecks: decision.asyncHeavyChecks, decision };
+}
+
 export function buildWorkerTransport({ kind, policy, runtime, bbTransport, worktree,
   prepareSpawn, prepareFeedback } = {}) {
   if (kind === undefined || kind === 'bb') return bbTransport;
@@ -118,7 +141,8 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
       const promptFile = await prepareSpawn({ attempt, handoff, execSpec, runtimeId });
       const launched = await runtime.spawn({ taskId: attempt.task_id, attemptId: attempt.attempt_id,
         worktree: worktree ?? policy?.route?.worktree, promptFile, executor: execSpec,
-        spaceLabel: policy?.route?.repoId, tabLabel: `DF #${attempt.task_id}`, runtimeId });
+        spaceLabel: policy?.route?.herdrSpaceId ?? policy?.route?.repoId,
+        tabLabel: `DF #${attempt.task_id}`, runtimeId });
       if (launched?.runtimeId !== runtimeId) throw new Error('worker_runtime_id_mismatch');
       if (!deliveredFeedback.has(runtimeId)) deliveredFeedback.set(runtimeId, 0);
       return { threadId: launched.runtimeId };
@@ -1063,16 +1087,63 @@ async function execute() {
       const runLocal = offlineProfileRunner(root, { beforeEffect });
       const runVisual = offlineVisualRunner(root, { beforeEffect });
       let diff, localEvidence, visualEvidence = null;
+      // V2-9b: адаптивное разбиение проверок активируется только явным
+      // adaptiveGates.enabled доверенного профиля. Входы планировщика —
+      // read-only: diff кандидата из git (сбой чтения — безопасный []) и
+      // журнальные попытки телеметрии того же root. Решение фиксируется
+      // read-only событием adaptive_gate_decision; отложенные async-проверки
+      // попадают в метаданные evidence без обхода Tamper Gate, Scope Fence
+      // и formal-проверок (formal остаются синхронными по контракту гейта).
+      const adaptiveLocalPlan = async (binding, trusted) => {
+        if (trusted?.adaptiveGates?.enabled !== true) return null;
+        let diffPaths = [];
+        try {
+          const names = await rawGit('diff', '--no-renames', '-z', '--name-only',
+            route.base, binding.candidate_sha, '--');
+          diffPaths = names.split('\0').filter(name => name.length > 0);
+        } catch {
+          diffPaths = [];
+        }
+        let recentAttempts = [];
+        try {
+          const lines = await readTelemetryLines(join(root, 'telemetry.jsonl'));
+          recentAttempts = parseTelemetryLines(lines).entries;
+        } catch {
+          recentAttempts = [];
+        }
+        const gates = trusted.adaptiveGates;
+        const plan = planAdaptiveChecks({ profile: trusted, diffPaths,
+          telemetryStats: gates.telemetryStats ?? null,
+          recentRollbacks: recentAttempts,
+          thresholds: gates.thresholds ?? gates });
+        const deferredAsyncChecks = plan.asyncChecks.length === 0 ? []
+          : (plan.decision?.decisions ?? []).filter(entry => entry.disposition === 'async')
+            .map(entry => entry.id);
+        const metadata = { mode: plan.mode, reason: plan.reason,
+          syncCount: plan.syncChecks.length, asyncCount: plan.asyncChecks.length,
+          deferredAsyncChecks };
+        const note = { kind: 'adaptive_gate_decision', phase: 'l1_local',
+          task_id: attempt.task_id, attempt_id: attempt.attempt_id, epoch: attempt.epoch,
+          mode: plan.mode, reason: plan.reason,
+          detail: { syncCount: metadata.syncCount, asyncCount: metadata.asyncCount } };
+        eventBus?.emit(note);
+        console.log(JSON.stringify(note));
+        return { plan, metadata };
+      };
       const result = await acceptHeld({ attempt: acceptanceAttempt, submission, policy, journal: root, ports: {
         board: port, inspect: telemetry.port('inspect', inspect),
         local: telemetry.port('l1_local', async (binding, trusted) => {
           enterPhase('l1_l3');
           try {
             if (attemptSignals.signal.aborted) throw attemptSignals.signal.reason;
-            if (!ab && !foreman) return await runLocal(binding, trusted);
+            const adaptive = await adaptiveLocalPlan(binding, trusted);
+            const planned = adaptive ? { ...trusted, checks: adaptive.plan.syncChecks } : trusted;
+            const stamp = result => adaptive && result !== null && typeof result === 'object'
+              ? { ...result, adaptiveGate: adaptive.metadata } : result;
+            if (!ab && !foreman) return stamp(await runLocal(binding, planned));
             diff = ab ? await inspectPilotDiff(ab, { git: rawGit, base: route.base, candidate: binding.candidate_sha })
               : await foremanDiff({ git: rawGit, base: route.base, candidate: binding.candidate_sha });
-            localEvidence = await runLocal(binding, trusted);
+            localEvidence = stamp(await runLocal(binding, planned));
             return localEvidence;
           } finally {
             // Таймер l1_l3 снимается на выходе из фазы: при частичном наборе

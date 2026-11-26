@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { allowedPathsFromAttempt, allowedPathsFromLabels, buildWorkerTransport, isApprovedWorker,
-  queueModeSpecInputs, resolveWorkerRuntimeKind, scopeFenceReworkResult } from './run-isolated.mjs';
+  planAdaptiveChecks, queueModeSpecInputs, resolveWorkerRuntimeKind, scopeFenceReworkResult } from './run-isolated.mjs';
 import { deterministicRuntimeId } from './worker-runtime.mjs';
 import { workerIntakePrompt } from './intake-prompt.mjs';
 
@@ -250,4 +250,178 @@ test('portable reconcileSpawn is empty for missing or exited subproc sessions', 
 test('bb kind preserves the legacy transport object', () => {
   const legacy = { marker: true };
   assert.equal(buildWorkerTransport({ kind: 'bb', bbTransport: legacy }), legacy);
+});
+
+test('planAdaptiveChecks disabled default passes every check through synchronously unchanged', () => {
+  const checks = [{ id: 'unit' }, { id: 'e2e' }];
+  for (const profile of [
+    { checks },
+    { checks, adaptiveGates: { enabled: false } },
+    { checks, adaptiveGates: {} },
+    {},
+    null,
+    undefined,
+  ]) {
+    const plan = planAdaptiveChecks({ profile });
+    assert.equal(plan.enabled, false);
+    assert.equal(plan.mode, 'strict_sync');
+    assert.equal(plan.reason, 'disabled');
+    assert.equal(plan.syncChecks, Array.isArray(profile?.checks) ? profile.checks : plan.syncChecks);
+    assert.deepEqual(plan.syncChecks, Array.isArray(profile?.checks) ? profile.checks : []);
+    assert.deepEqual(plan.asyncChecks, []);
+    assert.equal(plan.decision, null);
+  }
+  // Extraordinary inputs never throw and stay disabled pass-throughs.
+  for (const input of [undefined, null, {}, { profile: 'bad' }, { profile: { checks: 'bad' } }]) {
+    const plan = planAdaptiveChecks(input ?? undefined);
+    assert.equal(plan.enabled, false);
+    assert.equal(plan.mode, 'strict_sync');
+    assert.equal(plan.reason, 'disabled');
+    assert.deepEqual(plan.syncChecks, []);
+    assert.deepEqual(plan.asyncChecks, []);
+    assert.equal(plan.decision, null);
+  }
+});
+
+test('planAdaptiveChecks enabled splits fast synchronous and heavy reversible asynchronous checks', () => {
+  const checks = [
+    { id: 'lint', kind: 'fast', reversible: true },
+    { id: 'e2e-heavy', kind: 'heavy', reversible: true },
+  ];
+  for (const [profile, extra] of [
+    [{ adaptiveGates: { enabled: true }, checks }, {}],
+    [{ checks }, { thresholds: { enabled: true } }],
+  ]) {
+    const plan = planAdaptiveChecks({
+      profile,
+      telemetryStats: { lint: { medianMs: 5_000 }, 'e2e-heavy': { medianMs: 300_000 } },
+      ...extra,
+    });
+    assert.equal(plan.enabled, true);
+    assert.equal(plan.mode, 'optimistic_async');
+    assert.equal(plan.reason, 'adaptive_duration');
+    assert.deepEqual(plan.syncChecks.map(check => check.id), ['lint']);
+    assert.deepEqual(plan.asyncChecks.map(check => check.id), ['e2e-heavy']);
+    assert.equal(plan.asyncChecks[0].autoRollbackOnFail, true);
+    assert.ok(plan.decision);
+    assert.equal(plan.decision.mode, 'optimistic_async');
+  }
+});
+
+test('planAdaptiveChecks keeps formal checks pinned synchronous even when slow and reversible', () => {
+  const plan = planAdaptiveChecks({
+    profile: { adaptiveGates: { enabled: true }, checks: [
+      { id: 'proof', kind: 'formal', reversible: true },
+      { id: 'heavy', kind: 'heavy', reversible: true },
+    ] },
+    telemetryStats: { proof: 300_000, heavy: 300_000 },
+  });
+  assert.equal(plan.enabled, true);
+  assert.equal(plan.mode, 'optimistic_async');
+  assert.deepEqual(plan.syncChecks.map(check => check.id), ['proof']);
+  assert.deepEqual(plan.asyncChecks.map(check => check.id), ['heavy']);
+  assert.equal(plan.decision.decisions.find(decision => decision.id === 'proof').reason, 'formal_override');
+});
+
+test('planAdaptiveChecks escalates high-risk diff paths to strict synchronous mode', () => {
+  const plan = planAdaptiveChecks({
+    profile: { adaptiveGates: { enabled: true }, checks: [
+      { id: 'heavy', kind: 'heavy', reversible: true },
+    ] },
+    diffPaths: ['migrations/0001_init.sql'],
+    telemetryStats: { heavy: 300_000 },
+    thresholds: { highRiskPaths: ['migrations/'] },
+  });
+  assert.equal(plan.enabled, true);
+  assert.equal(plan.mode, 'strict_sync');
+  assert.equal(plan.reason, 'high_risk_path');
+  assert.equal(plan.syncChecks.length, 1);
+  assert.deepEqual(plan.asyncChecks, []);
+});
+
+test('planAdaptiveChecks forces strict sync when the rollback circuit breaker trips above ten percent', () => {
+  const tripped = planAdaptiveChecks({
+    profile: { adaptiveGates: { enabled: true }, checks: [
+      { id: 'heavy', kind: 'heavy', reversible: true },
+    ] },
+    telemetryStats: { heavy: 300_000 },
+    recentRollbacks: { totalRuns: 20, rollbacks: 3 },
+  });
+  assert.equal(tripped.enabled, true);
+  assert.equal(tripped.mode, 'strict_sync');
+  assert.equal(tripped.reason, 'rollback_circuit_breaker');
+  assert.deepEqual(tripped.asyncChecks, []);
+  assert.equal(tripped.decision.circuitBreaker.open, true);
+
+  // Boundary: exactly ten percent is not a trip. A fast check stays
+  // synchronous so the empty-sync fallback does not mask the split.
+  const boundary = planAdaptiveChecks({
+    profile: { adaptiveGates: { enabled: true }, checks: [
+      { id: 'lint', kind: 'fast', reversible: true },
+      { id: 'heavy', kind: 'heavy', reversible: true },
+    ] },
+    telemetryStats: { lint: 5_000, heavy: 300_000 },
+    recentRollbacks: { totalRuns: 20, rollbacks: 2 },
+  });
+  assert.equal(boundary.mode, 'optimistic_async');
+  assert.deepEqual(boundary.syncChecks.map(check => check.id), ['lint']);
+  assert.equal(boundary.asyncChecks.length, 1);
+});
+
+test('planAdaptiveChecks fails closed to strict sync of every check when the sync set would be empty', () => {
+  const checks = [
+    { id: 'heavy-a', kind: 'heavy', reversible: true },
+    { id: 'heavy-b', kind: 'heavy', reversible: true },
+  ];
+  const plan = planAdaptiveChecks({
+    profile: { adaptiveGates: { enabled: true }, checks },
+    telemetryStats: { 'heavy-a': 300_000, 'heavy-b': 300_000 },
+  });
+  assert.equal(plan.enabled, true);
+  assert.equal(plan.mode, 'strict_sync');
+  assert.equal(plan.reason, 'empty_sync_fallback');
+  assert.equal(plan.syncChecks, checks);
+  assert.deepEqual(plan.asyncChecks, []);
+});
+
+test('planAdaptiveChecks is deterministic across repeated invocation', () => {
+  const input = {
+    profile: { adaptiveGates: { enabled: true }, checks: [
+      { id: 'lint', kind: 'fast', reversible: true },
+      { id: 'heavy', kind: 'heavy', reversible: true },
+    ] },
+    diffPaths: ['src/index.ts'],
+    telemetryStats: { lint: 5_000, heavy: 300_000 },
+    recentRollbacks: [],
+  };
+  const first = planAdaptiveChecks(input);
+  const second = planAdaptiveChecks(input);
+  assert.deepEqual(second, first);
+});
+
+test('portable worker transport prefers herdrSpaceId over repoId and falls back when absent', async () => {
+  for (const [route, expected] of [
+    [{ repoId: 'repo-1', herdrSpaceId: 'sp-native-9' }, 'sp-native-9'],
+    [{ repoId: 'repo-1' }, 'repo-1'],
+    [{ herdrSpaceId: 'sp-native-7' }, 'sp-native-7'],
+    [{}, undefined],
+  ]) {
+    const runtime = {
+      probeAvailability: async () => ({ status: 'available' }),
+      spawn: async input => ({ runtimeId: input.runtimeId, spaceLabel: input.spaceLabel }),
+      feedback: async () => ({ delivered: true }),
+      observe: async () => ({ state: 'working' }),
+    };
+    let spawnInput;
+    const capturingRuntime = { ...runtime,
+      async spawn(input) { spawnInput = input; return runtime.spawn(input); } };
+    const transport = buildWorkerTransport({ kind: 'hc',
+      policy: { bb: { provider: 'acp-devin', model: 'swe-2-1-medium' }, route },
+      runtime: capturingRuntime, bbTransport: {},
+      prepareSpawn: async () => '/tmp/prompt', prepareFeedback: async () => 'rework' });
+    const attempt = { task_id: '4525', epoch: 2, attempt_id: 'attempt-space' };
+    assert.deepEqual(await transport.spawn(attempt),
+      { threadId: deterministicRuntimeId('hc', '4525', 'attempt-space') });
+    assert.equal(spawnInput.spaceLabel, expected);
+  }
 });
