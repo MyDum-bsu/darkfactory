@@ -330,3 +330,45 @@ test('arbiterIntakePrompt shapes the prompt by the arbiter model family when pro
   assert.match(pinned, /slice digest b{64}/);
   assert.match(pinned, /- \[global\] CSV for export \(dec-1\)/);
 });
+
+test('worker prompt without executor still emits the scope fence when allowedPaths is present (F-08)', () => {
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: false,
+    allowedPaths: ['board_pipeline/intake-prompt.mjs', 'board_pipeline/'] });
+  assert.match(prompt, /Scope Fence \(hard constraint\):/);
+  assert.ok(prompt.includes('- board_pipeline/intake-prompt.mjs'));
+  assert.ok(prompt.includes('- board_pipeline/'));
+  assert.match(prompt, /scope_fence_violation/);
+  assert.match(prompt, /Treat every other repository path as read-only/);
+  // Детерминированная эмиссия: тот же вход — тот же промпт.
+  assert.equal(prompt, workerIntakePrompt({ ...worker, productQuestions: false,
+    allowedPaths: ['board_pipeline/intake-prompt.mjs', 'board_pipeline/'] }));
+});
+
+test('worker prompt without executor and without allowedPaths emits no scope fence', () => {
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: false });
+  assert.doesNotMatch(prompt, /Scope Fence/);
+  // null трактуется как отсутствие периметра, как и undefined.
+  const nullPaths = workerIntakePrompt({ ...worker, productQuestions: false, allowedPaths: null });
+  assert.doesNotMatch(nullPaths, /Scope Fence/);
+});
+
+test('worker prompt without executor is fail-closed on malformed allowed paths (F-08)', () => {
+  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false,
+    allowedPaths: ['../outside'] }), /scope_fence_path_invalid/);
+  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false,
+    allowedPaths: [] }), /scope_fence_input_invalid/);
+  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false,
+    allowedPaths: ['/absolute'] }), /scope_fence_path_invalid/);
+});
+
+test('scope fence block content is identical with and without executor shaping', () => {
+  const plain = workerIntakePrompt({ ...worker, productQuestions: false,
+    allowedPaths: ['board_pipeline/'] });
+  const shaped = workerIntakePrompt({ ...worker, productQuestions: false,
+    allowedPaths: ['board_pipeline/'], executor: { provider: 'acp-devin', model: 'swe-2-1-medium' } });
+  for (const line of ['Scope Fence (hard constraint):', '- board_pipeline/',
+    'Treat every other repository path as read-only, even if you notice an incidental defect there.']) {
+    assert.ok(plain.includes(line), `plain: ${line}`);
+    assert.ok(shaped.includes(line), `shaped: ${line}`);
+  }
+});

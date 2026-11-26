@@ -149,8 +149,14 @@ function attemptOf(record, route) {
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
 export async function advance({ route, state, board, bb, submissions, verify, authorize,
   recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger, eventBus,
-  recoverInterruptedChecking = false }) {
+  recoverInterruptedChecking = false, workingTimeoutMs = 90 * 60 * 1000 }) {
   checkRoute(route);
+  // Wall-clock бюджет фазы 'working': зависший воркер не может продлевать
+  // аренду бесконечно. Операторское значение обязано быть конечным
+  // положительным числом миллисекунд — иначе маршрут не исполняется.
+  if (!Number.isFinite(workingTimeoutMs) || workingTimeoutMs <= 0) {
+    throw new Error('A trusted, enrolled route is required');
+  }
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const hazards = mutants ?? {};
   const binding = createHash('sha256').update(JSON.stringify(route)).digest('hex');
@@ -528,6 +534,27 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   const after = record.turnSeq ?? 0;
   let submission;
   let turnSeq;
+  const stopWith = async (reason, extraState = null, detail = '') => {
+    const privateText = `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}.${detail ? ` ${detail}` : ''} Проверьте ход; повтор не отправлен.`;
+    const blockText = board.blockText?.(attempt.epoch, privateText) ?? privateText;
+    await save({ phase: 'blocking', turnSeq,
+      intent: { kind: 'block', attemptId: record.attemptId, epoch: attempt.epoch,
+        turnSeq, reason, blockText: blockText.slice(0, 1000) },
+      ...(extraState ?? {}) });
+    try {
+      await board.block(attempt.task_id, attempt.epoch, blockText);
+      await save({ phase: 'hold', reason, receipt: { kind: 'block' } });
+    } catch {
+      return reconcileInFlight();
+    }
+    return visible();
+  };
+  // Wall-clock бюджет фазы 'working' стартует с первого тика, наблюдающего
+  // фазу, и не сбрасывается кругами доработки: записанное значение переживает
+  // рестарты процесса, поэтому продление аренды не обнуляет часы.
+  if (record.phase === 'working' && !Number.isFinite(record.workingSince)) {
+    await save({ workingSince: Date.now() });
+  }
   if (recoveredChecking) {
     // Конверт уже прошёл проверку на исходном тике и зафиксирован в записи:
     // verify() повторяется по реконструированному конверту того же кандидата,
@@ -536,13 +563,35 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     submission = { task_id: attempt.task_id, epoch: attempt.epoch,
       attempt_id: attempt.attempt_id, worker_thread_id: attempt.bb_thread_id,
       candidate_sha: record.sha };
-    await save({ checkingRecovered: true });
+    // Монотонный recoverySeq (F-02 / Core P1-7): каждое восстановление
+    // прерванной проверки увеличивает счётчик в доверенной записи попытки.
+    // verify получает его отдельным контроллерным аргументом — приёмка
+    // перепроверяет кандидата под свежим ключом журнала, а не застревает
+    // на uncertain прерванного запуска.
+    const recoverySeq = (Number.isSafeInteger(record.recoverySeq) && record.recoverySeq >= 0
+      ? record.recoverySeq : 0) + 1;
+    await save({ checkingRecovered: true, recoverySeq });
   } else {
     const observation = await submissions.read(attempt, after);
     // GUARD:NoWatermarkRegression — ход не новее watermark никогда не засчитывается
     // за ответ на уже отправленный feedback.
     if (!observation || !Number.isSafeInteger(observation.turnSeq) ||
-        (!hazards.staleTurnWatermark && observation.turnSeq <= after)) return visible();
+        (!hazards.staleTurnWatermark && observation.turnSeq <= after)) {
+      // Зависший воркер не продлевает аренду бесконечно: свежего хода нет,
+      // а wall-clock бюджет фазы 'working' исчерпан — воркер останавливается
+      // best-effort, карточка видимо блокируется для владельца.
+      if (record.phase === 'working' && Number.isFinite(record.workingSince) &&
+          Date.now() - record.workingSince > workingTimeoutMs) {
+        if (typeof bb.stop === 'function') {
+          try { await bb.stop(record.threadId); } catch { /* best effort: стоп не отменяет блок */ }
+        }
+        // Свежего хода нет: диагностика ссылается на watermark последнего
+        // подтверждённого хода, а не на несуществующий ответ воркера.
+        turnSeq = after;
+        return stopWith('worker_working_timeout');
+      }
+      return visible();
+    }
     submission = observation.submission;
     turnSeq = observation.turnSeq;
     // A legacy record remembers its checked SHA, but not which BB turn produced it.
@@ -576,21 +625,6 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       }
     }
   }
-  const stopWith = async (reason, extraState = null, detail = '') => {
-    const privateText = `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}.${detail ? ` ${detail}` : ''} Проверьте ход; повтор не отправлен.`;
-    const blockText = board.blockText?.(attempt.epoch, privateText) ?? privateText;
-    await save({ phase: 'blocking', turnSeq,
-      intent: { kind: 'block', attemptId: record.attemptId, epoch: attempt.epoch,
-        turnSeq, reason, blockText: blockText.slice(0, 1000) },
-      ...(extraState ?? {}) });
-    try {
-      await board.block(attempt.task_id, attempt.epoch, blockText);
-      await save({ phase: 'hold', reason, receipt: { kind: 'block' } });
-    } catch {
-      return reconcileInFlight();
-    }
-    return visible();
-  };
   const askOwner = async ({ kind, prompt, evidence, result, extraState, releasePlan }) => {
     const sha = await questionGate.capture({ attempt, turnSeq });
     const candidateSha = result?.receipt?.evidence?.sha;
@@ -691,7 +725,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       release_channel: 'isolated-static', previous_live_digest: prepared.previous.digest } } : {}) };
   let result;
   try {
-    result = await verify(verification, { ...submission, task_id: taskId });
+    // При восстановлении прерванной проверки verify получает монотонный
+    // recoverySeq отдельным контроллерным аргументом: сдача воркера не может
+    // ни подменить, ни подавить счётчик восстановления.
+    result = await verify(verification, { ...submission, task_id: taskId },
+      recoveredChecking ? { recoverySeq: record.recoverySeq } : undefined);
   } catch (error) {
     const message = String(error?.message ?? error);
     const leaseEvidence = `${error?.code ?? ''} ${message}`;
@@ -881,8 +919,19 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     } catch {
       return reconcileInFlight();
     }
+  } else if (result.outcome === 'denied' &&
+      /lease[_ ]lost|claim_not_held|claim_lost|epoch_mismatch/i.test(String(result.reason ?? ''))) {
+    // Отказ по аренде не блокирует карточку: lease уже потерян, board.block
+    // всё равно не пройдёт — фиксируется lease_lost, как при броске verify.
+    await save({ phase: 'lease_lost', reason: result.reason ?? 'claim_not_held' });
   } else if (/claim_not_held/.test(String(result.reason ?? ''))) {
     await save({ phase: 'lease_lost', reason: result.reason ?? 'claim_not_held' });
+  } else if (result.outcome === 'denied') {
+    // Не-lease отказ приёмки (Core P1-6): локальный hold без board.block
+    // оставлял карточку бесхозно захваченной до истечения аренды. Отказ
+    // проходит тот же видимый путь, что и прочие стопы верификации:
+    // причина пишется на карточку через board.block.
+    return stopWith(result.reason ?? 'denied');
   } else {
     await save({ phase: result.outcome === 'uncertain' ? 'uncertain' : 'hold', reason: result.reason ?? 'unverified' });
   }
