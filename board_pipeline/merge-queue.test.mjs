@@ -80,6 +80,33 @@ test('canonicalizeBranchName rejects empty, whitespace, control chars and dot-do
   assert.equal(canonicalizeBranchName(' main '), 'main');
 });
 
+test('canonicalizeBranchName rejects forbidden characters hidden in the remote segment', () => {
+  // regression (L2 review): validation runs on the input BEFORE prefix
+  // stripping — otherwise the discarded remote segment launders '..',
+  // whitespace and control characters into a clean-looking remainder
+  assert.equal(canonicalizeBranchName('refs/remotes/../dev'), null);
+  assert.equal(canonicalizeBranchName('refs/remotes/a\0b/dev'), null);
+  assert.equal(canonicalizeBranchName('refs/remotes/a b/dev'), null);
+  assert.equal(canonicalizeBranchName('refs/remotes/a\tb/dev'), null);
+  // пустой remote-сегмент не является валидным remote-tracking ref
+  assert.equal(canonicalizeBranchName('refs/remotes//dev'), null);
+  assert.equal(canonicalizeBranchName('refs/remotes//main'), null);
+  // ветка после remote обязана существовать
+  assert.equal(canonicalizeBranchName('refs/remotes/origin/'), null);
+});
+
+test('canonicalizeBranchName strips ref prefixes case-insensitively', () => {
+  // regression (L2 review): the protected match is case-insensitive, so the
+  // prefix wrapper must not depend on spelling either — otherwise ORIGIN/main
+  // bypasses the gate that origin/main cannot pass
+  assert.equal(canonicalizeBranchName('ORIGIN/main'), 'main');
+  assert.equal(canonicalizeBranchName('REFS/HEADS/main'), 'main');
+  assert.equal(canonicalizeBranchName('Refs/Remotes/Origin/main'), 'main');
+  assert.equal(canonicalizeBranchName('oRiGiN/release/v2'), 'release/v2');
+  // регистр остатка сохраняется: каноническая форма не lower-case
+  assert.equal(canonicalizeBranchName('ORIGIN/Dev'), 'Dev');
+});
+
 test('protected branch patterns match exactly and by prefix', () => {
   // Паттерн 'release' + '/' + '*' записан конкатенацией: литерал со смежными
   // символами '/' и '*' tamper-gate читал бы как незакрытый блок-комментарий.
@@ -138,6 +165,8 @@ test('validateMergeCandidate rejects incomplete or unproven candidates', () => {
     [{ targetBranch: '../etc' }, 'merge_target_branch_invalid'],
     [{ targetBranch: 'a\0b' }, 'merge_target_branch_invalid'],
     [{ targetBranch: 'refs/heads/' }, 'merge_target_branch_invalid'],
+    [{ targetBranch: 'refs/remotes//dev' }, 'merge_target_branch_invalid'],
+    [{ targetBranch: 'refs/remotes/../dev' }, 'merge_target_branch_invalid'],
     [{ targetBranch: 'has space' }, 'merge_target_branch_invalid'],
   ]) {
     const candidate = patch === null || patch === undefined ? patch : validCandidate(patch);
@@ -226,6 +255,27 @@ test('HMAC binding uses the canonical branch, not the raw spelling', async () =>
   await assert.rejects(() => processMergeCandidate(validCandidate({ targetBranch: 'refs/heads/main',
     ownerApproval: { approved: true, token: rawToken } }), portsMock(), options),
     /protected_branch_requires_owner_approval/);
+});
+
+test('bypass attempts via case-variant ref prefixes hit the protected gate', async () => {
+  // regression (L2 review): ORIGIN/main and REFS/HEADS/main are the same
+  // protected target as origin/main — case must not open auto-merge
+  for (const branch of ['ORIGIN/main', 'REFS/HEADS/main', 'Refs/Remotes/Origin/master', 'Origin/RELEASE/v2']) {
+    assert.equal(isProtectedBranch(branch), true, branch);
+    const ports = portsMock();
+    await assert.rejects(() => processMergeCandidate(validCandidate({ targetBranch: branch }), ports),
+      /protected_branch_requires_owner_approval/, branch);
+    assert.equal(ports.calls.fastForward.length, 0, branch);
+    assert.equal(ports.calls.rebase.length, 0, branch);
+    assert.equal(ports.calls.update.length, 0, branch);
+  }
+  // валидный HMAC на каноническое имя проходит и через заглавную обёртку
+  const candidate = validCandidate({ targetBranch: 'ORIGIN/main' });
+  candidate.ownerApproval = approvalFor(candidate, SECRET, 'main');
+  const ports = portsMock();
+  const result = await processMergeCandidate(candidate, ports, { ownerApprovalSecret: SECRET });
+  assert.equal(result.status, 'merged');
+  assert.deepEqual(ports.calls.fastForward, [['main', SHA_B, { expectedHead: SHA_A }]]);
 });
 
 test('bypass attempts via ref spelling hit the protected gate', async () => {

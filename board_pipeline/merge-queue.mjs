@@ -40,31 +40,39 @@ function invalid(code) {
   return new MergeQueueInvalid(code);
 }
 
-// Канонизирует имя ветки для политических решений: trim, снятие префиксов
-// refs/heads/, refs/remotes/<remote>/ и origin/ до неподвижной точки
-// (refs/remotes/origin/main — remote-tracking ref, ветка main). Вход с
-// управляющими символами, пробельными символами внутри, '..', пустой после
-// trim или пустой после снятия префиксов отклоняется (null) — такое имя не
-// может участвовать в слиянии и отсекается валидацией раньше.
+// Канонизирует имя ветки для политических решений: trim, отказ по управляющим
+// символам, пробелам внутри и '..' ДО снятия префиксов — иначе отброшенный
+// remote-сегмент отмывал бы запрещённые символы (refs/remotes/../dev),
+// а затем снятие префиксов refs/heads/, refs/remotes/<remote>/ и origin/ до
+// неподвижной точки (refs/remotes/origin/main — remote-tracking ref, ветка
+// main). Снятие регистронезависимо: защищённое сравнение идёт в нижнем
+// регистре, поэтому и префиксная обёртка не должна зависеть от написания —
+// иначе ORIGIN/main обходил бы гейт, который origin/main не проходит. Пустой
+// remote-сегмент (refs/remotes//dev) и отсутствие ветки после него
+// отклоняются. Пустой остаток после снятия префиксов — тоже отказ (null).
 export function canonicalizeBranchName(branch) {
   if (typeof branch !== 'string') return null;
-  let value = branch.trim();
-  let previous;
-  do {
-    previous = value;
-    if (value.startsWith('refs/heads/')) {
+  const trimmed = branch.trim();
+  if (trimmed === '' || CONTROL_CHARS_RE.test(trimmed) || /\s/.test(trimmed) ||
+      trimmed.includes('..')) {
+    return null;
+  }
+  let value = trimmed;
+  for (;;) {
+    const lower = value.toLowerCase();
+    if (lower.startsWith('refs/heads/')) {
       value = value.slice('refs/heads/'.length);
-    } else if (value.startsWith('refs/remotes/')) {
+    } else if (lower.startsWith('refs/remotes/')) {
       const rest = value.slice('refs/remotes/'.length);
       const slash = rest.indexOf('/');
-      value = slash === -1 ? '' : rest.slice(slash + 1);
-    } else if (value.startsWith('origin/')) {
+      if (slash <= 0) return null; // нет ветки после remote или пустой remote-сегмент
+      value = rest.slice(slash + 1);
+    } else if (lower.startsWith('origin/')) {
       value = value.slice('origin/'.length);
+    } else {
+      break;
     }
-  } while (value !== previous);
-  if (value === '' || CONTROL_CHARS_RE.test(value) || /\s/.test(value) ||
-      value.includes('..')) {
-    return null;
+    if (value === '') return null;
   }
   return value;
 }
