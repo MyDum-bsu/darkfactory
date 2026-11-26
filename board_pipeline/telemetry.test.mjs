@@ -17,7 +17,8 @@ import { commitFile, neonFixture } from './review-test-fixture.mjs';
 import { memoryBoardSdk } from './board-test-fixture.mjs';
 import { loadSdk } from './sdk.mjs';
 import { aggregateTelemetry, createTelemetryRecorder, formatTelemetryReport, formatTelemetrySummary,
-  normalizeUsage, roundGateOf, threadUsage, TELEMETRY_PHASES } from './telemetry.mjs';
+  normalizeUsage, roundGateOf, threadUsage, TELEMETRY_MAX_BYTES, TELEMETRY_MAX_ROTATIONS,
+  TELEMETRY_PHASES } from './telemetry.mjs';
 
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -196,6 +197,48 @@ test('fail-open: пустая телеметрия не создаёт файл'
   assert.equal(record, null);
   assert.equal(summary, null);
   await assert.rejects(lstat(join(journal, 'telemetry.jsonl')), { code: 'ENOENT' });
+});
+
+test('rotation: переполненный telemetry.jsonl сдвигается перед дописью, старая ротация удаляется', async t => {
+  assert.equal(TELEMETRY_MAX_BYTES, 10 * 1024 * 1024);
+  assert.equal(TELEMETRY_MAX_ROTATIONS, 3);
+  const journal = await mkdtemp(join(tmpdir(), 'telemetry-rotate-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+  const file = join(journal, 'telemetry.jsonl');
+  const active = `${'x'.repeat(600)}\n`;
+  await writeFile(file, active);
+  await writeFile(`${file}.1`, 'first\n');
+  await writeFile(`${file}.2`, 'second\n');
+  await writeFile(`${file}.3`, 'third\n');
+
+  const rec = createTelemetryRecorder({ journal, clock: () => 0, maxBytes: 1024, maxRotations: 3 });
+  await rec.phase('spawn', async () => {});
+  const { record } = await rec.finish({ outcome: 'done', open: false });
+  assert.ok(record);
+
+  const lines = (await readFile(file, 'utf8')).trim().split('\n');
+  assert.equal(lines.length, 1);
+  assert.equal(JSON.parse(lines[0]).kind, 'attempt_summary');
+  assert.equal(await readFile(`${file}.1`, 'utf8'), active);
+  assert.equal(await readFile(`${file}.2`, 'utf8'), 'first\n');
+  assert.equal(await readFile(`${file}.3`, 'utf8'), 'second\n');
+  await assert.rejects(lstat(`${file}.4`), { code: 'ENOENT' });
+});
+
+test('rotation: активный файл в пределах лимита дописывается без ротации', async t => {
+  const journal = await mkdtemp(join(tmpdir(), 'telemetry-no-rotate-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+  const file = join(journal, 'telemetry.jsonl');
+  await writeFile(file, 'seed\n');
+  const rec = createTelemetryRecorder({ journal, clock: () => 0, maxBytes: 64 * 1024, maxRotations: 1 });
+  await rec.phase('spawn', async () => {});
+  await rec.finish({ outcome: 'done', open: false });
+
+  const lines = (await readFile(file, 'utf8')).trim().split('\n');
+  assert.equal(lines[0], 'seed');
+  assert.equal(lines.length, 2);
+  assert.equal(JSON.parse(lines[1]).kind, 'attempt_summary');
+  await assert.rejects(lstat(`${file}.1`), { code: 'ENOENT' });
 });
 
 test('partial: попытка, подхваченная после рестарта, помечается partial', async t => {

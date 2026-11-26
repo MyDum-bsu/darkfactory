@@ -4,10 +4,35 @@
 // превращаются в null/заметку в приватном журнале и никогда не ломают приёмку
 // и эффекты контроллера. Никаких секретов и сырых логов в сводке.
 
-import { appendFile, readFile } from 'node:fs/promises';
+import { appendFile, lstat, readFile, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 export const TELEMETRY_SCHEMA = 1;
+
+// Ротация приватного JSONL-журнала по размеру: демоны 24/7 пишут попытки
+// безгранично, поэтому перед дописью активный файл проверяется на лимит и
+// сдвигается в цепочку telemetry.jsonl.1 … telemetry.jsonl.<maxRotations>;
+// самая старая ротация удаляется. Значения опускаются до быстрых в unit-тестах.
+export const TELEMETRY_MAX_BYTES = 10 * 1024 * 1024;
+export const TELEMETRY_MAX_ROTATIONS = 3;
+
+// Сдвиг цепочки ротаций перед дописью: активный файл, которому следующая
+// строка превысит maxBytes, уходит в .1, прежние ротации сдвигаются, самая
+// старая удаляется. Все операции best-effort вызывающей fail-open обвязки:
+// отсутствующие звенья цепочки пропускаются, а любой сбой ротации/записи —
+// заметка приватного журнала, не ошибка приёмки.
+async function rotateTelemetryFile(path, lineBytes, maxBytes, maxRotations) {
+  const stats = await lstat(path).catch(() => null);
+  if (!stats || !stats.isFile()) return;
+  if (stats.size + lineBytes <= maxBytes) return;
+  await rm(`${path}.${maxRotations}`, { force: true });
+  for (let index = maxRotations - 1; index >= 1; index -= 1) {
+    await rename(`${path}.${index}`, `${path}.${index + 1}`).catch(error => {
+      if (error?.code !== 'ENOENT') throw error;
+    });
+  }
+  await rename(path, `${path}.1`);
+}
 
 // Канонические фазы попытки: spawn воркера, окно работы воркера (между
 // подтверждённым spawn/feedback и следующей приёмкой), детерминированные
@@ -162,8 +187,15 @@ export function formatTelemetrySummary(record) {
 }
 
 export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clock = Date.now,
-  models = {}, subject = null } = {}) {
+  models = {}, subject = null, maxBytes = TELEMETRY_MAX_BYTES,
+  maxRotations = TELEMETRY_MAX_ROTATIONS } = {}) {
   const path = typeof journal === 'string' && journal ? join(journal, file) : null;
+  // Лимиты ротации: только конечные положительные значения; невалидное
+  // конфигурирование fail-closed откатывается к безопасному дефолту.
+  const rotationMaxBytes = Number.isFinite(maxBytes) && maxBytes > 0
+    ? Math.floor(maxBytes) : TELEMETRY_MAX_BYTES;
+  const rotationMaxRotations = Number.isSafeInteger(maxRotations) && maxRotations >= 1
+    ? maxRotations : TELEMETRY_MAX_ROTATIONS;
   let events = 0;
   let startedAt = null;
   let endedAt = null;
@@ -472,7 +504,11 @@ export function createTelemetryRecorder({ journal, file = 'telemetry.jsonl', clo
         try {
           const line = { kind: 'attempt_summary', schema: TELEMETRY_SCHEMA, ...record };
           if (notes.length) line.notes = [...notes];
-          await appendFile(path, `${JSON.stringify(line)}\n`, { mode: 0o600 });
+          const text = `${JSON.stringify(line)}\n`;
+          // Ротация строго до дописи: переполненный активный файл сдвигается
+          // в цепочку .1…N, и строка пишется в свежее начало журнала.
+          await rotateTelemetryFile(path, Buffer.byteLength(text), rotationMaxBytes, rotationMaxRotations);
+          await appendFile(path, text, { mode: 0o600 });
         } catch (error) {
           note(`telemetry_write_failed:${error?.code ?? error?.message ?? 'unknown'}`);
         }

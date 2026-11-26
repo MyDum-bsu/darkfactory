@@ -16,20 +16,25 @@ const YAML_LIMIT = 256 * 1024;
 export const EXAMPLE_CATALOG_PATH = join(REPO_ROOT, 'ops', 'local', 'models-catalog.example.yaml');
 export const EXAMPLE_POLICY_PATH = join(REPO_ROOT, 'ops', 'local', 'routing-policy.example.yaml');
 
-export const MODEL_FAMILIES = Object.freeze(['cognition', 'google', 'deepseek', 'openai', 'anthropic']);
+export const MODEL_FAMILIES = Object.freeze(['cognition', 'google', 'deepseek', 'openai', 'anthropic', 'glm']);
 export const MODEL_STATUSES = Object.freeze(['promo_free', 'active', 'standby', 'quota_paused', 'disabled']);
 export const COST_TIERS = Object.freeze(['free', 'subscription', 'paid_api']);
 export const ROUTING_MODES = Object.freeze(['economy', 'balanced', 'sprint']);
 export const REGISTRY_ROLES = Object.freeze([
   'lead', 'coder_default', 'coder_heavy', 'reviewer', 'arbiter', 'ux_critic']);
 export const ELIGIBLE_STATUSES = Object.freeze(['promo_free', 'active', 'standby']);
-// Провайдеры, исполняемые L2 read-only раннером критика/арбитра: у раннера
-// есть egress-endpoint без coding-харнесса. ACP-харнессы (acp-devin,
-// acp-zcode-start, codex-acp, bb) требуют интерактивной сессии с правами
-// записи и в read-only sandbox не запускаются — кандидат reviewer/arbiter
-// с таким provider неисполняем, даже если семейство и квота подходят.
+// Провайдеры, исполняемые L2 read-only раннером критика/арбитра: точное
+// зеркало ключей PROVIDER_EGRESS review-runner.mjs — провайдеры с
+// egress-endpoint без coding-харнесса. Сырой 'anthropic' сюда не входит:
+// у раннера нет egress anthropic, и такой спек отклоняется приёмкой
+// route_critic_not_runnable — эмиссия его в routing.allowlist ломала всю
+// политику роутинга. Harness 'pi' ключом не является: исполняемость
+// pi-записи определяется вложением модели (см. isL2RunnableEntry).
+// ACP-харнессы (acp-devin, acp-zcode-start, codex-acp, bb,
+// acp-antigravity-acp) в позитивный список не входят — консервативный
+// fail-safe фильтр моста.
 export const L2_RUNNABLE_PROVIDERS = Object.freeze(
-  ['google', 'openai', 'anthropic', 'deepseek', 'pi', 'opencode-go']);
+  ['openai', 'google', 'deepseek', 'glm', 'cognition', 'opencode-go']);
 const L2_RUNNABLE_SET = new Set(L2_RUNNABLE_PROVIDERS);
 
 const ROLE_SET = new Set(REGISTRY_ROLES);
@@ -338,12 +343,24 @@ function publicEntry(entry, status, index, rank, quota) {
 // Механический мост инвариантов worker-selector в реестр: запись каталога
 // (или публичный элемент цепочки с теми же полями provider/model)
 // исполняема L2 read-only раннером тогда и только тогда, когда её
-// provider входит в строгий позитивный список L2_RUNNABLE_PROVIDERS.
-// Сопоставление точное, без нормализации регистра: неканоническая форма
-// ('Google') fail-closed неисполняема, как и нестроковый/отсутствующий
-// provider или не-объект.
+// provider входит в строгий позитивный список L2_RUNNABLE_PROVIDERS —
+// ключи PROVIDER_EGRESS review-runner.mjs. Сопоставление точное, без
+// нормализации регистра: неканоническая форма ('Google') fail-closed
+// неисполняема, как и нестроковый/отсутствующий provider или не-объект.
+// Harness 'pi' сам egress не несёт: как в runnerReviewSpec, исполняемость
+// определяет вложение 'provider/model' — первый сегмент модели в нижнем
+// регистре обязан быть провайдером с egress ('pi/openai/gpt-6.2-sol'
+// исполняем, 'pi/anthropic/claude-opus-5.5' и pi-запись без вложения —
+// нет). Вырожденные вложения-харнессы без собственного egress
+// консервативно отфильтровываются — fail-safe направление.
 export function isL2RunnableEntry(entry) {
   if (!isRecord(entry) || typeof entry.provider !== 'string') return false;
+  if (entry.provider === 'pi') {
+    if (typeof entry.model !== 'string') return false;
+    const slash = entry.model.indexOf('/');
+    if (slash < 1) return false;
+    return L2_RUNNABLE_SET.has(entry.model.slice(0, slash).toLowerCase());
+  }
   return L2_RUNNABLE_SET.has(entry.provider);
 }
 
