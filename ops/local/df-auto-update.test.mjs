@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runAutoUpdate } from './df-auto-update.mjs';
+import { compareVersions, runAutoUpdate } from './df-auto-update.mjs';
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'df-auto-update-test-'));
@@ -232,4 +232,93 @@ test('systemd templates contain required unit, service and timer fields', async 
   for (const required of ['[Unit]', '[Timer]', 'OnCalendar=*-*-* 04:30:00', 'RandomizedDelaySec=900', 'Persistent=true']) {
     assert.ok(timer.includes(required), required);
   }
+});
+
+test('compareVersions: basic ordering, equality and range boundaries', () => {
+  assert.equal(compareVersions('1.1.0', '1.0.0'), true);
+  assert.equal(compareVersions('1.0.0', '1.1.0'), false);
+  assert.equal(compareVersions('1.0.0', '1.0.0'), false);
+  assert.equal(compareVersions('10.0.0', '9.9.9'), true);
+  assert.equal(compareVersions('0.0.1', '0.0.0'), true);
+  // Numeric components compare exactly beyond the 2^53 integer precision limit.
+  assert.equal(compareVersions('1.2.9007199254740993', '1.2.9007199254740992'), true);
+  assert.equal(compareVersions('1.2.9007199254740992', '1.2.9007199254740993'), false);
+});
+
+test('compareVersions: release outranks its prerelease, never downgrades', () => {
+  // An installed prerelease must update to the released version (boundary).
+  assert.equal(compareVersions('1.2.3', '1.2.3-beta'), true);
+  assert.equal(compareVersions('1.2.3-beta', '1.2.3'), false);
+  assert.equal(compareVersions('1.2.3-beta', '1.2.3-beta'), false);
+  assert.equal(compareVersions('1.2.3-beta.2', '1.2.3-beta.1'), true);
+  assert.equal(compareVersions('1.2.3-beta.1', '1.2.3-beta.2'), false);
+  assert.equal(compareVersions('1.2.3-beta.10', '1.2.3-beta.2'), true);
+  assert.equal(compareVersions('1.2.3-beta.2', '1.2.3-beta.10'), false);
+  // Numeric identifiers rank below alphanumeric ones; fewer fields rank lower.
+  assert.equal(compareVersions('1.2.3-alpha', '1.2.3-1'), true);
+  assert.equal(compareVersions('1.2.3-1', '1.2.3-alpha'), false);
+  assert.equal(compareVersions('1.2.3-alpha.1', '1.2.3-alpha'), true);
+  assert.equal(compareVersions('1.2.3-alpha', '1.2.3-alpha.1'), false);
+  // Build metadata does not affect precedence.
+  assert.equal(compareVersions('1.2.3+build', '1.2.3'), false);
+  assert.equal(compareVersions('1.2.3', '1.2.3+build'), false);
+  assert.equal(compareVersions('1.2.3+b.2', '1.2.3+b.1'), false);
+});
+
+test('compareVersions: empty, minimal and null/undefined input never updates', () => {
+  for (const bad of ['', ' ', 'v1.2.3', '1.2', '1.2.3.4', 'latest', '1.2.x', '1.2.3-']) {
+    assert.equal(compareVersions(bad, '1.0.0'), false, JSON.stringify(bad));
+    assert.equal(compareVersions('1.0.0', bad), false, JSON.stringify(bad));
+  }
+  for (const bad of [null, undefined, 0, 1.5, {}, [], false]) {
+    assert.equal(compareVersions(bad, '1.0.0'), false, String(bad));
+    assert.equal(compareVersions('1.0.0', bad), false, String(bad));
+  }
+});
+
+test('installed prerelease npm package updates to the released version', async t => {
+  const env = await fixture(t);
+  await writeFile(join(env.home, '.npm-global/lib/node_modules/bb-app/package.json'),
+    '{"version":"1.1.0-beta"}\n');
+  const harness = fakeHarness(env);
+  const report = await runAutoUpdate(options(env, 'hub'), harness);
+  const bbApp = report.components.find(component => component.name === 'bb-app');
+  assert.equal(bbApp.status, 'updated');
+  assert.equal(bbApp.before, '1.1.0-beta');
+  assert.equal(bbApp.after, '1.1.0');
+  assert.ok(harness.calls.some(([command, args]) =>
+    command === 'npm' && args[0] === 'install' && args.includes('bb-app@latest')));
+});
+
+test('repeated invocation is idempotent: no reinstall when already current', async t => {
+  const env = await fixture(t);
+  const first = await runAutoUpdate(options(env, 'hub'), fakeHarness(env));
+  assert.equal(first.components.find(component => component.name === 'bb-app').status, 'updated');
+  assert.equal(first.components.find(component => component.name === 'pi').status, 'updated');
+
+  const harness = fakeHarness(env);
+  const second = await runAutoUpdate(options(env, 'hub'), harness);
+  for (const name of ['bb-app', 'pi']) {
+    assert.equal(second.components.find(component => component.name === name).status,
+      'already_current', name);
+  }
+  assert.equal(harness.calls.filter(([command, args]) =>
+    command === 'npm' && args[0] === 'install').length, 0);
+  assert.equal(second.ok, true);
+  const persisted = JSON.parse(await readFile(env.stateFile, 'utf8'));
+  assert.equal(persisted.status, second.status);
+});
+
+test('concurrent invocations never share a tmp path and leave valid state', async t => {
+  const env = await fixture(t);
+  const [first, second] = await Promise.all([
+    runAutoUpdate(options(env, 'hub'), fakeHarness(env)),
+    runAutoUpdate(options(env, 'hub'), fakeHarness(env)),
+  ]);
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  const persisted = JSON.parse(await readFile(env.stateFile, 'utf8'));
+  assert.equal(typeof persisted.timestamp, 'string');
+  assert.equal(persisted.components.length, first.components.length);
+  assert.equal((await stat(env.stateFile)).mode & 0o777, 0o600);
 });

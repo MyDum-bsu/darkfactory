@@ -83,20 +83,66 @@ async function mustRun(ctx, command, args, options) {
   return result;
 }
 
-function compareVersions(latest, current) {
-  if (typeof latest !== 'string' || typeof current !== 'string') return false;
-  const parse = value => {
-    const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(value.trim());
-    return match ? match.slice(1, 4).map(Number) : null;
+// Strict semver x.y.z with optional prerelease/build: the suffix is not
+// silently stripped, because a prerelease changes precedence (1.2.3-beta
+// is lower than the 1.2.3 release) while build metadata does not. An
+// invalid string is not a version: compareVersions answers false (no
+// update — the conservative direction without mutations).
+const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const NUMERIC_IDENTIFIER = /^\d+$/;
+
+function parseSemver(value) {
+  if (typeof value !== 'string') return null;
+  const match = SEMVER.exec(value.trim());
+  if (!match) return null;
+  return {
+    core: match.slice(1, 4),
+    prerelease: match[4] === undefined ? null : match[4].split('.'),
   };
-  const a = parse(latest);
-  const b = parse(current);
+}
+
+// Numeric identifiers compare without Number precision loss: leading
+// zeros do not change the value, then by length and lexicographically.
+function compareNumericIdentifiers(a, b) {
+  const na = a.replace(/^0+(?=\d)/, '');
+  const nb = b.replace(/^0+(?=\d)/, '');
+  if (na.length !== nb.length) return na.length < nb.length ? -1 : 1;
+  if (na !== nb) return na < nb ? -1 : 1;
+  return 0;
+}
+
+// Semver prerelease precedence: a numeric identifier is lower than an
+// alphanumeric one; with an equal prefix fewer fields rank lower.
+function comparePrerelease(a, b) {
+  const common = Math.min(a.length, b.length);
+  for (let i = 0; i < common; i += 1) {
+    if (a[i] === b[i]) continue;
+    const aNumeric = NUMERIC_IDENTIFIER.test(a[i]);
+    const bNumeric = NUMERIC_IDENTIFIER.test(b[i]);
+    if (aNumeric && bNumeric) return compareNumericIdentifiers(a[i], b[i]);
+    if (aNumeric) return -1;
+    if (bNumeric) return 1;
+    return a[i] < b[i] ? -1 : 1;
+  }
+  if (a.length === b.length) return 0;
+  return a.length < b.length ? -1 : 1;
+}
+
+// true only when latest is strictly newer than current: equality or any
+// unparsable input is false and the update never starts.
+export function compareVersions(latest, current) {
+  const a = parseSemver(latest);
+  const b = parseSemver(current);
   if (!a || !b) return false;
   for (let i = 0; i < 3; i += 1) {
-    if (a[i] > b[i]) return true;
-    if (a[i] < b[i]) return false;
+    const order = compareNumericIdentifiers(a.core[i], b.core[i]);
+    if (order !== 0) return order > 0;
   }
-  return false;
+  // With equal x.y.z a release outranks every prerelease of it: an
+  // installed 1.2.3-beta must update to the released 1.2.3, not stick.
+  if (a.prerelease === null) return b.prerelease !== null;
+  if (b.prerelease === null) return false;
+  return comparePrerelease(a.prerelease, b.prerelease) > 0;
 }
 
 export function findBusyProcesses(processText) {
@@ -332,9 +378,16 @@ export function normalizeOptions(options = {}, deps = {}) {
   };
 }
 
+// Counter in the temporary file name: a repeated or concurrent run in the
+// same process and millisecond never shares one tmp path — otherwise
+// concurrent writeFile calls could interleave content before rename.
+let tmpFileCounter = 0;
+
 async function writeStateAtomic(file, report) {
   await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = join(dirname(file), `.auto-update.${process.pid}.${Date.now()}.tmp`);
+  tmpFileCounter = (tmpFileCounter + 1) % Number.MAX_SAFE_INTEGER;
+  const tmp = join(dirname(file),
+    `.auto-update.${process.pid}.${Date.now()}.${tmpFileCounter}.tmp`);
   await writeFile(tmp, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
   await rename(tmp, file);
 }
