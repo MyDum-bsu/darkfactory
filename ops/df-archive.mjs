@@ -2,7 +2,7 @@
 // df-archive — operator CLI for the local Session Archive.
 
 import { createHash } from 'node:crypto';
-import { readFile, realpath } from 'node:fs/promises';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -24,6 +24,7 @@ const COMMAND_OPTIONS = {
 };
 const BOOLEAN_OPTIONS = new Set(['json']);
 const HARNESSES = new Set(['agy', 'pi']);
+const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 
 function usageError(message) {
   return new Error(`df_archive_usage: ${message}`);
@@ -110,7 +111,21 @@ async function ingest(values, defaultDbPath) {
   const dbPath = requireDb(values, defaultDbPath, 'ingest');
   const harness = requireHarness(values.harness);
   const inputPath = resolve(values.file);
+  const inputInfo = await lstat(inputPath);
+  if (!inputInfo.isFile()) {
+    throw new Error('df_archive_transcript_not_file: input transcript must be a regular file');
+  }
+  if (inputInfo.size > MAX_TRANSCRIPT_BYTES) {
+    throw new Error('df_archive_transcript_too_large: input transcript exceeds 64 MiB');
+  }
   const canonicalPath = await realpath(inputPath);
+  const canonicalInfo = await lstat(canonicalPath);
+  if (!canonicalInfo.isFile()) {
+    throw new Error('df_archive_transcript_not_file: input transcript must be a regular file');
+  }
+  if (canonicalInfo.size > MAX_TRANSCRIPT_BYTES) {
+    throw new Error('df_archive_transcript_too_large: input transcript exceeds 64 MiB');
+  }
   const jsonl = await readFile(canonicalPath, 'utf8');
   const messages = harness === 'agy' ? parseAgyTranscript(jsonl) : parsePiTranscript(jsonl);
   if (messages.length === 0) {

@@ -40,8 +40,7 @@ const parseRuntimeArgv = argv => {
 };
 
 export function resolveRuntime({ argv = [], env = process.env, runtimeRoot = runtime, exists = existsSync } = {}) {
-  const selected = parseRuntimeArgv(argv) ?? env.DF_WORKER_RUNTIME ??
-    (exists(join(runtimeRoot, 'routes.json')) ? 'bb' : 'hc');
+  const selected = parseRuntimeArgv(argv) ?? env.DF_WORKER_RUNTIME ?? 'hc';
   if (!WORKER_RUNTIMES.includes(selected)) throw new Error('worker_runtime_kind_invalid');
   return selected;
 }

@@ -240,6 +240,9 @@ async function branchDriftPreflight({ worktrees, values, deps }) {
 
 // Собирает проверенный план вызова `vb tasks create`. Ничего не исполняет.
 export async function buildEnqueuePlan(values, deps = {}) {
+  if (values.brief !== undefined && values.text !== undefined) {
+    fail('brief_text_conflict: pass either --brief or --text, not both');
+  }
   const url = values['board-url'];
   try {
     const parsed = new URL(url ?? '');
@@ -374,8 +377,8 @@ export async function buildEnqueuePlan(values, deps = {}) {
     specDigest = briefDigest;
   }
   // --text — фактический текст карточки, который читает воркер: без явного
-  // --spec-digest дайджест закрепляет именно его (sha256 utf8), а не файл
-  // --brief. Иначе метка не сходилась бы с текстом карточки и run-isolated
+  // --spec-digest дайджест закрепляет именно его (sha256 utf8). Иначе метка
+  // не сходилась бы с текстом карточки и run-isolated
   // молча опускал бы спеку из промпта воркера (sha256(specText) !== spec_digest).
   // Явный --spec-digest — осознанное закрепление оператора, как и раньше.
   if (values.text !== undefined && values['spec-digest'] === undefined) {
