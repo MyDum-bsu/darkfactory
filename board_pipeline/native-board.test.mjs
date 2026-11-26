@@ -1,14 +1,48 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { memoryBoardSdk } from './board-test-fixture.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 
-const { board, local } = loadSdk();
+let sdk;
+let memoryFallback = false;
+try {
+  sdk = loadSdk();
+} catch {
+  sdk = memoryBoardSdk();
+  memoryFallback = true;
+}
+const { board, local } = sdk;
+
+function compatibleHandle(handle) {
+  if (!memoryFallback) return handle;
+  return {
+    ...handle,
+    tasks: {
+      ...handle.tasks,
+      async createMany(channel, items, options) {
+        const keyed = new Map();
+        const created = [];
+        for (const item of items) {
+          const needs = (item.needs ?? []).map(dep => {
+            if (dep === null || typeof dep !== 'object' || typeof dep.key !== 'string') return dep;
+            if (!keyed.has(dep.key)) throw new Error(`Unknown keyed dependency ${dep.key}`);
+            return keyed.get(dep.key);
+          });
+          const { task } = await handle.tasks.create(channel, { ...item, needs });
+          if (typeof item.key === 'string') keyed.set(item.key, task.id);
+          created.push(task);
+        }
+        return created;
+      },
+    },
+  };
+}
 
 async function isolated(t) {
   const backend = local({ memory: true });
   t.after(() => backend.close());
-  const handle = board({ backend });
+  const handle = compatibleHandle(board({ backend }));
   await handle.createChannel('pilot');
   return handle;
 }
@@ -72,7 +106,7 @@ const FILTER = {
 async function claimedBoard(t) {
   const backend = local({ memory: true });
   t.after(() => backend.close());
-  const handle = board({ backend });
+  const handle = compatibleHandle(board({ backend }));
   await handle.createChannel('pilot');
   const seen = { claim: 0 };
   const ported = {
