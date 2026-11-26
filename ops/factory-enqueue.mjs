@@ -240,9 +240,6 @@ async function branchDriftPreflight({ worktrees, values, deps }) {
 
 // Собирает проверенный план вызова `vb tasks create`. Ничего не исполняет.
 export async function buildEnqueuePlan(values, deps = {}) {
-  if (values.brief !== undefined && values.text !== undefined) {
-    fail('brief_text_conflict: pass either --brief or --text, not both');
-  }
   const url = values['board-url'];
   try {
     const parsed = new URL(url ?? '');
@@ -530,6 +527,14 @@ export async function runEnqueue(argv, deps = {}) {
     touch: { type: 'string', multiple: true }, 'drift-base': { type: 'string' },
     'allow-drift': { type: 'boolean' }, 'check-drift': { type: 'boolean' },
     'dry-run': { type: 'boolean' }, json: { type: 'boolean' } } });
+  // CLI-контракт оператора: --brief и --text вместе не принимаются. При
+  // совместной передаче --brief молча терял бы всякий эффект (тело карточки
+  // и дайджест — из --text), поэтому неоднозначная команда отклоняется
+  // понятной ошибкой до сборки плана и до вызова vb. Программный контракт
+  // buildEnqueuePlan (первичность text) этим не меняется.
+  if (values.brief !== undefined && values.text !== undefined) {
+    fail('brief_text_conflict: pass either --brief or --text, not both');
+  }
   const plan = await buildEnqueuePlan(values, deps);
   if (values['dry-run']) {
     return { dryRun: true, plan };

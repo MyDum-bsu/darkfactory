@@ -5,7 +5,7 @@
 // от текущей даты. Временные каталоги удаляются в finally.
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -164,7 +164,7 @@ test('df-models check: reviewer только ACP-харнесса не прох�
     assert.equal(result.code, 1);
     const report = JSON.parse(result.stderr);
     assert.equal(report.ok, false);
-    assert.ok(report.problems.includes('no eligible L2 reviewer model from a different family'),
+    assert.ok(report.problems.includes('no eligible reviewer model from a different family'),
       `unexpected problems: ${JSON.stringify(report.problems)}`);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -182,7 +182,7 @@ test('df-models check: arbiter третьего семейства без L2-и�
     assert.equal(result.code, 1);
     const report = JSON.parse(result.stderr);
     assert.equal(report.ok, false);
-    assert.ok(report.problems.includes('no eligible L2 arbiter model from a third family'),
+    assert.ok(report.problems.includes('no eligible arbiter model from a third family'),
       `unexpected problems: ${JSON.stringify(report.problems)}`);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -201,6 +201,90 @@ test('df-models check: половинчатая установка конфиг�
     const report = JSON.parse(result.stderr);
     assert.equal(report.ok, false);
     assert.match(report.error, /model_registry_file_missing/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('df-models check: example-конфиг с самовосстанавливающейся паузой Sol валиден в устоявшемся состоянии', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'df-models-test-'));
+  try {
+    // Канонический example: единственные L2-исполняемые кандидаты —
+    // deepseek-v4.1-flash (active) и gpt-6.2-sol (quota_paused с until).
+    // Пауза с until самовосстанавливается по расписанию и не является
+    // дефектом конфигурации: strictL2-тройка в устоявшемся состоянии
+    // полная, check обязан пройти независимо от текущей даты.
+    for (const file of ['models-catalog.example.yaml', 'routing-policy.example.yaml']) {
+      const target = file.replace('.example', '');
+      await writeFile(join(dir, target),
+        await readFile(join(OPS_DIR, 'local', file), 'utf8'), 'utf8');
+    }
+    const result = await runCli(['check', '--config-dir', dir]);
+    assert.equal(result.code, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.ok, true);
+    assert.ok(report.arbiter, 'arbiter must be present in the report');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('df-models check: бессрочная quota_paused арбитра — структурная деградация, а не транзиент', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'df-models-test-'));
+  try {
+    // quota_paused БЕЗ until не истекает: arbiter третьего семейства
+    // отсутствует структурно — check обязан отказать даже в устоявшемся
+    // состоянии, а не ждать самовосстановления, которого нет в расписании.
+    const paused = `
+  - id: arb-paused
+    provider: openai
+    model: gpt-paused
+    family: openai
+    status: quota_paused
+    cost_tier: subscription
+    capabilities: [code, reasoning, review]
+    quota_source: manual
+    notes: indefinitely paused arbiter
+`;
+    await writeFile(join(dir, 'models-catalog.yaml'), `${catalogYaml().trimEnd()}\n${paused}`, 'utf8');
+    await writeFile(join(dir, 'routing-policy.yaml'),
+      policyYaml({ reviewer: 'rev-google', arbiter: 'arb-paused' }), 'utf8');
+    const result = await runCli(['check', '--config-dir', dir]);
+    assert.equal(result.code, 1);
+    const report = JSON.parse(result.stderr);
+    assert.equal(report.ok, false);
+    assert.ok(report.problems.includes('no eligible arbiter model from a third family'),
+      `unexpected problems: ${JSON.stringify(report.problems)}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('df-models check: quota_paused с будущим until самовосстанавливается и не блокирует check', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'df-models-test-'));
+  try {
+    // Пауза с будущим until — заявленное расписание возврата: в устоявшемся
+    // состоянии запись active, strictL2-тройка полная, check проходит.
+    const healing = `
+  - id: arb-healing
+    provider: openai
+    model: gpt-healing
+    family: openai
+    status: quota_paused
+    cost_tier: subscription
+    until: "2099-01-01"
+    capabilities: [code, reasoning, review]
+    quota_source: manual
+    notes: self-healing paused arbiter
+`;
+    await writeFile(join(dir, 'models-catalog.yaml'), `${catalogYaml().trimEnd()}\n${healing}`, 'utf8');
+    await writeFile(join(dir, 'routing-policy.yaml'),
+      policyYaml({ reviewer: 'rev-google', arbiter: 'arb-healing' }), 'utf8');
+    const result = await runCli(['check', '--config-dir', dir]);
+    assert.equal(result.code, 0, result.stderr);
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.ok, true);
+    assert.equal(report.arbiter, 'arb-healing');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

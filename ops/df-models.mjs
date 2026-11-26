@@ -292,11 +292,23 @@ async function addModel(options) {
 async function checkConfig(options) {
   try {
     const registry = await loadForCli(options);
-    const triad = resolveTriad(registry, { now: new Date(), strictL2: true });
+    // check валидирует структуру конфигурации, а не транзиентный момент
+    // запуска: until-ограниченные статусы самовосстанавливаются по
+    // заявленному расписанию (promo_free → standby, quota_paused → active)
+    // и не являются дефектом конфигурации, поэтому strictL2-тройка
+    // резолвится в устоявшемся состоянии — после всех заявленных until.
+    // Деградация без until (disabled, бессрочная quota_paused) не истекает
+    // и остаётся структурной: тройка без L2-исполняемого reviewer или
+    // arbiter — отказ, а не ложное ok: true.
+    const expiries = registry.catalog.models
+      .map(entry => untilMs(entry.until))
+      .filter(ms => ms !== null);
+    const steadyMs = Math.max(Date.now(), ...expiries.map(ms => ms + 1));
+    const triad = resolveTriad(registry, { now: new Date(steadyMs), strictL2: true });
     const problems = [];
     if (!triad.coder) problems.push('no eligible coder_default model');
-    if (!triad.reviewer) problems.push('no eligible L2 reviewer model from a different family');
-    if (!triad.arbiter) problems.push('no eligible L2 arbiter model from a third family');
+    if (!triad.reviewer) problems.push('no eligible reviewer model from a different family');
+    if (!triad.arbiter) problems.push('no eligible arbiter model from a third family');
     if (triad.reviewer && !isL2RunnableEntry(triad.reviewer)) {
       problems.push('reviewer is not runnable by the L2 runner');
     }
