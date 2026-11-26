@@ -1519,6 +1519,63 @@ test('has_ui: false затем отсутствие поля при has_ui в п
   assert.equal(seen.claim, 1);
 });
 
+test('переносимые worker thread id проходят held-приёмку', async (t) => {
+  for (const worker of ['df-3840-d0d63638ee', 'subproc-d0d63638ee89']) {
+    const { handle, ported } = await isolated(t);
+    const id = await task(handle);
+    const { epoch, port } = await held(ported, id);
+    const { ports, calls } = stubs();
+    const res = await acceptHeld({
+      attempt: attempt(id, epoch, { bb_thread_id: worker }),
+      submission: submission(id, epoch, { worker_thread_id: worker }),
+      policy: policy(id, { worker }),
+      journal: await tmpJournal(),
+      ports: { ...ports, board: port },
+    });
+    assert.equal(res.outcome, 'verified');
+    assert.deepEqual(calls, { inspect: 2, local: 1, review: 1 });
+  }
+});
+
+test('malformed portable worker thread ids are rejected before checks', async (t) => {
+  const { handle, ported } = await isolated(t);
+  const id = await task(handle);
+  const { epoch, port } = await held(ported, id);
+  for (const worker of [
+    'df-3840',
+    'df-3840-d0d63638e',
+    'df-3840-d0d63638ee1',
+    'df-3840-D0D63638EE',
+    'df_3840_d0d63638ee',
+    'subproc-d0d63638ee8',
+    'subproc-d0d63638ee89aa',
+    'subproc-zzzzzzzzzzzz',
+  ]) {
+    const { ports, calls } = stubs();
+    const res = await acceptHeld({
+      attempt: attempt(id, epoch, { bb_thread_id: worker }),
+      submission: submission(id, epoch, { worker_thread_id: worker }),
+      policy: policy(id, { worker }),
+      journal: await tmpJournal(),
+      ports: { ...ports, board: port },
+    });
+    assert.equal(res.outcome, 'denied');
+    assert.equal(res.reason, 'invalid_worker_thread');
+    assert.deepEqual(calls, { inspect: 0, local: 0, review: 0 });
+  }
+  const { ports, calls } = stubs();
+  const empty = await acceptHeld({
+    attempt: attempt(id, epoch, { bb_thread_id: '' }),
+    submission: submission(id, epoch, { worker_thread_id: '' }),
+    policy: policy(id, { worker: '' }),
+    journal: await tmpJournal(),
+    ports: { ...ports, board: port },
+  });
+  assert.equal(empty.outcome, 'denied');
+  assert.equal(empty.reason, 'missing_field:bb_thread_id');
+  assert.deepEqual(calls, { inspect: 0, local: 0, review: 0 });
+});
+
 test('длинный bb_thread_id отклоняется до любых проверок', async (t) => {
   const { handle, ported } = await isolated(t);
   const id = await task(handle);

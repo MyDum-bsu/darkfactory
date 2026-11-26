@@ -14,6 +14,7 @@ import { l2RunnableSpec, runnerReviewSpec } from './review-runner.mjs';
 import { assertTriadIndependent, opencodeGoPolicyViolation,
   retiredProviderViolation, workerFamily } from './worker-selector.mjs';
 import { isValidL1Profile } from './l1-profiles.mjs';
+import { isWorkerThreadId } from './worker-runtime.mjs';
 
 const HANDOFF_KEYS = [
   'task_id',
@@ -68,6 +69,8 @@ const SUBMISSION_OPTIONAL = ['dispute'];
 const SHA_RE = /^[0-9a-f]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
+const acceptedWorkerThreadId = value =>
+  typeof value === 'string' && value.length <= 64 && isWorkerThreadId(value);
 const ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 const REVIEW_OK = 'REVIEW_OK';
 const REVIEW_BLOCKED = 'REVIEW_BLOCKED';
@@ -110,7 +113,7 @@ function validateHandoff(handoff) {
     }
   }
   if (!/^[1-9][0-9]{0,14}$/.test(handoff.task_id)) throw new Denied('invalid_task_id');
-  if (!/^thr_[a-z0-9]{1,60}$/.test(handoff.worker_thread_id)) throw new Denied('invalid_worker_thread');
+  if (!acceptedWorkerThreadId(handoff.worker_thread_id)) throw new Denied('invalid_worker_thread');
   if (!path.isAbsolute(handoff.worktree)) throw new Denied('worktree_not_absolute');
   if (!SHA_RE.test(handoff.candidate_sha)) throw new Denied('candidate_sha_not_full');
   if (!SHA_RE.test(handoff.base_sha)) throw new Denied('base_sha_not_full');
@@ -249,7 +252,7 @@ function validateAttempt(attempt) {
   if (!/^[1-9][0-9]{0,14}$/.test(attempt.task_id)) throw new Denied('invalid_task_id');
   if (!Number.isSafeInteger(attempt.epoch) || attempt.epoch <= 0) throw new Denied('invalid_epoch');
   if (!ID_RE.test(attempt.attempt_id)) throw new Denied('invalid_attempt_id');
-  if (!/^thr_[a-z0-9]{1,60}$/.test(attempt.bb_thread_id)) throw new Denied('invalid_worker_thread');
+  if (!acceptedWorkerThreadId(attempt.bb_thread_id)) throw new Denied('invalid_worker_thread');
   if (!path.isAbsolute(attempt.worktree)) throw new Denied('worktree_not_absolute');
   if (!SHA_RE.test(attempt.base_sha)) throw new Denied('base_sha_not_full');
   if (!FINISH.has(attempt.finish)) throw new Denied('invalid_finish');
@@ -409,7 +412,7 @@ function validateSubmission(submission, attempt) {
   if (!/^[1-9][0-9]{0,14}$/.test(submission.task_id)) throw new Denied('invalid_task_id');
   if (!Number.isSafeInteger(submission.epoch) || submission.epoch <= 0) throw new Denied('invalid_epoch');
   if (!ID_RE.test(submission.attempt_id)) throw new Denied('invalid_attempt_id');
-  if (!/^thr_[a-z0-9]{1,60}$/.test(submission.worker_thread_id)) throw new Denied('invalid_worker_thread');
+  if (!acceptedWorkerThreadId(submission.worker_thread_id)) throw new Denied('invalid_worker_thread');
   if (!SHA_RE.test(submission.candidate_sha)) throw new Denied('candidate_sha_not_full');
   if (submission.task_id !== attempt.task_id) throw new Denied('task_mismatch');
   if (submission.epoch !== attempt.epoch) throw new Denied('epoch_mismatch');
