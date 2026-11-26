@@ -203,3 +203,112 @@ test('seed по умолчанию — подтверждённый профил
   assert.ok(Object.keys(sc.cells).length > 0);
   assert.ok(SEED_PROFILE.every(e => Number.isSafeInteger(e.observations) && e.observations >= 1));
 });
+
+test('невызванный arbiter не зачитывается: модель в models — не доказательство вызова', () => {
+  const silent = line({ models: { worker: DEVIN, critic: NEON, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, rework: 0, pass: 1, arbitration: 0 },
+    phases: { total: 1000, arbiter: null } });
+  const sc = aggregateScorecard([silent], { seed: [] });
+  assert.equal(sc.cells[bucketKey(SOL, 'arbiter', 'backend', 'S')], undefined);
+});
+
+test('вызванный arbiter зачитывается: arbitration, измеренная фаза, статус, токены', () => {
+  const key = bucketKey(SOL, 'arbiter', 'backend', 'S');
+  // arbitration > 0 — вызван; фаза arbiter не измерена — wall падает на total.
+  const byArbitration = line({ models: { worker: DEVIN, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 2, rework: 1, pass: 1, arbitration: 1 },
+    phases: { total: 5000, arbiter: null } });
+  const cell = aggregateScorecard([byArbitration], { seed: [] }).cells[key];
+  assert.equal(cell.observations, 1);
+  assert.equal(cell.avg_wall_ms, 5000);
+  // Конечная phases_ms.arbiter — вызван; wall — его собственная фаза, не total.
+  const byPhase = line({ models: { worker: DEVIN, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 2, arbitration: 0 },
+    phases: { total: 9000, arbiter: 3000 } });
+  const cell2 = aggregateScorecard([byPhase], { seed: [] }).cells[key];
+  assert.equal(cell2.observations, 1);
+  assert.equal(cell2.avg_wall_ms, 3000);
+  // phases_status.arbiter — доказательство вызова само по себе.
+  const byStatus = line({ models: { worker: DEVIN, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, arbitration: 0 },
+    phases: { total: 1000, arbiter: null },
+    extra: { phases_status: { arbiter: 'fail' } } });
+  assert.equal(aggregateScorecard([byStatus], { seed: [] }).cells[key].observations, 1);
+  // Токены арбитра — доказательство вызова; объект из одних null — нет.
+  const byTokens = line({ models: { worker: DEVIN, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, arbitration: 0 },
+    phases: { total: 1000, arbiter: null },
+    tokens: { arbiter: { input: 10, output: null, cached: null } } });
+  assert.equal(aggregateScorecard([byTokens], { seed: [] }).cells[key].observations, 1);
+  const nullTokens = line({ models: { worker: DEVIN, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, arbitration: 0 },
+    phases: { total: 1000, arbiter: null },
+    tokens: { arbiter: { input: null, output: null, cached: null } } });
+  assert.equal(aggregateScorecard([nullTokens], { seed: [] }).cells[key], undefined);
+  // Legacy-фикстура без собственного ключа arbiter — прежнее поведение,
+  // как и для critic: минимальные записи старых журналов не теряются.
+  const legacy = line({ models: { worker: DEVIN, arbiter: SOL },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, arbitration: 0 },
+    phases: { total: 1000 } });
+  assert.equal(aggregateScorecard([legacy], { seed: [] }).cells[key].observations, 1);
+});
+
+test('невызванный critic не зачитывается: l2_critic null и нет следов вызова', () => {
+  // Реальная запись telemetry.mjs: фаза l2_critic присутствует, но null —
+  // попытка развернулась на L1 до ревью.
+  const skipped = line({ models: { worker: DEVIN, critic: NEON },
+    labels: { size: 'M', domain: 'ui' },
+    rounds: { total: 1, rework: 1, gates: { l1: 1 } },
+    phases: { total: 1000, l2_critic: null } });
+  const sc = aggregateScorecard([skipped], { seed: [] });
+  assert.equal(sc.cells[bucketKey(NEON, 'critic', 'ui', 'M')], undefined);
+  // Воркер при этом зачитывается по-прежнему.
+  assert.equal(sc.cells[bucketKey(DEVIN, 'worker', 'ui', 'M')].observations, 1);
+});
+
+test('вызванный critic зачитывается со своей фазой wall time', () => {
+  const key = bucketKey(NEON, 'critic', 'ui', 'M');
+  // l2_critic измерен — вызван; avg_wall — 45000 фазы, а не 60000 total.
+  const invoked = line({ models: { worker: DEVIN, critic: NEON },
+    labels: { size: 'M', domain: 'ui' },
+    rounds: { total: 1, rework: 0 },
+    phases: { total: 60000, l2_critic: 45000 } });
+  const cell = aggregateScorecard([invoked], { seed: [] }).cells[key];
+  assert.equal(cell.observations, 1);
+  assert.equal(cell.avg_wall_ms, 45000);
+  // L2-гейт поймал дефект — критик вызван, даже если фаза null; wall — total.
+  const byGate = line({ models: { worker: DEVIN, critic: NEON },
+    labels: { size: 'M', domain: 'ui' },
+    rounds: { total: 2, rework: 1, gates: { l2: 1 } },
+    phases: { total: 7000, l2_critic: null } });
+  const cell2 = aggregateScorecard([byGate], { seed: [] }).cells[key];
+  assert.equal(cell2.observations, 1);
+  assert.equal(cell2.avg_wall_ms, 7000);
+  // Токены критика — доказательство вызова при null-фазе.
+  const byTokens = line({ models: { worker: DEVIN, critic: NEON },
+    labels: { size: 'M', domain: 'ui' },
+    rounds: { total: 1 },
+    phases: { total: 1000, l2_critic: null },
+    tokens: { critic: { input: 10, output: 2, cached: null } } });
+  assert.equal(aggregateScorecard([byTokens], { seed: [] }).cells[key].observations, 1);
+  // phases_status.l2_critic — доказательство вызова само по себе.
+  const byStatus = line({ models: { worker: DEVIN, critic: NEON },
+    labels: { size: 'M', domain: 'ui' },
+    rounds: { total: 1 },
+    phases: { total: 1000, l2_critic: null },
+    extra: { phases_status: { l2_critic: 'ok' } } });
+  assert.equal(aggregateScorecard([byStatus], { seed: [] }).cells[key].observations, 1);
+  // Legacy-фикстура без собственного ключа l2_critic — прежнее поведение.
+  const legacy = line({ models: { worker: DEVIN, critic: NEON },
+    labels: { size: 'M', domain: 'ui' },
+    rounds: { total: 1 },
+    phases: { total: 1000 } });
+  assert.equal(aggregateScorecard([legacy], { seed: [] }).cells[key].observations, 1);
+});

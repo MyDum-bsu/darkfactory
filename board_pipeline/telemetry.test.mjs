@@ -82,6 +82,16 @@ test('roundGateOf: те же соответствия гейтов, что в wo
   assert.equal(roundGateOf(undefined), null);
 });
 
+test('roundGateOf: scope_fence_violation → scope_fence и виден в rounds.gates', async t => {
+  assert.equal(roundGateOf('scope_fence_violation'), 'scope_fence');
+  const journal = await mkdtemp(join(tmpdir(), 'telemetry-fence-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+  const rec = createTelemetryRecorder({ journal, clock: () => 0 });
+  await rec.phase('spawn', async () => {});
+  rec.recordRound({ outcome: 'rework', reason: 'scope_fence_violation' });
+  assert.deepEqual(rec.summary().rounds.gates, { scope_fence: 1 });
+});
+
 test('телеметрия попытки: фазы, окно воркера, раунды, токены, JSONL 0600', async t => {
   const journal = await mkdtemp(join(tmpdir(), 'telemetry-unit-'));
   t.after(() => rm(journal, { recursive: true, force: true }));
@@ -219,6 +229,114 @@ test('recordUsage: суммирует токены по раундам, null н�
   const first = createTelemetryRecorder({ journal, clock: () => 0 });
   first.recordUsage('critic', { input_tokens: 10, output_tokens: 2 });
   assert.deepEqual(first.summary().tokens.critic, { input: 10, output: 2, cached: null });
+});
+
+test('phases_status: последний исход фазы ok/fail, восстановление после сбоя', async t => {
+  const journal = await mkdtemp(join(tmpdir(), 'telemetry-status-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+  let now = 0;
+  const rec = createTelemetryRecorder({ journal, clock: () => now });
+  await rec.phase('spawn', async () => { now += 100; });
+  rec.workerResume({});
+  now += 50;
+  // l2_critic упал: ошибка шага проходит наружу, фаза фиксируется как fail.
+  await assert.rejects(
+    rec.phase('l2_critic', async () => { now += 200; throw new Error('review_error'); },
+      { workerWindow: true }),
+    { message: 'review_error' });
+  let snap = rec.summary();
+  assert.equal(snap.phases_status.spawn, 'ok');
+  assert.equal(snap.phases_status.l2_critic, 'fail');
+  // Окно воркера закрыто в начале l2_critic — 'ok' независимо от исхода гейта.
+  assert.equal(snap.phases_status.worker, 'ok');
+  // Неизмеренные фазы опускаются, total — не измеряемая фаза.
+  for (const absent of ['arbiter', 'l1_local', 'l3_visual', 'tamper', 'total']) {
+    assert.equal(Object.hasOwn(snap.phases_status, absent), false, absent);
+  }
+  // Перезапуск после сбоя: последний исход ok перекрывает fail.
+  await rec.phase('l2_critic', async () => { now += 150; });
+  snap = rec.summary();
+  assert.equal(snap.phases_status.l2_critic, 'ok');
+  // Финальная строка журнала несёт те же статусы.
+  await rec.finish({ outcome: 'done', open: false });
+  const line = JSON.parse((await readFile(join(journal, 'telemetry.jsonl'), 'utf8')).trim());
+  assert.equal(line.phases_status.l2_critic, 'ok');
+  assert.equal(line.phases_status.spawn, 'ok');
+});
+
+test('repo_id/labels/cost_usd: захват в observe, сводка и строка журнала', async t => {
+  const journal = await mkdtemp(join(tmpdir(), 'telemetry-meta-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+  const rec = createTelemetryRecorder({ journal, clock: () => 0,
+    subject: { task_id: '9001', attempt_id: 'a1', epoch: 1, repo_id: 'darkfactory',
+      labels: { size: 'M', domain: 'backend' } } });
+  await rec.phase('spawn', async () => {});
+  // Оба соглашения recordCost; двоично-точные суммы: 0.5 + 0.25 + 0.125 = 0.875.
+  assert.equal(rec.recordCost('critic', { cost_usd: 0.5 }), 0.5);
+  assert.equal(rec.recordCost(0.25), 0.25);
+  assert.equal(rec.recordCost('worker', { usage: { cost_usd: 0.125 } }), 0.125);
+  const snap = rec.summary();
+  assert.equal(snap.repo_id, 'darkfactory');
+  assert.deepEqual(snap.labels, { size: 'M', domain: 'backend' });
+  assert.equal(snap.cost_usd, 0.875);
+  const { record } = await rec.finish({ outcome: 'done', open: false });
+  assert.equal(record.repo_id, 'darkfactory');
+  assert.equal(record.cost_usd, 0.875);
+  const line = JSON.parse((await readFile(join(journal, 'telemetry.jsonl'), 'utf8')).trim().split('\n')[0]);
+  assert.equal(line.repo_id, 'darkfactory');
+  assert.deepEqual(line.labels, { size: 'M', domain: 'backend' });
+  assert.equal(line.cost_usd, 0.875);
+
+  // camelCase repoId и верхнеуровневые size/domain; trimmed-значения.
+  const second = createTelemetryRecorder({ journal, clock: () => 0 });
+  second.observe({ repoId: '  other-repo  ', size: ' S ', domain: 'ui' });
+  await second.phase('spawn', async () => {});
+  const snap2 = second.summary();
+  assert.equal(snap2.repo_id, 'other-repo');
+  assert.deepEqual(snap2.labels, { size: 'S', domain: 'ui' });
+  // Частичные метки: только domain — labels без size.
+  const third = createTelemetryRecorder({ journal, clock: () => 0 });
+  third.observe({ domain: 'docs' });
+  await third.phase('spawn', async () => {});
+  assert.deepEqual(third.summary().labels, { domain: 'docs' });
+  // Метки, пришедшие поздним observe, дополняют ранние.
+  const fourth = createTelemetryRecorder({ journal, clock: () => 0,
+    subject: { repo_id: 'darkfactory' } });
+  fourth.observe({ labels: { size: 'L', domain: 'security' } });
+  await fourth.phase('spawn', async () => {});
+  assert.equal(fourth.summary().repo_id, 'darkfactory');
+  assert.deepEqual(fourth.summary().labels, { size: 'L', domain: 'security' });
+});
+
+test('fail-open: невалидная стоимость и метки не выдумываются', async t => {
+  const journal = await mkdtemp(join(tmpdir(), 'telemetry-cost-'));
+  t.after(() => rm(journal, { recursive: true, force: true }));
+  const rec = createTelemetryRecorder({ journal, clock: () => 0 });
+  rec.observe({ repo_id: '', repoId: '   ', labels: { size: '', domain: null },
+    size: 42, domain: {} });
+  await rec.phase('spawn', async () => {});
+  rec.recordCost('critic', null);
+  rec.recordCost('critic', { cost_usd: -3 });
+  rec.recordCost('critic');
+  rec.recordCost(NaN);
+  rec.recordCost({ cost_usd: Number.POSITIVE_INFINITY });
+  rec.recordCost('bogus');
+  const snap = rec.summary();
+  assert.equal(Object.hasOwn(snap, 'repo_id'), false);
+  assert.equal(Object.hasOwn(snap, 'labels'), false);
+  assert.equal(Object.hasOwn(snap, 'cost_usd'), false);
+  // Ноль — валидная записанная стоимость, а не выдуманная.
+  rec.recordCost(0);
+  assert.equal(rec.summary().cost_usd, 0);
+});
+
+test('aggregateTelemetry: cost_usd суммируется, без чисел — null', () => {
+  const entry = extra => JSON.stringify({ kind: 'attempt_summary', schema: 1,
+    task_id: '1', attempt_id: 'a', outcome: 'done', open: false, ...extra });
+  const agg = aggregateTelemetry([entry({ cost_usd: 0.5 }), entry({}), entry({ cost_usd: 0.25 })]);
+  assert.equal(agg.cost_usd, 0.75);
+  assert.equal(aggregateTelemetry([entry({}), entry({ cost_usd: 'junk' })]).cost_usd, null);
+  assert.equal(aggregateTelemetry([]).cost_usd, null);
 });
 
 test('embed: сводка в квитанции ≤1000, не влезла — квитанция без неё', async t => {

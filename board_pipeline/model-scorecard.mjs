@@ -114,6 +114,47 @@ function criticCaught(entry) {
   return (entry.rounds?.gates?.l2 ?? 0) > 0;
 }
 
+// Токены роли — доказательство вызова: хотя бы одно конечное число
+// (ноль валиден); объект из одних null — провайдер usage не отдал.
+function hasTokenNumbers(usage) {
+  if (usage === null || typeof usage !== 'object') return false;
+  return Number.isFinite(usage.input) || Number.isFinite(usage.output) ||
+    Number.isFinite(usage.cached);
+}
+
+// Вызвана ли роль в попытке: модель в entry.models — необходимое условие
+// для всех ролей, но для critic/arbiter недостаточное — pinned-триада
+// присутствует в моделях каждой попытки, а реально арбитр/критик могли
+// ни разу не вызываться (pass в L1/tamper, auto-approve). Без следов
+// вызова роль не зачитывается, иначе скоркард слепнет: модель получает
+// наблюдения за работу, которую не выполняла.
+export function roleInvoked(entry, role) {
+  if (!SCORE_ROLES.includes(role)) return false;
+  if (modelKey(entry?.models?.[role]) === null) return false;
+  // Воркер с валидной моделью вызван всегда: без воркера попытки нет.
+  if (role === 'worker') return true;
+  // Записи telemetry.mjs всегда несут собственные ключи l2_critic и arbiter
+  // в phases_ms (null, когда фаза не измерена) — вызов доказывается
+  // измеренной фазой, раундом арбитража/L2-гейтом, статусом фазы или
+  // токенами. Минимальные legacy-фикстуры, опускающие ключ фазы целиком,
+  // сохраняют прежнее поведение, иначе существующие тесты ломались бы.
+  const phaseKey = role === 'arbiter' ? 'arbiter' : 'l2_critic';
+  if (entry?.phases_ms !== null && typeof entry?.phases_ms === 'object' &&
+      Object.hasOwn(entry.phases_ms, phaseKey)) {
+    if (role === 'arbiter') {
+      return (entry?.rounds?.arbitration ?? 0) > 0 ||
+        Number.isFinite(entry.phases_ms.arbiter) ||
+        entry?.phases_status?.arbiter != null ||
+        hasTokenNumbers(entry?.tokens?.arbiter);
+    }
+    return Number.isFinite(entry.phases_ms.l2_critic) ||
+      (entry?.rounds?.gates?.l2 ?? 0) > 0 ||
+      entry?.phases_status?.l2_critic != null ||
+      hasTokenNumbers(entry?.tokens?.critic);
+  }
+  return true;
+}
+
 const emptyCell = () => ({
   n: 0, seed_n: 0,
   pass_n: 0, first_pass: 0,
@@ -219,12 +260,19 @@ export function aggregateScorecard(lines, { seed = SEED_PROFILE } = {}) {
       const model = entry.models?.[role];
       const key = modelKey(model);
       if (key === null) continue;
+      // Роль не вызывалась в попытке — не зачитывается: pinned-триада в
+      // моделях не доказывает факт вызова critic/arbiter.
+      if (!roleInvoked(entry, role)) continue;
+      // wallMs роли: её собственная фаза, когда измерена; иначе total.
+      const phaseKey = role === 'critic' ? 'l2_critic' : role === 'arbiter' ? 'arbiter' : null;
+      const roleWallMs = phaseKey !== null && Number.isFinite(entry.phases_ms?.[phaseKey])
+        ? entry.phases_ms[phaseKey] : wallMs;
       const id = `${key}|${role}|${domain}|${size}`;
       const slot = buckets.get(id) ?? { cell: emptyCell(),
         meta: { model: { provider: model.provider, model: model.model }, role, domain, size } };
       addToCell(slot.cell, {
         firstPass: isClosed(entry) ? firstPass : null,
-        rounds, wallMs,
+        rounds, wallMs: roleWallMs,
         tokens: tokensPerRound(entry, role),
         caught: role === 'critic' ? criticCaught(entry) : null,
       });
