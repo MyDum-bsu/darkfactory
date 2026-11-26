@@ -608,15 +608,19 @@ export const runCommand = (cmd, timeoutMs) => async args => {
 // shell, с таймаутом. stderr дренируется всегда — буфер pipe не забивается,
 // хвост диагностики попадает в detail. Команда решает сама, как разбудить
 // LLM-агента Steward.
-export const escalateViaCommand = (executable, timeoutMs = 120_000) => async payload => {
-  const child = spawn(executable, [], { stdio: ['pipe', 'ignore', 'pipe'] });
+export const escalateViaCommand = (executable, timeoutMs = 120_000, args = []) => async payload => {
+  const child = spawn(executable, args, { stdio: ['pipe', 'ignore', 'pipe'] });
   let stderr = '';
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', chunk => { if (stderr.length < 4096) stderr += chunk; });
   child.stdin.on('error', () => {});
   const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
   try {
-    child.stdin.end(JSON.stringify(payload, null, 2));
+    try {
+      child.stdin.end(JSON.stringify(payload, null, 2));
+    } catch (error) {
+      if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error?.code)) throw error;
+    }
     const [code, signal] = await Promise.race([
       once(child, 'close'),
       once(child, 'error').then(([error]) => { throw error; }),

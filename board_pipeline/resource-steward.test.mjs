@@ -18,6 +18,18 @@ const bytesGiB = n => n * GiB;
 const DAY_MS = 86_400_000;
 
 const sandbox = async label => mkdtemp(join(tmpdir(), `rsteward-${label}-`));
+const pathWithBuildBudget = async fallback => {
+  let lastError;
+  for (const candidate of [...new Set(['/dev/shm', '/run', fallback])]) {
+    try {
+      await requireWorkspaceSpace(candidate, 'build');
+      return candidate;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+};
 // mtime в прошлом/будущем без ожидания реального времени
 const age = async (path, days) => {
   const ts = new Date(Date.now() - days * DAY_MS);
@@ -826,18 +838,13 @@ test('parseArgv: flags, mounts and unknown flag rejection', () => {
 });
 
 test('escalation hook drains stderr (no pipe stall) and reports it in detail', async () => {
-  const dir = await sandbox('hook');
-  const hookPath = join(dir, 'hook.sh');
-  try {
-    // 200 KB в stderr — больше буфера pipe: без дренирования хук завис бы.
-    await writeFile(hookPath, '#!/bin/sh\nyes hook-diag | head -c 200000 >&2\nexit 7\n', { mode: 0o700 });
-    const outcome = await escalateViaCommand(hookPath, 15_000)({ reason: 'test' });
-    assert.equal(outcome.code, 7);
-    assert.ok(outcome.detail.includes('hook-diag'));
-    assert.ok(outcome.detail.length <= 500); // диагностика обрезана до хвоста
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  // 200 KB в stderr — больше буфера pipe: без дренирования хук завис бы.
+  const outcome = await escalateViaCommand('/bin/sh', 15_000, [
+    '-c', 'yes hook-diag | head -c 200000 >&2; exit 7',
+  ])({ reason: 'test' });
+  assert.equal(outcome.code, 7);
+  assert.ok(outcome.detail.includes('hook-diag'));
+  assert.ok(outcome.detail.length <= 500); // диагностика обрезана до хвоста
 });
 
 test('escalation hook spawn failure rejects with the underlying Error, not an error array', async () => {
@@ -853,15 +860,10 @@ test('escalation hook spawn failure rejects with the underlying Error, not an er
 });
 
 test('escalation hook may close stdin early without an unhandled EPIPE failure', async () => {
-  const dir = await sandbox('hookepipe');
-  const hookPath = join(dir, 'exit-now.sh');
-  try {
-    await writeFile(hookPath, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
-    const outcome = await escalateViaCommand(hookPath, 5_000)({ reason: 'test', payload: 'x'.repeat(1024 * 1024) });
-    assert.equal(outcome.code, 0);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  const outcome = await escalateViaCommand('/bin/sh', 5_000, ['-c', 'exit 0'])({
+    reason: 'test', payload: 'x'.repeat(1024 * 1024),
+  });
+  assert.equal(outcome.code, 0);
 });
 
 test('default mounts contain no operator-specific filesystem', () => {
@@ -872,11 +874,11 @@ test('CLI without --journal writes the journal under XDG_STATE_HOME (real spawn)
   const work = await sandbox('cli');
   const stateDir = join(work, 'state');
   try {
-    // Следим только за ФС песочницы с запасом, чтобы реальный CLI не начал уборку.
-    await requireWorkspaceSpace(work, 'build');
+    // Следим за ФС с гарантированным запасом, чтобы реальный CLI не начал уборку.
+    const measuredRoot = await pathWithBuildBudget(work);
     const child = spawn(process.execPath, [
       join(import.meta.dirname, 'resource-steward.mjs'),
-      '--no-docker', '--mount', work, '--bb', '/bin/false',
+      '--no-docker', '--mount', measuredRoot, '--bb', '/bin/false',
     ], { env: { ...process.env, XDG_STATE_HOME: stateDir }, stdio: 'ignore' });
     const [code] = await once(child, 'close');
     assert.equal(code, 0);
