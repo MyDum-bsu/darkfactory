@@ -43,6 +43,7 @@ const GATE_BY_REASON = new Map([
   ['local_checks_failed', 'l1'],
   ['tamper_gate_failed', 'tamper'],
   ['visual_gate_failed', 'l3'],
+  ['scope_fence_violation', 'scope_fence'],
 ]);
 const DIGEST64 = /^[0-9a-f]{64}$/;
 

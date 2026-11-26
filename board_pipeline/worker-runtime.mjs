@@ -1,11 +1,12 @@
 import { execFile, spawn as nodeSpawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile as readFileDefault } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const TAIL_LIMIT = 8192;
+const MAX_TERMINAL_SUBPROC_SESSIONS = 32;
 
 export const EXECUTOR_COMMANDS = Object.freeze({
   'acp-devin': 'devin',
@@ -47,19 +48,72 @@ export function normalizeExecutor(executor) {
     ...(effort === undefined ? {} : { effort: token(effort, 'executor_effort_invalid') }) });
 }
 
-export function buildExecutorCommand(executor, { prompt, interactive = true, followUp = false } = {}) {
+function validatePermissionMode(permissionMode) {
+  if (permissionMode === undefined) return undefined;
+  if (!['full', 'accept-edits'].includes(permissionMode)) fail('permission_mode_invalid');
+  return permissionMode;
+}
+
+function permissionArguments(spec, permissionMode) {
+  const mode = validatePermissionMode(permissionMode);
+  if (mode === undefined) return [];
+  if (spec.command === 'devin') {
+    return ['--permission-mode', mode === 'full' ? 'dangerous' : 'accept-edits',
+      '--respect-workspace-trust', 'false'];
+  }
+  if (spec.command === 'agy') {
+    return mode === 'full' ? ['--dangerously-skip-permissions'] : ['--mode', 'accept-edits'];
+  }
+  return [];
+}
+
+function promptArguments(spec, { prompt, promptFile } = {}) {
+  if (spec.command === 'devin' && promptFile !== undefined) {
+    return ['--prompt-file', text(promptFile, 'prompt_file_invalid')];
+  }
+  return ['--', text(prompt, 'worker_prompt_invalid')];
+}
+
+function effortArguments(spec) {
+  if (spec.command === 'pi' && spec.effort !== undefined) return ['--thinking', spec.effort];
+  if (spec.command === 'agy' && spec.effort !== undefined) return ['--effort', spec.effort];
+  return [];
+}
+
+export function buildExecutorCommand(executor, { prompt, promptFile, permissionMode,
+  interactive = true, followUp = false } = {}) {
   const spec = normalizeExecutor(executor);
-  const initial = text(prompt, 'worker_prompt_invalid');
-  const argv = ['--model', spec.model];
-  if (spec.command === 'pi' && spec.effort !== undefined) argv.push('--thinking', spec.effort);
-  if (spec.command === 'agy' && spec.effort !== undefined) argv.push('--effort', spec.effort);
+  const argv = ['--model', spec.model, ...effortArguments(spec),
+    ...permissionArguments(spec, permissionMode)];
   if (interactive) {
     if (spec.command === 'agy') argv.push('--prompt-interactive');
   } else {
     if (followUp) argv.push('--continue');
     argv.push('--print');
   }
-  argv.push('--', initial);
+  argv.push(...promptArguments(spec, { prompt, promptFile }));
+  return Object.freeze({ command: spec.command, argv: Object.freeze(argv), executor: spec });
+}
+
+export function buildResumeCommand(executor, { sessionId, prompt, promptFile, permissionMode,
+  interactive = true } = {}) {
+  const spec = normalizeExecutor(executor);
+  const argv = ['--model', spec.model, ...effortArguments(spec),
+    ...permissionArguments(spec, permissionMode)];
+  if (spec.command === 'devin') {
+    if (sessionId !== undefined) argv.push('-r', token(sessionId, 'session_id_invalid'));
+  } else if (spec.command === 'pi') {
+    argv.push('--continue');
+  } else if (spec.command === 'agy') {
+    if (sessionId === undefined) argv.push('--continue');
+    else argv.push('--resume', token(sessionId, 'session_id_invalid'));
+  }
+  if (interactive) {
+    if (spec.command === 'agy') argv.push('--prompt-interactive');
+  } else {
+    argv.push('--print');
+  }
+  argv.push(...promptArguments(spec, { prompt, promptFile }));
   return Object.freeze({ command: spec.command, argv: Object.freeze(argv), executor: spec });
 }
 
@@ -79,12 +133,16 @@ function parseJson(result, code) {
   }
 }
 
+function confirmedProbeRefusal(reason) {
+  return { status: 'confirmed_refusal', activeBackgroundAgentCount: 0, reason };
+}
+
 function probeFailure(command, error) {
   const detail = `${error?.stderr ?? ''}\n${error?.message ?? ''}`.toLowerCase();
   if (error?.code === 'ENOENT' || error?.errno === 'ENOENT' || detail.includes('not found')) {
-    return { status: 'unavailable', reason: `${command}_not_found` };
+    return confirmedProbeRefusal(`${command}_not_found`);
   }
-  if (typeof error?.code === 'number') return { status: 'unavailable', reason: `${command}_probe_failed` };
+  if (typeof error?.code === 'number') return confirmedProbeRefusal(`${command}_probe_failed`);
   return { status: 'unknown_outcome', reason: `${command}_probe_unknown` };
 }
 
@@ -106,6 +164,13 @@ export function deterministicRuntimeId(kind, taskId, attemptId) {
     return `df-${safe}-${hash.slice(0, 10)}`.slice(0, 32);
   }
   if (kind === 'subproc') return `subproc-${hash.slice(0, 12)}`;
+  fail('worker_runtime_kind_invalid');
+}
+
+function freshRuntimeId(kind) {
+  const hex = randomUUID().replaceAll('-', '');
+  if (kind === 'hc') return `df-r${hex.slice(0, 8)}-${hex.slice(8, 18)}`;
+  if (kind === 'subproc') return `subproc-${hex.slice(0, 12)}`;
   fail('worker_runtime_kind_invalid');
 }
 
@@ -135,7 +200,14 @@ function validateSpawnInput(input) {
     ...(input.spaceLabel === undefined ? {} : { spaceLabel: text(input.spaceLabel, 'space_label_invalid') }),
     ...(input.tabLabel === undefined ? {} : { tabLabel: text(input.tabLabel, 'tab_label_invalid') }),
     ...(input.runtimeId === undefined ? {} : { runtimeId: token(input.runtimeId, 'runtime_id_invalid') }),
+    ...(input.permissionMode === undefined ? {} : { permissionMode: validatePermissionMode(input.permissionMode) }),
   });
+}
+
+function validateResumeInput(input) {
+  const base = validateSpawnInput(input);
+  return Object.freeze({ ...base,
+    ...(input.sessionId === undefined ? {} : { sessionId: token(input.sessionId, 'session_id_invalid') }) });
 }
 
 function validateRuntimeId(runtimeId) {
@@ -168,7 +240,7 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     try {
       executor = normalizeExecutor(spec);
     } catch (error) {
-      return { status: 'unavailable', reason: error.message };
+      return confirmedProbeRefusal(error.message);
     }
     if (kind === 'hc') {
       const transport = await probeOne('hc');
@@ -182,18 +254,19 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     return Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
   }
 
-  async function spawnHc(input, prompt) {
-    const runtimeId = input.runtimeId ?? deterministicRuntimeId('hc', input.taskId, input.attemptId);
+  async function runHc(input, built, { resumed = false } = {}) {
+    const runtimeId = input.runtimeId ?? (resumed
+      ? freshRuntimeId('hc') : deterministicRuntimeId('hc', input.taskId, input.attemptId));
     if (!/^[a-z0-9_-]{1,32}$/.test(runtimeId)) fail('runtime_id_invalid');
-    const built = buildExecutorCommand(input.executor, { prompt, interactive: true });
     const labels = [
       ['darkfactory.task', input.taskId],
       ['darkfactory.attempt', input.attemptId],
       ['darkfactory.executor', built.command],
+      ...(resumed ? [['darkfactory.resumed', 'true']] : []),
       ...(input.spaceLabel === undefined ? [] : [['herdr.space', input.spaceLabel]]),
       ...(input.tabLabel === undefined ? [] : [['herdr.tab', input.tabLabel]]),
     ];
-    const argv = ['run', '--bg', '--keep', '--json', '--cwd', input.worktree,
+    const argv = ['run', '--bg', '--no-parent', '--no-notify', '--json', '--cwd', input.worktree,
       '--name', runtimeId];
     for (const [key, value] of labels) argv.push('--label', `${key}=${value}`);
     argv.push('--', built.command, ...built.argv);
@@ -202,6 +275,23 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     if (typeof terminalId !== 'string' || !terminalId) fail('hc_spawn_unattested');
     return Object.freeze({ runtimeId, transport: 'hc', terminalId,
       ...(Number.isSafeInteger(launched.pid) ? { pid: launched.pid } : {}) });
+  }
+
+  async function spawnHc(input, prompt) {
+    const built = buildExecutorCommand(input.executor, { prompt, promptFile: input.promptFile,
+      permissionMode: input.permissionMode, interactive: true });
+    return runHc(input, built);
+  }
+
+  function pruneTerminalSessions(protectRuntimeId) {
+    const terminal = [...sessions.entries()].filter(([, session]) => session.state !== 'working');
+    let excess = terminal.length - MAX_TERMINAL_SUBPROC_SESSIONS;
+    for (const [runtimeId] of terminal) {
+      if (excess <= 0) break;
+      if (runtimeId === protectRuntimeId) continue;
+      sessions.delete(runtimeId);
+      excess -= 1;
+    }
   }
 
   function watchChild(session, child) {
@@ -221,6 +311,7 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
       if (session.state === 'working') {
         finishTurn();
         session.state = 'exited';
+        pruneTerminalSessions(session.runtimeId);
       }
     });
     child.on?.('exit', (code, signal) => {
@@ -228,6 +319,7 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
       session.state = code === 0 ? 'done' : 'exited';
       session.exitCode = Number.isSafeInteger(code) ? code : undefined;
       session.signal = signal ?? undefined;
+      pruneTerminalSessions(session.runtimeId);
     });
   }
 
@@ -239,10 +331,11 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     return child;
   }
 
-  async function spawnSubproc(input, prompt) {
-    const built = buildExecutorCommand(input.executor, { prompt, interactive: false });
-    const runtimeId = input.runtimeId ?? deterministicRuntimeId('subproc', input.taskId, input.attemptId);
-    if (sessions.has(runtimeId)) fail('worker_runtime_exists');
+  function startSubprocSession(input, built, runtimeId, { replaceTerminal = false } = {}) {
+    const existing = sessions.get(runtimeId);
+    if (existing && !(replaceTerminal && existing.state !== 'working')) fail('worker_runtime_exists');
+    if (existing) sessions.delete(runtimeId);
+    pruneTerminalSessions(runtimeId);
     const session = { ...input, runtimeId, turn: 0, tail: '', state: 'working', child: null };
     sessions.set(runtimeId, session);
     try {
@@ -255,10 +348,28 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     }
   }
 
+  async function spawnSubproc(input, prompt) {
+    const built = buildExecutorCommand(input.executor, { prompt, promptFile: input.promptFile,
+      permissionMode: input.permissionMode, interactive: false });
+    const runtimeId = input.runtimeId ?? deterministicRuntimeId('subproc', input.taskId, input.attemptId);
+    return startSubprocSession(input, built, runtimeId);
+  }
+
   async function spawnWorker(rawInput) {
     const input = validateSpawnInput(rawInput);
     const prompt = text(await promptFromFile(input.promptFile), 'worker_prompt_invalid');
     return kind === 'hc' ? spawnHc(input, prompt) : spawnSubproc(input, prompt);
+  }
+
+  async function resumeWorker(rawInput) {
+    const input = validateResumeInput(rawInput);
+    const prompt = text(await promptFromFile(input.promptFile), 'worker_prompt_invalid');
+    const built = buildResumeCommand(input.executor, { sessionId: input.sessionId, prompt,
+      promptFile: input.promptFile, permissionMode: input.permissionMode,
+      interactive: kind === 'hc' });
+    if (kind === 'hc') return runHc(input, built, { resumed: true });
+    const runtimeId = input.runtimeId ?? freshRuntimeId('subproc');
+    return startSubprocSession(input, built, runtimeId, { replaceTerminal: true });
   }
 
   async function feedbackHc(runtimeId, message) {
@@ -274,7 +385,8 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     if (!session) fail('worker_runtime_unknown');
     if (session.state === 'working') fail('worker_busy');
     const followUp = buildFollowUpMessage({ taskId: session.taskId, attemptId: session.attemptId, message });
-    const built = buildExecutorCommand(session.executor, { prompt: followUp, interactive: false, followUp: true });
+    const built = buildExecutorCommand(session.executor, { prompt: followUp,
+      permissionMode: session.permissionMode, interactive: false, followUp: true });
     const child = launchSubproc(session, built);
     return Object.freeze({ delivered: true, turn: session.turn,
       ...(Number.isSafeInteger(child.pid) ? { pid: child.pid } : {}) });
@@ -288,7 +400,12 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
 
   async function observeHc(runtimeId) {
     const terminal = await hc(['get', '--json', '--', runtimeId]);
-    const read = await hc(['read', '--json', '--lines', '40', '--', runtimeId]);
+    let read = null;
+    try {
+      read = await hc(['read', '--json', '--lines', '40', '--', runtimeId]);
+    } catch {
+      read = null;
+    }
     const exitCode = terminalExitCode(terminal);
     const tail = typeof read?.text === 'string' ? read.text.slice(-TAIL_LIMIT) : undefined;
     return Object.freeze({ state: hcState(terminal),
@@ -302,6 +419,7 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     if (kind === 'hc') return observeHc(id);
     const session = sessions.get(id);
     if (!session) return Object.freeze({ state: 'exited' });
+    if (session.state !== 'working') pruneTerminalSessions(id);
     return Object.freeze({ state: session.state,
       ...(session.turn > 0 ? { turn: session.turn } : {}),
       ...(session.exitCode === undefined ? {} : { exitCode: session.exitCode }),
@@ -321,6 +439,7 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     const session = sessions.get(id);
     if (!session) return Object.freeze({ stopped: false, state: 'exited' });
     if (session.state !== 'working') {
+      pruneTerminalSessions(id);
       return Object.freeze({ stopped: false, state: session.state,
         ...(session.exitCode === undefined ? {} : { exitCode: session.exitCode }) });
     }
@@ -328,5 +447,6 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     return Object.freeze({ stopped: killed, state: session.state, ...(killed ? { signal: 'SIGTERM' } : {}) });
   }
 
-  return Object.freeze({ kind, probeAvailability, spawn: spawnWorker, feedback, observe, stop });
+  return Object.freeze({ kind, probeAvailability, spawn: spawnWorker, resume: resumeWorker,
+    feedback, observe, stop });
 }

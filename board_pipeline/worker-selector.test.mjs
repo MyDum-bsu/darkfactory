@@ -20,12 +20,14 @@ import {
   PRIMARY_WORKER,
   resolveArbitration,
   retiredProviderViolation,
+  roundGate,
   roundSignature,
   selectEscalationReviewer,
   selectWorker,
   workerFamily,
 } from './worker-selector.mjs';
 import { ReviewDenied } from './review-runner.mjs';
+import { createWorkerRuntime } from './worker-runtime.mjs';
 
 const BASE = 'a'.repeat(40);
 const ATTEMPT = { task_id: '7', epoch: 3, attempt_id: 'att-1', base_sha: BASE };
@@ -98,6 +100,37 @@ test('подтверждённый отказ первичного → резе�
   // google-критик ломает antigravity/gemini — он записан пропущенным до попыток.
   assert.equal(selection.attemptedWorkers.length, 3);
   assert.equal(selection.attemptedWorkers[0].verdict, 'skipped');
+});
+
+test('portable probe confirmed_refusal drives fallback end-to-end', async () => {
+  const missing = Object.assign(new Error('spawn devin ENOENT'), { code: 'ENOENT' });
+  const runtime = createWorkerRuntime({ kind: 'subproc', exec: async command => {
+    if (command === 'devin') throw missing;
+    return { stdout: '1.0' };
+  } });
+  const probed = [];
+  const { calls, spawn } = spawnLog([{ threadId: 'thr_dse2e' }]);
+  const selection = await attemptSpawnWithFallback({
+    attempt: ATTEMPT, spawn, inspectWorktree: cleanTree,
+    probe: async worker => {
+      const result = await runtime.probeAvailability(worker);
+      probed.push([worker.provider, result]);
+      return result;
+    },
+  });
+  assert.equal(selection.outcome, 'spawned');
+  assert.equal(selection.worker.provider, 'pi');
+  assert.equal(selection.threadId, 'thr_dse2e');
+  assert.equal(selection.fallbackReason, 'confirmed_refusal:acp-devin');
+  assert.deepEqual(probed[0], ['acp-devin',
+    { status: 'confirmed_refusal', activeBackgroundAgentCount: 0, reason: 'devin_not_found' }]);
+  assert.deepEqual(calls.map(c => c.provider), ['pi']);
+});
+
+test('roundGate classifies scope fence violations as scope_fence', () => {
+  assert.equal(roundGate({ reason: 'scope_fence_violation' }), 'scope_fence');
+  assert.equal(roundGate({ reason: 'local_checks_failed' }), 'l1');
+  assert.equal(roundGate({ reason: 'tamper_gate_failed' }), 'tamper');
 });
 
 // Резерв, нарушающий триаду, пропускается: критик google ломает
