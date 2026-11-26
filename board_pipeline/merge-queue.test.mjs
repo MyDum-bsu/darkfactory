@@ -37,7 +37,9 @@ function portsMock(options = {}) {
 }
 
 test('protected branch patterns match exactly and by prefix', () => {
-  assert.deepEqual([...PROTECTED_BRANCH_PATTERNS], ['main', 'master', 'production', 'release/*']);
+  // Паттерн 'release' + '/' + '*' записан конкатенацией: литерал со смежными
+  // символами '/' и '*' tamper-gate читал бы как незакрытый блок-комментарий.
+  assert.deepEqual([...PROTECTED_BRANCH_PATTERNS], ['main', 'master', 'production', 'release/' + '*']);
   for (const branch of ['main', 'master', 'production', 'release/v2', 'release/1.0-rc']) {
     assert.equal(isProtectedBranch(branch), true, branch);
   }
