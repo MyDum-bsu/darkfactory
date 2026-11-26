@@ -1,6 +1,21 @@
 import { SAFE_CATALOG } from './rework-distiller.mjs';
-import { formatWorkerPrompt, resolveModelFamily } from './model-prompt-profiles.mjs';
+import { formatArbiterPrompt, formatWorkerPrompt, resolveModelFamily } from './model-prompt-profiles.mjs';
 import { scopeFencePromptBlock } from './scope-fence.mjs';
+
+const EMPTY_DECISIONS_TEXT = '(no active decisions)';
+const EMPTY_MEMORY_TEXT = '(project memory is empty)';
+
+// A slice explicitly represents an empty store when it carries no entries and
+// no meaningful text. The boilerplate block is then redundant and skipped;
+// a truncated slice with hidden entries is never treated as empty — the
+// fail-closed validation in the block builder still runs first and throws.
+function isEmptyStoreSlice(slice, placeholder) {
+  if (!slice || typeof slice !== 'object') return false;
+  if (slice.truncated === true && typeof slice.total === 'number' && slice.total > 0) return false;
+  const ids = Array.isArray(slice.ids) ? slice.ids : [];
+  const text = typeof slice.text === 'string' ? slice.text.trim() : '';
+  return ids.length === 0 && (text === '' || text === placeholder);
+}
 
 const OWNER_PRECHECK = [
   'Before asking a product question, check the approved requirements and the "Accepted decisions" section in the input specification/assignment.',
@@ -66,13 +81,27 @@ export function projectMemoryPromptBlock(slice) {
 }
 
 export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions,
-  projectMemory, lessons, executor, allowedPaths }) {
-  const instructions = [
-    brief,
-    `\nWorktree path: ${tree}. Write JSON atomically to ${handoffPath} and end the turn. Preserve field types: ${JSON.stringify(handoff)}`,
-  ];
-  if (decisions) instructions.push(decisionsPromptBlock(decisions));
-  if (projectMemory) instructions.push(projectMemoryPromptBlock(projectMemory));
+  projectMemory, lessons, executor, allowedPaths, projectContext }) {
+  const instructions = [brief];
+  // Read-only project conventions/taste (AGENTS.md or project guide excerpt),
+  // embedded before the execution instructions; omitted when undefined/empty.
+  if (projectContext !== undefined && projectContext !== null) {
+    if (typeof projectContext !== 'string') throw new Error('prompt_input_invalid:projectContext');
+    if (projectContext.trim() !== '') {
+      instructions.push(`Project context (read-only conventions/taste):\n${projectContext}`);
+    }
+  }
+  instructions.push(`\nWorktree path: ${tree}. Write JSON atomically to ${handoffPath} and end the turn. Preserve field types: ${JSON.stringify(handoff)}`);
+  if (decisions) {
+    // Validation runs first and stays fail-closed; only the redundant
+    // empty-store rendering is skipped, never an invalid or truncated slice.
+    const block = decisionsPromptBlock(decisions);
+    if (!isEmptyStoreSlice(decisions, EMPTY_DECISIONS_TEXT)) instructions.push(block);
+  }
+  if (projectMemory) {
+    const block = projectMemoryPromptBlock(projectMemory);
+    if (!isEmptyStoreSlice(projectMemory, EMPTY_MEMORY_TEXT)) instructions.push(block);
+  }
   if (lessons) instructions.push(lessonsPromptBlock(lessons));
   if (productQuestions) {
     instructions.push(OWNER_PRECHECK,
@@ -89,9 +118,25 @@ export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQ
   });
 }
 
-export function arbiterIntakePrompt(spec, extra, decisions, projectMemory) {
-  return ['Use the following specification; output only an arbitration decision, not a critic verdict.',
-    spec, extra, decisions && decisionsPromptBlock(decisions),
-    projectMemory && projectMemoryPromptBlock(projectMemory), OWNER_PRECHECK,
-    'Choose escalate_owner only for a remaining product fork.'].filter(Boolean).join('\n\n');
+export function arbiterIntakePrompt(spec, extra, decisions, projectMemory, arbiter) {
+  const guidance = 'Use the following specification; output only an arbitration decision, not a critic verdict.';
+  const escalator = 'Choose escalate_owner only for a remaining product fork.';
+  // Validation runs first and stays fail-closed; only redundant empty-store
+  // boilerplate is skipped, never an invalid or truncated slice.
+  const decisionsBlock = decisions ? decisionsPromptBlock(decisions) : null;
+  const memoryBlock = projectMemory ? projectMemoryPromptBlock(projectMemory) : null;
+  const includeDecisions = decisionsBlock !== null && !isEmptyStoreSlice(decisions, EMPTY_DECISIONS_TEXT);
+  const includeMemory = memoryBlock !== null && !isEmptyStoreSlice(projectMemory, EMPTY_MEMORY_TEXT);
+  if (arbiter === undefined || arbiter === null) {
+    return [guidance, spec, extra, includeDecisions ? decisionsBlock : null,
+      includeMemory ? memoryBlock : null, OWNER_PRECHECK,
+      escalator].filter(Boolean).join('\n\n');
+  }
+  return formatArbiterPrompt({
+    family: resolveModelFamily(arbiter),
+    guidance,
+    spec: [spec, extra, includeDecisions ? decisionsBlock : null,
+      includeMemory ? memoryBlock : null].filter(Boolean).join('\n\n'),
+    rules: [OWNER_PRECHECK, escalator].join('\n\n'),
+  });
 }

@@ -61,7 +61,14 @@ function neonVerdict(response, digest) {
   return parseReviewVerdict(text);
 }
 
-function neonBody({ task_id, candidate_sha, subject_digest, review_round, prior_findings }, prompt, files, captures) {
+export function neonBody({ task_id, candidate_sha, subject_digest, review_round, prior_findings }, prompt, files, captures) {
+  // The candidate file list is evidence and must precede the prompt: in the
+  // google review profile the role, rules and JSON output contract are
+  // terminal, so nothing may be emitted after </json_output_contract>.
+  const catalog = JSON.stringify(files);
+  const fileList = Buffer.byteLength(catalog) <= INLINE_CATALOG
+    ? `Candidate file list: ${catalog}`
+    : `Candidate file list: all ${files.length} paths are in files.json (not embedded).`;
   const system = [
     `Independent Standards and Spec review for task #${task_id} at ${candidate_sha}.`,
     'Read the complete tracked diff in diff.patch and consult files.json for the exact candidate inventory.',
@@ -91,11 +98,12 @@ function neonBody({ task_id, candidate_sha, subject_digest, review_round, prior_
         : ['(none supplied)']),
     ] : []),
     `Copy this exact subject_digest into the JSON: ${subject_digest}.`,
+    '',
+    fileList,
+    '',
     prompt,
   ].join('\n');
-  const catalog = JSON.stringify(files);
-  return Buffer.byteLength(catalog) <= INLINE_CATALOG ? `${system}\n\nCandidate file list: ${catalog}`
-    : `${system}\n\nCandidate file list: all ${files.length} paths are in files.json (not embedded).`;
+  return system;
 }
 
 async function freshScratch(worktree) {

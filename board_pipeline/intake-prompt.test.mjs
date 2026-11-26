@@ -218,3 +218,115 @@ test('worker prompt scope fence is fail-closed on malformed allowed paths', () =
     executor: { provider: 'acp-devin', model: 'swe-2-1-medium' },
     allowedPaths: [] }), /scope_fence_input_invalid/);
 });
+
+test('worker prompt embeds optional projectContext read-only before execution instructions', () => {
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: false,
+    projectContext: 'Use ESM modules; prefer small pure functions.' });
+  const ctx = prompt.indexOf('Project context (read-only conventions/taste):');
+  assert.ok(ctx > 0, 'project context section is present after the brief');
+  assert.ok(ctx < prompt.indexOf('Write JSON atomically'), 'project context precedes execution instructions');
+  assert.match(prompt, /Use ESM modules; prefer small pure functions\./);
+  // The context is embedded verbatim and deterministically.
+  assert.equal(prompt, workerIntakePrompt({ ...worker, productQuestions: false,
+    projectContext: 'Use ESM modules; prefer small pure functions.' }));
+  // Executor-aware prompts keep the project context inside the base contract.
+  const shaped = workerIntakePrompt({ ...worker, productQuestions: false,
+    projectContext: 'Use ESM modules.', executor: { provider: 'acp-devin', model: 'swe-2-1-medium' } });
+  assert.match(shaped, /Project context \(read-only conventions\/taste\):\nUse ESM modules\./);
+});
+
+test('worker prompt omits projectContext when undefined, empty or whitespace', () => {
+  for (const projectContext of [undefined, null, '', '   ', '\n\t ']) {
+    const prompt = workerIntakePrompt({ ...worker, productQuestions: false, projectContext });
+    assert.doesNotMatch(prompt, /Project context \(read-only/);
+  }
+  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false, projectContext: 42 }),
+    /prompt_input_invalid:projectContext/);
+});
+
+test('empty decision and project memory stores skip redundant boilerplate', () => {
+  const emptyDecisions = { text: '', digest: 'c'.repeat(64), ids: [], truncated: false, total: 0 };
+  const emptyMemory = { text: '', digest: 'd'.repeat(64), ids: [], truncated: false, total: 0 };
+  const prompt = workerIntakePrompt({ ...worker, productQuestions: false,
+    decisions: emptyDecisions, projectMemory: emptyMemory });
+  assert.doesNotMatch(prompt, /Accepted owner decisions/);
+  assert.doesNotMatch(prompt, /Project memory \(read-only/);
+  assert.doesNotMatch(prompt, /no active decisions/);
+  assert.doesNotMatch(prompt, /project memory is empty/);
+
+  // Placeholder text spelling of an empty store is skipped the same way.
+  const placeholder = workerIntakePrompt({ ...worker, productQuestions: false,
+    decisions: { ...emptyDecisions, text: '(no active decisions)' },
+    projectMemory: { ...emptyMemory, text: '(project memory is empty)' } });
+  assert.doesNotMatch(placeholder, /Accepted owner decisions/);
+  assert.doesNotMatch(placeholder, /Project memory \(read-only/);
+
+  // The arbiter prompt skips the same empty-store boilerplate.
+  const arbiter = arbiterIntakePrompt(spec, 'Operator rules.', emptyDecisions, emptyMemory);
+  assert.doesNotMatch(arbiter, /Accepted owner decisions/);
+  assert.doesNotMatch(arbiter, /Project memory \(read-only/);
+
+  // Non-empty stores keep their digest-pinned blocks in worker and arbiter prompts.
+  const pinned = workerIntakePrompt({ ...worker, productQuestions: false,
+    decisions: slice, projectMemory: memorySlice });
+  assert.match(pinned, /digest a{64}/);
+  assert.match(pinned, /digest b{64}/);
+  const pinnedArbiter = arbiterIntakePrompt(spec, 'Operator rules.', slice, memorySlice);
+  assert.match(pinnedArbiter, /slice digest a{64}/);
+  assert.match(pinnedArbiter, /slice digest b{64}/);
+});
+
+test('empty-store skipping stays fail-closed on invalid or truncated slices', () => {
+  const truncated = { text: '', digest: 'c'.repeat(64), ids: [], truncated: true, total: 3 };
+  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false, decisions: truncated }),
+    /decision_ledger_slice_truncated/);
+  assert.throws(() => arbiterIntakePrompt(spec, 'extra', truncated), /decision_ledger_slice_truncated/);
+  const truncatedMemory = { text: '', digest: 'd'.repeat(64), ids: [], truncated: true, total: 2 };
+  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false, projectMemory: truncatedMemory }),
+    /project_memory_slice_truncated/);
+  const invalid = { text: '', digest: 'short', ids: [] };
+  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false, decisions: invalid }),
+    /decision_ledger_slice_invalid/);
+  assert.throws(() => arbiterIntakePrompt(spec, 'extra', null, invalid), /project_memory_slice_invalid/);
+});
+
+test('arbiterIntakePrompt shapes the prompt by the arbiter model family when provided', () => {
+  const legacy = arbiterIntakePrompt(spec, 'Operator rules.');
+  // Backwards compatible: no arbiter spec keeps the legacy shape byte-for-byte.
+  assert.equal(arbiterIntakePrompt(spec, 'Operator rules.'), legacy);
+
+  const google = arbiterIntakePrompt(spec, 'Operator rules.', undefined, undefined,
+    { provider: 'google', model: 'gemini-4-neon' });
+  assert.ok(google.indexOf(spec) < google.indexOf('Based on the specification and context provided above'));
+  assert.ok(google.indexOf('Before asking a product question') > google.indexOf('Based on the specification'));
+  assert.match(google, /escalate_owner/);
+
+  const openai = arbiterIntakePrompt(spec, 'Operator rules.', undefined, undefined,
+    { provider: 'openai', model: 'gpt-6.2-sol' });
+  assert.ok(openai.includes('<arbitration_task>'), 'openai arbitration XML');
+  assert.ok(openai.includes('<structured_output_contract>'));
+  assert.match(openai, /escalate_owner/);
+  assert.match(openai, /Operator rules\./);
+
+  const deepseek = arbiterIntakePrompt(spec, 'Operator rules.', undefined, undefined,
+    { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' });
+  assert.match(deepseek, /ARBITRATION TASK CONTRACT/);
+  assert.match(deepseek, /Operator rules\./);
+
+  const anthropic = arbiterIntakePrompt(spec, 'Operator rules.', undefined, undefined,
+    { provider: 'agy', model: 'claude-opus-5.5' });
+  assert.match(anthropic, /Default to action/);
+  assert.match(anthropic, /Before asking a product question/);
+
+  const cognition = arbiterIntakePrompt(spec, 'Operator rules.', undefined, undefined,
+    { provider: 'acp-devin', model: 'swe-2-1-high' });
+  assert.match(cognition, /output only an arbitration decision/);
+  assert.match(cognition, /escalate_owner/);
+
+  // Pinned non-empty slices survive family shaping with their digests intact.
+  const pinned = arbiterIntakePrompt(spec, 'Operator rules.', slice, memorySlice,
+    { provider: 'openai', model: 'gpt-6.2-sol' });
+  assert.match(pinned, /slice digest a{64}/);
+  assert.match(pinned, /slice digest b{64}/);
+  assert.match(pinned, /- \[global\] CSV for export \(dec-1\)/);
+});

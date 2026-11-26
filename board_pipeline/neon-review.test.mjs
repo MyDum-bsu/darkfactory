@@ -4,7 +4,8 @@ import { once } from 'node:events';
 import { chmod, lstat, mkdir, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { isolatedNeonReviewRunner } from './neon-review.mjs';
+import { isolatedNeonReviewRunner, neonBody } from './neon-review.mjs';
+import { formatReviewPrompt } from './model-prompt-profiles.mjs';
 import { hostAgyTransport } from './agy-transport.mjs';
 import { agyStreamFixture, commitFile, neonFixture } from './review-test-fixture.mjs';
 import agyStream from './agy-stream.cjs';
@@ -72,6 +73,36 @@ test('Neon ReviewPort separates offline snapshot and Agy model-only request', as
   assert.equal(receipt.snapshot_reads, 1);
   assert.deepEqual(receipt.attestation, { model: 'agy_stream_init', effort: 'agy_cli_request' });
   assert.match(receipt.transcript_sha256, /^[a-f0-9]{64}$/);
+});
+
+test('neonBody places the candidate file list before the prompt and keeps the Google terminal contract', () => {
+  const binding = { task_id: '77', candidate_sha: 'a'.repeat(40), subject_digest, review_round: 1 };
+  const googlePrompt = formatReviewPrompt({ family: 'google', spec: 'UNIQUE_SPEC_MARKER', diffContext: 'DIFF', rules: 'RULES' });
+  assert.ok(googlePrompt.endsWith('</json_output_contract>'));
+
+  const body = neonBody(binding, googlePrompt, ['candidate/sum.js'], null);
+  const listAt = body.indexOf('Candidate file list:');
+  const promptAt = body.indexOf('UNIQUE_SPEC_MARKER');
+  assert.ok(listAt >= 0 && promptAt >= 0 && listAt < promptAt, 'file list must precede the prompt');
+  assert.ok(body.endsWith('</json_output_contract>'), 'nothing may follow the closing JSON contract tag');
+  assert.equal(body, neonBody(binding, googlePrompt, ['candidate/sum.js'], null));
+
+  // Oversized inventories fall back to the files.json pointer, still before the prompt.
+  const bigFiles = Array.from({ length: 2000 }, (_, i) => `candidate/file-${i}-padding-padding-padding.js`);
+  const big = neonBody(binding, googlePrompt, bigFiles, null);
+  assert.match(big, /Candidate file list: all 2000 paths are in files\.json \(not embedded\)\./);
+  assert.ok(big.indexOf('Candidate file list:') < big.indexOf('UNIQUE_SPEC_MARKER'));
+  assert.ok(big.endsWith('</json_output_contract>'));
+
+  // Empty and minimal inventories stay inline and keep the prompt terminal.
+  const empty = neonBody(binding, googlePrompt, [], null);
+  assert.match(empty, /Candidate file list: \[\]/);
+  assert.ok(empty.endsWith('</json_output_contract>'));
+
+  // Non-Google prompts are equally terminal: the prompt is always the last block.
+  const plain = neonBody(binding, 'PLAIN PROMPT TAIL', ['candidate/sum.js'], null);
+  assert.ok(plain.indexOf('Candidate file list:') < plain.indexOf('PLAIN PROMPT TAIL'));
+  assert.ok(plain.endsWith('PLAIN PROMPT TAIL'));
 });
 
 test('Neon Round 2+ diff failure throws ReviewDenied, not ReferenceError', async t => {
