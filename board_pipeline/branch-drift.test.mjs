@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { inspectWorktreesAndBranches, assertNoBranchDrift,
-  parseWorktreeList } from './branch-drift.mjs';
+  classifyWorkerSession, parseWorktreeList } from './branch-drift.mjs';
 import { buildEnqueuePlan } from '../ops/factory-enqueue.mjs';
 
 const HEX = 'a'.repeat(64);
@@ -170,6 +170,64 @@ test('P1: baseRef starting with - rejected (no git option injection)', async () 
   await assert.rejects(() => inspectWorktreesAndBranches({
     repoDir: '/repo/main', baseRef: '--all', execGit: baseGit() }),
     /base_ref_invalid/);
+});
+
+test('portable worker classification covers df, feat/df and subproc conventions', () => {
+  assert.equal(classifyWorkerSession({ branch: 'df-3840-d0d63638ee' }), 'hc');
+  assert.equal(classifyWorkerSession({ branch: 'feat/df-slot-4' }), 'hc');
+  assert.equal(classifyWorkerSession({ branch: 'subproc-d0d63638ee89' }), 'subproc');
+  assert.equal(classifyWorkerSession({ branch: 'bb/thr_abc123' }), 'bb');
+  assert.equal(classifyWorkerSession({ path: '/home/operator/df-slot-4' }), 'hc');
+  assert.equal(classifyWorkerSession({ path: '/tmp/subproc-d0d63638ee89' }), 'subproc');
+  assert.equal(classifyWorkerSession({ path: '/repo/wt-thr_abc123' }), 'bb');
+  assert.equal(classifyWorkerSession({ branch: 'dfx', path: '/repo/plain' }), null);
+  assert.equal(classifyWorkerSession({ branch: 'feature/subproc-d0d63638ee89' }), null);
+});
+
+test('portable worker branches and worktrees are classified alongside bb threads', async () => {
+  const worktrees = `worktree /repo/main
+HEAD aaaa
+branch refs/heads/main
+
+worktree /home/operator/df-slot-4
+HEAD bbbb
+branch refs/heads/feat/df-slot-4
+
+worktree /tmp/subproc-d0d63638ee89
+HEAD cccc
+detached
+
+worktree /repo/wt-bb
+HEAD dddd
+branch refs/heads/bb/thr_old1
+`;
+  const branches = ['feat/df-task', 'subproc-d0d63638ee89', 'bb/thr_old2', 'feat/other'];
+  const execGit = fakeGit([
+    [(a) => a.join(' ') === 'worktree list --porcelain', worktrees],
+    [(a, cwd) => a.join(' ') === 'status --porcelain',
+      (a, cwd) => cwd === '/home/operator/df-slot-4' ? ' M board_pipeline/x.mjs\n' : ''],
+    [(a) => a[0] === 'branch', () => `${branches.join('\n')}\n`],
+    [(a) => a[0] === 'diff', () => 'board_pipeline/x.mjs\n'],
+  ]);
+  const report = await inspectWorktreesAndBranches({ repoDir: '/repo/main', baseRef: 'main', execGit });
+  assert.equal(report.bbThreadWorktrees.length, 1);
+  assert.equal(report.bbThreadWorktrees[0].branch, 'bb/thr_old1');
+  assert.deepEqual(Object.fromEntries(report.workerWorktrees.map(wt => [wt.path, wt.workerKind])), {
+    '/home/operator/df-slot-4': 'hc',
+    '/tmp/subproc-d0d63638ee89': 'subproc',
+    '/repo/wt-bb': 'bb',
+  });
+  const dirtyDf = report.dirtyWorktrees.find(wt => wt.path === '/home/operator/df-slot-4');
+  assert.equal(dirtyDf.isBbThread, false);
+  assert.equal(dirtyDf.workerKind, 'hc');
+  const byBranch = Object.fromEntries(report.unmergedBranches.map(item => [item.branch, item]));
+  assert.equal(byBranch['feat/df-task'].workerKind, 'hc');
+  assert.equal(byBranch['subproc-d0d63638ee89'].workerKind, 'subproc');
+  assert.equal(byBranch['bb/thr_old2'].workerKind, 'bb');
+  assert.equal(byBranch['bb/thr_old2'].isBbThread, true);
+  assert.equal(byBranch['feat/other'].workerKind, null);
+  assert.equal(byBranch['feat/other'].isBbThread, false);
+  assert.match(report.summary, /3 worker worktree\(s\)/);
 });
 
 // --- интеграция в ops/factory-enqueue.mjs -----------------------------------

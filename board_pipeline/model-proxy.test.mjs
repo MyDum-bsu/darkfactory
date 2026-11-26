@@ -6,7 +6,7 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { connectUpstream, withModelProxy } from './model-proxy.mjs';
+import { connectUpstream, DEFAULT_IO_TIMEOUT_MS, withModelProxy } from './model-proxy.mjs';
 
 function exchange(path, text) {
   return new Promise((resolve, reject) => {
@@ -181,6 +181,45 @@ test('direct mode keeps the pre-connect 502 handler but removes it after CONNECT
   tunnel.emit('error', new Error('established tunnel failed'));
   assert.equal(client.output, 'HTTP/1.1 200 Connection Established\r\n\r\n');
   assert.equal(client.destroyed, true);
+});
+
+test('model proxy io timeout defaults to at least 300s and accepts a validated override', () => {
+  class TimeoutSocket extends FakeSocket {
+    setTimeout(ms) {
+      this.timeoutMs = ms;
+      return this;
+    }
+  }
+  const direct = (timeout, override) => {
+    const client = new FakeSocket();
+    const tunnel = new TimeoutSocket();
+    connectUpstream({ direct: true }, 'chatgpt.com:443', client, new Set(), Buffer.alloc(0), () => {},
+      () => tunnel, override);
+    assert.equal(tunnel.timeoutMs, timeout);
+  };
+  direct(DEFAULT_IO_TIMEOUT_MS, undefined);
+  direct(456_000, 456_000);
+  assert.equal(DEFAULT_IO_TIMEOUT_MS >= 300_000, true);
+  assert.throws(() => connectUpstream({ direct: true }, 'chatgpt.com:443', new FakeSocket(), new Set(),
+    Buffer.alloc(0), () => {}, () => new FakeSocket(), 0), /model_proxy_timeout_invalid/);
+});
+
+test('model proxy rejects non-positive or non-integer ioTimeoutMs options before opening sockets', async () => {
+  for (const ioTimeoutMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '300000']) {
+    await assert.rejects(withModelProxy({
+      allow: ['chatgpt.com:443'], env: { DF_MODEL_PROXY_DIRECT: '1' }, ioTimeoutMs,
+    }, async () => assert.fail('unexpected listener')), /model_proxy_timeout_invalid/);
+  }
+});
+
+test('connect handler error boundary returns 502 cleanly without an unhandled rejection', async () => {
+  await withModelProxy({
+    allow: ['chatgpt.com:443'], env: { DF_MODEL_PROXY_DIRECT: '1' },
+    connectUpstreamImpl: () => { throw new Error('upstream exploded'); },
+  }, async path => {
+    assert.match(await exchange(path, tunnel('chatgpt.com:443')), /^HTTP\/1\.1 502 Model Proxy Unavailable/);
+    assert.match(await exchange(path, tunnel('chatgpt.com:443')), /^HTTP\/1\.1 502 Model Proxy Unavailable/);
+  });
 });
 
 test('explicit DF_MODEL_PROXY_DIRECT=1 allows allowlisted direct mode while still rejecting unlisted hosts', async () => {

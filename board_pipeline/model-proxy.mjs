@@ -10,7 +10,13 @@ import { join } from 'node:path';
 
 const AUTHORITY = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}:443$/;
 const LIMIT = 16;
-const IO_TIMEOUT_MS = 120_000;
+export const DEFAULT_IO_TIMEOUT_MS = 300_000;
+
+function normalizeIoTimeoutMs(value) {
+  if (value === undefined) return DEFAULT_IO_TIMEOUT_MS;
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error('model_proxy_timeout_invalid');
+  return value;
+}
 
 function proxyConfig(env) {
   const chosen = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
@@ -46,7 +52,18 @@ function deny(socket, code, reason) {
   if (!socket.destroyed) socket.end(`HTTP/1.1 ${code} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
 }
 
-export function connectUpstream(proxy, authority, client, pending, upstreamHead, track, dial = netConnect) {
+function denyAndDestroy(socket, code, reason) {
+  try {
+    if (socket.destroyed) return;
+    socket.once('finish', () => socket.destroy());
+    deny(socket, code, reason);
+  } catch {
+    try { socket.destroy(); } catch {}
+  }
+}
+
+export function connectUpstream(proxy, authority, client, pending, upstreamHead, track, dial = netConnect, ioTimeoutMs) {
+  const timeoutMs = normalizeIoTimeoutMs(ioTimeoutMs);
   // Never forward client-controlled headers, including Proxy-Authorization.
   if (proxy.direct) {
     const colon = authority.lastIndexOf(':');
@@ -58,7 +75,7 @@ export function connectUpstream(proxy, authority, client, pending, upstreamHead,
     client.once('close', () => tunnel.destroy());
     const onPreConnectError = () => deny(client, 502, 'Model Proxy Unavailable');
     tunnel.once('error', onPreConnectError);
-    tunnel.setTimeout(IO_TIMEOUT_MS, () => tunnel.destroy(new Error('model_proxy_timeout')));
+    tunnel.setTimeout(timeoutMs, () => tunnel.destroy(new Error('model_proxy_timeout')));
     tunnel.once('connect', () => {
       tunnel.off('error', onPreConnectError);
       if (client.destroyed) { tunnel.destroy(); return; }
@@ -83,7 +100,7 @@ export function connectUpstream(proxy, authority, client, pending, upstreamHead,
   client.once('close', () => upstream.destroy());
   const onPreConnectError = () => deny(client, 502, 'Model Proxy Unavailable');
   upstream.once('error', onPreConnectError);
-  upstream.setTimeout(IO_TIMEOUT_MS, () => upstream.destroy(new Error('model_proxy_timeout')));
+  upstream.setTimeout(timeoutMs, () => upstream.destroy(new Error('model_proxy_timeout')));
   upstream.once('connect', (response, tunnel, head) => {
     upstream.off('error', onPreConnectError);
     if (response.statusCode !== 200 || client.destroyed) {
@@ -117,7 +134,9 @@ async function connectPhase(allowed, startup, authority, beforeConnect) {
   return startup.has(authority) ? 'startup' : allowed.has(authority) ? 'model' : null;
 }
 
-export async function withModelProxy({ allow, bootstrap = [], env = process.env, hostClient = false, beforeConnect }, run) {
+export async function withModelProxy({ allow, bootstrap = [], env = process.env, hostClient = false, beforeConnect,
+  ioTimeoutMs, connectUpstreamImpl = connectUpstream }, run) {
+  const timeoutMs = normalizeIoTimeoutMs(ioTimeoutMs);
   const allowed = permit(allow);
   const startup = bootstrap.length ? permit(bootstrap) : new Set();
   if ([...startup].some(host => allowed.has(host))) throw new Error('model_proxy_phase_overlap');
@@ -137,7 +156,7 @@ export async function withModelProxy({ allow, bootstrap = [], env = process.env,
   const sockets = new Set();
   const track = socket => {
     sockets.add(socket);
-    socket.setTimeout(IO_TIMEOUT_MS, () => socket.destroy());
+    socket.setTimeout(timeoutMs, () => socket.destroy());
     socket.on('error', () => socket.destroy());
     socket.once('close', () => sockets.delete(socket));
   };
@@ -146,19 +165,23 @@ export async function withModelProxy({ allow, bootstrap = [], env = process.env,
   server.maxConnections = LIMIT;
   server.on('connection', track);
   server.on('connect', async (request, client, head) => {
-    if (auth) {
-      const proposed = Buffer.from(request.headers['proxy-authorization'] ?? '');
-      if (proposed.length !== auth.length || !timingSafeEqual(auth, proposed)) {
-        deny(client, 407, 'Model Proxy Authentication Required');
-        return;
+    try {
+      if (auth) {
+        const proposed = Buffer.from(request.headers['proxy-authorization'] ?? '');
+        if (proposed.length !== auth.length || !timingSafeEqual(auth, proposed)) {
+          deny(client, 407, 'Model Proxy Authentication Required');
+          return;
+        }
       }
-    }
-    const phase = await connectPhase(allowed, startup, request.url, beforeConnect);
-    if (phase === null || client.destroyed) { deny(client, 403, 'Model Destination Denied'); return; }
-    const close = connectUpstream(proxy, request.url, client, pending, head, track);
-    if (phase === 'startup') {
-      startups.add(close);
-      client.once('close', () => startups.delete(close));
+      const phase = await connectPhase(allowed, startup, request.url, beforeConnect);
+      if (phase === null || client.destroyed) { deny(client, 403, 'Model Destination Denied'); return; }
+      const close = connectUpstreamImpl(proxy, request.url, client, pending, head, track, netConnect, timeoutMs);
+      if (phase === 'startup') {
+        startups.add(close);
+        client.once('close', () => startups.delete(close));
+      }
+    } catch {
+      denyAndDestroy(client, 502, 'Model Proxy Unavailable');
     }
   });
   try {

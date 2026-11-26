@@ -16,6 +16,7 @@
 // хука эскалации, ни записи в журнал — только план и read-only измерения.
 
 import { execFile } from 'node:child_process';
+import { constants as fsConstants } from 'node:fs';
 import { lstat, mkdir, open, readdir, readFile, realpath, rm, rmdir, statfs } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -27,7 +28,7 @@ import { once } from 'node:events';
 const GiB = 1024n ** 3n;
 const DAY_MS = 86_400_000;
 
-export const DISK_TIER1_GIB = 5n; // < 5 GiB → уборка Тира 1
+export const DISK_TIER1_GIB = 8n; // < 8 GiB → уборка Тира 1, на уровне дискового floor демона
 export const DISK_ALARM_GIB = 2n; // < 2 GiB после Тира 1 → тревога + эскалация
 export const RAM_MIN_GIB = 1.5;   // < 1.5 GiB MemAvailable → стоп idle-тредов
 // Точная граница 1.5 GiB в байтах — сравнение в bigint, без float.
@@ -166,6 +167,19 @@ export async function pruneExpiredTmp({ tmpRoot, cutoffMs, journal, dryRun, fsIm
 export async function pruneCacheRoot({ root, cutoffMs, journal, dryRun, fsImpl, maxEntries = 50_000, maxDepth = 16 }) {
   const fs = fsImpl ?? { readdir, lstat, rm, rmdir, realpath };
   const result = { root, deletedFiles: 0, removedDirs: 0, refused: 0, truncated: false, errors: 0 };
+  let rootStat;
+  try {
+    rootStat = await fs.lstat(root);
+  } catch (error) {
+    await journal({ event: 'cache_skip', root, error: error.message });
+    result.errors++;
+    return result;
+  }
+  if (rootStat.isSymbolicLink()) {
+    await journal({ event: 'cache_skip', root, reason: 'symlink' });
+    result.refused++;
+    return result;
+  }
   let base;
   try {
     base = await fs.realpath(root);
@@ -270,7 +284,7 @@ export async function dockerPrune({ execDocker, journal, dryRun }) {
 
 // --- BB: только однозначно пустующие треды ----------------------------------
 
-const THREAD_ID = /^thr_[a-z0-9]+$/;
+const WORKER_SESSION_ID = /^(?:thr_[a-z0-9]+|df-[a-z0-9_-]{1,12}-[a-f0-9]{10}|subproc-[a-f0-9]{12})$/;
 const BACKGROUND_KEYS = ['activeBackgroundAgentCount', 'activeBackgroundCommandCount', 'activePlanModeCount', 'activeWorkflowCount'];
 const hasBackgroundWork = activity =>
   !!activity && BACKGROUND_KEYS.some(key => Number(activity[key]) > 0);
@@ -284,7 +298,7 @@ export function selectIdleThreads(threads, { pinnedThreads = [], selfThreadId } 
   const skipped = [];
   for (const thread of Array.isArray(threads) ? threads : []) {
     const id = thread?.id;
-    if (!THREAD_ID.test(id ?? '')) continue;
+    if (!WORKER_SESSION_ID.test(id ?? '')) continue;
     if (id === selfThreadId) { skipped.push({ id, reason: 'self' }); continue; }
     if (pinned.has(id)) { skipped.push({ id, reason: 'pinned_by_config' }); continue; }
     if (thread.status !== 'idle') { skipped.push({ id, reason: `status:${thread.status ?? 'unknown'}` }); continue; }
@@ -312,8 +326,14 @@ export function parseBbThreadList(stdout) {
 export async function openJournal(path, fsImpl) {
   const fs = fsImpl ?? { mkdir, open };
   await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const fd = await fs.open(path, 'a', 0o600);
-  await fd.chmod(0o600); // существующий файл мог быть создан с другими правами
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND | (fsConstants.O_NOFOLLOW ?? 0);
+  const fd = await fs.open(path, flags, 0o600);
+  try {
+    await fd.chmod(0o600); // существующий файл мог быть создан с другими правами
+  } catch (error) {
+    try { await fd.close(); } catch {}
+    throw error;
+  }
   const write = async entry => {
     await fd.write(`${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
     await fd.sync();
@@ -374,6 +394,7 @@ export async function runSteward(options) {
     tmpDays = 7,
     cacheDays = 7,
     journalPath,
+    journalFactory = openJournal,
     dockerEnabled = true,
     execDocker,
     execBb,
@@ -398,7 +419,7 @@ export async function runSteward(options) {
     if (!isAbsolute(journalPath)) throw new Error('journalPath must be an absolute path');
   }
 
-  const journal = dryRun ? noopJournal : await openJournal(journalPath);
+  const journal = dryRun ? noopJournal : await journalFactory(journalPath);
   const errors = [];
   const summary = {
     dryRun,
@@ -410,129 +431,132 @@ export async function runSteward(options) {
     ram: { low: false, stopped: 0, skipped: [], errors: 0 },
     errors,
   };
-  await journal({ event: 'tick_start', dryRun, mounts, tmpDays, cacheDays, tmpRoot });
+  try {
+    await journal({ event: 'tick_start', dryRun, mounts, tmpDays, cacheDays, tmpRoot });
 
-  // 1. Измерение. Ошибка одного монта — ошибка тика, а не ноль байт.
-  const measured = [];
-  for (const mount of mounts) {
-    try {
-      const bytes = await statfsImpl(mount);
-      const level = evaluateDisk(bytes);
-      measured.push({ mount, bytes, level });
-      summary.mounts.push({ mount, availableGiB: availableGiB(bytes), level });
-      await journal({ event: 'measurement', mount, availableGiB: availableGiB(bytes), level });
-    } catch (error) {
-      errors.push(`measure ${mount}: ${error.message}`);
-      summary.mounts.push({ mount, error: error.message });
-      await journal({ event: 'measurement_error', mount, error: error.message });
-    }
-  }
-
-  // 2. Тир 1 — только если где-то ниже 5 GiB. На пустом месте — ни одного
-  //    действия и ни одного вызова LLM.
-  const needsTier1 = measured.some(m => m.level === 'tier1' || m.level === 'alarm');
-  if (needsTier1) {
-    await journal({ event: 'tier1_start' });
-    const tier1 = {
-      triggeredBy: measured.filter(m => m.level !== 'ok').map(m => m.mount),
-      docker: [],
-      tmp: null,
-      caches: [],
-    };
-    // Docker prune — эффект: в dry-run только план, реальный вызов без dry-run.
-    if (dryRun || !dockerEnabled) {
-      tier1.docker = dockerEnabled ? DOCKER_ACTIONS.map(action => ({ ...action, dryRun: true })) : ['disabled'];
-    } else if (typeof execDocker === 'function') {
-      tier1.docker = await dockerPrune({ execDocker, journal, dryRun });
-    } else {
-      tier1.docker = ['no_executor'];
-    }
-    tier1.tmp = await pruneExpiredTmp({ tmpRoot, cutoffMs: now - tmpDays * DAY_MS, journal, dryRun, fsImpl });
-    for (const cache of cacheRoots) {
-      tier1.caches.push(await pruneCacheRoot({ root: cache.path, cutoffMs: now - cacheDays * DAY_MS, journal, dryRun, fsImpl }));
-    }
-    await journal({
-      event: 'tier1_done',
-      tmp: tier1.tmp,
-      caches: tier1.caches.map(({ root, ...counts }) => ({ root, ...counts })),
-      docker: tier1.docker,
-    });
-    summary.tier1 = tier1;
-
-    // 3. Повторное измерение. Тревога — < 2 GiB после Тира 1, ровно одна
-    //    эскалация за тик по худшему монту.
-    let worst = null;
-    for (const { mount } of measured) {
+    // 1. Измерение. Ошибка одного монта — ошибка тика, а не ноль байт.
+    const measured = [];
+    for (const mount of mounts) {
       try {
         const bytes = await statfsImpl(mount);
         const level = evaluateDisk(bytes);
-        summary.postTier1.push({ mount, availableGiB: availableGiB(bytes), level });
-        await journal({ event: 'measurement_post', mount, availableGiB: availableGiB(bytes), level });
-        if (level === 'alarm' && (!worst || bytes < worst.bytes)) worst = { mount, bytes };
+        measured.push({ mount, bytes, level });
+        summary.mounts.push({ mount, availableGiB: availableGiB(bytes), level });
+        await journal({ event: 'measurement', mount, availableGiB: availableGiB(bytes), level });
       } catch (error) {
-        errors.push(`remeasure ${mount}: ${error.message}`);
-        await journal({ event: 'measurement_error', mount, phase: 'post_tier1', error: error.message });
+        errors.push(`measure ${mount}: ${error.message}`);
+        summary.mounts.push({ mount, error: error.message });
+        await journal({ event: 'measurement_error', mount, error: error.message });
       }
     }
-    if (worst) {
-      summary.alarm = await raiseAlarm({ mount: worst.mount, availableBytes: worst.bytes, journalPath, escalate, journal, dryRun });
-    }
-  }
 
-  // 4. RAM: < 1.5 GiB → стоп idle-тредов BB. Список тредов — read-only
-  //    измерение даже в dry-run; сам stop — эффект и в dry-run не выполняется.
-  try {
-    const ramBytes = await memInfoImpl();
-    summary.ram.availableGiB = availableGiB(ramBytes);
-    await journal({ event: 'ram_measurement', availableGiB: availableGiB(ramBytes) });
-    if (evaluateRam(ramBytes)) {
-      summary.ram.low = true;
-      await journal({ event: 'ram_low', thresholdGiB: RAM_MIN_GIB });
-      if (typeof execBb === 'function') {
-        const listed = await execBb(['thread', 'list', '--json']);
-        // runCommand не бросает исключений: ненулевой код — честная ошибка, а не пустой список.
-        if (listed.code !== 0) {
-          throw new Error(`bb thread list: ${String(listed.stderr ?? '').slice(-200) || `exit code ${listed.code}`}`);
-        }
-        const threads = parseBbThreadList(listed.stdout);
-        const { stoppable, skipped } = selectIdleThreads(threads, { pinnedThreads, selfThreadId });
-        summary.ram.skipped = skipped;
-        await journal({ event: 'ram_plan', stopCount: stoppable.length, skippedCount: skipped.length });
-        if (dryRun) {
-          summary.ram.plannedStops = stoppable.map(s => s.id);
-        } else {
-          for (const { id } of stoppable) {
-            let outcome;
-            try {
-              outcome = await execBb(['thread', 'stop', id]);
-            } catch (error) {
-              outcome = { code: -1, stderr: error.message };
-            }
-            // Ненулевой код возврата stop — не засчитанный стоп: ошибка, тик продолжается.
-            if (outcome.code !== 0) {
-              const reason = String(outcome.stderr ?? '').slice(-200) || `exit code ${outcome.code}`;
-              await journal({ event: 'ram_stop_error', threadId: id, code: outcome.code, error: reason });
-              summary.ram.errors++;
-              errors.push(`stop ${id}: ${reason}`);
-              continue;
-            }
-            await journal({ event: 'ram_stop', threadId: id, code: outcome.code });
-            summary.ram.stopped++;
-          }
-        }
+    // 2. Тир 1 — только если где-то ниже 8 GiB. На пустом месте — ни одного
+    //    действия и ни одного вызова LLM.
+    const needsTier1 = measured.some(m => m.level === 'tier1' || m.level === 'alarm');
+    if (needsTier1) {
+      await journal({ event: 'tier1_start' });
+      const tier1 = {
+        triggeredBy: measured.filter(m => m.level !== 'ok').map(m => m.mount),
+        docker: [],
+        tmp: null,
+        caches: [],
+      };
+      // Docker prune — эффект: в dry-run только план, реальный вызов без dry-run.
+      if (dryRun || !dockerEnabled) {
+        tier1.docker = dockerEnabled ? DOCKER_ACTIONS.map(action => ({ ...action, dryRun: true })) : ['disabled'];
+      } else if (typeof execDocker === 'function') {
+        tier1.docker = await dockerPrune({ execDocker, journal, dryRun });
       } else {
-        summary.ram.skipped.push({ reason: 'no_bb_executor' });
+        tier1.docker = ['no_executor'];
+      }
+      tier1.tmp = await pruneExpiredTmp({ tmpRoot, cutoffMs: now - tmpDays * DAY_MS, journal, dryRun, fsImpl });
+      for (const cache of cacheRoots) {
+        tier1.caches.push(await pruneCacheRoot({ root: cache.path, cutoffMs: now - cacheDays * DAY_MS, journal, dryRun, fsImpl }));
+      }
+      await journal({
+        event: 'tier1_done',
+        tmp: tier1.tmp,
+        caches: tier1.caches.map(({ root, ...counts }) => ({ root, ...counts })),
+        docker: tier1.docker,
+      });
+      summary.tier1 = tier1;
+
+      // 3. Повторное измерение. Тревога — < 2 GiB после Тира 1, ровно одна
+      //    эскалация за тик по худшему монту.
+      let worst = null;
+      for (const { mount } of measured) {
+        try {
+          const bytes = await statfsImpl(mount);
+          const level = evaluateDisk(bytes);
+          summary.postTier1.push({ mount, availableGiB: availableGiB(bytes), level });
+          await journal({ event: 'measurement_post', mount, availableGiB: availableGiB(bytes), level });
+          if (level === 'alarm' && (!worst || bytes < worst.bytes)) worst = { mount, bytes };
+        } catch (error) {
+          errors.push(`remeasure ${mount}: ${error.message}`);
+          await journal({ event: 'measurement_error', mount, phase: 'post_tier1', error: error.message });
+        }
+      }
+      if (worst) {
+        summary.alarm = await raiseAlarm({ mount: worst.mount, availableBytes: worst.bytes, journalPath, escalate, journal, dryRun });
       }
     }
-  } catch (error) {
-    summary.ram.errors++;
-    errors.push(`ram: ${error.message}`);
-    await journal({ event: 'ram_error', error: error.message });
-  }
 
-  await journal({ event: 'tick_end', errors: errors.length, alarm: summary.alarm, stopped: summary.ram.stopped });
-  if (!dryRun) await journal.close();
-  return summary;
+    // 4. RAM: < 1.5 GiB → стоп idle-тредов BB. Список тредов — read-only
+    //    измерение даже в dry-run; сам stop — эффект и в dry-run не выполняется.
+    try {
+      const ramBytes = await memInfoImpl();
+      summary.ram.availableGiB = availableGiB(ramBytes);
+      await journal({ event: 'ram_measurement', availableGiB: availableGiB(ramBytes) });
+      if (evaluateRam(ramBytes)) {
+        summary.ram.low = true;
+        await journal({ event: 'ram_low', thresholdGiB: RAM_MIN_GIB });
+        if (typeof execBb === 'function') {
+          const listed = await execBb(['thread', 'list', '--json']);
+          // runCommand не бросает исключений: ненулевой код — честная ошибка, а не пустой список.
+          if (listed.code !== 0) {
+            throw new Error(`bb thread list: ${String(listed.stderr ?? '').slice(-200) || `exit code ${listed.code}`}`);
+          }
+          const threads = parseBbThreadList(listed.stdout);
+          const { stoppable, skipped } = selectIdleThreads(threads, { pinnedThreads, selfThreadId });
+          summary.ram.skipped = skipped;
+          await journal({ event: 'ram_plan', stopCount: stoppable.length, skippedCount: skipped.length });
+          if (dryRun) {
+            summary.ram.plannedStops = stoppable.map(s => s.id);
+          } else {
+            for (const { id } of stoppable) {
+              let outcome;
+              try {
+                outcome = await execBb(['thread', 'stop', id]);
+              } catch (error) {
+                outcome = { code: -1, stderr: error.message };
+              }
+              // Ненулевой код возврата stop — не засчитанный стоп: ошибка, тик продолжается.
+              if (outcome.code !== 0) {
+                const reason = String(outcome.stderr ?? '').slice(-200) || `exit code ${outcome.code}`;
+                await journal({ event: 'ram_stop_error', threadId: id, code: outcome.code, error: reason });
+                summary.ram.errors++;
+                errors.push(`stop ${id}: ${reason}`);
+                continue;
+              }
+              await journal({ event: 'ram_stop', threadId: id, code: outcome.code });
+              summary.ram.stopped++;
+            }
+          }
+        } else {
+          summary.ram.skipped.push({ reason: 'no_bb_executor' });
+        }
+      }
+    } catch (error) {
+      summary.ram.errors++;
+      errors.push(`ram: ${error.message}`);
+      await journal({ event: 'ram_error', error: error.message });
+    }
+
+    await journal({ event: 'tick_end', errors: errors.length, alarm: summary.alarm, stopped: summary.ram.stopped });
+    return summary;
+  } finally {
+    if (!dryRun) await journal.close();
+  }
 }
 
 // --- CLI --------------------------------------------------------------------
@@ -589,12 +613,13 @@ export const escalateViaCommand = (executable, timeoutMs = 120_000) => async pay
   let stderr = '';
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', chunk => { if (stderr.length < 4096) stderr += chunk; });
+  child.stdin.on('error', () => {});
   const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
   try {
     child.stdin.end(JSON.stringify(payload, null, 2));
     const [code, signal] = await Promise.race([
       once(child, 'close'),
-      once(child, 'error').then(error => { throw error; }),
+      once(child, 'error').then(([error]) => { throw error; }),
     ]);
     return { code, detail: [signal ? `signal ${signal}` : '', stderr.slice(-400)].filter(Boolean).join('; ') };
   } finally {

@@ -16,6 +16,22 @@ const defaultExecGit = async (args, cwd) =>
   (await execFileAsync('git', args, { cwd, timeout: 20_000 })).stdout;
 
 const BB_THREAD_BRANCH = /^bb\/thr_[a-z0-9]+/;
+const HC_WORKER_BRANCH = /^(?:feat\/)?df-[^/]+/;
+const SUBPROC_WORKER_BRANCH = /^subproc-[^/]+/;
+
+const portablePathKind = path => {
+  const base = posix.basename(String(path ?? ''));
+  if (/^df-[^/]+/.test(base)) return 'hc';
+  if (/^subproc-[^/]+/.test(base)) return 'subproc';
+  return null;
+};
+
+export function classifyWorkerSession({ branch, path } = {}) {
+  if (BB_THREAD_BRANCH.test(branch ?? '') || /thr_/.test(path ?? '')) return 'bb';
+  if (HC_WORKER_BRANCH.test(branch ?? '') || portablePathKind(path) === 'hc') return 'hc';
+  if (SUBPROC_WORKER_BRANCH.test(branch ?? '') || portablePathKind(path) === 'subproc') return 'subproc';
+  return null;
+}
 
 // git worktree list --porcelain → [{ path, head, branch, detached }]
 export function parseWorktreeList(text) {
@@ -77,20 +93,26 @@ export async function inspectWorktreesAndBranches({
 
   const dirtyWorktrees = [];
   const bbThreadWorktrees = [];
+  const workerWorktrees = [];
   for (const wt of worktrees) {
     const statusText = await execGit(['status', '--porcelain'], wt.path)
       .catch(() => null);
     // Worktree недоступен/удалён из-под git — считаем грязным (fail-closed).
     const dirtyFiles = statusText === null ? ['<status_unavailable>']
       : parsePorcelainStatus(statusText);
-    const isBbThread = BB_THREAD_BRANCH.test(wt.branch ?? '') || /thr_/.test(wt.path);
+    const workerKind = classifyWorkerSession(wt);
+    const isBbThread = workerKind === 'bb';
     if (isBbThread) {
       bbThreadWorktrees.push({ path: wt.path, branch: wt.branch,
         dirty: dirtyFiles.length > 0, dirtyCount: dirtyFiles.length });
     }
+    if (workerKind) {
+      workerWorktrees.push({ path: wt.path, branch: wt.branch, workerKind,
+        dirty: dirtyFiles.length > 0, dirtyCount: dirtyFiles.length });
+    }
     if (dirtyFiles.length) {
       dirtyWorktrees.push({ path: wt.path, branch: wt.branch, head: wt.head,
-        dirty: true, dirtyFiles, dirtyCount: dirtyFiles.length, isBbThread });
+        dirty: true, dirtyFiles, dirtyCount: dirtyFiles.length, isBbThread, workerKind });
     }
   }
 
@@ -110,10 +132,11 @@ export async function inspectWorktreesAndBranches({
     const intersects = diffText === null || touchPaths.length === 0 ||
       files.some(f => touches(f, touchPaths));
     if (intersects) {
+      const workerKind = classifyWorkerSession({ branch });
       unmergedBranches.push({ branch,
         files: touchPaths.length && diffText !== null
           ? files.filter(f => touches(f, touchPaths)) : files,
-        fileCount: files.length, isBbThread: BB_THREAD_BRANCH.test(branch) });
+        fileCount: files.length, isBbThread: workerKind === 'bb', workerKind });
     }
   }
 
@@ -122,10 +145,11 @@ export async function inspectWorktreesAndBranches({
     `${unmergedBranches.length} unmerged branch(es)`,
     `${dirtyWorktrees.length} dirty worktree(s)`,
     `${bbThreadWorktrees.length} bb/thr_* worktree(s)`,
+    `${workerWorktrees.length} worker worktree(s)`,
     touchPaths.length ? `touchPaths: ${touchPaths.join(', ')}` : 'touchPaths: <all>',
   ].join('; ');
   return { ok: !driftDetected, driftDetected, baseRef, unmergedBranches,
-    dirtyWorktrees, bbThreadWorktrees, summary };
+    dirtyWorktrees, bbThreadWorktrees, workerWorktrees, summary };
 }
 
 // Fail-closed: drift && !allowDrift → Error('branch_drift_detected')
