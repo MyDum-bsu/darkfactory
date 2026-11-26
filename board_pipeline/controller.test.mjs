@@ -471,6 +471,59 @@ test('a triad violation rejects the route before any claim or spawn', async t =>
   assert.equal(x.effects.spawn, 0);
 });
 
+test('pre-claim triad validation uses configured baseWorker over selectWorker fallback', async t => {
+  const x = await lab(t);
+  const configured = { provider: 'acp-devin', model: 'swe-2-1-max' };
+  x.cfg.route.critic = { provider: 'acp-devin', model: 'swe-2-medium' };
+  x.cfg.workerSelector = workerSelector({
+    baseWorker: configured,
+    selectWorker: () => [{ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' }],
+  });
+  assert.equal((await x.tick()).reason, 'route_triad_violation:review_same_family');
+  assert.equal((await x.inspect()).state, 'ready');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('pre-claim triad validation accepts an independent configured baseWorker', async t => {
+  const x = await lab(t);
+  const configured = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+  const critic = { provider: 'acp-devin', model: 'swe-2-medium' };
+  x.cfg.route.critic = critic;
+  x.cfg.workerSelector = workerSelector({
+    critic,
+    baseWorker: configured,
+    selectWorker: () => [ws.PRIMARY_WORKER],
+    pinTriad: async () => ({ plan: [configured], critic, arbiter: ws.DEFAULT_ARBITER }),
+  });
+  x.cfg.bb.probeAvailability = async () => ({ status: 'available', activeBackgroundAgentCount: 0 });
+  x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
+  x.cfg.bb.spawn = async envelope => {
+    x.effects.spawn++;
+    assert.deepEqual(envelope.executor, configured);
+    return { threadId: 'thr_configured' };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.deepEqual(record.executor, configured);
+  assert.equal(x.effects.spawn, 1);
+});
+
+test('pre-claim triad validation keeps the selectWorker fallback when baseWorker is undefined', async t => {
+  const x = await lab(t);
+  let selected = 0;
+  x.cfg.route.critic = { provider: 'acp-devin', model: 'swe-2-medium' };
+  x.cfg.workerSelector = workerSelector({
+    selectWorker: () => {
+      selected++;
+      return [ws.PRIMARY_WORKER];
+    },
+  });
+  assert.equal((await x.tick()).reason, 'route_triad_violation:review_same_family');
+  assert.equal(selected, 1);
+  assert.equal((await x.inspect()).state, 'ready');
+  assert.equal(x.effects.spawn, 0);
+});
+
 // Пункт 4: нарушение триады первичным отклоняет маршрут до claim; нарушение
 // резервом — пропуск резерва, маршрут продолжается со следующим кандидатом.
 test('a fallback violating the triad is skipped, the route continues', async t => {

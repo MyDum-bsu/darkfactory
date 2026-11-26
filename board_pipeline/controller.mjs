@@ -291,7 +291,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         return visible();
       }
       try {
-        const [primary] = workerSelector.selectWorker({ route });
+        const primary = workerSelector.baseWorker ?? workerSelector.selectWorker({ route })[0];
         workerSelector.assertTriadIndependent({ executor: primary, critic: selCritic, arbiter: selArbiter });
       } catch (e) {
         await save({ binding, phase: 'hold',

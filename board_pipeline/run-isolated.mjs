@@ -74,6 +74,17 @@ export const isApprovedWorker = bb =>
     /^opencode-go\//i.test(bb.model) &&
     workerSelector.workerFamily(bb) === 'deepseek');
 
+export function baseWorkerFromPolicy(policy) {
+  const bb = policy?.bb;
+  if (typeof bb?.provider === 'string' && bb.provider.trim() !== '' &&
+      typeof bb?.model === 'string' && bb.model.trim() !== '') {
+    return { provider: bb.provider, model: bb.model,
+      ...(typeof bb.reasoningLevel === 'string' && bb.reasoningLevel !== ''
+        ? { reasoningLevel: bb.reasoningLevel } : {}) };
+  }
+  return workerSelector.PRIMARY_WORKER;
+}
+
 async function readOperatorInputs(paths) {
   const inputs = new Map(await Promise.all(paths.map(async path => [path, await readFile(path)])));
   const digest = createHash('sha256').update(JSON.stringify(paths.map(path =>
@@ -1299,16 +1310,19 @@ async function execute() {
   const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
     release: releasePort, recheckRejectedHandoff: recheck, eventBus,
     workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter,
+      baseWorker: baseWorkerFromPolicy(p),
       ...(ab ? { selectWorker: () => [{ provider: p.bb.provider, model: p.bb.model }] } : {}), arbitrate,
       // VS-4.2 (#1263): триада резолвится один раз — при запуске попытки —
       // контроллером через pinTriad и закрепляется в записи (spawn, L2,
       // арбитраж, seal идут на одной тройке; скоркард не перечитывается на
       // каждом тике). Любая деградация — проверенный откат resolveTriad.
-      pinTriad: async () => {
+      pinTriad: async ({ attempt } = {}) => {
         const routed = workerSelector.resolveTriad({
+          ...(attempt?.labels?.size !== undefined ? { size: attempt.labels.size } : {}),
+          ...(attempt?.labels?.domain !== undefined ? { domain: attempt.labels.domain } : {}),
           policy: p,
           scorecard: await currentScorecard(),
-          base: { worker: ab ? { provider: p.bb.provider, model: p.bb.model } : workerSelector.PRIMARY_WORKER,
+          base: { worker: baseWorkerFromPolicy(p),
             critic: reviewSetup.critic, arbiter: reviewSetup.arbiter },
           log: note => console.log(JSON.stringify(note)),
         });

@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { allowedPathsFromAttempt, allowedPathsFromLabels, buildWorkerTransport, isApprovedWorker,
-  planAdaptiveChecks, queueModeSpecInputs, resolveWorkerRuntimeKind, scopeFenceReworkResult } from './run-isolated.mjs';
+import { allowedPathsFromAttempt, allowedPathsFromLabels, baseWorkerFromPolicy, buildWorkerTransport,
+  isApprovedWorker, planAdaptiveChecks, queueModeSpecInputs, resolveWorkerRuntimeKind,
+  scopeFenceReworkResult } from './run-isolated.mjs';
 import { deterministicRuntimeId } from './worker-runtime.mjs';
+import { DEFAULT_ARBITER, DEFAULT_CRITIC, PRIMARY_WORKER, resolveTriad } from './worker-selector.mjs';
 import { workerIntakePrompt } from './intake-prompt.mjs';
 
 test('isApprovedWorker accepts SWE-2.1 implementation workers and legacy SWE-2 High', () => {
@@ -423,5 +426,73 @@ test('portable worker transport prefers herdrSpaceId over repoId and falls back 
     assert.deepEqual(await transport.spawn(attempt),
       { threadId: deterministicRuntimeId('hc', '4525', 'attempt-space') });
     assert.equal(spawnInput.spaceLabel, expected);
+  }
+});
+
+test('baseWorkerFromPolicy honors an operator-configured Devin worker and reasoningLevel', () => {
+  const policy = { bb: { provider: 'acp-devin', model: 'swe-2-1-max', reasoningLevel: 'high' } };
+  assert.deepEqual(baseWorkerFromPolicy(policy),
+    { provider: 'acp-devin', model: 'swe-2-1-max', reasoningLevel: 'high' });
+});
+
+test('baseWorkerFromPolicy honors an operator-configured pi opencode-go worker', () => {
+  const policy = { bb: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } };
+  assert.deepEqual(baseWorkerFromPolicy(policy),
+    { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' });
+});
+
+test('baseWorkerFromPolicy falls back to PRIMARY_WORKER for missing, incomplete or blank policy.bb', () => {
+  for (const policy of [
+    undefined,
+    null,
+    {},
+    { bb: undefined },
+    { bb: null },
+    { bb: {} },
+    { bb: { provider: 'acp-devin' } },
+    { bb: { model: 'swe-2-1-max' } },
+    { bb: { provider: '   ', model: 'swe-2-1-max' } },
+    { bb: { provider: 'acp-devin', model: '' } },
+    { bb: { provider: 7, model: 'swe-2-1-max' } },
+    { bb: { provider: 'acp-devin', model: null } },
+  ]) {
+    assert.equal(baseWorkerFromPolicy(policy), PRIMARY_WORKER);
+  }
+});
+
+test('baseWorkerFromPolicy omits empty reasoningLevel but preserves a non-empty value unchanged', () => {
+  assert.deepEqual(baseWorkerFromPolicy({ bb: {
+    provider: 'acp-devin', model: 'swe-2-1-max', reasoningLevel: '' } }),
+    { provider: 'acp-devin', model: 'swe-2-1-max' });
+  assert.deepEqual(baseWorkerFromPolicy({ bb: {
+    provider: 'acp-devin', model: 'swe-2-1-max', reasoningLevel: 'xhigh' } }),
+    { provider: 'acp-devin', model: 'swe-2-1-max', reasoningLevel: 'xhigh' });
+});
+
+test('resolveTriad uses baseWorkerFromPolicy as the first worker plan entry', () => {
+  for (const bb of [
+    { provider: 'acp-devin', model: 'swe-2-1-max' },
+    { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
+  ]) {
+    const policy = { bb };
+    const baseWorker = baseWorkerFromPolicy(policy);
+    const routed = resolveTriad({ policy,
+      base: { worker: baseWorker, critic: DEFAULT_CRITIC, arbiter: DEFAULT_ARBITER } });
+    assert.equal(routed.outcome, 'shadow');
+    assert.deepEqual(routed.plan[0], baseWorker);
+    assert.deepEqual(routed.selected.worker, baseWorker);
+  }
+});
+
+test('package.json test script executes all five formerly orphaned V2 suites', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  for (const file of [
+    'board_pipeline/ab-pilot.test.mjs',
+    'board_pipeline/adaptive-gates.test.mjs',
+    'board_pipeline/model-prompt-profiles.test.mjs',
+    'board_pipeline/scope-fence.test.mjs',
+    'board_pipeline/worker-runtime.test.mjs',
+  ]) {
+    assert.ok(pkg.scripts.test.split(' ').includes(file), `${file} missing from npm test`);
   }
 });
