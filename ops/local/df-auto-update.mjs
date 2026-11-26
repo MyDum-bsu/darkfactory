@@ -83,12 +83,20 @@ async function mustRun(ctx, command, args, options) {
   return result;
 }
 
-// Strict semver x.y.z with optional prerelease/build: the suffix is not
-// silently stripped, because a prerelease changes precedence (1.2.3-beta
-// is lower than the 1.2.3 release) while build metadata does not. An
-// invalid string is not a version: compareVersions answers false (no
-// update — the conservative direction without mutations).
-const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+// Strict SemVer 2.0.0 x.y.z with optional prerelease/build: the suffix is
+// not silently stripped, because a prerelease changes precedence
+// (1.2.3-beta is lower than the 1.2.3 release) while build metadata does
+// not. Numeric identifiers with leading zeros ('01') are rejected exactly
+// as the spec demands — accepting them would make distinct strings
+// numerically equal and break the comparator's total order. An invalid
+// string is not a version: compareVersions answers false (no update —
+// the conservative direction without mutations).
+const CORE_PART = '(0|[1-9]\\d*)';
+const PRERELEASE_PART = '(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)';
+const SEMVER = new RegExp(
+  `^${CORE_PART}\\.${CORE_PART}\\.${CORE_PART}` +
+  `(?:-(${PRERELEASE_PART}(?:\\.${PRERELEASE_PART})*))?` +
+  '(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$');
 const NUMERIC_IDENTIFIER = /^\d+$/;
 
 function parseSemver(value) {

@@ -276,6 +276,27 @@ test('compareVersions: empty, minimal and null/undefined input never updates', (
   }
 });
 
+test('compareVersions: leading zeros in numeric identifiers are invalid semver', () => {
+  // Strict SemVer 2.0.0 forbids leading zeros in numeric identifiers.
+  // Accepting '01' as equal to '1' would make distinct strings numerically
+  // equal and terminate the prerelease comparison before later fields,
+  // breaking the total order — such input is rejected instead (no update).
+  for (const bad of ['1.2.3-01.2', '1.2.3-01.1', '1.2.3-01', '01.2.3', '1.02.3', '1.2.03']) {
+    assert.equal(compareVersions(bad, '1.2.3-1.1'), false, JSON.stringify(bad));
+    assert.equal(compareVersions('1.2.3-1.1', bad), false, JSON.stringify(bad));
+    assert.equal(compareVersions(bad, bad), false, JSON.stringify(bad));
+  }
+  // Single zero is a valid numeric identifier; field count still decides.
+  assert.equal(compareVersions('1.2.3-0.1', '1.2.3-0'), true);
+  assert.equal(compareVersions('1.2.3-0', '1.2.3-0.1'), false);
+  // Alphanumeric identifiers may contain leading zeros; numeric ranks lower.
+  assert.equal(compareVersions('1.2.3-01a', '1.2.3-1'), true);
+  assert.equal(compareVersions('1.2.3-1', '1.2.3-01a'), false);
+  // Build metadata may contain leading zeros and never affects precedence.
+  assert.equal(compareVersions('1.2.3+001', '1.2.3'), false);
+  assert.equal(compareVersions('1.2.3', '1.2.3+001'), false);
+});
+
 test('installed prerelease npm package updates to the released version', async t => {
   const env = await fixture(t);
   await writeFile(join(env.home, '.npm-global/lib/node_modules/bb-app/package.json'),
