@@ -19,6 +19,7 @@ import { createControlRoomAggregator, createBoardObserver,
   createBranchDriftProvider, createModelsProvider, createTelemetryProvider,
   buildActiveTrees, buildFleetTelemetry, normalizeFleetHost, RING_LIMIT } from './aggregator.mjs';
 import { createFinopsProvider } from './finops.mjs';
+import vm from 'node:vm';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1535,4 +1536,157 @@ test('buildFleetTelemetry: cost and rework anomaly thresholds are strict', () =>
   });
   assert.equal(overThreshold.anomalies.find(a => a.kind === 'burn_rate_high').metric, 2.0001);
   assert.equal(overThreshold.anomalies.find(a => a.kind === 'high_rework_rate').metric, 0.6667);
+});
+
+// --- AUDIT-3c: df-herd --project, df-models hint, app.js render logic ---------
+
+test('df-herd --once --project фильтрует колонки Ops по проекту', async () => {
+  const server = createControlRoomAggregator({ port: 0,
+    boardTasksProvider: async () => [
+      { task_id: 'A1', state: 'claimed', title: 'alpha-run', labels: { project: 'alpha' } },
+      { task_id: 'A2', state: 'ready', title: 'alpha-queue', labels: { project: 'alpha' } },
+      { task_id: 'B1', state: 'claimed', title: 'beta-run', labels: { project: 'beta' } },
+      { task_id: 'B2', state: 'ready', title: 'beta-queue', labels: { project: 'beta' } }] });
+  await server.start();
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const filtered = await execFileAsync('node', [
+      join(MODULE_DIR, 'df-herd.mjs'), '--once', '--project', 'alpha',
+      '--url', base], { timeout: 15_000 });
+    assert.ok(filtered.stdout.includes('#A1'), 'alpha running card visible');
+    assert.ok(filtered.stdout.includes('#A2'), 'alpha queued card visible');
+    assert.equal(filtered.stdout.includes('#B1'), false, 'beta running card filtered out');
+    assert.equal(filtered.stdout.includes('#B2'), false, 'beta queued card filtered out');
+    const unfiltered = await execFileAsync('node', [
+      join(MODULE_DIR, 'df-herd.mjs'), '--once', '--url', base], { timeout: 15_000 });
+    for (const id of ['#A1', '#A2', '#B1', '#B2']) {
+      assert.ok(unfiltered.stdout.includes(id), `${id} visible without filter`);
+    }
+  } finally {
+    await server.stop();
+  }
+});
+
+test('df-herd: models tab печатает корректный синтаксис df-models set <id> <status>', async () => {
+  const server = createControlRoomAggregator({ port: 0,
+    modelsProvider: async () => ({ ok: true, mode: 'balanced', triad: {}, models: [] }) });
+  await server.start();
+  try {
+    const { stdout } = await execFileAsync('node', [
+      join(MODULE_DIR, 'df-herd.mjs'), '--once', '--tab', 'models',
+      '--url', `http://127.0.0.1:${server.port}`], { timeout: 15_000 });
+    assert.ok(stdout.includes('df-models set <id> <status>'), stdout.split('\n').slice(-3).join('\n'));
+    assert.equal(stdout.includes('df-models set <role> <model>'), false);
+  } finally {
+    await server.stop();
+  }
+});
+
+// Минимальный DOM-stub для детерминированной проверки render-логики app.js
+// в node: поведение append/classList/textContent повторяет браузерный DOM
+// (в частности, append возвращает undefined — chaining запрещён).
+function loadWebApp(source) {
+  const ids = new Map();
+  const makeElement = tag => {
+    const classes = new Set();
+    const node = {
+      tagName: tag, children: [], childNodes: [], textContent: '', className: '',
+      dataset: {}, style: {},
+      append(...kids) { for (const k of kids) { node.children.push(k); node.childNodes.push(k); } },
+      replaceChildren() { node.children = []; node.childNodes = []; },
+      addEventListener() {},
+      removeEventListener() {},
+      classList: {
+        add: (...cls) => cls.forEach(c => classes.add(c)),
+        remove: (...cls) => cls.forEach(c => classes.delete(c)),
+        toggle: (cls, force) => {
+          const on = force === undefined ? !classes.has(cls) : Boolean(force);
+          if (on) classes.add(cls); else classes.delete(cls);
+          return on;
+        },
+        contains: cls => classes.has(cls),
+      },
+    };
+    return node;
+  };
+  const sandbox = {
+    document: {
+      getElementById(id) {
+        if (!ids.has(id)) ids.set(id, makeElement('div'));
+        return ids.get(id);
+      },
+      createElement: tag => makeElement(tag),
+      querySelectorAll: () => [],
+      addEventListener() {},
+      body: makeElement('body'),
+    },
+    fetch: async () => { throw new Error('offline test harness'); },
+    EventSource: class { close() {} },
+    setInterval: () => 0,
+    setTimeout, clearTimeout, URL, console, encodeURIComponent,
+    navigator: {},
+  };
+  let hooks = null;
+  sandbox.__capture = value => { hooks = value; };
+  vm.createContext(sandbox);
+  vm.runInContext(`${source}\n;__capture({ renderProjects, renderStatus });`, sandbox);
+  return { hooks, ids };
+}
+
+function projectCounts(projNode) {
+  const out = {};
+  for (let i = 0; i < projNode.children.length; i++) {
+    const child = projNode.children[i];
+    if (child.className === 'role') {
+      out[child.textContent.trim()] = Number(projNode.children[i + 1]?.textContent);
+      i += 1;
+    }
+  }
+  return out;
+}
+
+test('app.js renderProjects: счётчики по phase+state — Worker/Stage/Lead/Arbiter точны', async () => {
+  const source = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
+  const { hooks, ids } = loadWebApp(source);
+  const snap = {
+    running: [
+      { task_id: 'W1', state: 'claimed', phase: 'working', labels: { project: 'alpha' } },
+      { task_id: 'C1', state: 'claimed', phase: 'checking', labels: { project: 'alpha' } },
+      { task_id: 'L1', state: 'claimed', phase: 'claiming', labels: { project: 'alpha' } },
+      { task_id: 'L2', state: 'claimed', phase: null, labels: { project: 'beta' } },
+      { task_id: 'W2', state: 'working', phase: null, labels: { project: 'beta' } },
+      { task_id: 'C2', state: 'checking', phase: null, labels: { project: 'beta' } }],
+    queued: [{ task_id: 'Q1', state: 'ready', labels: { project: 'beta' } }],
+    needsOwner: [{ task_id: 'B1', state: 'blocked', labels: { project: 'beta' } }],
+    recentlyCompleted: [],
+  };
+  hooks.renderProjects(snap);
+  const box = ids.get('projects');
+  const byName = new Map();
+  for (const projNode of box.children) {
+    const name = projNode.children[0].textContent;
+    byName.set(name, projectCounts(projNode));
+  }
+  assert.deepEqual(byName.get('alpha'), { Lead: 1, Worker: 1, 'Stage/Critic': 1, Arbiter: 0 });
+  assert.deepEqual(byName.get('beta'), { Lead: 1, Worker: 1, 'Stage/Critic': 1, Arbiter: 1 });
+  // Пустой snapshot — placeholder без проектов.
+  hooks.renderProjects({ running: [], queued: [], needsOwner: [], recentlyCompleted: [] });
+  assert.equal(box.children.length, 1);
+  assert.equal(box.children[0].className, 'empty');
+});
+
+test('app.js renderStatus: kill-switch читается из snap.killSwitch или snap.pilot.killSwitch', async () => {
+  const source = await readFile(join(MODULE_DIR, 'web', 'app.js'), 'utf8');
+  const { hooks, ids } = loadWebApp(source);
+  const base = { netHealth: {}, running: [] };
+  hooks.renderStatus({ ...base, pilot: { killSwitch: true } });
+  assert.equal(ids.get('chip-killswitch').textContent, 'KILL-SWITCH');
+  assert.equal(ids.get('chip-killswitch').classList.contains('bad'), true);
+  hooks.renderStatus({ ...base, killSwitch: true });
+  assert.equal(ids.get('chip-killswitch').textContent, 'KILL-SWITCH');
+  hooks.renderStatus({ ...base });
+  assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: off');
+  assert.equal(ids.get('chip-killswitch').classList.contains('bad'), false);
+  hooks.renderStatus({ ...base, pilot: {} });
+  assert.equal(ids.get('chip-killswitch').textContent, 'kill-switch: off');
 });

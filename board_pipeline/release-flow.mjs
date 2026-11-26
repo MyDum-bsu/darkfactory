@@ -11,8 +11,6 @@ export async function advanceRelease({ record, save, visible, board, release, ga
   const { releasePlan: plan, question, ownerAnswer: answer, taskId, epoch, attemptId } = record;
   const resumed = { task_id: taskId, epoch, attempt_id: attemptId };
   const blockReason = `Release smoke failed; restored and checked ${plan?.previous?.sha}.`;
-  const promoted = { sha: plan?.sha, digest: plan?.digest, operation: plan && promotingOperation(plan) };
-  const restored = { ...plan?.previous, operation: plan && rollbackOperation(plan) };
   const matches = (live, expected) => sameVersion(live, expected) && live.operation === expected.operation;
   const approvalAt = now => issueApproval({ plan, question, answer, resumed, gate, now });
 
@@ -21,8 +19,16 @@ export async function advanceRelease({ record, save, visible, board, release, ga
     return visible();
   }
 
+  // Дайджест операций над повреждённым releasePlan (SubjectDenied из
+  // canonicalJson, нестроковые поля) обязан попадать в тот же catch, что и
+  // валидация печати: иначе malformed-план уходит uncaught-отказом мимо
+  // hold/uncertain-перехода. Присвоение гарантировано: catch завершается return.
+  let promoted;
+  let restored;
   let approval;
   try {
+    promoted = { sha: plan?.sha, digest: plan?.digest, operation: plan && promotingOperation(plan) };
+    restored = { ...plan?.previous, operation: plan && rollbackOperation(plan) };
     const seal = record.releaseVerification;
     if (!plan || seal?.settle !== 'deferred' || seal.task_id !== plan.task_id || seal.epoch !== plan.approval_epoch ||
         seal.attempt_id !== plan.approval_attempt_id || seal.evidence?.sha !== plan.sha ||

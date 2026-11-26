@@ -58,6 +58,40 @@ test('реестр: дефолт node, python-node для optimization/autoresea
   assert.equal(resolveL1Profile({ l1Profile: 'python-node' }).id, 'python-node');
 });
 
+test('реестр: дефолты активных репозиториев флота и прототипная безопасность', () => {
+  // Каждый активный репозиторий флота закреплён в реестре дефолтов.
+  assert.equal(REPO_DEFAULT_L1_PROFILES['music-restoration'], 'python-node');
+  assert.equal(REPO_DEFAULT_L1_PROFILES['moml-course'], 'python-node');
+  assert.equal(REPO_DEFAULT_L1_PROFILES.darkfactory, 'node');
+  assert.equal(REPO_DEFAULT_L1_PROFILES['bsu-cabinet-skill'], 'node');
+  assert.equal(defaultL1ProfileForRepo('music-restoration'), 'python-node');
+  assert.equal(defaultL1ProfileForRepo('moml-course'), 'python-node');
+  assert.equal(defaultL1ProfileForRepo('darkfactory'), 'node');
+  assert.equal(defaultL1ProfileForRepo('bsu-cabinet-skill'), 'node');
+  assert.equal(resolveL1Profile({ repoId: 'music-restoration' }).id, 'python-node');
+  assert.equal(resolveL1Profile({ repoId: 'moml-course' }).id, 'python-node');
+  assert.equal(resolveL1Profile({ repoId: 'darkfactory' }).id, 'node');
+  assert.equal(resolveL1Profile({ repoId: 'bsu-cabinet-skill' }).id, 'node');
+  assert.equal(effectiveL1ProfileId({ repoId: 'music-restoration' }), 'python-node');
+  assert.equal(effectiveL1ProfileId({ repoId: 'darkfactory' }), 'node');
+  // Каждое закреплённое значение — валидное имя профиля реестра.
+  for (const [repoId, profile] of Object.entries(REPO_DEFAULT_L1_PROFILES)) {
+    assert.equal(isValidL1Profile(profile), true, `${repoId}:${profile}`);
+  }
+  // Реестр дефолтов заморожен и нечитаем через прототип: ключи с дефисом
+  // и ключи Object.prototype не дают ни записей, ни унаследованных значений.
+  assert.ok(Object.isFrozen(REPO_DEFAULT_L1_PROFILES));
+  for (const protoKey of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+    assert.equal(Object.hasOwn(REPO_DEFAULT_L1_PROFILES, protoKey), false, protoKey);
+    assert.equal(defaultL1ProfileForRepo(protoKey), 'node', protoKey);
+  }
+  // Точное совпадение ключа: вариации регистра/префикса — незарегистрированные
+  // репозитории с дефолтом node.
+  for (const miss of ['Music-Restoration', 'music', 'darkfactory2', 'moml', ' bsu-cabinet-skill']) {
+    assert.equal(defaultL1ProfileForRepo(miss), 'node', miss);
+  }
+});
+
 test('реестр: fail-closed на неизвестный, пустой, null и прототипный профиль', () => {
   for (const bad of ['bogus', '', null, 0, '__proto__', 'toString', 'constructor',
     'hasOwnProperty', {}, ['node'], 'NODE', 'python']) {

@@ -3,7 +3,8 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import { test } from 'node:test';
 import { answerBytes, createQuestion, signedAnswerVerifier } from './question-gate.mjs';
 import { createReleasePackage, issueApproval, releaseQuestionDetails, promoteKey } from './release-contract.mjs';
-import { localReleasePort } from './local-release.mjs';
+import { localReleasePort, promotingOperation } from './local-release.mjs';
+import { advanceRelease } from './release-flow.mjs';
 
 const now = 1000_000;
 const source = { task_id: '31', epoch: 4, attempt_id: 'attempt-old' };
@@ -56,5 +57,42 @@ test('release transport rejects production, Board and URL aliases before access 
   for (const url of ['https://example.invalid', 'http://localhost:44981', 'http://127.0.0.1:44100',
     'http://127.0.0.1:44981/unexpected', 'http://0.0.0.0:44981', 'http://127.0.0.1:70000']) {
     await assert.rejects(localReleasePort({ url }), { code: 'release_endpoint_invalid' });
+  }
+});
+// advanceRelease над повреждённым releasePlan: дайджест операций
+// (promotingOperation/rollbackOperation → canonicalJson) бросает SubjectDenied
+// синхронно, ещё до валидации печати. Бросок обязан попадать в catch
+// валидационного блока и завершаться stop(...) — 'hold' на release_ready,
+// 'uncertain' на любой другой фазе — а не уходить uncaught-отказом.
+test('advanceRelease: malformed releasePlan resolves via stop -> hold/uncertain without throwing', async () => {
+  const harness = phase => {
+    const saves = [];
+    const effectsForbidden = new Error('release/board/gate effects must not run on malformed plan');
+    return {
+      saves,
+      record: { releasePlan: { ...plan, corrupt: undefined }, question, ownerAnswer: signed(question),
+        taskId: source.task_id, epoch: resumed.epoch, attemptId: resumed.attempt_id, phase },
+      save: async update => { saves.push(update); },
+      visible: () => ({ kind: 'visible-snapshot' }),
+      board: { lookup: async () => { throw effectsForbidden; } },
+      release: { readBack: async () => { throw effectsForbidden; },
+        promote: async () => { throw effectsForbidden; },
+        rollback: async () => { throw effectsForbidden; },
+        verify: async () => { throw effectsForbidden; } },
+      gate: { now: () => { throw effectsForbidden; }, canResume: async () => { throw effectsForbidden; } },
+      leaseAlive: async () => { throw effectsForbidden; },
+    };
+  };
+  // undefined-значение ключа: canonicalJson отклоняет план как не-JSON
+  // deterministic-броском SubjectDenied ещё на promotingOperation(plan).
+  assert.throws(() => promotingOperation({ ...plan, corrupt: undefined }), /subject_not_json/);
+  for (const [phase, expected] of [['release_ready', 'hold'], ['release_promoting', 'uncertain']]) {
+    const run = harness(phase);
+    const result = await advanceRelease(run);
+    assert.deepEqual(result, { kind: 'visible-snapshot' });
+    // Ровно одно сохранение: переход в stop с reason не-ReleaseDenied ошибки.
+    assert.equal(run.saves.length, 1, JSON.stringify(run.saves));
+    assert.equal(run.saves[0].phase, expected);
+    assert.equal(run.saves[0].reason, 'release_approval_invalid');
   }
 });
