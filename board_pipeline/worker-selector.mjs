@@ -38,7 +38,7 @@ export const FALLBACK_ANTIGRAVITY_NEON = Object.freeze({
 export const DEFAULT_CRITIC = NEON_CRITIC;
 export const DEFAULT_ARBITER = SOL_ARBITER;
 
-const DETERMINISTIC_GATES = new Set(['l1', 'tamper', 'l3']);
+const DETERMINISTIC_GATES = new Set(['l1', 'tamper', 'l3', 'scope_fence']);
 const GATE_BY_REASON = new Map([
   ['local_checks_failed', 'l1'],
   ['tamper_gate_failed', 'tamper'],

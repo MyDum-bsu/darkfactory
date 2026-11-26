@@ -398,13 +398,31 @@ test('no_progress: повторный tree_sha', () => {
 });
 
 test('no_progress: два раза подряд красный детерминированный гейт с той же сигнатурой', () => {
-  for (const gate of ['l1', 'tamper', 'l3']) {
+  for (const gate of ['l1', 'tamper', 'l3', 'scope_fence']) {
     const history = [detRound(gate, 'same-sig'), detRound(gate, 'same-sig')];
     const p = evaluateReworkProgress({ roundsHistory: history });
     assert.equal(p.trigger, 'no_progress', gate);
     assert.equal(p.kind, 'repeated_deterministic_failure');
     assert.equal(p.deterministicGate, true);
   }
+});
+
+test('no_progress: scope_fence duplicate tree_sha stays deterministic and fails closed', () => {
+  const tree = 'a'.repeat(40);
+  const duplicate = evaluateReworkProgress({ roundsHistory: [
+    detRound('scope_fence', 'sig-a', { tree_sha: tree }),
+    detRound('scope_fence', 'sig-b', { tree_sha: tree }),
+  ] });
+  assert.equal(duplicate.trigger, 'no_progress');
+  assert.equal(duplicate.kind, 'duplicate_tree_sha');
+  assert.equal(duplicate.deterministicGate, true);
+  const repeated = evaluateReworkProgress({ roundsHistory: [
+    detRound('scope_fence', 'same-sig', { tree_sha: 'a'.repeat(40) }),
+    detRound('scope_fence', 'same-sig', { tree_sha: 'b'.repeat(40) }),
+  ] });
+  assert.equal(repeated.trigger, 'no_progress');
+  assert.equal(repeated.kind, 'repeated_deterministic_failure');
+  assert.equal(repeated.deterministicGate, true);
 });
 
 // Пункт 6: разные упавшие проверки L1 дают разные сигнатуры — починка сходится.
