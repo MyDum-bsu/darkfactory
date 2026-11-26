@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { execFile, spawn } from 'node:child_process';
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,12 +13,15 @@ import {
   compactProjectMemory,
   createProjectMemoryWriter,
   entryDigest,
+  extractPostReviewMemoryUpdates,
   memoryPolicyConfig,
   pinProjectMemory,
   PROJECT_MEMORY_DIR_ENV,
+  PROJECT_MEMORY_HMAC_KEY_ENV,
   PROJECT_MEMORY_SCHEMA,
   PROJECT_MEMORY_SECTIONS,
   removeProjectMemoryEntry,
+  resolveMemoryHmacKey,
   resolveMemoryStoreDir,
   resolveProjectMemory,
   REVIEW_RECEIPT_SCHEMA,
@@ -791,4 +794,192 @@ test('regression R8: post-review memory write failure never throws and never bre
     assert.equal(res2.recorded, false);
     assert.equal(res2.reason, 'post_review_memory_write_failed');
   } finally { await cleanup(); }
+});
+
+// AUDIT-3b: гарантированно мёртвый pid — завершившийся дочерний процесс.
+async function spawnDeadPid() {
+  return new Promise(resolve => {
+    const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    child.on('exit', () => resolve(child.pid));
+    child.on('error', () => resolve(2 ** 22 + 12345));
+  });
+}
+
+test('stale lock recovery: dead-pid lock is reclaimed and the write succeeds', async () => {
+  const { storeDir, writer, mintReceipt, cleanup } = await sandbox();
+  try {
+    const deadPid = await spawnDeadPid();
+    const lockPath = join(storeDir, 'proj_stale.memory.json.lock');
+    await writeFile(lockPath, JSON.stringify({ pid: deadPid, createdAt: new Date().toISOString() }));
+    const res = await writer.recordUpdate({
+      projectId: 'proj_stale',
+      receiptPath: await mintReceipt(),
+      updates: [{ id: 'sl-1', section: 'invariants', text: 'Write after dead-pid lock recovery' }],
+    });
+    assert.equal(res.total, 1);
+    // Лок снят владельцем после записи — файла не осталось.
+    await assert.rejects(() => readFile(lockPath), /ENOENT/);
+  } finally { await cleanup(); }
+});
+
+test('stale lock recovery: expired lock of a live pid is reclaimed after staleLockMs', async () => {
+  const { storeDir, writer, mintReceipt, cleanup } = await sandbox();
+  try {
+    const lockPath = join(storeDir, 'proj_expired.memory.json.lock');
+    // pid жив (наш собственный процесс), но лок старше staleLockMs — снимается.
+    await writeFile(lockPath, JSON.stringify({
+      pid: process.pid,
+      createdAt: new Date(Date.now() - 120_000).toISOString(),
+    }));
+    const res = await writer.recordUpdate({
+      projectId: 'proj_expired',
+      receiptPath: await mintReceipt(),
+      updates: [{ id: 'sl-2', section: 'pitfalls', text: 'Write after expired lock recovery' }],
+    });
+    assert.equal(res.total, 1);
+    await assert.rejects(() => readFile(lockPath), /ENOENT/);
+  } finally { await cleanup(); }
+});
+
+test('live lock contention is preserved: fresh lock of a live pid still blocks writes', async () => {
+  const { storeDir, writer, mintReceipt, cleanup } = await sandbox();
+  try {
+    const lockPath = join(storeDir, 'proj_live.memory.json.lock');
+    await writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+    const receiptPath = await mintReceipt();
+    await assert.rejects(
+      () => writer.recordUpdate({
+        projectId: 'proj_live',
+        receiptPath,
+        updates: [{ section: 'invariants', text: 'must never land' }],
+      }),
+      /project_memory_locked/,
+    );
+    // Живой лок не тронут восстановлением — убираем вручную.
+    const meta = JSON.parse(await readFile(lockPath, 'utf8'));
+    assert.equal(meta.pid, process.pid);
+    await rm(lockPath, { force: true });
+  } finally { await cleanup(); }
+});
+
+test('resolveMemoryHmacKey: explicit key, env fallback, and strict private key file', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'memory-key-'));
+  try {
+    // Явный ключ приоритетнее env и keyFile.
+    assert.equal(await resolveMemoryHmacKey({ hmacKey: TEST_HMAC_KEY, env: {} }), TEST_HMAC_KEY);
+    assert.equal(
+      await resolveMemoryHmacKey({ hmacKey: TEST_HMAC_KEY, env: { [PROJECT_MEMORY_HMAC_KEY_ENV]: 'env-key-0123456789abcdef' } }),
+      TEST_HMAC_KEY,
+    );
+    // Fallback на env.
+    assert.equal(
+      await resolveMemoryHmacKey({ env: { [PROJECT_MEMORY_HMAC_KEY_ENV]: 'env-key-0123456789abcdef' } }),
+      'env-key-0123456789abcdef',
+    );
+    // Слишком короткие ключи отклоняются в любом канале.
+    await assert.rejects(() => resolveMemoryHmacKey({ hmacKey: 'short', env: {} }),
+      /project_memory_untrusted_write/);
+    await assert.rejects(() => resolveMemoryHmacKey({ env: { [PROJECT_MEMORY_HMAC_KEY_ENV]: 'short' } }),
+      /project_memory_untrusted_write/);
+    // Без единого источника — fail-closed.
+    await assert.rejects(() => resolveMemoryHmacKey({ env: {} }), /project_memory_untrusted_write/);
+
+    // Key-файл создаётся с режимом 0600 и стабильным ключом при перечитывании.
+    const keyFile = join(dir, 'memory-hmac.key');
+    const k1 = await resolveMemoryHmacKey({ env: {}, keyFile });
+    assert.match(k1, /^[a-f0-9]{64}$/);
+    const st = await stat(keyFile);
+    assert.equal(st.mode & 0o777, 0o600);
+    assert.equal(await resolveMemoryHmacKey({ env: {}, keyFile }), k1);
+
+    // Symlink на key-файл — отказ, даже если цель валидна.
+    const link = join(dir, 'linked.key');
+    await symlink(keyFile, link);
+    await assert.rejects(() => resolveMemoryHmacKey({ env: {}, keyFile: link }),
+      /project_memory_keyfile_symlink/);
+
+    // Group/world-readable key-файл — отказ.
+    const insecure = join(dir, 'insecure.key');
+    await writeFile(insecure, 'insecure-key-0123456789abcdef\n', { mode: 0o644 });
+    await assert.rejects(() => resolveMemoryHmacKey({ env: {}, keyFile: insecure }),
+      /project_memory_keyfile_mode_insecure/);
+
+    // Существующий валидный файл 0600 читается с trim.
+    const strict = join(dir, 'strict.key');
+    await writeFile(strict, 'strict-key-0123456789abcdef\n', { mode: 0o600 });
+    assert.equal(await resolveMemoryHmacKey({ env: {}, keyFile: strict }), 'strict-key-0123456789abcdef');
+
+    // Относительный путь key-файла — отказ.
+    await assert.rejects(() => resolveMemoryHmacKey({ env: {}, keyFile: 'relative.key' }),
+      /project_memory_keyfile_path_invalid/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('extractPostReviewMemoryUpdates: concrete invariants from checked_invariants and pitfalls from blocking findings', () => {
+  const updates = extractPostReviewMemoryUpdates({
+    reviewReceipt: {
+      verdict: 'REVIEW_OK',
+      summary: 'Ephemeral critic summary that must not win over checked_invariants',
+      checked_invariants: [
+        'Board is the single source of truth for the queue',
+        'Operator store stays outside the worker worktree',
+      ],
+    },
+    roundsHistory: [
+      { gate: 'l2', findings: [
+        { file: 'src/a.mjs', expected: 'atomic write via tmp+rename', actual: 'partial write', severity: 'P1' },
+        { file: 'src/b.mjs', expected: 'no host paths', actual: 'leaked host path' },
+        { file: 'src/c.mjs', expected: 'nit-level style', actual: 'minor style', severity: 'nit' },
+        { file: 'src/d.mjs', expected: 'p2 polish', actual: 'p2 issue', severity: 'P2' },
+      ] },
+    ],
+    verifiedSha: SHA_A,
+    attempt: { task_id: '1265', attempt_id: 'att-x', epoch: 1 },
+  });
+  const invariants = updates.filter(u => u.section === 'invariants');
+  assert.deepEqual(invariants.map(u => u.text), [
+    'Board is the single source of truth for the queue',
+    'Operator store stays outside the worker worktree',
+  ]);
+  const pitfalls = updates.filter(u => u.section === 'pitfalls');
+  // P1 и неразмеченная находки — блокирующие pitfalls; nit/P2 отфильтрованы.
+  assert.equal(pitfalls.length, 2);
+  assert.match(pitfalls[0].text, /src\/a\.mjs/);
+  assert.match(pitfalls[0].text, /atomic write via tmp\+rename/);
+  assert.match(pitfalls[0].text, /partial write/);
+  assert.match(pitfalls[1].text, /src\/b\.mjs/);
+  assert.ok(!pitfalls.some(p => /src\/c\.mjs/.test(p.text) || /src\/d\.mjs/.test(p.text)));
+
+  // Обратная совместимость: без checked_invariants summary остаётся fallback в invariants.
+  const legacy = extractPostReviewMemoryUpdates({
+    reviewReceipt: { verdict: 'REVIEW_OK', summary: 'Legacy summary fallback' },
+    verifiedSha: SHA_A,
+    attempt: { task_id: '1265' },
+  });
+  assert.deepEqual(legacy, [{ section: 'invariants', text: 'Legacy summary fallback' }]);
+
+  // И roundsHistory может приходить внутри результата, без явного параметра.
+  const embedded = extractPostReviewMemoryUpdates({
+    result: {
+      status: 'verified',
+      sha: SHA_A,
+      review: { verdict: 'REVIEW_OK', sha: SHA_A },
+      roundsHistory: [{ gate: 'l2', findings: [
+        { file: 'src/e.mjs', expected: 'validate input', actual: 'no validation' },
+      ] }],
+    },
+    verifiedSha: SHA_A,
+    attempt: { task_id: '1266' },
+  });
+  const embeddedPitfalls = embedded.filter(u => u.section === 'pitfalls');
+  assert.equal(embeddedPitfalls.length, 1);
+  assert.match(embeddedPitfalls[0].text, /validate input/);
+
+  // Явный memoryUpdates по-прежнему приоритетнее любой экстракции.
+  const explicit = [{ section: 'dead_ends', text: 'Explicit memory update wins' }];
+  assert.deepEqual(extractPostReviewMemoryUpdates({
+    reviewReceipt: { memoryUpdates: explicit, checked_invariants: ['ignored'] },
+    verifiedSha: SHA_A,
+    attempt: { task_id: '1265' },
+  }), explicit);
 });

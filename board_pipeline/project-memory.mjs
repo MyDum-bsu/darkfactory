@@ -8,7 +8,7 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { lstatSync } from 'node:fs';
 import { link, lstat, mkdir, open, readFile, readlink, realpath, rename, rm,
-  unlink, writeFile } from 'node:fs/promises';
+  stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
@@ -72,29 +72,80 @@ const sanitizeSnippet = (text, maxLen = 240) => {
 
 // Автоматическое извлечение компактных записей памяти из реального результата
 // acceptHeld / квитанции ревью, когда явный список memoryUpdates не передан.
+// Инварианты берутся из конкретных checked_invariants критика (эфемерный
+// summary — только обратносовместимый fallback), pitfalls — из блокирующих
+// находок roundsHistory / prior findings, когда они переданы.
 export function extractPostReviewMemoryUpdates({
   outcome,
   result,
   attempt,
   reviewReceipt,
   verifiedSha,
+  roundsHistory,
 }) {
   const res = result ?? outcome;
   const explicit = res?.memoryUpdates ?? reviewReceipt?.memoryUpdates;
   if (Array.isArray(explicit) && explicit.length > 0) return explicit;
 
   const updates = [];
-  const summary = sanitizeSnippet(
-    reviewReceipt?.summary ?? res?.review?.summary ?? res?.summary,
-  );
-  if (summary) {
-    updates.push({ section: 'invariants', text: summary });
+  const seen = new Set();
+  const push = (section, text) => {
+    if (!text || seen.has(`${section}${text}`)) return;
+    seen.add(`${section}${text}`);
+    updates.push({ section, text });
+  };
+
+  const checkedRaw = Array.isArray(reviewReceipt?.checked_invariants)
+    ? reviewReceipt.checked_invariants
+    : (Array.isArray(res?.review?.checked_invariants) ? res.review.checked_invariants : []);
+  for (const rawInvariant of checkedRaw.slice(0, 5)) {
+    const text = sanitizeSnippet(
+      typeof rawInvariant === 'string' ? rawInvariant : (rawInvariant?.text ?? rawInvariant?.invariant),
+    );
+    if (text) push('invariants', text);
   }
+  if (!updates.some(u => u.section === 'invariants')) {
+    const summary = sanitizeSnippet(
+      reviewReceipt?.summary ?? res?.review?.summary ?? res?.summary,
+    );
+    if (summary) {
+      push('invariants', summary);
+    }
+  }
+
+  const rounds = Array.isArray(roundsHistory) ? roundsHistory
+    : (Array.isArray(res?.roundsHistory) ? res.roundsHistory
+      : (Array.isArray(reviewReceipt?.roundsHistory) ? reviewReceipt.roundsHistory : []));
+  let pitfallCount = 0;
+  for (const round of rounds) {
+    if (pitfallCount >= 3) break;
+    for (const finding of Array.isArray(round?.findings) ? round.findings : []) {
+      if (pitfallCount >= 3) break;
+      if (finding === null || typeof finding !== 'object') continue;
+      // Только блокирующие находки — P2/nit не становятся уроком проекта.
+      if (['P2', 'nit'].includes(finding.severity)) continue;
+      const file = sanitizeSnippet(finding.file, 80);
+      const expected = sanitizeSnippet(finding.expected, 100);
+      const actual = sanitizeSnippet(finding.actual, 100);
+      const parts = [
+        file || null,
+        expected ? `expected ${expected}` : null,
+        actual ? `actual ${actual}` : null,
+      ].filter(p => p !== null);
+      if (parts.length === 0) continue;
+      const text = sanitizeSnippet(parts.join(' — '), 240);
+      if (text) {
+        push('pitfalls', text);
+        pitfallCount += 1;
+      }
+    }
+  }
+
   const notes = reviewReceipt?.notes ?? res?.review?.notes;
   if (Array.isArray(notes)) {
     for (const rawNote of notes.slice(0, 3)) {
       const note = sanitizeSnippet(typeof rawNote === 'string' ? rawNote : rawNote?.text);
-      if (note) updates.push({ section: 'conventions', text: note });
+      if (note) push('conventions', note);
     }
   }
   if (updates.length === 0) {
@@ -273,20 +324,60 @@ async function readStoreDoc(file, projectId) {
   return doc;
 }
 
-async function withStoreLock(file, fn) {
+export const DEFAULT_STALE_LOCK_MS = 60_000;
+
+// Жив ли процесс: ESRCH — процесса нет (мёртвый лок); EPERM и прочие —
+// процесс существует, но принадлежит другому пользователю, лок живой.
+const pidAlive = pid => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== 'ESRCH';
+  }
+};
+
+// Восстановление после SIGKILL посреди записи: лок несёт JSON
+// { pid, createdAt }; лок старше staleLockMs или лок мёртвого pid снимается.
+// Нечитаемый/legacy-лок судится по mtime; свежий живой лок не трогается —
+// валидная конкурентная блокировка не ломается.
+async function clearStaleStoreLock(lock, staleLockMs, now = Date.now()) {
+  let raw;
+  try { raw = await readFile(lock, 'utf8'); } catch { return false; }
+  let meta = null;
+  try { meta = JSON.parse(raw); } catch { /* legacy/пустой лок — судим по mtime */ }
+  let createdAtMs = NaN;
+  let pid = null;
+  if (meta !== null && typeof meta === 'object' && !Array.isArray(meta)) {
+    if (typeof meta.createdAt === 'string') createdAtMs = Date.parse(meta.createdAt);
+    if (Number.isSafeInteger(meta.pid) && meta.pid > 0) pid = meta.pid;
+  }
+  if (!Number.isFinite(createdAtMs)) {
+    try { createdAtMs = (await stat(lock)).mtimeMs; } catch { return false; }
+  }
+  const expired = Number.isFinite(createdAtMs) && (now - createdAtMs) > staleLockMs;
+  const dead = pid !== null && !pidAlive(pid);
+  if (!expired && !dead) return false;
+  await rm(lock, { force: true }).catch(() => {});
+  return true;
+}
+
+async function withStoreLock(file, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } = {}) {
   const lock = `${file}.lock`;
   let fd;
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
-      fd = await open(lock, 'wx');
+      fd = await open(lock, 'wx', 0o600);
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
+      await clearStaleStoreLock(lock, staleLockMs);
       await delay(50);
     }
   }
   if (fd === undefined) throw new Error('project_memory_locked');
   try {
+    await fd.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
     return await fn();
   } finally {
     await fd.close().catch(() => {});
@@ -1069,6 +1160,58 @@ export function memoryPolicyConfig(policy) {
   if (typeof policy === 'string') return { storeDir: policy };
   if (typeof policy === 'object' && !Array.isArray(policy)) return policy;
   throw new Error('project_memory_policy_invalid');
+}
+
+export const PROJECT_MEMORY_HMAC_KEY_ENV = 'DF_PROJECT_MEMORY_HMAC_KEY';
+
+// Разрешение операторского HMAC-ключа без plaintext в policy JSON:
+// явный ключ > env DF_PROJECT_MEMORY_HMAC_KEY > приватный key-файл 0600
+// (читается или создаётся с случайным ключом). Key-файл fail-closed:
+// symlink, не-файл или group/world-readable режим — отказ, а не чтение.
+export async function resolveMemoryHmacKey({ hmacKey, env = process.env, keyFile } = {}) {
+  if (hmacKey !== undefined && hmacKey !== null && hmacKey !== '') {
+    assertValidHmacKey(hmacKey);
+    return hmacKey;
+  }
+  const fromEnv = env?.[PROJECT_MEMORY_HMAC_KEY_ENV];
+  if (typeof fromEnv === 'string' && fromEnv !== '') {
+    assertValidHmacKey(fromEnv);
+    return fromEnv;
+  }
+  if (keyFile !== undefined) {
+    if (typeof keyFile !== 'string' || !isAbsolute(keyFile)) {
+      throw new Error('project_memory_keyfile_path_invalid');
+    }
+    const meta = await lstat(keyFile).catch(error => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (meta !== null) {
+      if (meta.isSymbolicLink()) throw new Error('project_memory_keyfile_symlink');
+      if (!meta.isFile()) throw new Error('project_memory_keyfile_not_a_file');
+      if ((meta.mode & 0o077) !== 0) throw new Error('project_memory_keyfile_mode_insecure');
+      const stored = (await readFile(keyFile, 'utf8')).trim();
+      assertValidHmacKey(stored);
+      return stored;
+    }
+    // Первичная генерация: wx-захват делает гонку двух создателей
+    // идемпотентной — проигравший перечитывает уже записанный ключ.
+    await mkdir(dirname(keyFile), { recursive: true, mode: 0o700 });
+    const generated = randomBytes(32).toString('hex');
+    try {
+      const handle = await open(keyFile, 'wx', 0o600);
+      try {
+        await handle.writeFile(`${generated}\n`);
+      } finally {
+        await handle.close();
+      }
+      return generated;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      return resolveMemoryHmacKey({ keyFile, env: {} });
+    }
+  }
+  throw new Error('project_memory_untrusted_write');
 }
 
 async function cli(argv) {

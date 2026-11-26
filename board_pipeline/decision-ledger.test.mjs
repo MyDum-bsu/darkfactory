@@ -1,15 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, symlink,
   writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { pinDecisions, recordDecision, recordDigest, resolveActiveDecisions,
-  resolveLedgerPath, LEDGER_PATH_ENV, LEDGER_SCHEMA } from './decision-ledger.mjs';
+import { formatDecisionsMarkdown, pinDecisions, recordDecision, recordDigest,
+  resolveActiveDecisions, resolveLedgerPath, LEDGER_PATH_ENV, LEDGER_SCHEMA } from './decision-ledger.mjs';
 import { canonicalJson } from './subject.mjs';
 
 const exec = promisify(execFile);
@@ -426,5 +426,100 @@ test('recordDecision refuses a duplicated id before appending', async () => {
       rule: 'hostile', id: a.id, ...base('lead') }), /decision_ledger_duplicate_id/);
     const lines = (await readFile(ledger, 'utf8')).trim().split('\n');
     assert.equal(lines.length, 1); // журнал не испорчен
+  } finally { await cleanup(); }
+});
+
+// AUDIT-3b: гарантированно мёртвый pid — завершившийся дочерний процесс.
+async function spawnDeadPid() {
+  return new Promise(resolve => {
+    const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    child.on('exit', () => resolve(child.pid));
+    child.on('error', () => resolve(2 ** 22 + 12345));
+  });
+}
+
+test('stale lock recovery: dead-pid lock is reclaimed and recordDecision succeeds', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const deadPid = await spawnDeadPid();
+    const lockPath = `${ledger}.lock`;
+    await writeFile(lockPath, JSON.stringify({ pid: deadPid, createdAt: new Date().toISOString() }));
+    const rec = await recordDecision({ ledgerPath: ledger, scope: 'global',
+      rule: 'written after dead-pid lock recovery', worktree: tree, ...base('lead') });
+    assert.equal(rec.status, 'active');
+    // Лок снят владельцем после записи — файла не осталось.
+    await assert.rejects(() => readFile(lockPath), /ENOENT/);
+  } finally { await cleanup(); }
+});
+
+test('stale lock recovery: expired lock of a live pid is reclaimed after staleLockMs', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const lockPath = `${ledger}.lock`;
+    // pid жив (наш собственный процесс), но лок старше staleLockMs — снимается.
+    await writeFile(lockPath, JSON.stringify({
+      pid: process.pid,
+      createdAt: new Date(Date.now() - 120_000).toISOString(),
+    }));
+    const rec = await recordDecision({ ledgerPath: ledger, scope: 'global',
+      rule: 'written after expired lock recovery', worktree: tree, ...base('lead') });
+    assert.equal(rec.status, 'active');
+    await assert.rejects(() => readFile(lockPath), /ENOENT/);
+  } finally { await cleanup(); }
+});
+
+test('live lock contention is preserved: fresh lock of a live pid still blocks writes', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const lockPath = `${ledger}.lock`;
+    await writeFile(lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+    await assert.rejects(() => recordDecision({ ledgerPath: ledger, scope: 'global',
+      rule: 'must never land', worktree: tree, ...base('lead') }), /decision_ledger_locked/);
+    // Живой лок не тронут восстановлением — убираем вручную.
+    const meta = JSON.parse(await readFile(lockPath, 'utf8'));
+    assert.equal(meta.pid, process.pid);
+    await rm(lockPath, { force: true });
+    // После ручного снятия запись снова работает — журнал не испорчен.
+    const rec = await recordDecision({ ledgerPath: ledger, scope: 'global',
+      rule: 'lands after manual unlock', worktree: tree, ...base('lead') });
+    assert.equal(rec.status, 'active');
+    const lines = (await readFile(ledger, 'utf8')).trim().split('\n');
+    assert.equal(lines.length, 1);
+  } finally { await cleanup(); }
+});
+
+test('formatDecisionsMarkdown renders a concise table of active decisions for intake sync', async () => {
+  const { tree, ledger, cleanup } = await sandbox();
+  try {
+    const a = await recordDecision({ ledgerPath: ledger, scope: 'global',
+      rule: 'Board is the single queue', worktree: tree, ...base('lead') });
+    const old = await recordDecision({ ledgerPath: ledger, scope: 'project:proj_aaa',
+      rule: 'outdated project rule', worktree: tree, ...base('lead') });
+    const b = await recordDecision({ ledgerPath: ledger, scope: 'project:proj_aaa',
+      rule: 'pipe | and newline\nmust not break the table', supersedes: old.id, worktree: tree, ...base('lead') });
+
+    const entries = (await readFile(ledger, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+    const md = formatDecisionsMarkdown(entries);
+    assert.match(md, /^\| id \| scope \| rule \| source_card \|/);
+    assert.match(md, /\| --- \| --- \| --- \| --- \|/);
+    assert.match(md, new RegExp(`\\| ${a.id} \\| global \\| Board is the single queue \\| 1261 \\|`));
+    assert.match(md, new RegExp(`\\| ${b.id} \\| project:proj_aaa \\|`));
+    // Погашенная supersedes-цель отфильтрована по семантике append-only
+    // журнала, хотя её строка в логе всё ещё status 'active'.
+    assert.doesNotMatch(md, /outdated project rule/);
+    // Явный status 'superseded' фильтруется так же.
+    const md2 = formatDecisionsMarkdown(entries.map(e => ({ ...e, status: 'superseded' })));
+    assert.equal(md2, '_No active decisions._');
+    // Пайпы экранируются, переводы строк схлопываются — таблица не ломается.
+    assert.match(md, /pipe \\\| and newline must not break the table/);
+    assert.ok(!md.split('\n').some(line => line.includes('must not break') && !line.startsWith('| ')));
+    // Пустой/неактивный набор — честная заглушка, а не битая таблица.
+    assert.equal(formatDecisionsMarkdown([]), '_No active decisions._');
+    assert.equal(formatDecisionsMarkdown(null), '_No active decisions._');
+    assert.equal(formatDecisionsMarkdown([{ ...entries[0], status: 'superseded' }]), '_No active decisions._');
+    // Срез items (camelCase sourceCard, без status) тоже рендерится.
+    const slice = await resolveActiveDecisions({ ledgerPath: ledger, projectId: 'proj_aaa', worktree: tree });
+    const md3 = formatDecisionsMarkdown(slice.items.map(i => ({ ...i, sourceCard: '1261' })));
+    assert.match(md3, /\| global \| Board is the single queue \| 1261 \|/);
   } finally { await cleanup(); }
 });
