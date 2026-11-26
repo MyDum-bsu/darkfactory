@@ -65,6 +65,32 @@ const SEVERITY_RANK = { allow: 0, ordinary: 1, critical: 2 };
 const hit = (severity, rule, reason) => ({ severity, rule, reason });
 const BLOCKED_FS_ROOTS = new Set(['/', '~', '$HOME', '${HOME}', '.', '..', '*', '/*', '~/*']);
 
+// Маркер динамической подстановки: встраивается в слово argv на месте
+// $(...)/`...`/<(...)/>(...), чтобы внешняя команда не «не видела» аргумент.
+// Статический анализ не знает результата подстановки — argv[0] с маркером или
+// маркер/неэкранированный '$' в аргументах деструктивного глагола = fail-closed.
+const SENTINEL = '__DYNAMIC_SUBST__';
+const MAX_DEPTH = 16;
+const depthError = () => Object.assign(new Error('recursion_depth_exceeded'),
+  { code: 'recursion_depth_exceeded' });
+// Абсолютные системные/домашние пути: рекурсивный rm без -f по ним — разрушение
+// хоста даже в «интерактивном» режиме.
+const RM_SYSTEM_PATH = /^\/(?:etc|usr|bin|sbin|lib|lib64|boot|root|opt|proc|sys|dev|var|home)(?:\/|$)/;
+const isSystemHomePath = (t, norm) => {
+  const n = norm(t);
+  return n === '/' || n.startsWith('~') || n.startsWith('$HOME') ||
+    n.startsWith('${HOME}') || RM_SYSTEM_PATH.test(n);
+};
+// Допустимый вид цели регенерируемой директории: простое имя без метасимволов.
+const REGEN_TARGET = /^[A-Za-z0-9._\/-]+$/;
+// Защищённые ветки: push в них запрещён политикой выпуска даже без force.
+const PROTECTED_BRANCH = /^(?:refs\/heads\/)?(?:main|master|production|release\/.+)$/;
+// Глаголы, у которых динамический аргумент не даёт статически исключить
+// деструктивную форму вызова. git обрабатывается в ruleGit по подкомандам.
+const DYNAMIC_SENSITIVE = /^(rm|rmdir|shred|dd|chmod|chown|chgrp|docker|kubectl|gcloud|mkfs.*|mke2fs|mkdosfs|fdisk|parted|wipefs|sfdisk|sgdisk)$/;
+const isDynamicWord = w => typeof w === 'string' &&
+  (w.includes(SENTINEL) || w.includes('$'));
+
 // Лексер: разбор командной строки в сегменты команд с границами слов —
 // с учётом кавычек и экранирования. Кавычки и backslash снимаются на лету
 // и сливаются со словом: 'r'm → rm, "rm" → rm, \rm → rm; важно, что
@@ -113,6 +139,7 @@ function lexCommands(line, state, depth) {
             const subClose = findBacktickClose(line, j);
             if (subClose > j && subClose < end) {
               subs.push(line.slice(j + 1, subClose));
+              cur += SENTINEL;
               j = subClose;
               continue;
             }
@@ -121,6 +148,7 @@ function lexCommands(line, state, depth) {
             const subClose = findParenClose(line, j + 1);
             if (subClose > j + 1 && subClose < end) {
               subs.push(line.slice(j + 2, subClose));
+              cur += SENTINEL;
               j = subClose;
               continue;
             }
@@ -135,14 +163,36 @@ function lexCommands(line, state, depth) {
     }
     if (c === '`') {
       const close = findBacktickClose(line, i);
-      if (close > 0) { subs.push(line.slice(i + 1, close)); i = close; }
+      if (close > 0) {
+        subs.push(line.slice(i + 1, close));
+        cur += SENTINEL;
+        inWord = true;
+        i = close;
+      }
       continue;
     }
     if (c === '$' && line[i + 1] === '(') {
       const close = findParenClose(line, i + 1);
-      if (close > i + 1) { subs.push(line.slice(i + 2, close)); i = close; }
-      else { cur += c; inWord = true; }
+      if (close > i + 1) {
+        subs.push(line.slice(i + 2, close));
+        cur += SENTINEL;
+        inWord = true;
+        i = close;
+      } else { cur += c; inWord = true; }
       continue;
+    }
+    // Подстановка процесса <(...)/>(...): содержимое уходит в subs на
+    // рекурсивный разбор, в потоке слов остаётся маркер — иначе
+    // 'bash <(echo rm -rf /)' выглядит как безобидный редирект.
+    if ((c === '<' || c === '>') && line[i + 1] === '(') {
+      const close = findParenClose(line, i + 1);
+      if (close > i + 1) {
+        subs.push(line.slice(i + 2, close));
+        cur += SENTINEL;
+        inWord = true;
+        i = close;
+        continue;
+      }
     }
     if ((c === '&' && line[i + 1] === '&') || (c === '|' && line[i + 1] === '|')) {
       pushSegment(); i++; continue;
@@ -189,11 +239,12 @@ function lexCommands(line, state, depth) {
     inWord = true;
   }
   pushSegment();
-  if (depth < 16) {
-    for (const sub of subs) {
-      // Каждый sub раскрывается рекурсивно ровно один раз.
-      segments.push(...lexCommands(sub, state, depth + 1).segments);
-    }
+  // Глубина за пределами MAX_DEPTH — fail-closed: молча отброшенная
+  // подстановка прятала бы вложенную деструктивную команду от анализа.
+  if (subs.length && depth >= MAX_DEPTH) throw depthError();
+  for (const sub of subs) {
+    // Каждый sub раскрывается рекурсивно ровно один раз.
+    segments.push(...lexCommands(sub, state, depth + 1).segments);
   }
   return { segments };
 }
@@ -297,7 +348,10 @@ function envSplitString(args, i) {
 // Снятие обёрток: пути (/bin/rm → rm), sudo/command/env/xargs/sh -c —
 // рекурсивный разбор вложенных команд.
 function unwrap(argv, depth, state, visit) {
-  if (!argv.length || depth > 16) return argv;
+  if (!argv.length) return argv;
+  // Обёртки глубже MAX_DEPTH — fail-closed: возврат неразобранного argv
+  // позволял спрятать команду за цепочкой sudo/env/nice/timeout.
+  if (depth > MAX_DEPTH) throw depthError();
   state.check();
   let args = argv.slice();
   let first = args[0];
@@ -467,20 +521,39 @@ function ruleRm(args) {
   if (targets.some(t => BLOCKED_FS_ROOTS.has(norm(t)) || t === '-')) {
     return hit(CRITICAL, 'rm_root', 'rm -rf по корню/домашней/текущей директории');
   }
+  // Рекурсивный rm без -f по абсолютным системным/домашним путям всё равно
+  // разрушает хост: интерактивные подтверждения не спасают содержимое.
+  if (!flags.has('f') && targets.some(t => isSystemHomePath(t, norm))) {
+    return hit(CRITICAL, 'rm_recursive_system',
+      'rm -r без -f по системной/домашней директории');
+  }
   if (!flags.has('f')) return null;
-  // REGEN_DIRS — только относительные/проектные цели: rm -rf /tmp и
-  // ~/build — системные/домашние пути, allow по basename не работает.
-  if (targets.every(t => !/^[\/~$]/.test(t) &&
-      !norm(t).split('/').includes('..') &&
+  // REGEN_DIRS — только относительные/проектные цели простого вида: rm -rf
+  // /tmp, ~/build и цели с метасимволами/пробелами/'..'/'$' — системные или
+  // непроверяемые пути, allow по basename не работает.
+  if (targets.every(t => REGEN_TARGET.test(t) && !t.startsWith('/') &&
+      !t.includes('..') && !t.includes('$') &&
       REGEN_DIRS.has(norm(t).split('/').pop()))) {
     return hit('allow', 'rm_regen', 'rm -rf по регенерируемой директории');
   }
   return hit(ORDINARY, 'rm_rf', 'rm -rf по не регенерируемой директории');
 }
 
+// Деструктивные подкоманды git: маркер подстановки или '$' в их аргументах
+// не даёт статически исключить force/reset --hard — fail-closed.
+const GIT_DESTRUCTIVE_SUBS = new Set(['push', 'reset', 'clean', 'branch',
+  'checkout', 'restore']);
+
 function ruleGit(args) {
   const rest = skipGlobalFlags(args, 'git');
   const sub = rest[0];
+  if (typeof sub === 'string' && isDynamicWord(sub)) {
+    return hit(CRITICAL, 'dynamic_subst', 'подкоманда git формируется динамически');
+  }
+  if (GIT_DESTRUCTIVE_SUBS.has(sub) && rest.slice(1).some(isDynamicWord)) {
+    return hit(CRITICAL, 'dynamic_subst',
+      `git ${sub} с динамическими аргументами не проверяем статически`);
+  }
   if (sub === 'push') {
     const flags = rest.slice(1);
     if (flags.some(f => f === '-f' || f === '--force' || f === '--force-all' ||
@@ -494,6 +567,29 @@ function ruleGit(args) {
     // push --delete / push origin :branch — удаление удалённой ветки.
     if (rest.slice(1).some(w => w === '--delete' || w === '-d' || w.startsWith(':'))) {
       return hit(ORDINARY, 'git_push_delete', 'git push удаляет удалённую ветку');
+    }
+    // Push в защищённую ветку запрещён политикой выпуска даже без force:
+    // main/master/production/release/* в любой refspec-позиции (включая
+    // refs/heads/main и HEAD:main). Первый позиционный аргумент — remote.
+    const positionals = [];
+    for (let i = 1; i < rest.length; i++) {
+      const w = rest[i];
+      if (w === '--') continue;
+      if (w.startsWith('-')) {
+        if (['-o', '--push-option', '--repo', '--receive-pack', '--exec']
+            .includes(w.split('=')[0]) && !w.includes('=')) {
+          i++;
+        }
+        continue;
+      }
+      positionals.push(w);
+    }
+    for (const refspec of positionals.slice(1)) {
+      const dest = refspec.includes(':') ? refspec.split(':')[1] : refspec;
+      if (PROTECTED_BRANCH.test(dest)) {
+        return hit(CRITICAL, 'git_push_protected',
+          `git push в защищённую ветку ${dest} запрещён политикой выпуска`);
+      }
     }
     // --force-with-lease / --force-if-includes — безопасные форс-пуши.
     return null;
@@ -627,6 +723,19 @@ function ruleFind(args) {
 
 // --- движок ------------------------------------------------------------------
 
+// Рекурсивный разбор вложенной командной строки (sh -c, eval, env -S,
+// herestring): глубина вложения общая для всех точек входа, за пределами
+// MAX_DEPTH — fail-closed, а не молчаливый allow.
+function recurseLine(inner, state) {
+  state.nest = (state.nest ?? 0) + 1;
+  if (state.nest > MAX_DEPTH) throw depthError();
+  try {
+    return analyze(lexCommands(inner, state, 0).segments, state);
+  } finally {
+    state.nest--;
+  }
+}
+
 function analyze(segments, state) {
   let worst = hit('allow', 'none', '');
   const raise = h => {
@@ -656,7 +765,7 @@ function analyze(segments, state) {
       if (SQL_DESTRUCTIVE.test(inner)) {
         raise(hit(CRITICAL, 'sql_destructive', 'DROP/TRUNCATE в тексте команды'));
       }
-      raise(analyze(lexCommands(inner, state, 0).segments, state));
+      raise(recurseLine(inner, state));
     });
     if (!unwrapped.length) {
       if (fromPipe && unwrapped.shellConsumed === true) {
@@ -665,6 +774,21 @@ function analyze(segments, state) {
       return;
     }
     const cmd = unwrapped[0];
+    // argv[0] с маркером подстановки или '$' — команда формируется
+    // динамически ('$(echo rm) -rf /', 'bash <(...)' после снятия обёртки):
+    // статически не проверяемо — fail-closed.
+    if (isDynamicWord(cmd)) {
+      raise(hit(CRITICAL, 'dynamic_subst', 'команда формируется динамической подстановкой'));
+      return;
+    }
+    // Деструктивные глаголы с динамическими аргументами: подстановка или
+    // неэкранированная переменная может нести флаги/цели, которые разбор
+    // не видит ('rm -rf $(echo /)', 'docker rm $(echo -f) x').
+    if (DYNAMIC_SENSITIVE.test(cmd) && unwrapped.slice(1).some(isDynamicWord)) {
+      raise(hit(CRITICAL, 'dynamic_subst',
+        `${cmd} с динамическими аргументами не проверяем статически`));
+      return;
+    }
     // Поток в интерпретатор без видимого тела команды: curl x | bash,
     // echo "rm -rf /" | sh, ... | bash -o pipefail — критично.
     if (fromPipe && (SHELL_WRAPPERS.has(cmd) || unwrapped.shellConsumed === true)) {
@@ -712,7 +836,7 @@ function analyze(segments, state) {
       if (SQL_DESTRUCTIVE.test(inner)) {
         raise(hit(CRITICAL, 'sql_destructive', 'DROP/TRUNCATE в тексте команды'));
       }
-      raise(analyze(lexCommands(inner, state, 0).segments, state));
+      raise(recurseLine(inner, state));
     }
     analyzeArgv(tokenize(words), words.fromPipe === true);
     if (worst.severity === CRITICAL) return worst;
@@ -746,6 +870,11 @@ export function checkCommand(command, { timeoutMs = 200 } = {}) {
     }
     return { decision: 'block', severity: worst.severity, rule: worst.rule, reason: worst.reason };
   } catch (error) {
+    if (error.code === 'recursion_depth_exceeded') {
+      // Fail-closed: глубина рекурсии/обёрток за пределом — блок, не allow.
+      return { decision: 'block', severity: 'critical',
+        rule: 'recursion_depth_exceeded', reason: 'recursion_depth_exceeded' };
+    }
     if (error.code === 'guard_timeout') {
       // Fail-closed: неуспевший разбор блокирует, а не пропускает.
       return { decision: 'block', severity: 'critical', rule: 'guard_timeout',

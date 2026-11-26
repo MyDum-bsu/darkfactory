@@ -122,9 +122,14 @@ function escapesCandidate(norm) {
   }
 }
 
-function fsForbidden(p) {
-  if (p === null) return false;
-  const norm = path.resolve(p);
+// /proc/<pid>/{root,cwd,fd,mem,environ,map_files} — ловушки обхода песочницы:
+// /proc/self/root — симлинк на '/', через который доступен весь хост,
+// /proc/self/environ выдаёт переменные окружения (с секретами), fd/mem —
+// чужие дескрипторы и память процесса.
+const PROC_BYPASS = /^\/proc\/[^/]+\/(?:root|cwd|fd|mem|environ|map_files)(?:\/|$)/;
+
+function fsForbiddenLexical(norm) {
+  if (PROC_BYPASS.test(norm)) return true;
   if (norm === '/pi-cfg' || norm.startsWith('/pi-cfg/')) return true;
   if (norm === PI_HOME || norm.startsWith(PI_HOME + '/')) {
     if (SECRET_FILES.has(norm)) return !piInternal();
@@ -134,6 +139,19 @@ function fsForbidden(p) {
     return escapesCandidate(norm);
   }
   return !ALLOW_DIRS.some(dir => norm === dir || norm.startsWith(dir + '/'));
+}
+
+function fsForbidden(p) {
+  if (p === null) return false;
+  const norm = path.resolve(p);
+  if (fsForbiddenLexical(norm)) return true;
+  // Симлинки резолвятся до проверки: ссылка из разрешённого поддерева
+  // (/tmp/x -> /proc/self/root или -> /pi-cfg) не выводит за периметр.
+  // Несуществующие пути не резолвятся — остаётся лексическая проверка.
+  let real = null;
+  try { real = origRealpathSync(norm); } catch { /* цели нет — лексики достаточно */ }
+  if (real !== null && real !== norm && fsForbiddenLexical(real)) return true;
+  return false;
 }
 
 // Поддельный stat для auth.json: файл удалён, но креденшельный код pi может
@@ -308,7 +326,19 @@ const allowEndpoints = new Set((process.env.PI_ALLOW_CONNECT ?? '')
 const bridgePort = Number(process.env.DF_MODEL_PROXY_PORT);
 
 function privateHost(host) {
-  const h = String(host ?? '').toLowerCase().replace(/^\[|\]$/g, '');
+  let h = String(host ?? '').toLowerCase().replace(/^\[|\]$/g, '');
+  // IPv4-mapped IPv6 (::ffff:127.0.0.1, ::ffff:7f00:1) — тот же частный
+  // адрес в иной записи: нормализуем до IPv4 перед проверками диапазонов.
+  const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(h);
+  if (mapped) h = mapped[1];
+  else {
+    const hexMapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
+    if (hexMapped) {
+      const hi = parseInt(hexMapped[1], 16);
+      const lo = parseInt(hexMapped[2], 16);
+      h = `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+    }
+  }
   if (h === 'localhost' || h.endsWith('.localhost') || h === '::1' || h === '::' ||
       h.startsWith('fe80') || h.startsWith('fc') || h.startsWith('fd')) return true;
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
@@ -342,6 +372,14 @@ net.Socket.prototype.connect = function (...args) {
   // Node 22 нормализует вызов в единый массив [options, listener].
   const opts = Array.isArray(args[0]) ? args[0][0] : args[0];
   if (typeof opts === 'object' && opts !== null && opts.path) {
+    // Unix domain socket — тоже путь ФС: /proc/self/root/... или симлинк
+    // в запрещённое поддерево закрыт той же политикой, что и fs.
+    if (fsForbidden(String(opts.path))) {
+      const err = eacces(String(opts.path), 'connect');
+      process.nextTick(() => this.destroy(err));
+      return this;
+    }
+    lock();
     return origConnect.apply(this, args);
   }
   const host = typeof opts === 'object' && opts !== null ? (opts.host ?? 'localhost')
@@ -378,18 +416,37 @@ function requestTarget(args, defaultPort) {
   return { host: 'localhost', port: defaultPort };
 }
 
-function deniedRequest(host, port) {
+function deniedRequest(host, port, err) {
   const req = new EventEmitter();
   req.write = () => false;
-  req.end = () => { process.nextTick(() => req.emit('error', enet(host, port))); return req; };
+  req.end = () => {
+    process.nextTick(() => req.emit('error', err ?? enet(host, port)));
+    return req;
+  };
   req.abort = req.destroy = () => req;
   req.setTimeout = () => req;
   return req;
 }
 
+// Опции http(s).request могут нести Unix domain socket: его путь подчиняется
+// той же fs-политике, что и в net.connect — иначе сокет в /proc/self/root
+// или за симлинком обходит периметр.
+function socketPathOf(args) {
+  const first = args[0];
+  if (first !== null && typeof first === 'object' && !(first instanceof URL) &&
+      typeof first.socketPath === 'string') {
+    return first.socketPath;
+  }
+  return null;
+}
+
 for (const [mod, defPort] of [[http, 80], [https, 443]]) {
   const origRequest = mod.request;
   mod.request = function (...args) {
+    const socketPath = socketPathOf(args);
+    if (socketPath !== null && fsForbidden(socketPath)) {
+      return deniedRequest(socketPath, 0, eacces(socketPath, 'connect'));
+    }
     const { host, port } = requestTarget(args, defPort);
     if (!connectAllowed(host, port)) return deniedRequest(host, port);
     lock();
@@ -446,7 +503,8 @@ const CHILD_PATHS = new Set(['/usr/bin/rg', '/usr/bin/grep', '/bin/grep',
 const FIND_DENY = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete',
   '-fls', '-fprint', '-fprint0', '-fprintf']);
 const FIND_FOLLOW_DENY = new Set(['-H', '-L', '-follow']);
-const RG_DENY_LONG = new Set(['pre', 'pre-glob', 'follow', 'ignore-file', 'file']);
+const RG_DENY_LONG = new Set(['pre', 'pre-glob', 'follow', 'ignore-file', 'file',
+  'ignore-file-case-insensitive']);
 const GREP_DENY_LONG = new Set(['file', 'exclude-from', 'dereference-recursive']);
 const LONG_VALUE = {
   rg: new Set(['after-context', 'before-context', 'context', 'colors', 'encoding', 'engine',
@@ -526,12 +584,16 @@ function scanLsArgs(argv) {
     }
     if (options && token.startsWith('--')) {
       const name = token.slice(2).split('=', 1)[0];
+      // --dereference заставляет ls ходить по симлинкам за пределы снимка.
+      if (name === 'dereference') return null;
       if (LONG_VALUE.ls.has(name) && !token.includes('=')) i++;
       continue;
     }
     if (options && token.length > 1 && token.startsWith('-')) {
       const body = token.slice(1);
       for (let j = 0; j < body.length; j++) {
+        // -L dereference: stat целей симлинков за пределами /candidate.
+        if (body[j] === 'L') return null;
         if (SHORT_VALUE.ls.has(body[j])) {
           if (j === body.length - 1) i++;
           break;
@@ -589,6 +651,7 @@ function argsAllowed(file, rest) {
     if (paths === null) return false;
   } else if (cmd === 'ls') {
     paths = scanLsArgs(argv);
+    if (paths === null) return false;
   } else {
     return false;
   }
