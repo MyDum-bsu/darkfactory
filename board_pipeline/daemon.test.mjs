@@ -466,3 +466,172 @@ test('run-isolated --daemon: pilot scope under stop switch also exits 0', async 
   assert.equal(events.at(-1).reason, 'kill_switch');
   assert.equal(events.filter(e => e.event === 'tick').length, 0);
 });
+
+// --- Astra #17 + Opus P2-8: degraded preflight, onTick isolation, backoff ----
+
+test('daemon loop: disk failure with active in-flight attempt still ticks with preflightFailed', async t => {
+  const dir = await privateDir(t);
+  const journal = new RotatingJournal({ directory: dir });
+  const seen = [];
+  const ac = new AbortController();
+  let checks = 0;
+  const result = await runDaemon({
+    intervalMs: 1000, journal, sleep: instant, signal: ac.signal,
+    installSignalHandlers: false,
+    checkDisk: async () => { checks++; if (checks > 1) throw new Error('disk budget: low'); },
+    hasActiveAttempt: () => true,
+    tick: async ctx => {
+      seen.push(ctx);
+      if (seen.length === 2) ac.abort();
+      return { phase: 'working' };
+    },
+  });
+  assert.equal(seen.length, 2, 'lease maintenance тика продолжается несмотря на preflight');
+  assert.ok(seen.every(ctx => ctx?.preflightFailed === true),
+    'тик обязан получать preflightFailed: true при отказе диска');
+  const log = await readFile(join(dir, 'daemon.jsonl'), 'utf8');
+  assert.match(log, /disk_budget_degraded/);
+  assert.match(log, /disk_budget_blocked/);
+});
+
+test('daemon loop: disk failure without active attempt skips ticks (backward compatible)', async () => {
+  let checks = 0;
+  let calls = 0;
+  const ac = new AbortController();
+  const result = await runDaemon({
+    intervalMs: 1000, sleep: instant, signal: ac.signal,
+    installSignalHandlers: false,
+    checkDisk: async () => {
+      checks++;
+      // Стартовый preflight (checks === 1) проходит, диск заполняется позже.
+      if (checks === 5) ac.abort();
+      if (checks > 1) throw new Error('disk budget: low');
+    },
+    hasActiveAttempt: () => false,
+    tick: async () => { calls++; return { phase: 'idle' }; },
+  });
+  assert.equal(calls, 0, 'без активной попытки тики пропускаются');
+  assert.equal(result.stopped, 'signal');
+});
+
+test('daemon loop: hasActiveAttempt probe failure preserves lease maintenance', async t => {
+  const dir = await privateDir(t);
+  const journal = new RotatingJournal({ directory: dir });
+  let calls = 0;
+  const ac = new AbortController();
+  let checks = 0;
+  await runDaemon({
+    intervalMs: 1000, journal, sleep: instant, signal: ac.signal,
+    installSignalHandlers: false,
+    checkDisk: async () => { checks++; if (checks > 1) throw new Error('disk budget: low'); },
+    hasActiveAttempt: () => { throw new Error('probe broken'); },
+    tick: async ctx => {
+      calls++;
+      assert.equal(ctx.preflightFailed, true);
+      if (calls === 2) ac.abort();
+      return { phase: 'working' };
+    },
+  });
+  assert.equal(calls, 2, 'неопределённость трактуется в пользу сохранения lease');
+  const log = await readFile(join(dir, 'daemon.jsonl'), 'utf8');
+  assert.match(log, /has_active_attempt_error/);
+});
+
+test('daemon loop: healthy disk passes preflightFailed false to tick', async () => {
+  const seen = [];
+  const ac = new AbortController();
+  await runDaemon({
+    intervalMs: 1000, sleep: instant, signal: ac.signal,
+    installSignalHandlers: false,
+    checkDisk: async () => {},
+    tick: async ctx => { seen.push(ctx); if (seen.length === 1) ac.abort(); return { phase: 'idle' }; },
+  });
+  assert.deepEqual(seen, [{ preflightFailed: false }]);
+});
+
+test('daemon loop: onTick exception cannot crash the daemon and is journaled', async t => {
+  const dir = await privateDir(t);
+  const journal = new RotatingJournal({ directory: dir });
+  let calls = 0;
+  const ac = new AbortController();
+  const result = await runDaemon({
+    intervalMs: 1000, journal, sleep: instant, signal: ac.signal,
+    installSignalHandlers: false,
+    tick: async () => { calls++; if (calls === 3) ac.abort(); return { phase: 'idle' }; },
+    onTick: async () => { throw new Error('policy exploded'); },
+  });
+  assert.equal(calls, 3, 'цикл продолжает работать после исключения в onTick');
+  assert.equal(result.stopped, 'signal');
+  const log = await readFile(join(dir, 'daemon.jsonl'), 'utf8');
+  assert.match(log, /ontick_error.*policy exploded/);
+});
+
+test('daemon loop: repeated tick_error waits grow exponentially and stay bounded', async t => {
+  const dir = await privateDir(t);
+  const journal = new RotatingJournal({ directory: dir });
+  const waits = [];
+  let calls = 0;
+  const ac = new AbortController();
+  await runDaemon({
+    intervalMs: 1000, journal, signal: ac.signal,
+    installSignalHandlers: false,
+    maxTickErrorBackoffMs: 3000,
+    sleep: async ms => { waits.push(ms); },
+    tick: async () => {
+      calls++;
+      if (calls <= 4) throw new Error(`boom ${calls}`);
+      if (calls === 5) return { phase: 'idle' }; // успех сбрасывает backoff
+      if (calls === 6) throw new Error('boom again');
+      ac.abort();
+      return { phase: 'idle' };
+    },
+  });
+  assert.equal(calls, 7);
+  // 1000, 2000, cap 3000, cap 3000; успех — обычный интервал; сброшенный backoff — снова 1000.
+  assert.deepEqual(waits, [1000, 2000, 3000, 3000, 1000, 1000]);
+  const log = await readFile(join(dir, 'daemon.jsonl'), 'utf8');
+  const errors = log.trim().split('\n').map(line => JSON.parse(line))
+    .filter(entry => entry.event === 'tick_error');
+  assert.deepEqual(errors.map(entry => entry.consecutiveErrors), [1, 2, 3, 4, 1]);
+  assert.deepEqual(errors.map(entry => entry.backoffMs), [1000, 2000, 3000, 3000, 1000]);
+});
+
+test('daemon loop: maxTickErrorBackoffMs is validated', async () => {
+  await assert.rejects(() => runDaemon({
+    tick: async () => ({}), intervalMs: 1000, maxTickErrorBackoffMs: 0,
+  }), /maxTickErrorBackoffMs must be a positive integer/);
+});
+
+test('daemon loop: startup disk failure with active attempt starts degraded instead of crashing', async t => {
+  const dir = await privateDir(t);
+  const journal = new RotatingJournal({ directory: dir });
+  let calls = 0;
+  const ac = new AbortController();
+  const result = await runDaemon({
+    intervalMs: 1000, journal, sleep: instant, signal: ac.signal,
+    installSignalHandlers: false,
+    checkDisk: async () => { throw new Error('disk budget: low'); },
+    hasActiveAttempt: () => true,
+    tick: async ctx => {
+      calls++;
+      assert.equal(ctx.preflightFailed, true, 'восстановленная попытка тикается в degraded-режиме');
+      if (calls === 1) ac.abort();
+      return { phase: 'working' };
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.stopped, 'signal');
+  const log = await readFile(join(dir, 'daemon.jsonl'), 'utf8');
+  assert.match(log, /disk_budget_degraded/);
+});
+
+test('daemon loop: startup disk failure without active attempt still refuses to start', async () => {
+  let calls = 0;
+  await assert.rejects(() => runDaemon({
+    intervalMs: 1000, installSignalHandlers: false, sleep: instant,
+    checkDisk: async () => { throw new Error('disk budget: low'); },
+    hasActiveAttempt: () => false,
+    tick: async () => { calls++; return { phase: 'idle' }; },
+  }), /disk budget/);
+  assert.equal(calls, 0);
+});

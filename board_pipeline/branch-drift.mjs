@@ -125,9 +125,12 @@ export async function inspectWorktreesAndBranches({
   for (const branch of branchText.split('\n').map(b => b.trim()).filter(Boolean)) {
     // Текущая HEAD-ветка сама себе «влита»; git уже её отфильтровал.
     // '--' отделяет ревизии от путей — ветка не может притвориться опцией/путём.
-    const diffText = await execGit(['diff', '--name-only', `${baseRef}...${branch}`,
-      '--'], repoDir).catch(() => null);
-    const files = diffText === null ? ['<diff_unavailable>'] : diffText.split('\n').filter(Boolean);
+    // -z: NUL-разделённые сырые пути без quoting — переименованные файлы и
+    // имена с переводами строк/кавычками не могут уйти от детекции дрейфа;
+    // --no-renames: rename не схлопывается в 'old => new', оба пути видимы.
+    const diffText = await execGit(['diff', '--no-renames', '--name-only', '-z',
+      `${baseRef}...${branch}`, '--'], repoDir).catch(() => null);
+    const files = diffText === null ? ['<diff_unavailable>'] : diffText.split('\0').filter(Boolean);
     // diff недоступен → считаем пересечением (fail-closed), не тихий ok:true.
     const intersects = diffText === null || touchPaths.length === 0 ||
       files.some(f => touches(f, touchPaths));
