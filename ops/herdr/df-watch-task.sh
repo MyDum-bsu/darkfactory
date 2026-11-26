@@ -75,6 +75,18 @@ if [[ -n "$slot_filter" && ! "$slot_filter" =~ ^[1-4]$ ]]; then
   exit 2
 fi
 
+# --lines and --interval are interpolated into tail/sleep invocations, so
+# they must be plain positive integers: anything else is a usage error
+# (exit 2) instead of a half-broken render loop.
+if [[ ! "$lines" =~ ^0*[1-9][0-9]*$ ]]; then
+  printf 'df-watch-task: --lines must be a positive integer >= 1, got %s\n' "$lines" >&2
+  exit 2
+fi
+if [[ ! "$interval" =~ ^0*[1-9][0-9]*$ ]]; then
+  printf 'df-watch-task: --interval must be a positive integer >= 1, got %s\n' "$interval" >&2
+  exit 2
+fi
+
 # Extract selected fields from an attempt.json snapshot. Prints exactly six
 # lines in fixed order: task_id, attempt_id, epoch, phase, thread_id,
 # worktree. Missing keys yield empty lines. Values are machine-generated ids
@@ -108,12 +120,33 @@ read_attempt_fields() {
   ' "$1" 2>/dev/null
 }
 
-# First digit embedded in a file or directory name; empty when absent.
+# Slot digit carried by a file or directory name; empty when absent.
+# Only the dedicated slot suffix counts: `-s<N>$` or `slot-?<N>$` on the
+# extensionless stem (so daemon-slot2.log and daemon-state-slot3 both
+# resolve). Digits anywhere else — dates, pids, serial numbers embedded in
+# the middle of a rotated log name — must NOT steer slot assignment.
 slot_digit() {
-  local name digit
+  local name stem digit=''
   name="$(basename -- "$1")"
-  digit="$(printf '%s' "$name" | sed -n 's/[^0-9]*\([0-9]\).*/\1/p')"
+  stem="${name%.log}"
+  if [[ "$stem" =~ -s([0-9]+)$ ]]; then
+    digit="${BASH_REMATCH[1]}"
+  elif [[ "$stem" =~ slot-?([0-9]+)$ ]]; then
+    digit="${BASH_REMATCH[1]}"
+  fi
   printf '%s' "$digit"
+}
+
+# Strip terminal control sequences from untrusted stream output before it
+# is printed: CSI sequences (ESC [ ... final), OSC sequences (ESC ] ...
+# terminated by BEL or ST), remaining one-shot ESC sequences, and C0
+# control bytes except tab. Without this a worker session could redraw or
+# inject into the operator's terminal.
+strip_control() {
+  sed -e 's/\x1b\[[0-?]*[ -/]*[@-~]//g' \
+      -e 's/\x1b\][^\x07\x1b]*\(\x07\|\x1b\\\)\?//g' \
+      -e 's/\x1b[@-Z\\-_]//g' \
+      -e 's/[\x00-\x08\x0b-\x1f\x7f]//g'
 }
 
 print_rule() {
@@ -164,8 +197,13 @@ render_once() {
 
       if [[ "$stream" == true && -n "$thread_id" ]]; then
         printf '%s\n' '  --- live session (hc read) ---'
-        if command -v hc >/dev/null 2>&1; then
-          timeout 10 hc read "$thread_id" 2>&1 | tail -n "$lines" | sed 's/^/  /' || \
+        # The thread id is machine-generated but still untrusted input to a
+        # shell pipeline: whitelist the id alphabet and pass it after `--`
+        # so a leading dash can never become an hc option.
+        if [[ ! "$thread_id" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+          printf '  (invalid thread id — stream skipped)\n'
+        elif command -v hc >/dev/null 2>&1; then
+          timeout 10 hc read -- "$thread_id" 2>&1 | strip_control | tail -n "$lines" | sed 's/^/  /' || \
             printf '  (hc read unavailable or timed out)\n'
         else
           printf '  (hc CLI not found in PATH)\n'

@@ -4,12 +4,14 @@
 // value (deployedAt) is asserted by shape, never by exact value.
 
 import assert from 'node:assert/strict';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { promisify } from 'node:util';
 
 import {
   mapSlotsToSessions,
@@ -17,13 +19,28 @@ import {
   parseAgyQuotaResponse,
   parseOpenCodeQuotaResponse,
 } from './telemetry-parsers.mjs';
-import { MANIFEST_NAME, applyDeploy, planDeploy } from './deploy-herdr.mjs';
+import { MANIFEST_NAME, applyDeploy, main as deployMain, planDeploy } from './deploy-herdr.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const NOW = Date.parse('2026-11-26T20:00:00.000Z');
 
 function sha256Hex(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
+}
+
+const execFileAsync = promisify(execFile);
+
+async function runFile(command, args, options = {}) {
+  try {
+    const result = await execFileAsync(command, args, options);
+    return { code: 0, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+  } catch (error) {
+    return {
+      code: typeof error.code === 'number' ? error.code : 1,
+      stdout: error.stdout ?? '',
+      stderr: error.stderr ?? '',
+    };
+  }
 }
 
 // --- parseAgyQuotaResponse ---------------------------------------------------
@@ -180,6 +197,30 @@ test('parseOpenCodeQuotaResponse parses legacy rollingUsage/weeklyUsage/monthlyU
   assert.throws(() => parseOpenCodeQuotaResponse('x', NOW), /opencode_response_invalid/);
 });
 
+test('quota parsers treat numeric values below 1e12 as epoch seconds, not milliseconds', () => {
+  // 999,999,999 epoch seconds is 999,999,999,000 ms: one second after the
+  // pinned nowMs. If it were misread as milliseconds it would be a 1970-era
+  // already-expired reset instead.
+  const nowMs = 999_999_998_000;
+  const epochSeconds = 999_999_999;
+  const agy = parseAgyQuotaResponse({
+    groups: [{ buckets: [{ window: '5h', remainingFraction: 0.5, resetTime: epochSeconds }] }],
+  }, nowMs);
+  assert.equal(agy.windows[0].resetIn, 1000);
+
+  const opencode = parseOpenCodeQuotaResponse({
+    rollingUsage: { usagePercent: 10, resetTime: epochSeconds },
+  }, nowMs);
+  assert.equal(opencode.windows[0].resetIn, 1000);
+
+  // The exact 1e12 boundary is already epoch milliseconds. Multiplying it by
+  // 1000 would push the reset far into the future instead of one second out.
+  const boundary = parseOpenCodeQuotaResponse({
+    usage: { rolling: { percent: 10, resetsAt: 1e12 } },
+  }, 999_999_999_000);
+  assert.equal(boundary.windows[0].resetIn, 1000);
+});
+
 // --- mapSlotsToSessions ------------------------------------------------------
 
 test('mapSlotsToSessions matches sessions to four slots by normalized cwd', () => {
@@ -265,6 +306,150 @@ test('df-watch-task.sh is executable and free of legacy getbb/bb-thread referenc
 
   const info = await stat(join(HERE, 'df-watch-task.sh'));
   assert.notEqual(info.mode & 0o111, 0);
+});
+
+test('df-watch-task.sh validates --lines and --interval as positive integers', async () => {
+  const script = join(HERE, 'df-watch-task.sh');
+  for (const args of [
+    ['--lines', '0'],
+    ['--lines', '000'],
+    ['--lines', '-1'],
+    ['--lines', '1.5'],
+    ['--lines', 'x'],
+    ['--interval', '0'],
+    ['--interval', '000'],
+    ['--interval', '-1'],
+    ['--interval', 'x'],
+  ]) {
+    const result = await runFile(script, args, { timeout: 5000 });
+    assert.equal(result.code, 2, `${args.join(' ')} should be a usage error`);
+    assert.match(result.stderr, /positive integer >= 1/);
+  }
+
+  // Leading zeroes still denote positive decimal integers, and validation is
+  // regex-based so very large values cannot wrap negative in shell arithmetic.
+  const emptyRoot = join(await mkdtemp(join(tmpdir(), 'df-watch-empty-')), 'state');
+  for (const args of [
+    ['--lines', '0001'],
+    ['--lines', '999999999999999999999999999'],
+    ['--interval', '0001'],
+    ['--interval', '999999999999999999999999999'],
+  ]) {
+    const result = await runFile(script, [
+      '--state-root', emptyRoot, '--once', ...args,
+    ], { timeout: 5000 });
+    assert.equal(result.code, 0, `${args.join(' ')} should be accepted: ${result.stderr}`);
+  }
+});
+
+test('df-watch-task.sh passes -- and a whitelisted thread id to hc and strips control sequences', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'df-watch-stream-'));
+  const stateRoot = join(root, 'state');
+  const attemptDir = join(stateRoot, 'daemon-state-slot2');
+  const bin = join(root, 'bin');
+  const capture = join(root, 'hc-args.txt');
+  await mkdir(attemptDir, { recursive: true });
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(attemptDir, 'attempt.json'), JSON.stringify({
+    task_id: '10366',
+    phase: 'implement',
+    thread_id: 'df-10366-3482f80c09',
+  }));
+  await writeFile(join(bin, 'hc'), `#!/usr/bin/env bash
+printf '%s\\n' "$@" > "$HC_CAPTURE"
+printf 'plain\\033[31mRED\\033[0m\\n\\033]0;evil-title\\aafter-osc\\n\\033]8;;http://evil\\033\\\\link-text\\033]8;;\\033\\\\end\\ncsi\\033[4:3mUNDER\\033[0m\\n'
+`, { mode: 0o755 });
+
+  const result = await runFile(join(HERE, 'df-watch-task.sh'), [
+    '--state-root', stateRoot,
+    '--slot', '2',
+    '--lines', '10',
+    '--once',
+  ], {
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, HC_CAPTURE: capture },
+    timeout: 5000,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual((await readFile(capture, 'utf8')).trimEnd().split('\n'), [
+    'read', '--', 'df-10366-3482f80c09',
+  ]);
+  assert.equal(result.stdout.includes('\u001b'), false);
+  assert.equal(result.stdout.includes('evil-title'), false);
+  assert.match(result.stdout, /plainRED/);
+  assert.match(result.stdout, /after-osc/);
+  assert.match(result.stdout, /link-text/);
+  assert.match(result.stdout, /csiUNDER/);
+  assert.equal(result.stdout.includes('[4:3m'), false);
+});
+
+test('df-watch-task.sh refuses a thread id outside the whitelist before invoking hc', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'df-watch-invalid-'));
+  const stateRoot = join(root, 'state');
+  const attemptDir = join(stateRoot, 'daemon-state-slot1');
+  const bin = join(root, 'bin');
+  const capture = join(root, 'hc-args.txt');
+  await mkdir(attemptDir, { recursive: true });
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(attemptDir, 'attempt.json'), JSON.stringify({
+    task_id: '10366',
+    thread_id: 'df-10366;injected',
+  }));
+  await writeFile(join(bin, 'hc'), `#!/usr/bin/env bash
+printf '%s\\n' "$@" > "$HC_CAPTURE"
+printf 'unexpected\\n'
+`, { mode: 0o755 });
+
+  const result = await runFile(join(HERE, 'df-watch-task.sh'), [
+    '--state-root', stateRoot,
+    '--slot', '1',
+    '--once',
+  ], {
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, HC_CAPTURE: capture },
+    timeout: 5000,
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /invalid thread id/);
+  assert.equal(result.stdout.includes('unexpected'), false);
+  await assert.rejects(stat(capture), { code: 'ENOENT' });
+});
+
+test('df-watch-task.sh slot matching uses only -s<N> or slot-?<N> suffixes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'df-watch-slots-'));
+  const stateRoot = join(root, 'state');
+  const writeAttempt = async (dirName, taskId, mtime) => {
+    const dir = join(stateRoot, dirName);
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, 'attempt.json');
+    await writeFile(file, JSON.stringify({ task_id: taskId, phase: 'implement' }));
+    await utimes(file, mtime, mtime);
+  };
+  await writeAttempt('daemon-state-slot2', 'valid-slot2', new Date('2024-01-01T00:00:00Z'));
+  // The first digit in this middle-of-name date is 2. It must not steer the
+  // directory into slot 2 even when its attempt snapshot is newer.
+  await writeAttempt('daemon-state-2026', 'middle-digit-not-slot2', new Date('2025-01-01T00:00:00Z'));
+  await writeAttempt('daemon-state-s3', 'valid-s3', new Date('2024-01-01T00:00:00Z'));
+  const validLog = join(stateRoot, 'daemon-slot2.log');
+  await writeFile(validLog, 'valid-slot2-log\n');
+  await utimes(validLog, new Date('2024-01-01T00:00:00Z'), new Date('2024-01-01T00:00:00Z'));
+  const middleLog = join(stateRoot, 'daemon-2026.log');
+  await writeFile(middleLog, 'middle-digit-log\n');
+  await utimes(middleLog, new Date('2025-01-01T00:00:00Z'), new Date('2025-01-01T00:00:00Z'));
+
+  const script = join(HERE, 'df-watch-task.sh');
+  const slot2 = await runFile(script, [
+    '--state-root', stateRoot, '--slot', '2', '--once', '--no-stream',
+  ], { timeout: 5000 });
+  assert.equal(slot2.code, 0, slot2.stderr);
+  assert.match(slot2.stdout, /valid-slot2/);
+  assert.equal(slot2.stdout.includes('middle-digit-not-slot2'), false);
+  assert.match(slot2.stdout, /valid-slot2-log/);
+  assert.equal(slot2.stdout.includes('middle-digit-log'), false);
+
+  const slot3 = await runFile(script, [
+    '--state-root', stateRoot, '--slot', '3', '--once', '--no-stream',
+  ], { timeout: 5000 });
+  assert.equal(slot3.code, 0, slot3.stderr);
+  assert.match(slot3.stdout, /valid-s3/);
 });
 
 // --- planDeploy / applyDeploy ------------------------------------------------
@@ -357,6 +542,149 @@ test('applyDeploy copies files, writes .bak backup and SHA-stamped manifest, ide
   assert.deepEqual(manifest2.files[0], { name: 'helper.mjs', sha256: sha256Hex(Buffer.from(updated)) });
 });
 
+test('applyDeploy refuses a symlinked target directory', async () => {
+  const { root, repo } = await makeSandbox();
+  await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
+  const realTarget = join(root, 'real-target');
+  const linkedTarget = join(root, 'linked-target');
+  await mkdir(realTarget, { recursive: true });
+  await symlink(realTarget, linkedTarget);
+
+  const plan = await planDeploy({
+    repoRoot: repo, targetDir: linkedTarget, sha: 'abc1234', files: ['helper.mjs'],
+  });
+  await assert.rejects(applyDeploy(plan, { dryRun: false }), /target_dir_not_directory/);
+  await assert.rejects(stat(join(realTarget, 'helper.mjs')), { code: 'ENOENT' });
+});
+
+test('applyDeploy refuses a symlinked concrete backup parent directory', async () => {
+  const { root, repo, target } = await makeSandbox();
+  await mkdir(target, { recursive: true });
+  await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
+  const realOutside = join(root, 'outside-parent');
+  const linkedParent = join(root, 'linked-parent');
+  await mkdir(realOutside, { recursive: true });
+  await symlink(realOutside, linkedParent);
+
+  const plan = await planDeploy({
+    repoRoot: repo, targetDir: target, sha: 'abc1234', files: ['helper.mjs'],
+  });
+  const malformedPlan = {
+    ...plan,
+    files: [{ ...plan.files[0], backup: join(linkedParent, 'helper.mjs.bak') }],
+  };
+  await assert.rejects(applyDeploy(malformedPlan, { dryRun: false }), /target_dir_not_directory/);
+  await assert.rejects(stat(join(target, 'helper.mjs')), { code: 'ENOENT' });
+});
+
+test('applyDeploy refuses symlinked target and backup paths without following them', async () => {
+  const { root, repo, target } = await makeSandbox();
+  await mkdir(target, { recursive: true });
+  await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
+  const victim = join(root, 'victim.txt');
+  await writeFile(victim, 'victim-original\n');
+  await symlink(victim, join(target, 'helper.mjs'));
+
+  const plan = await planDeploy({
+    repoRoot: repo, targetDir: target, sha: 'abc1234', files: ['helper.mjs'],
+  });
+  await assert.rejects(applyDeploy(plan, { dryRun: false }), /target_is_symlink/);
+  assert.equal(await readFile(victim, 'utf8'), 'victim-original\n');
+
+  // A planted .bak symlink is likewise fatal before any backup copy starts.
+  await rm(join(target, 'helper.mjs'));
+  await writeFile(join(target, 'helper.mjs'), 'legacy target\n');
+  const backupLink = join(target, 'helper.mjs.bak');
+  await symlink(victim, backupLink);
+  await assert.rejects(applyDeploy(plan, { dryRun: false }), /backup_is_symlink/);
+  assert.equal(await readFile(victim, 'utf8'), 'victim-original\n');
+  assert.equal(await readFile(join(target, 'helper.mjs'), 'utf8'), 'legacy target\n');
+});
+
+test('applyDeploy does not write through a preplanted predictable temp-file symlink', async () => {
+  const { root, repo, target } = await makeSandbox();
+  await mkdir(target, { recursive: true });
+  await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
+  const victim = join(root, 'tmp-victim.txt');
+  await writeFile(victim, 'victim-original\n');
+  const predictableTmp = `${join(target, 'helper.mjs')}.tmp-${process.pid}`;
+  await symlink(victim, predictableTmp);
+
+  const plan = await planDeploy({
+    repoRoot: repo, targetDir: target, sha: 'abc1234', files: ['helper.mjs'],
+  });
+  const result = await applyDeploy(plan, { dryRun: false });
+  assert.equal(result.actions[0].action, 'copied');
+  assert.equal(await readFile(victim, 'utf8'), 'victim-original\n');
+  assert.equal(await readFile(join(target, 'helper.mjs'), 'utf8'), VALID_MJS);
+});
+
+test('applyDeploy never clobbers an existing backup file', async () => {
+  const { repo, target } = await makeSandbox();
+  await mkdir(target, { recursive: true });
+  await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
+  await writeFile(join(target, 'helper.mjs'), 'deployed-before\n');
+  await writeFile(join(target, 'helper.mjs.bak'), 'original-backup\n');
+
+  const plan = await planDeploy({
+    repoRoot: repo, targetDir: target, sha: 'abc1234', files: ['helper.mjs'],
+  });
+  const result = await applyDeploy(plan, { dryRun: false });
+  assert.equal(result.actions[0].action, 'copied');
+  assert.equal(result.actions[0].backup, false);
+  assert.equal(await readFile(join(target, 'helper.mjs.bak'), 'utf8'), 'original-backup\n');
+  assert.equal(await readFile(join(target, 'helper.mjs'), 'utf8'), VALID_MJS);
+  assert.equal((await readdir(target)).filter(name => name.includes('.tmp-')).length, 0);
+});
+
+test('planDeploy verifies sha against git HEAD unless skipGitVerify is set', async () => {
+  const { repo, target } = await makeSandbox();
+  await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
+  await execFileAsync('git', ['init', '-q'], { cwd: repo });
+  await execFileAsync('git', ['add', 'helper.mjs'], { cwd: repo });
+  await execFileAsync('git', [
+    '-c', 'user.email=herdr-test@example.invalid',
+    '-c', 'user.name=Herdr Test',
+    'commit', '-qm', 'init',
+  ], { cwd: repo });
+  const { stdout } = await execFileAsync('git', ['-C', repo, 'rev-parse', 'HEAD']);
+  const head = stdout.trim();
+
+  const verified = await planDeploy({
+    repoRoot: repo, targetDir: target, sha: head, files: ['helper.mjs'],
+  });
+  assert.equal(verified.sha, head);
+
+  await assert.rejects(planDeploy({
+    repoRoot: repo, targetDir: target, sha: '0'.repeat(40), files: ['helper.mjs'],
+  }), /git_sha_mismatch/);
+
+  const skipped = await planDeploy({
+    repoRoot: repo,
+    targetDir: target,
+    sha: '0'.repeat(40),
+    files: ['helper.mjs'],
+    skipGitVerify: true,
+  });
+  assert.equal(skipped.sha, '0'.repeat(40));
+
+  let cliOut = '';
+  let cliErr = '';
+  const cliCode = await deployMain([
+    '--repo-root', repo,
+    '--target-dir', target,
+    '--sha', '0'.repeat(40),
+    '--files', 'helper.mjs',
+    '--dry-run',
+    '--skip-git-verify',
+  ], {
+    out: { write(chunk) { cliOut += chunk; } },
+    err: { write(chunk) { cliErr += chunk; } },
+  });
+  assert.equal(cliCode, 0, cliErr);
+  assert.match(cliOut, /dry-run/);
+});
+
 test('planDeploy rejects traversal, missing files, empty scripts and broken ESM', async () => {
   const { repo, target } = await makeSandbox();
   await writeFile(join(repo, 'good.mjs'), VALID_MJS);
@@ -382,4 +710,250 @@ test('planDeploy rejects traversal, missing files, empty scripts and broken ESM'
   const plan = await planDeploy({ ...base, files: ['ops/herdr/nested.mjs'] });
   assert.equal(plan.files[0].name, 'nested.mjs');
   assert.equal(plan.files[0].target, join(target, 'nested.mjs'));
+});
+
+// --- gitmark.py regression coverage ------------------------------------------
+
+const GITMARK = join(HERE, '../memory-index/gitmark.py');
+
+function runGitmark(args, options = {}) {
+  return runFile('python3', [GITMARK, ...args], options);
+}
+
+async function putGitmarkFile(root, relativePath, content) {
+  const file = join(root, relativePath);
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, content);
+}
+
+async function writeGitmarkFixture(root) {
+  await putGitmarkFile(root, 'memory/decisions.md',
+    '# Owner Decisions\n\nOwner approved the controller design in phase review.\n');
+  await putGitmarkFile(root, 'memory/notes.md',
+    '# Notes\n\nВеха V2-3 добавляет шину событий и пульт управления.\n');
+}
+
+async function waitForFile(file, timeoutMs = 5000) {
+  const started = Date.now();
+  for (;;) {
+    try {
+      await stat(file);
+      return;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (Date.now() - started > timeoutMs) throw new Error(`timeout waiting for ${file}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+test('gitmark reindex atomically replaces the database while an open reader keeps the old inode', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-atomic-')));
+  await writeGitmarkFixture(root);
+  await putGitmarkFile(root, 'memory/replace-me.md', '# Replace\n\nalphaunique\n');
+  const first = await runGitmark(['index', root, '--json']);
+  assert.equal(first.code, 0, first.stderr);
+
+  const db = join(root, '.gitmark', 'index.db');
+  const ready = join(root, 'reader-ready');
+  const release = join(root, 'reader-release');
+  const rowsFile = join(root, 'reader-rows.json');
+  const readerScript = `
+import json, sqlite3, sys, time
+from pathlib import Path
+db, ready, release, out = sys.argv[1:5]
+con = sqlite3.connect(db)
+con.execute('select count(*) from chunks').fetchone()
+Path(ready).write_text('ready')
+deadline = time.time() + 10
+while not Path(release).exists():
+    if time.time() > deadline:
+        sys.exit(3)
+    time.sleep(0.01)
+rows = [row[0] for row in con.execute('select text from chunks order by id')]
+Path(out).write_text(json.dumps(rows))
+con.close()
+`;
+  const reader = spawn('python3', ['-c', readerScript, db, ready, release, rowsFile], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let readerStdout = '';
+  let readerStderr = '';
+  reader.stdout.on('data', chunk => { readerStdout += chunk; });
+  reader.stderr.on('data', chunk => { readerStderr += chunk; });
+  const readerExit = new Promise((resolve, reject) => {
+    reader.on('error', reject);
+    reader.on('close', code => resolve({ code, stdout: readerStdout, stderr: readerStderr }));
+  });
+
+  await waitForFile(ready);
+  await putGitmarkFile(root, 'memory/replace-me.md', '# Replace\n\nzzzzzzzzzz\n');
+  const second = await runGitmark(['index', root, '--json']);
+  assert.equal(second.code, 0, second.stderr);
+  await writeFile(release, 'release\n');
+  const readerResult = await readerExit;
+  assert.equal(readerResult.code, 0, readerResult.stderr);
+
+  // The already-open SQLite handle still reads the old inode. A DROP TABLE
+  // rebuild would have mutated that same inode and alphaunique would vanish.
+  const oldRows = JSON.parse(await readFile(rowsFile, 'utf8')).join('\n');
+  assert.match(oldRows, /alphaunique/);
+  assert.equal(oldRows.includes('zzzzzzzzzz'), false);
+
+  // New readers open the replacement and see only the rebuilt content.
+  const beta = await runGitmark(['search', root, 'zzzzzzzzzz', '--json']);
+  assert.equal(beta.code, 0, beta.stderr);
+  assert.equal(JSON.parse(beta.stdout).results[0].path, 'memory/replace-me.md');
+  const alpha = await runGitmark(['search', root, 'alphaunique', '--json']);
+  assert.equal(alpha.code, 0, alpha.stderr);
+  assert.equal(JSON.parse(alpha.stdout).results.length, 0);
+
+  const third = await runGitmark(['index', root, '--json']);
+  assert.equal(third.code, 0, third.stderr);
+  const indexDirEntries = await readdir(join(root, '.gitmark'));
+  assert.deepEqual(indexDirEntries.filter(name => name !== 'index.db'), []);
+});
+
+test('gitmark search catches a missing grams table cleanly', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-no-grams-')));
+  await writeGitmarkFixture(root);
+  const indexed = await runGitmark(['index', root, '--json']);
+  assert.equal(indexed.code, 0, indexed.stderr);
+  const db = join(root, '.gitmark', 'index.db');
+  await execFileAsync('python3', [
+    '-c',
+    'import sqlite3,sys; con=sqlite3.connect(sys.argv[1]); con.execute("DROP TABLE chunks_grams"); con.commit(); con.close()',
+    db,
+  ]);
+
+  const result = await runGitmark(['search', root, 'controller design', '--json']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).results[0].path, 'memory/decisions.md');
+});
+
+test('gitmark search accepts a query with more than 200 distinct 4-grams', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-qgrams-')));
+  await writeGitmarkFixture(root);
+  const indexed = await runGitmark(['index', root, '--json']);
+  assert.equal(indexed.code, 0, indexed.stderr);
+
+  const tokens = [];
+  for (let i = 0; i < 240; i += 1) {
+    tokens.push(
+      String.fromCharCode(97 + Math.floor(i / 26)) +
+      String.fromCharCode(97 + (i % 26)) +
+      String.fromCharCode(97 + ((i * 7) % 26)) +
+      String.fromCharCode(97 + ((i * 11) % 26)),
+    );
+  }
+  const query = tokens.join(' ');
+  const normalized = query.toLowerCase().replace(/\s+/g, ' ');
+  const distinct = new Set();
+  for (let i = 0; i < normalized.length - 3; i += 1) {
+    distinct.add(normalized.slice(i, i + 4));
+  }
+  assert.ok(distinct.size > 200, `fixture should exceed the qgram cap, got ${distinct.size}`);
+
+  const result = await runGitmark(['search', root, query, '--json']);
+  assert.equal(result.code, 0, result.stderr);
+  JSON.parse(result.stdout);
+});
+
+test('gitmark cmd_search caps fuzzy qgram bindings at 200 and survives OperationalError', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-qcap-')));
+  const db = join(root, 'index.db');
+  await writeFile(db, '');
+
+  const tokens = [];
+  for (let i = 0; i < 240; i += 1) {
+    tokens.push(
+      String.fromCharCode(97 + Math.floor(i / 26)) +
+      String.fromCharCode(97 + (i % 26)) +
+      String.fromCharCode(97 + ((i * 7) % 26)) +
+      String.fromCharCode(97 + ((i * 11) % 26)),
+    );
+  }
+  const query = tokens.join(' ');
+  const harness = `
+import importlib.util, json, sys
+from pathlib import Path
+gitmark_path, root, db, query, raise_fuzz = sys.argv[1:6]
+spec = importlib.util.spec_from_file_location('gitmark_module', gitmark_path)
+gm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gm)
+operational_error = gm.sqlite3.OperationalError
+class FakeConnection:
+    def __init__(self):
+        self.fuzz_bind_counts = []
+    def execute(self, sql, params=()):
+        if 'g.gram IN' in sql:
+            self.fuzz_bind_counts.append(len(params))
+            if raise_fuzz == '1':
+                raise operational_error('boom')
+        return iter(())
+    def close(self):
+        pass
+fake = FakeConnection()
+original_connect = gm.sqlite3.connect
+gm.sqlite3.connect = lambda path: fake
+try:
+    code, payload = gm.cmd_search(Path(root), Path(db), query, 10, True)
+finally:
+    gm.sqlite3.connect = original_connect
+print(json.dumps({'code': code, 'counts': fake.fuzz_bind_counts, 'payload': payload}))
+`;
+
+  for (const raiseFuzz of ['0', '1']) {
+    const result = await execFileAsync('python3', [
+      '-c', harness, GITMARK, root, db, query, raiseFuzz,
+    ]);
+    const observed = JSON.parse(result.stdout);
+    assert.equal(observed.code, 0);
+    assert.deepEqual(observed.counts, [200]);
+    assert.deepEqual(observed.payload, { results: [] });
+  }
+});
+
+test('gitmark non-json search renders text and an empty query returns no hits', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-text-')));
+  await writeGitmarkFixture(root);
+  const indexed = await runGitmark(['index', root, '--json']);
+  assert.equal(indexed.code, 0, indexed.stderr);
+
+  const result = await runGitmark(['search', root, 'controller design']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout.trim().startsWith('{'), false);
+  assert.match(result.stdout, /memory\/decisions\.md:\d+  score=/);
+
+  const empty = await runGitmark(['search', root, '']);
+  assert.equal(empty.code, 0, empty.stderr);
+  assert.match(empty.stdout, /no hits/);
+});
+
+test('gitmark secrets scans exactly 2MiB regular files and skips larger or non-regular files', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'gitmark-secret-size-')));
+  const secret = 'ghp' + '_' + 'abcdefghijklmnopqrstuvwxyz012345';
+  const bigFile = join(root, 'big.txt');
+  const exact = Buffer.alloc(2 * 1024 * 1024, 'a');
+  Buffer.from(secret).copy(exact, 0);
+  await writeFile(bigFile, exact);
+
+  const exactHit = await runGitmark(['secrets', root, '--json'], { timeout: 5000 });
+  assert.equal(exactHit.code, 1, exactHit.stderr);
+  assert.equal(JSON.parse(exactHit.stdout).secrets[0].path, 'big.txt');
+
+  const tooLarge = Buffer.alloc(2 * 1024 * 1024 + 1, 'a');
+  Buffer.from(secret).copy(tooLarge, 0);
+  await writeFile(bigFile, tooLarge);
+  const skippedLarge = await runGitmark(['secrets', root, '--json'], { timeout: 5000 });
+  assert.equal(skippedLarge.code, 0, skippedLarge.stderr);
+  assert.equal(JSON.parse(skippedLarge.stdout).secrets.length, 0);
+
+  await writeFile(bigFile, 'clean\n');
+  const fifo = join(root, 'input.fifo');
+  const mkfifo = await runFile('mkfifo', [fifo], { timeout: 5000 });
+  assert.equal(mkfifo.code, 0, mkfifo.stderr);
+  const skippedFifo = await runGitmark(['secrets', root, '--json'], { timeout: 5000 });
+  assert.equal(skippedFifo.code, 0, skippedFifo.stderr);
+  assert.equal(JSON.parse(skippedFifo.stdout).secrets.length, 0);
 });

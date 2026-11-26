@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import tarfile
@@ -123,30 +124,53 @@ def db_path(root: Path, override):
 
 
 def cmd_index(root: Path, db: Path):
+    """Индекс строится во временном sibling-файле и атомарно подменяет live db.
+
+    DROP TABLE на живой index.db ломал параллельных читателей (search/lint) на
+    время перестройки. Теперь перестройка идёт в index.db.tmp.<pid> рядом с db
+    (та же ФС — os.replace атомарен), WAL + busy_timeout не дают блокировкам
+    читателей оборвать запись, а финальный os.replace подменяет файл мгновенно:
+    открытые соединения дочитывают старый inode, новые видят новый индекс.
+    """
     db.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(db)
-    con.executescript("DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS chunks_fts;"
-                      "DROP TABLE IF EXISTS chunks_trigram; DROP TABLE IF EXISTS chunks_grams;"
-                      "DROP TABLE IF EXISTS meta;")
-    con.executescript(SCHEMA)
-    count = 0
-    for path in iter_files(root):
-        rel = str(path.relative_to(root))
-        chunks = chunk_jsonl(path, rel) if path.suffix == '.jsonl' else chunk_md(path, rel)
-        for rel_path, line, text in chunks:
-            cur = con.execute('INSERT INTO chunks(path,line,text) VALUES(?,?,?)',
-                              (rel_path, line, text))
-            cid = cur.lastrowid
-            con.execute('INSERT INTO chunks_fts(rowid,text) VALUES(?,?)', (cid, text))
-            con.execute('INSERT INTO chunks_trigram(rowid,text) VALUES(?,?)', (cid, text))
-            con.executemany('INSERT INTO chunks_grams(chunk_id,gram) VALUES(?,?)',
-                            [(cid, g) for g in grams4(text)])
-            count += 1
-    con.execute('INSERT INTO meta VALUES(?,?)', ('indexed_files',
-                str(sum(1 for _ in iter_files(root)))))
-    con.commit()
-    con.close()
-    return count
+    tmp = db.parent / f'{db.name}.tmp.{os.getpid()}'
+    for stale in (tmp, Path(f'{tmp}-wal'), Path(f'{tmp}-shm')):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        con = sqlite3.connect(tmp)
+        try:
+            con.execute('PRAGMA journal_mode=WAL')
+            con.execute('PRAGMA busy_timeout=5000')
+            con.executescript(SCHEMA)
+            count = 0
+            for path in iter_files(root):
+                rel = str(path.relative_to(root))
+                chunks = chunk_jsonl(path, rel) if path.suffix == '.jsonl' else chunk_md(path, rel)
+                for rel_path, line, text in chunks:
+                    cur = con.execute('INSERT INTO chunks(path,line,text) VALUES(?,?,?)',
+                                      (rel_path, line, text))
+                    cid = cur.lastrowid
+                    con.execute('INSERT INTO chunks_fts(rowid,text) VALUES(?,?)', (cid, text))
+                    con.execute('INSERT INTO chunks_trigram(rowid,text) VALUES(?,?)', (cid, text))
+                    con.executemany('INSERT INTO chunks_grams(chunk_id,gram) VALUES(?,?)',
+                                    [(cid, g) for g in grams4(text)])
+                    count += 1
+            con.execute('INSERT INTO meta VALUES(?,?)', ('indexed_files',
+                        str(sum(1 for _ in iter_files(root)))))
+            con.commit()
+        finally:
+            con.close()
+        os.replace(tmp, db)
+        return count
+    finally:
+        for leftover in (tmp, Path(f'{tmp}-wal'), Path(f'{tmp}-shm')):
+            try:
+                leftover.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def fts5_query(query: str) -> str:
@@ -186,14 +210,20 @@ def cmd_search(root: Path, db: Path, query: str, limit: int, as_json: bool):
                 tri[len(tri)] = (cid, path, line, text)
         except sqlite3.OperationalError:
             pass
-    qgrams = grams4(query)
+    # sorted() делает срез детерминированным: порядок итерации set в Python
+    # зависит от PYTHONHASHSEED, а без cap длинный запрос упирается в
+    # SQLITE_LIMIT_VARIABLE_NUMBER и убивает весь поиск.
+    qgrams = sorted(grams4(query))[:200]
     if qgrams:
         marks = ','.join('?' * len(qgrams))
-        for cid, cnt, path, line, text in con.execute(
-                f'SELECT g.chunk_id, COUNT(*), c.path, c.line, c.text FROM chunks_grams g '
-                f'JOIN chunks c ON c.id=g.chunk_id WHERE g.gram IN ({marks}) '
-                'GROUP BY g.chunk_id ORDER BY COUNT(*) DESC LIMIT 50', tuple(qgrams)):
-            fuzz[len(fuzz)] = (cid, path, line, text)
+        try:
+            for cid, cnt, path, line, text in con.execute(
+                    f'SELECT g.chunk_id, COUNT(*), c.path, c.line, c.text FROM chunks_grams g '
+                    f'JOIN chunks c ON c.id=g.chunk_id WHERE g.gram IN ({marks}) '
+                    'GROUP BY g.chunk_id ORDER BY COUNT(*) DESC LIMIT 50', tuple(qgrams)):
+                fuzz[len(fuzz)] = (cid, path, line, text)
+        except sqlite3.OperationalError:
+            pass
     con.close()
 
     lists = []
@@ -314,6 +344,15 @@ def cmd_secrets(root: Path, as_json: bool):
             path = Path(dirpath) / name
             if path.is_symlink() and _escapes_root(path, root):
                 continue
+            # Только обычные файлы ограниченного размера: FIFO/сокет/устройство
+            # заблокировали бы читателя навсегда, а многогигабайтный blob —
+            # память процесса. stat() идёт по симлинку внутри root осознанно.
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 2 * 1024 * 1024:
+                continue
             try:
                 text = path.read_text(encoding='utf-8', errors='replace')
             except OSError:
@@ -352,7 +391,9 @@ def main(argv=None):
     elif args.cmd == 'secrets':
         code, payload = cmd_secrets(root, args.json)
 
-    if args.json or args.cmd in ('search', 'lint', 'secrets', 'index'):
+    # Не-JSON search печатает человекочитаемые строки path:line score snippet;
+    # остальные команды машиночитаемы и потому всегда JSON.
+    if args.json or args.cmd != "search":
         print(json.dumps(payload, ensure_ascii=False))
     else:
         print(payload.get('text', json.dumps(payload, ensure_ascii=False)))

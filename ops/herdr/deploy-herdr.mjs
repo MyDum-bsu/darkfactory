@@ -21,8 +21,9 @@
 //     --sha COMMIT --files a.mjs,b.sh [--dry-run|--apply]
 
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
+import { copyFile, lstat, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -61,10 +62,22 @@ async function checkJsSyntax(file) {
   }
 }
 
+// lstat that tolerates absence. lstat (never stat) is used for every
+// write-zone inspection so symlinks are seen as symlinks instead of being
+// silently followed.
+async function lstatOrNull(path) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
 // Builds the deterministic deploy plan. Throws on any contract violation:
 // validation is fail-closed because a half-deployed helper set is worse
 // than none.
-export async function planDeploy({ repoRoot, targetDir, sha, files }) {
+export async function planDeploy({ repoRoot, targetDir, sha, files, skipGitVerify = false }) {
   if (typeof repoRoot !== 'string' || !repoRoot) throw new TypeError('repo_root_required');
   if (typeof targetDir !== 'string' || !targetDir) throw new TypeError('target_dir_required');
   if (typeof sha !== 'string' || !/^[0-9a-f]{7,64}$/i.test(sha)) {
@@ -75,6 +88,22 @@ export async function planDeploy({ repoRoot, targetDir, sha, files }) {
   const rootReal = await realpath(repoRoot).catch(() => {
     throw new Error('repo_root_missing');
   });
+
+  // Provenance check: when the repo root carries a `.git` entry (directory
+  // or worktree gitfile) the stamped sha must be the exact checked-out
+  // HEAD. Deploying bits that do not match the stamped commit would break
+  // the audit chain. Non-git scratch directories (unit tests, temp staging)
+  // skip verification, as does an explicit skipGitVerify opt-out.
+  if (!skipGitVerify && (await lstatOrNull(join(rootReal, '.git'))) !== null) {
+    let head;
+    try {
+      const { stdout } = await execFileAsync('git', ['-C', rootReal, 'rev-parse', 'HEAD']);
+      head = stdout.trim().toLowerCase();
+    } catch {
+      throw new Error('git_verify_failed');
+    }
+    if (head !== sha.toLowerCase()) throw new Error('git_sha_mismatch');
+  }
 
   const entries = [];
   const seen = new Set();
@@ -131,10 +160,27 @@ export async function planDeploy({ repoRoot, targetDir, sha, files }) {
   };
 }
 
+// Atomic write: exclusive-create a random-named sibling temp file (the
+// random suffix plus "wx" make collisions and pre-planted symlink attacks
+// impossible), write it fully, then rename over the target. rename(2) is
+// atomic on POSIX within one filesystem, and the temp file always lives in
+// the same directory as the target, so the rename never crosses mounts.
 async function writeAtomic(file, content, mode) {
-  const tmp = `${file}.tmp-${process.pid}`;
-  await writeFile(tmp, content, mode === undefined ? {} : { mode });
-  await rename(tmp, file);
+  const tmp = `${file}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
+  let created = false;
+  try {
+    const handle = await open(tmp, 'wx', mode);
+    created = true;
+    try {
+      await handle.writeFile(content);
+    } finally {
+      await handle.close();
+    }
+    await rename(tmp, file);
+  } catch (error) {
+    if (created) await rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 // Applies a plan. Default is dry-run: the full action list is computed but
@@ -147,14 +193,42 @@ export async function applyDeploy(plan, { dryRun = true } = {}) {
   const actions = [];
   const manifestFiles = [];
 
-  if (!dryRun) await mkdir(plan.targetDir, { recursive: true });
+  if (!dryRun) {
+    await mkdir(plan.targetDir, { recursive: true });
+    // lstat (never stat) every target/backup parent. Normally this is the
+    // target directory itself because plans deploy flat, but checking the
+    // concrete parent of each write keeps applyDeploy fail-closed even for a
+    // malformed hand-built plan. A symlinked parent is not a directory under
+    // lstat, so it cannot redirect writes outside the audited zone.
+    const parents = new Set([plan.targetDir]);
+    for (const entry of plan.files) {
+      parents.add(dirname(entry.target));
+      parents.add(dirname(entry.backup));
+    }
+    for (const parent of parents) {
+      const parentInfo = await lstatOrNull(parent);
+      if (parentInfo === null || parentInfo.isSymbolicLink() || !parentInfo.isDirectory()) {
+        throw new Error('target_dir_not_directory');
+      }
+    }
+  }
 
   for (const entry of plan.files) {
+    // Symlinks at the target or backup path are refused outright: copying
+    // through a target symlink would leak host file content into backups,
+    // and a planted backup symlink must never be followed or clobbered.
+    const targetInfo = await lstatOrNull(entry.target);
+    if (targetInfo !== null && targetInfo.isSymbolicLink()) {
+      throw new Error(`target_is_symlink:${entry.name}`);
+    }
+    const backupInfo = await lstatOrNull(entry.backup);
+    if (backupInfo !== null && backupInfo.isSymbolicLink()) {
+      throw new Error(`backup_is_symlink:${entry.name}`);
+    }
+
     let existing = null;
-    try {
+    if (targetInfo !== null) {
       existing = await readFile(entry.target);
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
     }
 
     const alreadyCurrent = existing !== null && sha256Hex(existing) === entry.sha256;
@@ -164,9 +238,19 @@ export async function applyDeploy(plan, { dryRun = true } = {}) {
       continue;
     }
 
-    const backup = existing !== null;
+    // The .bak captures the pre-deploy state exactly once: an existing
+    // backup is the original and is never clobbered or rotated away.
+    const backup = existing !== null && backupInfo === null;
     if (!dryRun) {
-      if (backup) await copyFile(entry.target, entry.backup);
+      if (backup) {
+        try {
+          await copyFile(entry.target, entry.backup, fsConstants.COPYFILE_EXCL);
+        } catch (error) {
+          // EEXIST means a backup materialized between lstat and copy:
+          // the original backup wins, the race loser keeps no state.
+          if (error.code !== 'EEXIST') throw error;
+        }
+      }
       await writeAtomic(entry.target, entry.content, entry.mode);
     }
     actions.push({
@@ -203,6 +287,7 @@ function parseCli(argv) {
       files: { type: 'string' },
       'dry-run': { type: 'boolean', default: false },
       apply: { type: 'boolean', default: false },
+      'skip-git-verify': { type: 'boolean', default: false },
       help: { type: 'boolean', default: false },
     },
     strict: true,
@@ -220,6 +305,7 @@ Options:
   --files LIST      Comma-separated source files, relative to repo root
   --dry-run         Print planned actions without writing (default)
   --apply           Actually copy files, backups and manifest
+  --skip-git-verify Skip the git HEAD provenance check on --sha
 `;
 
 export async function main(argv, { out = process.stdout, err = process.stderr } = {}) {
@@ -251,6 +337,7 @@ export async function main(argv, { out = process.stdout, err = process.stderr } 
       targetDir: values['target-dir'],
       sha: values.sha,
       files,
+      skipGitVerify: values['skip-git-verify'],
     });
     const result = await applyDeploy(plan, { dryRun });
     for (const action of result.actions) {
