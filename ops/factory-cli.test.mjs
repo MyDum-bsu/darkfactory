@@ -1483,20 +1483,30 @@ test('run: --switch неканоническая строка и lstat-ошиб�
   }
 });
 
-test('enqueue: явный --vb разрешается до realpath, default vb — нет', async () => {
+test('enqueue: явный --vb symlink разрешается до realpath', async () => {
   const dir = await tempdir();
   try {
     const realVb = join(dir, 'vb-real');
     await writeFile(realVb, '#!/bin/sh\n');
     const linkVb = join(dir, 'vb-link');
     await symlink(realVb, linkVb);
+    // Штатная установка vb использует symlink в ~/.local/bin: explicit
+    // executable разрешается до канонической цели до boundary-проверок.
+    const linked = await buildEnqueuePlan({ ...baseValues(), vb: linkVb });
+    assert.equal(linked.tool, realVb);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('enqueue: явный --vb через симлинк отклоняется, default vb — нет', async () => {
+  const dir = await tempdir();
+  try {
+    const realVb = join(dir, 'vb-real');
+    await writeFile(realVb, '#!/bin/sh\n');
     // Без --vb — команда по умолчанию 'vb', проверка пути не применяется.
     const plan = await buildEnqueuePlan({ ...baseValues() });
     assert.equal(plan.tool, 'vb');
-    // Явный --vb через симлинк разрешается до канонической цели: штатная
-    // установка vb использует symlink в ~/.local/bin.
-    const linked = await buildEnqueuePlan({ ...baseValues(), vb: linkVb });
-    assert.equal(linked.tool, realVb);
     // Symlink внутри worktree наружу и symlink снаружи внутрь worktree
     // отклоняются по обоим концам разрешения.
     const wt = join(dir, 'wt');
