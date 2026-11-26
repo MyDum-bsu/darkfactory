@@ -47,7 +47,7 @@ const baseGit = ({ dirty = {}, unmerged = [], diffs = {} } = {}) => fakeGit([
   [(a) => a.join(' ') === 'worktree list --porcelain', () => WORKTREE_LIST],
   [(a, cwd) => a.join(' ') === 'status --porcelain', (a, cwd) => dirty[cwd] ?? ''],
   [(a) => a[0] === 'branch', () => unmerged.join('\n') + (unmerged.length ? '\n' : '')],
-  [(a, cwd) => a[0] === 'diff', (a) => (diffs[a[a.indexOf('--') - 1]] ?? []).join('\n')],
+  [(a, cwd) => a[0] === 'diff', (a) => (diffs[a[a.indexOf('--') - 1]] ?? []).map(f => `${f}\0`).join('')],
 ]);
 
 test('clean repo: no drift detected', async () => {
@@ -207,7 +207,7 @@ branch refs/heads/bb/thr_old1
     [(a, cwd) => a.join(' ') === 'status --porcelain',
       (a, cwd) => cwd === '/home/operator/df-slot-4' ? ' M board_pipeline/x.mjs\n' : ''],
     [(a) => a[0] === 'branch', () => `${branches.join('\n')}\n`],
-    [(a) => a[0] === 'diff', () => 'board_pipeline/x.mjs\n'],
+    [(a) => a[0] === 'diff', () => 'board_pipeline/x.mjs\0'],
   ]);
   const report = await inspectWorktreesAndBranches({ repoDir: '/repo/main', baseRef: 'main', execGit });
   assert.equal(report.bbThreadWorktrees.length, 1);
@@ -305,4 +305,127 @@ test('enqueue: touch paths reach drift check', async () => {
     checkBranchDrift: opts => { checked = opts; return assertNoBranchDrift(opts); },
   });
   assert.deepEqual(checked.touchPaths, ['ops/', 'docs/a.md']);
+});
+
+// --- Astra #20: NUL-delimited diff parsing -----------------------------------
+
+test('P2: diff uses --no-renames --name-only -z and parses NUL-delimited paths', async () => {
+  const seen = [];
+  const execGit = fakeGit([
+    [(a) => a.join(' ') === 'worktree list --porcelain', () => WORKTREE_LIST],
+    [(a, cwd) => a.join(' ') === 'status --porcelain', ''],
+    [(a) => a[0] === 'branch', () => 'feat/evasive\n'],
+    [(a) => a[0] === 'diff', (a) => {
+      seen.push(a);
+      // Имя с переводом строки внутри: newline-split разбил бы его на два
+      // ложных пути, quoted-форма ушла бы от touchPaths — NUL не ломается.
+      return `src/evasive\nname.mjs\0src/normal.mjs\0`;
+    }],
+  ]);
+  const report = await inspectWorktreesAndBranches({
+    repoDir: '/repo/main', baseRef: 'main', touchPaths: ['src/evasive\nname.mjs'], execGit });
+  assert.equal(report.unmergedBranches.length, 1, 'переименованное/quoted имя не уходит от детекции');
+  assert.deepEqual(report.unmergedBranches[0].files, ['src/evasive\nname.mjs']);
+  const diff = seen[0];
+  assert.ok(diff.includes('--no-renames'), 'rename detection выключена');
+  assert.ok(diff.includes('--name-only'));
+  assert.ok(diff.includes('-z'), 'NUL-разделённый вывод');
+  assert.equal(diff[diff.indexOf('--') - 1], 'main...feat/evasive');
+});
+
+test('P2: newline inside a filename does not split into false paths or evade touch filtering', async () => {
+  const execGit = fakeGit([
+    [(a) => a.join(' ') === 'worktree list --porcelain', () => WORKTREE_LIST],
+    [(a, cwd) => a.join(' ') === 'status --porcelain', ''],
+    [(a) => a[0] === 'branch', () => 'feat/evasive\n'],
+    // Имя файла 'docs/x.md\nsrc/evil.mjs' — одно целое. newline-split увидел бы
+    // 'src/evil.mjs' как отдельный путь и ложно пересёкся бы с touchPaths.
+    [(a) => a[0] === 'diff', () => 'docs/x.md\nsrc/evil.mjs\0'],
+  ]);
+  const report = await inspectWorktreesAndBranches({
+    repoDir: '/repo/main', baseRef: 'main', touchPaths: ['src'], execGit });
+  assert.equal(report.unmergedBranches.length, 0,
+    'перевод строки внутри имени не порождает ложное пересечение');
+  assert.equal(report.ok, true);
+});
+
+test('P2: quoted special characters in filenames survive intact as single paths', async () => {
+  const execGit = fakeGit([
+    [(a) => a.join(' ') === 'worktree list --porcelain', () => WORKTREE_LIST],
+    [(a, cwd) => a.join(' ') === 'status --porcelain', ''],
+    [(a) => a[0] === 'branch', () => 'feat/q\n'],
+    [(a) => a[0] === 'diff', () => 'src/we"ird\tsrc.mjs\0'],
+  ]);
+  const report = await inspectWorktreesAndBranches({
+    repoDir: '/repo/main', baseRef: 'main', touchPaths: ['src/we"ird\tsrc.mjs'], execGit });
+  assert.equal(report.unmergedBranches.length, 1);
+  assert.deepEqual(report.unmergedBranches[0].files, ['src/we"ird\tsrc.mjs']);
+});
+
+test('P2: empty diff parses to zero files rather than one empty path', async () => {
+  const execGit = fakeGit([
+    [(a) => a.join(' ') === 'worktree list --porcelain', () => WORKTREE_LIST],
+    [(a, cwd) => a.join(' ') === 'status --porcelain', ''],
+    [(a) => a[0] === 'branch', () => 'feat/empty\n'],
+    [(a) => a[0] === 'diff', () => ''],
+  ]);
+  const report = await inspectWorktreesAndBranches({
+    repoDir: '/repo/main', baseRef: 'main', execGit });
+  // Пустой diff при заданных touchPaths не пересекается.
+  const reportTouched = await inspectWorktreesAndBranches({
+    repoDir: '/repo/main', baseRef: 'main', touchPaths: ['src'], execGit });
+  assert.equal(reportTouched.unmergedBranches.length, 0);
+  assert.equal(report.unmergedBranches.length, 1, 'пустой touchPaths — любая ветка пересекается');
+  assert.deepEqual(report.unmergedBranches[0].files, []);
+});
+
+// Реальный git end-to-end: переименование и имя с переводом строки не уходят
+// от механической инспекции на живом репозитории.
+test('P2 real git: renamed and newline filenames cannot evade branch-drift detection', async t => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdir, mkdtemp, rename, rm, writeFile } = await import('node:fs/promises');
+  const repo = await mkdtemp(join(tmpdir(), 'drift-real-'));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const git = (...args) => execFileSync('git', ['-C', repo, ...args]).toString();
+  git('init', '--initial-branch=main');
+  await writeFile(join(repo, 'old.mjs'), 'x\n');
+  await mkdir(join(repo, 'src'));
+  await writeFile(join(repo, 'src', 'keep.mjs'), 'y\n');
+  git('add', '-A');
+  git('-c', 'user.email=t@t.invalid', '-c', 'user.name=T', '-c', 'commit.gpgsign=false',
+    'commit', '-m', 'seed');
+  git('checkout', '-b', 'feat/drift');
+  await rename(join(repo, 'old.mjs'), join(repo, 'new.mjs'));
+  // Имя с переводом строки — законный POSIX-путь, quoted-вывод без -z ушёл бы
+  // от точного совпадения touchPaths.
+  const evasive = 'src/evasive\nname.mjs';
+  await writeFile(join(repo, evasive), 'z\n');
+  git('add', '-A');
+  git('-c', 'user.email=t@t.invalid', '-c', 'user.name=T', '-c', 'commit.gpgsign=false',
+    'commit', '-m', 'drift');
+
+  // Точный touch на новое имя после rename пересекается.
+  const renamed = await inspectWorktreesAndBranches({
+    repoDir: repo, baseRef: 'main', touchPaths: ['new.mjs'] });
+  assert.equal(renamed.unmergedBranches.length, 1);
+  assert.ok(renamed.unmergedBranches[0].files.includes('new.mjs'));
+  // Ключевая регрессия: touch на СТАРЫЙ путь тоже пересекается — без
+  // --no-renames git схлопывал бы rename в одну цель и старый путь уходил
+  // от детекции дрейфа.
+  const oldPath = await inspectWorktreesAndBranches({
+    repoDir: repo, baseRef: 'main', touchPaths: ['old.mjs'] });
+  assert.equal(oldPath.unmergedBranches.length, 1,
+    'rename не схлопывается: старый путь тоже виден логике пересечения');
+
+  // Точный touch на имя с переводом строки.
+  const escaped = await inspectWorktreesAndBranches({
+    repoDir: repo, baseRef: 'main', touchPaths: [evasive] });
+  assert.equal(escaped.unmergedBranches.length, 1,
+    'имя с переводом строки пересекается точно, не уходит от детекции');
+  assert.ok(escaped.unmergedBranches[0].files.includes(evasive));
+
+  // А несвязный touch не пересекается — ложных срабатываний нет.
+  const unrelated = await inspectWorktreesAndBranches({
+    repoDir: repo, baseRef: 'main', touchPaths: ['no/such/path'] });
+  assert.equal(unrelated.unmergedBranches.length, 0);
 });

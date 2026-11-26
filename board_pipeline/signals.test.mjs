@@ -157,3 +157,92 @@ test('l1_l3-only бюджет: leavePhase на выходе из фазы сни
     'остаток завершённой l1_l3 не должен ложно аборитить попытку');
   signals.dispose();
 });
+
+// --- Astra #18: lease renewal coalescing + recursive poll scheduling ---------
+
+test('coalescing: at most one verifyHeld RPC in flight per attempt', async () => {
+  let calls = 0;
+  const pending = [];
+  const verifyHeld = () => { calls++; return new Promise(resolve => pending.push(resolve)); };
+  const signals = createAttemptSignals({
+    lease: { verifyHeld, taskId: '3', epoch: 7 }, pollMs: 5, random: () => 0,
+  });
+  await delay(50);
+  assert.equal(calls, 1, 'пока первый RPC в полёте, новые опросы не стартуют новые RPC');
+  // Завершение первого RPC планирует следующий опрос — ровно один.
+  pending.shift()({ epoch: 7 });
+  await delay(100);
+  assert.equal(calls, 2, 'после resolve запускается ровно один следующий RPC');
+  assert.equal(signals.signal.aborted, false);
+  signals.dispose();
+  for (const resolve of pending.splice(0)) resolve({ epoch: 7 });
+});
+
+test('coalescing: checkNow shares the in-flight poll RPC instead of a duplicate', async () => {
+  let calls = 0;
+  const pending = [];
+  const verifyHeld = () => { calls++; return new Promise(resolve => pending.push(resolve)); };
+  const signals = createAttemptSignals({
+    lease: { verifyHeld, taskId: '3', epoch: 7 }, pollMs: 5, random: () => 0,
+  });
+  await delay(40);
+  assert.equal(calls, 1);
+  // checkNow во время in-flight RPC присоединяется к тому же promise.
+  const check = signals.checkNow();
+  assert.equal(calls, 1, 'checkNow не порождает дублирующий RPC');
+  pending.shift()({ epoch: 7 });
+  await check;
+  assert.equal(calls, 1, 'один RPC обслужил и опрос, и checkNow');
+  assert.equal(signals.signal.aborted, false);
+  signals.dispose();
+  for (const resolve of pending.splice(0)) resolve({ epoch: 7 });
+});
+
+test('recursive scheduling: dispose during an in-flight poll stops the loop for good', async () => {
+  let calls = 0;
+  const pending = [];
+  const verifyHeld = () => { calls++; return new Promise(resolve => pending.push(resolve)); };
+  const signals = createAttemptSignals({
+    lease: { verifyHeld, taskId: '3', epoch: 7 }, pollMs: 5, random: () => 0,
+  });
+  await delay(40);
+  assert.equal(calls, 1);
+  signals.dispose();
+  // RPC завершается уже после dispose: новый опрос планироваться не должен.
+  pending.shift()({ epoch: 7 });
+  await delay(60);
+  assert.equal(calls, 1, 'после dispose цепочка опросов обрывается');
+  assert.equal(signals.signal.aborted, false);
+});
+
+test('recursive scheduling: fast RPCs keep polling alive across many ticks', async () => {
+  let calls = 0;
+  const signals = createAttemptSignals({
+    lease: { verifyHeld: async () => { calls++; return { epoch: 7 }; }, taskId: '3', epoch: 7 },
+    pollMs: 5, random: () => 0.5,
+  });
+  await delay(80);
+  assert.ok(calls >= 3, `несколько последовательных опросов прошло, got ${calls}`);
+  assert.equal(signals.signal.aborted, false);
+  signals.dispose();
+  const settled = calls;
+  await delay(40);
+  assert.equal(calls, settled, 'dispose останавливает рекурсивное планирование');
+});
+
+test('poll chain survives a slow lease rejection and still aborts with lease_lost', async () => {
+  let calls = 0;
+  const pending = [];
+  const verifyHeld = () => { calls++; return new Promise((resolve, reject) => pending.push(reject)); };
+  const signals = createAttemptSignals({
+    lease: { verifyHeld, taskId: '3', epoch: 7 }, pollMs: 5, random: () => 0,
+  });
+  await delay(40);
+  assert.equal(calls, 1);
+  assert.equal(signals.signal.aborted, false, 'отложенный RPC ещё не абортит');
+  pending.shift()(new Error('board unreachable'));
+  await delay(20);
+  assert.equal(signals.signal.aborted, true);
+  assert.equal(signals.signal.reason.message, 'board unreachable');
+  signals.dispose();
+});
