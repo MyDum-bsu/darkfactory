@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
-import { buildExecutorCommand, buildFollowUpMessage, createWorkerRuntime } from './worker-runtime.mjs';
+import { buildExecutorCommand, buildFollowUpMessage, createWorkerRuntime,
+  deterministicRuntimeId } from './worker-runtime.mjs';
 
 const SPAWN = {
   taskId: '3840', attemptId: 'attempt-1', worktree: '/tmp/worktree', promptFile: '/tmp/prompt.md',
@@ -55,11 +56,12 @@ test('hc spawn uses run --bg --keep, labels, and a shell-free argv tail', async 
   const { calls, exec } = hcMock(async () => ({ stdout: JSON.stringify({ address: 't7', pid: 123 }) }));
   const runtime = createWorkerRuntime({ kind: 'hc', exec, env: { MARKER: '1' }, readFile: async () => prompt });
   const spawned = await runtime.spawn(SPAWN);
-  assert.deepEqual(spawned, { runtimeId: 't7', transport: 'hc', terminalId: 't7', pid: 123 });
+  assert.deepEqual(spawned, { runtimeId: 'df-3840-d0d63638ee', transport: 'hc', terminalId: 't7', pid: 123 });
   assert.equal(calls.length, 1);
   const { command, argv, options } = calls[0];
   assert.equal(command, 'hc');
   assert.deepEqual(argv.slice(0, 6), ['run', '--bg', '--keep', '--json', '--cwd', '/tmp/worktree']);
+  assert.deepEqual(argv.slice(6, 8), ['--name', 'df-3840-d0d63638ee']);
   assert.equal(options.env.MARKER, '1');
   const labels = argv.filter((arg, i) => argv[i - 1] === '--label');
   assert.ok(labels.includes('darkfactory.task=3840'));
@@ -74,10 +76,16 @@ test('hc spawn uses run --bg --keep, labels, and a shell-free argv tail', async 
   assert.equal(argv.includes('bash'), false);
 });
 
+test('hc spawn requires a top-level attested terminal address', async () => {
+  const { exec } = hcMock(async () => ({ stdout: JSON.stringify({ terminal: { address: 'nested-t7' } }) }));
+  const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => 'prompt' });
+  await assert.rejects(() => runtime.spawn(SPAWN), /hc_spawn_unattested/);
+});
+
 test('hc feedback, observe and stop map CLI results to the runtime contract', async () => {
   const { calls, exec } = hcMock(async (command, argv) => {
     if (argv[0] === 'send') return { stdout: JSON.stringify({ turn: 3, started: true, status: 'idle' }) };
-    if (argv[0] === 'get') return { stdout: JSON.stringify({ state: 'live', status: { state: 'blocked' } }) };
+    if (argv[0] === 'get') return { stdout: JSON.stringify({ state: 'live', turn: 3, status: { state: 'blocked' } }) };
     if (argv[0] === 'read') return { stdout: JSON.stringify({ text: 'line 1\nline 2\n' }) };
     if (argv[0] === 'kill') return { stdout: JSON.stringify({ state: 'finished', exit_code: 0, reason: 'killed' }) };
     throw new Error(`unexpected ${argv[0]}`);
@@ -85,12 +93,12 @@ test('hc feedback, observe and stop map CLI results to the runtime contract', as
   const runtime = createWorkerRuntime({ kind: 'hc', exec });
   assert.deepEqual(await runtime.feedback({ runtimeId: 't7', message: 'fix the red test' }),
     { delivered: true, turn: 3, started: true, status: 'idle' });
-  assert.deepEqual(await runtime.observe({ runtimeId: 't7' }), { state: 'blocked', tail: 'line 1\nline 2\n' });
+  assert.deepEqual(await runtime.observe({ runtimeId: 't7' }), { state: 'blocked', turn: 3, tail: 'line 1\nline 2\n' });
   assert.deepEqual(await runtime.stop({ runtimeId: 't7' }), { stopped: true, state: 'exited', exitCode: 0 });
-  assert.deepEqual(calls[0].argv, ['send', '--json', 't7', 'fix the red test']);
-  assert.deepEqual(calls[1].argv, ['get', '--json', 't7']);
-  assert.deepEqual(calls[2].argv, ['read', '--json', '--lines', '40', 't7']);
-  assert.deepEqual(calls[3].argv, ['kill', '--json', 't7']);
+  assert.deepEqual(calls[0].argv, ['send', '--json', '--', 't7', 'fix the red test']);
+  assert.deepEqual(calls[1].argv, ['get', '--json', '--', 't7']);
+  assert.deepEqual(calls[2].argv, ['read', '--json', '--lines', '40', '--', 't7']);
+  assert.deepEqual(calls[3].argv, ['kill', '--json', '--', 't7']);
 });
 
 test('hc observe treats a finished terminal as exited even when its exit code is non-zero', async () => {
@@ -129,7 +137,7 @@ test('subproc spawn runs a print-mode turn directly and observes its determinist
     env: { SUBPROC_TEST: '1' }, spawn, readFile: async () => 'initial prompt' });
   const spawned = await runtime.spawn({ ...SPAWN,
     executor: { provider: 'pi', model: 'openai/gpt-6.2-sol', reasoningLevel: 'medium' } });
-  assert.deepEqual(spawned, { runtimeId: 'subproc-1', transport: 'subproc', pid: 4321 });
+  assert.deepEqual(spawned, { runtimeId: 'subproc-d0d63638ee89', transport: 'subproc', pid: 4321 });
   assert.equal(launches[0].command, 'pi');
   assert.deepEqual(launches[0].argv, ['--model', 'openai/gpt-6.2-sol', '--thinking', 'medium',
     '--print', '--', 'initial prompt']);
@@ -139,7 +147,7 @@ test('subproc spawn runs a print-mode turn directly and observes its determinist
   children[0].stdout.emit('data', 'worker output');
   children[0].emit('exit', 0, null);
   assert.deepEqual(await runtime.observe({ runtimeId: spawned.runtimeId }),
-    { state: 'done', exitCode: 0, tail: 'worker output' });
+    { state: 'done', turn: 1, exitCode: 0, tail: 'worker output' });
   assert.deepEqual(await runtime.observe({ runtimeId: 'missing' }), { state: 'exited' });
 });
 
@@ -186,4 +194,50 @@ test('subproc probe does not require hc and invalid input fails before a process
   await assert.rejects(() => runtime.spawn(SPAWN), /worker_prompt_invalid/);
   assert.equal(launches, 0);
   assert.throws(() => createWorkerRuntime({ kind: 'pty' }), /worker_runtime_kind_invalid/);
+});
+
+test('hc option separator protects positional ids and markdown rework text', async () => {
+  const rework = '- Fix line 10\n- Add test';
+  const { calls, exec } = hcMock(async (command, argv) => {
+    if (argv[0] === 'send') return { stdout: JSON.stringify({ started: true }) };
+    if (argv[0] === 'get') return { stdout: JSON.stringify({ state: 'live', status: { state: 'working' } }) };
+    if (argv[0] === 'read') return { stdout: JSON.stringify({ text: '' }) };
+    if (argv[0] === 'kill') return { stdout: JSON.stringify({ state: 'finished' }) };
+    throw new Error(`unexpected ${argv[0]}`);
+  });
+  const runtime = createWorkerRuntime({ kind: 'hc', exec });
+  await runtime.feedback({ runtimeId: 'df-task-0123456789', message: rework });
+  await runtime.observe({ runtimeId: 'df-task-0123456789' });
+  await runtime.stop({ runtimeId: 'df-task-0123456789' });
+  assert.deepEqual(calls[0].argv, ['send', '--json', '--', 'df-task-0123456789', rework]);
+  assert.deepEqual(calls[1].argv, ['get', '--json', '--', 'df-task-0123456789']);
+  assert.deepEqual(calls[2].argv, ['read', '--json', '--lines', '40', '--', 'df-task-0123456789']);
+  assert.deepEqual(calls[3].argv, ['kill', '--json', '--', 'df-task-0123456789']);
+});
+
+test('deterministic runtime ids round-trip through hc --name and subproc sessions', async () => {
+  assert.equal(deterministicRuntimeId('hc', '3840', 'attempt-1'), 'df-3840-d0d63638ee');
+  assert.equal(deterministicRuntimeId('subproc', '3840', 'attempt-1'), 'subproc-d0d63638ee89');
+  assert.equal(deterministicRuntimeId('hc', 'Task/4049!', 'attempt-2'),
+    deterministicRuntimeId('hc', 'Task/4049!', 'attempt-2'));
+  assert.throws(() => deterministicRuntimeId('bb', '3840', 'attempt-1'), /worker_runtime_kind_invalid/);
+
+  const hcId = 'df-explicit-0123456789';
+  const { calls, exec } = hcMock(async () => ({ stdout: JSON.stringify({ address: 'terminal-address' }) }));
+  const hcRuntime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => 'prompt' });
+  await assert.rejects(() => hcRuntime.spawn({ ...SPAWN, runtimeId: 'Bad Name' }), /runtime_id_invalid/);
+  const hcSpawned = await hcRuntime.spawn({ ...SPAWN, runtimeId: hcId });
+  assert.equal(hcSpawned.runtimeId, hcId);
+  assert.equal(hcSpawned.terminalId, 'terminal-address');
+  assert.deepEqual(calls[0].argv.slice(6, 8), ['--name', hcId]);
+
+  const children = [];
+  const subRuntime = createWorkerRuntime({ kind: 'subproc', exec: async () => ({ stdout: '' }),
+    spawn: () => { const child = childProcess(6100 + children.length); children.push(child); return child; },
+    readFile: async () => 'prompt' });
+  const subId = deterministicRuntimeId('subproc', '3840', 'attempt-1');
+  const subSpawned = await subRuntime.spawn({ ...SPAWN, runtimeId: subId,
+    executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } });
+  assert.equal(subSpawned.runtimeId, subId);
+  assert.deepEqual(await subRuntime.observe({ runtimeId: subId }), { state: 'working' });
 });

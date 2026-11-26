@@ -9,6 +9,7 @@
 // второго писателя.
 
 import { executorFamily, l2RunnableSpec, ReviewDenied } from './review-runner.mjs';
+import { isWorkerThreadId } from './worker-runtime.mjs';
 import { NEON_CRITIC, SOL_ARBITER, detectStalledReview, isSolArbiter } from './review-policy.mjs';
 import {
   DEFAULT_MIN_OBSERVATIONS,
@@ -244,7 +245,7 @@ export async function attemptSpawnWithFallback({
       lastRefusal = reason;
       continue;
     }
-    if (/^thr_[a-z0-9]+$/.test(launched?.threadId ?? '')) {
+    if (isWorkerThreadId(launched?.threadId)) {
       return {
         outcome: 'spawned',
         worker,

@@ -15,7 +15,7 @@
 //     --policy FILE --state DIR [--worktree DIR] [--memory-dir DIR] \
 //     [--ledger-path FILE] [--stop-on-idle] [--daemon] [--switch V] \
 //     [--interval-ms N] [--allow-live-pilot] [--recheck-rejected-handoff] \
-//     [--dry-run] [--json]
+//     [--runtime bb|hc|subproc] [--dry-run] [--json]
 import { execFile, spawn } from 'node:child_process';
 import { lstat, readdir, realpath, readFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
@@ -142,7 +142,7 @@ async function nestedPolicyFile(path, treeAliases) {
 
 const PASSTHROUGH_BOOL = ['stop-on-idle', 'daemon', 'allow-live-pilot',
   'recheck-rejected-handoff'];
-const PASSTHROUGH_VALUE = ['switch', 'interval-ms'];
+const PASSTHROUGH_VALUE = ['switch', 'interval-ms', 'runtime'];
 const LEDGER_PATH_ENV = 'DF_DECISION_LEDGER_PATH';
 const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 
@@ -193,6 +193,9 @@ function effectivePath({ explicit, policyValue, env, name }) {
 // только `git config --local core.fileMode false` в том же worktree, в
 // котором будет работать контроллер.
 export async function buildRunPlan(values, { env = process.env } = {}) {
+  if (values.runtime !== undefined && !['bb', 'hc', 'subproc'].includes(values.runtime)) {
+    fail('worker_runtime_kind_invalid');
+  }
   if (typeof values.provider !== 'string' || !values.provider.trim()) fail('provider_required');
   if (typeof values.model !== 'string' || !values.model.trim()) fail('model_required');
   if (!values.policy || !values.state) fail('policy_and_state_required');
@@ -646,7 +649,7 @@ export async function runFactory(argv, deps = {}) {
     switch: { type: 'string' }, 'interval-ms': { type: 'string' },
     'allow-live-pilot': { type: 'boolean' },
     'recheck-rejected-handoff': { type: 'boolean' },
-    'l1-profile': { type: 'string' },
+    'l1-profile': { type: 'string' }, runtime: { type: 'string' },
     'dry-run': { type: 'boolean' }, json: { type: 'boolean' } } });
   const plan = await buildRunPlan(values, { env: deps.env ?? process.env });
   if (values['dry-run']) {

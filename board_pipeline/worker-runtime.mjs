@@ -92,10 +92,21 @@ function appendTail(session, chunk) {
   session.tail = `${session.tail}${chunk}`.slice(-TAIL_LIMIT);
 }
 
-function terminalName(taskId, attemptId) {
-  const safe = taskId.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 12) || 'task';
-  const hash = createHash('sha256').update(`${taskId}:${attemptId}`).digest('hex').slice(0, 10);
-  return `df-${safe}-${hash}`.slice(0, 32);
+export function isWorkerThreadId(value) {
+  return typeof value === 'string' &&
+    /^(?:thr_[a-z0-9]+|df-[a-z0-9_-]{1,12}-[a-f0-9]{10}|subproc-[a-f0-9]{12})$/.test(value);
+}
+
+export function deterministicRuntimeId(kind, taskId, attemptId) {
+  const task = token(taskId, 'task_id_invalid');
+  const attempt = token(attemptId, 'attempt_id_invalid');
+  const hash = createHash('sha256').update(`${task}:${attempt}`).digest('hex');
+  if (kind === 'hc') {
+    const safe = task.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 12) || 'task';
+    return `df-${safe}-${hash.slice(0, 10)}`.slice(0, 32);
+  }
+  if (kind === 'subproc') return `subproc-${hash.slice(0, 12)}`;
+  fail('worker_runtime_kind_invalid');
 }
 
 function terminalExitCode(terminal) {
@@ -123,6 +134,7 @@ function validateSpawnInput(input) {
     executor: input.executor,
     ...(input.spaceLabel === undefined ? {} : { spaceLabel: text(input.spaceLabel, 'space_label_invalid') }),
     ...(input.tabLabel === undefined ? {} : { tabLabel: text(input.tabLabel, 'tab_label_invalid') }),
+    ...(input.runtimeId === undefined ? {} : { runtimeId: token(input.runtimeId, 'runtime_id_invalid') }),
   });
 }
 
@@ -137,7 +149,6 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
   if (typeof spawnProcess !== 'function') fail('worker_runtime_spawn_invalid');
 
   const sessions = new Map();
-  let nextSubproc = 0;
 
   const invoke = async (command, argv, options = {}) =>
     exec(command, argv, { env, timeout: 10_000, ...options });
@@ -172,6 +183,8 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
   }
 
   async function spawnHc(input, prompt) {
+    const runtimeId = input.runtimeId ?? deterministicRuntimeId('hc', input.taskId, input.attemptId);
+    if (!/^[a-z0-9_-]{1,32}$/.test(runtimeId)) fail('runtime_id_invalid');
     const built = buildExecutorCommand(input.executor, { prompt, interactive: true });
     const labels = [
       ['darkfactory.task', input.taskId],
@@ -181,13 +194,13 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
       ...(input.tabLabel === undefined ? [] : [['herdr.tab', input.tabLabel]]),
     ];
     const argv = ['run', '--bg', '--keep', '--json', '--cwd', input.worktree,
-      '--name', terminalName(input.taskId, input.attemptId)];
+      '--name', runtimeId];
     for (const [key, value] of labels) argv.push('--label', `${key}=${value}`);
     argv.push('--', built.command, ...built.argv);
     const launched = await hc(argv, { timeout: 30_000 });
-    const terminalId = launched?.address ?? launched?.terminal?.address;
+    const terminalId = launched?.address;
     if (typeof terminalId !== 'string' || !terminalId) fail('hc_spawn_unattested');
-    return Object.freeze({ runtimeId: terminalId, transport: 'hc', terminalId,
+    return Object.freeze({ runtimeId, transport: 'hc', terminalId,
       ...(Number.isSafeInteger(launched.pid) ? { pid: launched.pid } : {}) });
   }
 
@@ -198,10 +211,20 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     session.signal = undefined;
     child.stdout?.on?.('data', chunk => appendTail(session, chunk));
     child.stderr?.on?.('data', chunk => appendTail(session, chunk));
+    const finishTurn = () => {
+      if (session.activeTurn !== true) return;
+      session.activeTurn = false;
+      session.turn += 1;
+    };
+    session.activeTurn = true;
     child.on?.('error', () => {
-      if (session.state === 'working') session.state = 'exited';
+      if (session.state === 'working') {
+        finishTurn();
+        session.state = 'exited';
+      }
     });
     child.on?.('exit', (code, signal) => {
+      finishTurn();
       session.state = code === 0 ? 'done' : 'exited';
       session.exitCode = Number.isSafeInteger(code) ? code : undefined;
       session.signal = signal ?? undefined;
@@ -218,7 +241,8 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
 
   async function spawnSubproc(input, prompt) {
     const built = buildExecutorCommand(input.executor, { prompt, interactive: false });
-    const runtimeId = `subproc-${++nextSubproc}`;
+    const runtimeId = input.runtimeId ?? deterministicRuntimeId('subproc', input.taskId, input.attemptId);
+    if (sessions.has(runtimeId)) fail('worker_runtime_exists');
     const session = { ...input, runtimeId, turn: 0, tail: '', state: 'working', child: null };
     sessions.set(runtimeId, session);
     try {
@@ -238,7 +262,7 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
   }
 
   async function feedbackHc(runtimeId, message) {
-    const sent = await hc(['send', '--json', runtimeId, message], { timeout: 15_000 });
+    const sent = await hc(['send', '--json', '--', runtimeId, message], { timeout: 15_000 });
     return Object.freeze({ delivered: true,
       ...(sent.turn === undefined ? {} : { turn: sent.turn }),
       ...(sent.started === undefined ? {} : { started: sent.started }),
@@ -251,7 +275,6 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     if (session.state === 'working') fail('worker_busy');
     const followUp = buildFollowUpMessage({ taskId: session.taskId, attemptId: session.attemptId, message });
     const built = buildExecutorCommand(session.executor, { prompt: followUp, interactive: false, followUp: true });
-    session.turn += 1;
     const child = launchSubproc(session, built);
     return Object.freeze({ delivered: true, turn: session.turn,
       ...(Number.isSafeInteger(child.pid) ? { pid: child.pid } : {}) });
@@ -264,11 +287,12 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
   }
 
   async function observeHc(runtimeId) {
-    const terminal = await hc(['get', '--json', runtimeId]);
-    const read = await hc(['read', '--json', '--lines', '40', runtimeId]);
+    const terminal = await hc(['get', '--json', '--', runtimeId]);
+    const read = await hc(['read', '--json', '--lines', '40', '--', runtimeId]);
     const exitCode = terminalExitCode(terminal);
     const tail = typeof read?.text === 'string' ? read.text.slice(-TAIL_LIMIT) : undefined;
     return Object.freeze({ state: hcState(terminal),
+      ...(Number.isSafeInteger(terminal?.turn) ? { turn: terminal.turn } : {}),
       ...(exitCode === undefined ? {} : { exitCode }),
       ...(tail === undefined || tail === '' ? {} : { tail }) });
   }
@@ -279,12 +303,13 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     const session = sessions.get(id);
     if (!session) return Object.freeze({ state: 'exited' });
     return Object.freeze({ state: session.state,
+      ...(session.turn > 0 ? { turn: session.turn } : {}),
       ...(session.exitCode === undefined ? {} : { exitCode: session.exitCode }),
       ...(session.tail === '' ? {} : { tail: session.tail.slice(-TAIL_LIMIT) }) });
   }
 
   async function stopHc(runtimeId) {
-    const terminal = await hc(['kill', '--json', runtimeId], { timeout: 15_000 });
+    const terminal = await hc(['kill', '--json', '--', runtimeId], { timeout: 15_000 });
     const exitCode = terminalExitCode(terminal);
     return Object.freeze({ stopped: true, state: 'exited',
       ...(exitCode === undefined ? {} : { exitCode }) });

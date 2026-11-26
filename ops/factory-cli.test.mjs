@@ -1722,3 +1722,34 @@ test('run-isolated: заголовок DF #, без Пилот #', async () => {
   assert.doesNotMatch(source, /route\?\.ticket/);
   assert.doesNotMatch(source, /Пилот #\$\{attempt\.task_id\}/);
 });
+
+test('run: --runtime validates fail-closed and forwards to run-isolated', async () => {
+  const dir = await tempdir();
+  try {
+    const wt = join(dir, 'wt');
+    const state = join(dir, 'state');
+    await mkdir(wt);
+    await mkdir(state);
+    await chmod(state, 0o700);
+    const policy = await withPolicy(dir, policySpec(wt));
+    const args = ['--provider', 'acp-devin', '--model', 'swe-2-high',
+      '--policy', policy, '--state', state];
+    const gitCalls = [];
+    const git = async argv => { gitCalls.push(argv); return wt; };
+    const dry = await runFactory([...args, '--runtime', 'hc', '--dry-run'], { git, env: {} });
+    assert.equal(dry.dryRun, true);
+    const runtimeIndex = dry.plan.argv.indexOf('--runtime');
+    assert.notEqual(runtimeIndex, -1);
+    assert.equal(dry.plan.argv[runtimeIndex + 1], 'hc');
+    const direct = await runPlan(runValues(policy, state, { runtime: 'subproc' }));
+    assert.equal(direct.argv[direct.argv.indexOf('--runtime') + 1], 'subproc');
+    const beforeGit = gitCalls.length;
+    for (const bad of ['pty', '', 'HC']) {
+      await assert.rejects(() => runFactory([...args, '--runtime', bad, '--dry-run'],
+        { git, env: {} }), /worker_runtime_kind_invalid/);
+    }
+    assert.equal(gitCalls.length, beforeGit);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

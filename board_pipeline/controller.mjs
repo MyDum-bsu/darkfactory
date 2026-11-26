@@ -5,10 +5,12 @@ import { createReleasePackage, releaseQuestionDetails, ReleaseDenied } from './r
 import { advanceRelease, RELEASE_PHASES } from './release-flow.mjs';
 import { roundGate, roundSignature, effectiveL2ReworkLimit, l2ReworkLimitExceeded } from './worker-selector.mjs';
 import { partitionFindingsBySeverity } from './review-policy.mjs';
+import { isWorkerThreadId } from './worker-runtime.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
 const shaRE = /^[a-f0-9]{40}$/;
+const confirmedThreadId = value => isWorkerThreadId(value);
 
 // Контракт приёмки, который карточка обязана нести в метках для захвата из очереди:
 // разрешённый профиль, identity репозитория и валидные хэши спеки/политики.
@@ -223,11 +225,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       // GUARD:NoDuplicateSpawn — только ровно одно точное совпадение маркера
       // при живой аренде подхватывает тред; empty/ambiguous/ошибка — карантин
       // с сохранением брони worktree и нулём повторных bb.spawn.
-      const confirmed = res?.status === 'matched' && /^thr_[a-z0-9]+$/.test(res.threadId ?? '');
+      const confirmed = ['matched', 'found'].includes(res?.status) && confirmedThreadId(res.threadId);
       if (hazards.retrySpawnOnEmpty && !confirmed) {
         try {
           const retried = await bb.spawn(attemptOf(record, route));
-          if (/^thr_[a-z0-9]+$/.test(retried?.threadId ?? '')) {
+          if (confirmedThreadId(retried?.threadId)) {
             await save({ phase: 'working', threadId: retried.threadId,
               receipt: { kind: 'spawn', threadId: retried.threadId, confirmed: 'unsafe_retry' } });
             return visible();
@@ -418,7 +420,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       } else {
         launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
       }
-      if (!/^thr_[a-z0-9]+$/.test(launched?.threadId ?? '')) throw new Error('No confirmed BB thread');
+      if (!confirmedThreadId(launched?.threadId)) throw new Error('No confirmed BB thread');
       await save({ phase: 'working', threadId: launched.threadId,
         receipt: { kind: 'spawn', threadId: launched.threadId }, ...(workerTrail ?? {}) });
     } catch (e) {
