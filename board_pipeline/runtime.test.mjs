@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -188,4 +188,153 @@ test('evaluateSatisfactionReport is deterministic for boundary PASS and blocking
   const billion = evaluateSatisfactionReport({ ...pass, uncollapsedLongLists: 1e9 });
   assert.equal(billion.metrics.uncollapsedLongLists, 1e9);
   assert.equal(billion.defects.filter(defect => defect.category === 'uncollapsed-long-list').length, 64);
+});
+
+// --- P1: hardened inspect port, generalized node_modules mount allowlist ---
+
+test('isAllowedCandidateNodeModulesTarget accepts normalized /candidate/(.../)?node_modules only', async () => {
+  const { isAllowedCandidateNodeModulesTarget } = await import('./runtime.mjs');
+  for (const good of ['/candidate/node_modules', '/candidate/tracker/web/node_modules',
+    '/candidate/web/node_modules', '/candidate/a/b/c/node_modules',
+    '/candidate/packages-lib/node_modules']) {
+    assert.equal(isAllowedCandidateNodeModulesTarget(good), true, good);
+  }
+  for (const bad of ['/candidate', '/candidate/', '/etc/node_modules', '/node_modules',
+    '/candidate/../node_modules', '/candidate//node_modules', '/candidate/./node_modules',
+    '/candidate/x/../node_modules', '/candidate/x/node_modules/', '/candidate/x/node_modules/evil',
+    '/candidate/x//node_modules', 'candidate/node_modules', '', null, undefined, 42,
+    '/candidate/evil\x01/node_modules', '/candidate/evil\x7f/node_modules',
+    '/candidate/evil\n/node_modules']) {
+    assert.equal(isAllowedCandidateNodeModulesTarget(bad), false, String(bad));
+  }
+});
+
+test('offline docker runner mounts node_modules at generalized allowlisted targets', async t => {
+  const { root, repo, sha } = await repoFixture(t);
+  const journal = join(root, 'journal');
+  const deps = join(root, 'node_modules');
+  await mkdir(journal);
+  await mkdir(deps);
+  for (const to of ['/candidate/node_modules', '/candidate/web/node_modules',
+    '/candidate/tracker/web/node_modules']) {
+    const calls = [];
+    const execDocker = async (file, args) => {
+      calls.push([file, [...args]]);
+      if (args[0] === 'info') return { stdout: '["name=rootless"]', stderr: '' };
+      if (args[0] === 'run') {
+        // Точка монтирования создана в снимке реальным каталогом до docker run.
+        const spec = args.find(arg => arg.startsWith('type=bind,src=') && arg.includes('dst=/candidate,'));
+        const snap = spec.slice('type=bind,src='.length, spec.indexOf(',dst='));
+        const rel = to.slice('/candidate/'.length);
+        const target = join(snap, rel);
+        const st = await import('node:fs/promises').then(fs => fs.lstat(target));
+        assert.equal(st.isDirectory() && !st.isSymbolicLink(), true, `${to} не реальный каталог`);
+        return { stdout: 'checks ok', stderr: '' };
+      }
+      if (args[0] === 'rm') return { stdout: '', stderr: '' };
+      throw new Error(`unexpected docker call ${args.join(' ')}`);
+    };
+    const result = await offlineDockerRunner(journal, { execDocker })(
+      { task_id: '5030', worktree: repo, candidate_sha: sha },
+      { check: { image: IMAGE, argv: ['true'], cwd: '.', timeoutMs: 1000,
+        mounts: [{ from: deps, to }] } });
+    assert.equal(result.ok, true, to);
+    const run = calls.find(([, args]) => args[0] === 'run')?.[1];
+    assert.ok(run.includes(`type=bind,src=${deps},dst=${to},readonly`),
+      `mount spec missing for ${to}`);
+  }
+});
+
+test('offline docker runner rejects node_modules mounts outside the generalized allowlist', async t => {
+  const { root, repo, sha } = await repoFixture(t);
+  const journal = join(root, 'journal');
+  const deps = join(root, 'node_modules');
+  await mkdir(journal);
+  await mkdir(deps);
+  for (const to of ['/etc/node_modules', '/candidate/../node_modules',
+    '/candidate/x//node_modules', '/candidate/node_modules/', '/candidate/x/evil\x01/node_modules']) {
+    let ran = false;
+    const execDocker = async (file, args) => {
+      if (args[0] === 'info') return { stdout: '["name=rootless"]', stderr: '' };
+      if (args[0] === 'run') ran = true;
+      return { stdout: '', stderr: '' };
+    };
+    await assert.rejects(offlineDockerRunner(journal, { execDocker })(
+      { task_id: '5031', worktree: repo, candidate_sha: sha },
+      { check: { image: IMAGE, argv: ['true'], cwd: '.', timeoutMs: 1000,
+        mounts: [{ from: deps, to }] } }),
+      /outside the allowlist/, to);
+    assert.equal(ran, false, `docker run happened for ${to}`);
+  }
+});
+
+test('offline docker runner rejects node_modules mount target crossing a symlink', async t => {
+  const root = await temp(t, 'v24-runtime-link-');
+  const repo = join(root, 'worktree');
+  await mkdir(repo);
+  git(repo, 'init', '-q', '-b', 'pilot');
+  git(repo, 'config', 'user.email', 'test@local');
+  git(repo, 'config', 'user.name', 'test');
+  await writeFile(join(repo, 'page.txt'), 'synthetic\n');
+  // Симлинк-компонент в цепочке цели маунта: web указывает вовне дерева.
+  await symlink('/etc', join(repo, 'web'));
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-qm', 'candidate');
+  const sha = git(repo, 'rev-parse', 'HEAD');
+  const journal = join(root, 'journal');
+  const deps = join(root, 'node_modules');
+  await mkdir(journal);
+  await mkdir(deps);
+  let ran = false;
+  const execDocker = async (file, args) => {
+    if (args[0] === 'info') return { stdout: '["name=rootless"]', stderr: '' };
+    if (args[0] === 'run') ran = true;
+    return { stdout: '', stderr: '' };
+  };
+  await assert.rejects(offlineDockerRunner(journal, { execDocker })(
+    { task_id: '5032', worktree: repo, candidate_sha: sha },
+    { check: { image: IMAGE, argv: ['true'], cwd: '.', timeoutMs: 1000,
+      mounts: [{ from: deps, to: '/candidate/web/node_modules' }] } }),
+    /crosses a symlink/);
+  assert.equal(ran, false, 'docker run happened for a symlink-crossed target');
+});
+
+test('worktreeInspector does not execute repo-local fsmonitor/hooks config of the worker', async t => {
+  const { worktreeInspector } = await import('./runtime.mjs');
+  const root = await temp(t, 'v24-inspect-');
+  const repo = join(root, 'worktree');
+  await mkdir(repo);
+  git(repo, 'init', '-q', '-b', 'pilot');
+  git(repo, 'config', 'user.email', 'test@local');
+  git(repo, 'config', 'user.name', 'test');
+  await writeFile(join(repo, 'page.txt'), 'base\n');
+  git(repo, 'add', 'page.txt');
+  git(repo, 'commit', '-qm', 'base');
+  const base = git(repo, 'rev-parse', 'HEAD');
+  await writeFile(join(repo, 'page.txt'), 'candidate\n');
+  git(repo, 'add', 'page.txt');
+  git(repo, 'commit', '-qm', 'candidate');
+  const sha = git(repo, 'rev-parse', 'HEAD');
+  // Воркер оставил в репо-конфиге fsmonitor-хук, пишущий маркер при запуске:
+  // незащищённый git status исполняет его от имени контроллера.
+  const marker = join(root, 'fsmon-pwned');
+  const hook = join(root, 'fsmon-evil.sh');
+  await writeFile(hook, `#!/bin/sh\necho x >> "${marker}"\nexit 1\n`, { mode: 0o755 });
+  git(repo, 'config', 'core.fsmonitor', hook);
+  // Контроль атаки: незащищённый status действительно исполняет хук.
+  execFileSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' });
+  assert.ok(await realpath(marker).catch(() => null) !== null,
+    'контроль: fsmonitor-хук не исполнился в незащищённом вызове');
+  await rm(marker, { force: true });
+
+  const inspect = worktreeInspector({ profiles: { pilot: {
+    task: '9101', worker: 'thr_w', worktree: repo, base, branch: 'pilot',
+  } } });
+  const result = await inspect({ task_id: '9101', worker_thread_id: 'thr_w',
+    check_profile: 'pilot', worktree: repo, base_sha: base, candidate_sha: sha });
+  assert.equal(result.head, sha);
+  assert.equal(result.clean, true);
+  assert.equal(result.baseAncestor, true);
+  assert.equal(await realpath(marker).catch(() => null), null,
+    'fsmonitor-хук репо-конфига исполнился при инспекции');
 });
