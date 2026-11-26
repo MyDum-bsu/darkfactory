@@ -1355,3 +1355,125 @@ test('prior_findings are projected onto the acceptance whitelist before verify',
   assert.deepEqual(seen[1], [{ file: 'a.js', line: 12, expected: 'e1',
     actual: 'x'.repeat(2000), freq: 3, severity: 'P1', dod_violation: true }]);
 });
+
+test('queue mode pins allowed_paths into the contract and verification attempt', async t => {
+  const scoped = 'board_pipeline/,ops/control-room/';
+  const x = await queueLab(t, { labels: { ...CONTRACT, allowed_paths: scoped } });
+  await x.tick();
+  const record = await x.cfg.state.load();
+  assert.equal(record.contract.allowed_paths, scoped);
+  assert.equal(record.contract.labels.allowed_paths, scoped);
+  x.submit('c');
+  await x.tick();
+  const attempt = x.effects.attempts.at(-1);
+  assert.equal(attempt.allowed_paths, scoped);
+  assert.equal(attempt.labels.allowed_paths, undefined);
+  assert.deepEqual(attempt.labels, {});
+
+  const empty = await queueLab(t, { labels: { ...CONTRACT, allowed_paths: '' } });
+  await empty.tick();
+  const emptyRecord = await empty.cfg.state.load();
+  assert.equal(emptyRecord.contract.allowed_paths, undefined);
+  assert.equal(emptyRecord.contract.labels.allowed_paths, undefined);
+});
+
+test('claim_not_held verification outcomes and lease-loss throws become lease_lost', async t => {
+  for (const verify of [
+    async () => ({ outcome: 'denied', reason: 'claim_not_held:409' }),
+    async () => { throw new Error('Lease lost'); },
+  ]) {
+    const x = await lab(t);
+    await x.tick();
+    x.cfg.verify = verify;
+    x.submit('c');
+    const out = await x.tick();
+    assert.equal(out.phase, 'lease_lost');
+    const record = await x.cfg.state.load();
+    assert.equal(record.phase, 'lease_lost');
+    assert.equal(x.effects.feedback.length, 0);
+  }
+});
+
+test('an interrupted queue claiming attempt without a task is cleared and retried cleanly', async t => {
+  const x = await queueLab(t);
+  const claimReady = x.cfg.board.claimReady.bind(x.cfg.board);
+  x.cfg.board.claimReady = async () => { throw new Error('transient board read'); };
+  assert.equal((await x.tick()).phase, 'idle');
+  assert.equal(await x.cfg.state.load(), null);
+  assert.equal(x.effects.spawn, 0);
+  x.cfg.board.claimReady = claimReady;
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(x.effects.spawn, 1);
+});
+
+test('route change before spawn blocks the claimed card instead of orphaning the lease', async t => {
+  const x = await lab(t);
+  x.cfg.authorize = async state => state !== 'claimed';
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'route_changed_before_spawn');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('confirmed refusal of every pre-spawn worker blocks the claimed card', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => ({ plan: [ws.PRIMARY_WORKER] }),
+  });
+  x.cfg.bb.probeAvailability = async () => ({ status: 'confirmed_refusal', activeBackgroundAgentCount: 0 });
+  x.cfg.bb.inspectWorktree = async () => ({ clean: true, head: 'a'.repeat(40) });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'all_workers_confirmed_refused');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('pinTriad exceptions block the claimed card instead of orphaning the lease', async t => {
+  const x = await lab(t);
+  x.cfg.workerSelector = workerSelector({
+    pinTriad: async () => { throw new Error('scorecard exploded'); },
+  });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'route_pin_failed');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.spawn, 0);
+});
+
+test('a crashed worker is resumed at most twice and then held deterministically', async t => {
+  const x = await lab(t);
+  const resumes = [];
+  x.cfg.bb.resume = async packet => {
+    resumes.push(packet);
+    return { resumed: true, threadId: packet.attempt.bb_thread_id };
+  };
+  x.cfg.submissions.read = async (attempt, after) => ({
+    turnSeq: after + 1, completed: false, state: 'exited', exitCode: 1,
+  });
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(resumes.length, 2);
+  assert.deepEqual(resumes.map(packet => packet.crashResumes), [0, 1]);
+  const record = await x.cfg.state.load();
+  assert.equal(record.crashResumes, 2);
+  assert.equal(record.phase, 'working');
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_turn_finished_without_new_handoff');
+  assert.equal(resumes.length, 2);
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('a typed invalid handoff blocks as invalid instead of crashing verification', async t => {
+  const x = await lab(t);
+  await x.tick();
+  x.cfg.submissions.read = async () => ({ turnSeq: 1, completed: true, state: 'idle', submission: null });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'invalid_or_stale_submission');
+  assert.equal((await x.inspect()).state, 'blocked');
+  assert.equal(x.effects.verify, 0);
+});

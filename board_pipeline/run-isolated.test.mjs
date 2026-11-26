@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { adaptiveLocalPlanCore, allowedPathsFromAttempt, allowedPathsFromLabels, baseWorkerFromPolicy,
   buildWorkerTransport, filterAdaptiveTelemetry, isApprovedWorker, planAdaptiveChecks,
-  queueModeSpecInputs, resolveWorkerRuntimeKind, scopeFenceReworkResult } from './run-isolated.mjs';
+  queueModeSpecInputs, readSubmissionEnvelope, resolveWorkerRuntimeKind,
+  scopeFenceReworkResult } from './run-isolated.mjs';
 import { deterministicRuntimeId } from './worker-runtime.mjs';
 import { DEFAULT_ARBITER, DEFAULT_CRITIC, PRIMARY_WORKER, resolveTriad } from './worker-selector.mjs';
 import { workerIntakePrompt } from './intake-prompt.mjs';
@@ -660,4 +661,148 @@ test('planAdaptiveChecks forwards explicit highRiskPaths alongside thresholds', 
   assert.equal(plan.mode, 'strict_sync');
   assert.equal(plan.reason, 'high_risk_path');
   assert.deepEqual(plan.asyncChecks, []);
+});
+
+test('portable worker transport forwards permissionMode and exposes stop, resume and hc reconcileFeedback', async () => {
+  const calls = [];
+  const runtimeId = deterministicRuntimeId('hc', '6242', 'attempt-transport');
+  let observed = { state: 'working', turn: 2, tail: 'worker output' };
+  const runtime = {
+    probeAvailability: async () => ({ status: 'available' }),
+    spawn: async input => {
+      calls.push(['spawn', input]);
+      return { runtimeId: input.runtimeId };
+    },
+    resume: async input => {
+      calls.push(['resume', input]);
+      return { runtimeId: input.runtimeId };
+    },
+    stop: async input => {
+      calls.push(['stop', input]);
+      return { stopped: true };
+    },
+    feedback: async input => {
+      calls.push(['feedback', input]);
+      return { delivered: true };
+    },
+    observe: async () => observed,
+  };
+  const transport = buildWorkerTransport({ kind: 'hc', permissionMode: 'full',
+    policy: { bb: { provider: 'acp-devin', model: 'swe-2-1-medium' }, route: { repoId: 'repo-1' } },
+    runtime, bbTransport: {}, worktree: '/tmp/worktree',
+    prepareSpawn: async () => '/private/worker-prompt.md', prepareFeedback: async () => 'rework' });
+  const attempt = { task_id: '6242', epoch: 1, attempt_id: 'attempt-transport' };
+  assert.deepEqual(await transport.spawn(attempt), { threadId: runtimeId });
+  assert.equal(calls[0][1].permissionMode, 'full');
+  const resume = await transport.resume({ attempt: { ...attempt, bb_thread_id: runtimeId },
+    reason: 'worker_crashed' });
+  assert.deepEqual(resume, { resumed: true, threadId: runtimeId });
+  assert.equal(calls[1][1].permissionMode, 'full');
+  assert.deepEqual(await transport.stop(runtimeId), { stopped: true });
+  assert.deepEqual(calls[2], ['stop', { runtimeId }]);
+
+  observed = { state: 'working', turn: 2, tail: 'Замечание фабрики fb-7. Исправь найденное.' };
+  assert.deepEqual(await transport.reconcileFeedback({ attempt, feedbackId: 'fb-7', afterSeq: 1 }),
+    { status: 'delivered', threadId: runtimeId, turn: 2 });
+  observed = { state: 'working', turn: 2, tail: 'no factory marker here' };
+  assert.deepEqual(await transport.reconcileFeedback({ attempt, feedbackId: 'fb-7', afterSeq: 2 }),
+    { status: 'empty' });
+});
+
+test('portable observeTurn does not reuse stale idle after feedback without a new active turn', async () => {
+  const sequence = [
+    { state: 'idle' },
+    { state: 'idle' },
+    { state: 'working' },
+    { state: 'idle' },
+  ];
+  const runtime = {
+    probeAvailability: async () => ({ status: 'available' }),
+    spawn: async input => ({ runtimeId: input.runtimeId }),
+    feedback: async () => ({ delivered: true }),
+    observe: async () => sequence.shift() ?? { state: 'idle' },
+  };
+  const transport = buildWorkerTransport({ kind: 'hc',
+    policy: { bb: { provider: 'acp-devin', model: 'swe-2-1-medium' }, route: {} },
+    runtime, bbTransport: {}, prepareSpawn: async () => '/tmp/prompt', prepareFeedback: async () => 'rework' });
+  const attempt = { task_id: '6242', epoch: 1, attempt_id: 'attempt-race' };
+  const runtimeId = deterministicRuntimeId('hc', attempt.task_id, attempt.attempt_id);
+  await transport.spawn(attempt);
+  assert.deepEqual(await transport.observeTurn({ runtimeId, after: 0 }),
+    { turnSeq: 1, completed: true, state: 'idle' });
+  await transport.feedback({ attempt: { ...attempt, bb_thread_id: runtimeId }, feedbackId: 'fb-race' });
+  assert.equal(await transport.observeTurn({ runtimeId, after: 1 }), undefined);
+  assert.equal(await transport.observeTurn({ runtimeId, after: 1 }), undefined);
+  assert.deepEqual(await transport.observeTurn({ runtimeId, after: 1 }),
+    { turnSeq: 2, completed: true, state: 'idle' });
+
+  const restartedSequence = [{ state: 'working' }, { state: 'idle' }];
+  const restartedRuntime = {
+    probeAvailability: async () => ({ status: 'available' }),
+    spawn: async input => ({ runtimeId: input.runtimeId }),
+    feedback: async () => ({ delivered: true }),
+    observe: async () => restartedSequence.shift() ?? { state: 'idle' },
+  };
+  const restarted = buildWorkerTransport({ kind: 'hc',
+    policy: { bb: { provider: 'acp-devin', model: 'swe-2-1-medium' }, route: {} },
+    runtime: restartedRuntime, bbTransport: {}, prepareSpawn: async () => '/tmp/prompt',
+    prepareFeedback: async () => 'rework' });
+  const restartId = deterministicRuntimeId('hc', '6242', 'attempt-restart');
+  assert.equal(await restarted.observeTurn({ runtimeId: restartId, after: 1 }), undefined);
+  assert.deepEqual(await restarted.observeTurn({ runtimeId: restartId, after: 1 }),
+    { turnSeq: 2, completed: true, state: 'idle' });
+});
+
+test('readSubmissionEnvelope returns typed invalid handoffs for malformed, oversized and symlink files', async () => {
+  const observed = { turnSeq: 4, completed: true, state: 'idle' };
+  const source = '/private/inbox/attempt/submission.json';
+  const deps = overrides => ({
+    observed,
+    source,
+    lstatImpl: async () => ({ isFile: () => true, size: 32 }),
+    realpathImpl: async () => source,
+    readJsonImpl: async () => ({ candidate_sha: 'c'.repeat(40) }),
+    ...overrides,
+  });
+  const malformed = await readSubmissionEnvelope(deps({
+    readJsonImpl: async () => { throw new SyntaxError('bad json'); },
+  }));
+  assert.equal(malformed.turnSeq, 4);
+  assert.equal(malformed.submission, null);
+  const oversized = await readSubmissionEnvelope(deps({
+    lstatImpl: async () => ({ isFile: () => true, size: 8193 }),
+  }));
+  assert.equal(oversized.submission, null);
+  const symlink = await readSubmissionEnvelope(deps({
+    realpathImpl: async () => '/outside/submission.json',
+  }));
+  assert.equal(symlink.submission, null);
+  const missing = await readSubmissionEnvelope(deps({
+    lstatImpl: async () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; },
+  }));
+  assert.equal(Object.hasOwn(missing, 'submission'), false);
+  const valid = await readSubmissionEnvelope(deps());
+  assert.deepEqual(valid.submission, { candidate_sha: 'c'.repeat(40) });
+});
+
+test('portable observeTurn never fabricates a new turn from an explicit stale watermark', async () => {
+  const observations = [{ state: 'idle', turn: 1 }, { state: 'idle', turn: 0 }];
+  const feedbackInputs = [];
+  const runtime = {
+    probeAvailability: async () => ({ status: 'available' }),
+    spawn: async input => ({ runtimeId: input.runtimeId }),
+    feedback: async input => {
+      feedbackInputs.push(input);
+      return { delivered: true, turn: 1, started: true };
+    },
+    observe: async () => observations.shift() ?? { state: 'idle', turn: 1 },
+  };
+  const transport = buildWorkerTransport({ kind: 'hc',
+    policy: { bb: { provider: 'acp-devin', model: 'swe-2-1-medium' }, route: {} },
+    runtime, bbTransport: {}, prepareSpawn: async () => '/tmp/prompt', prepareFeedback: async () => 'rework' });
+  const attempt = { task_id: '6242', epoch: 1, attempt_id: 'attempt-stale-turn' };
+  const runtimeId = deterministicRuntimeId('hc', attempt.task_id, attempt.attempt_id);
+  await transport.feedback({ attempt: { ...attempt, bb_thread_id: runtimeId }, feedbackId: 'fb-stale' });
+  assert.equal(await transport.observeTurn({ runtimeId, after: 1 }), undefined);
+  assert.equal(await transport.observeTurn({ runtimeId, after: 0 }), undefined);
 });

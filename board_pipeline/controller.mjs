@@ -6,6 +6,7 @@ import { advanceRelease, RELEASE_PHASES } from './release-flow.mjs';
 import { roundGate, roundSignature, effectiveL2ReworkLimit, l2ReworkLimitExceeded } from './worker-selector.mjs';
 import { partitionFindingsBySeverity } from './review-policy.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
+import { PilotDenied } from './pilot-gate.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
@@ -81,6 +82,15 @@ function queueFilter(route) {
 }
 
 function contractOf(labels) {
+  const pinnedLabels = Object.fromEntries([
+    ...['requires_lean', 'requires_colab', 'touches_migrations', 'pr_ci_red', 'test_first']
+      .map(key => [key, labels?.[key] === 'true' ? true : labels?.[key] === 'false' ? false : undefined]),
+    ['has_ui', labels?.has_ui === 'true' ? true : labels?.has_ui === 'false' ? false : undefined],
+    ['domain', typeof labels?.domain === 'string' && /^[a-z][a-z0-9-]{0,47}$/.test(labels.domain)
+      ? labels.domain : undefined],
+  ].filter(([, value]) => value !== undefined));
+  const hasAllowedPaths = typeof labels?.allowed_paths === 'string' && labels.allowed_paths.length > 0;
+  if (hasAllowedPaths) pinnedLabels.allowed_paths = labels.allowed_paths;
   return {
     repo_id: labels?.repo_id,
     spec_digest: labels?.spec_digest,
@@ -98,15 +108,10 @@ function contractOf(labels) {
     // Категория рутинной работы для policy-driven auto-approve (#1745):
     // контрактная метка карточки, не слово воркера.
     category: typeof labels?.category === 'string' ? labels.category : undefined,
+    ...(hasAllowedPaths ? { allowed_paths: labels.allowed_paths } : {}),
     // Декларируемые предикаты skillPicker из меток карточки: boolean-метки
     // нормализуются 'true'/'false' → boolean, domain — id-строкой.
-    labels: Object.fromEntries([
-      ...['requires_lean', 'requires_colab', 'touches_migrations', 'pr_ci_red', 'test_first']
-        .map(key => [key, labels?.[key] === 'true' ? true : labels?.[key] === 'false' ? false : undefined]),
-      ['has_ui', labels?.has_ui === 'true' ? true : labels?.has_ui === 'false' ? false : undefined],
-      ['domain', typeof labels?.domain === 'string' && /^[a-z][a-z0-9-]{0,47}$/.test(labels.domain)
-        ? labels.domain : undefined],
-    ].filter(([, value]) => value !== undefined)),
+    labels: pinnedLabels,
   };
 }
 
@@ -128,7 +133,11 @@ function attemptOf(record, route) {
     if (record.contract.l1_profile !== undefined) attempt.l1_profile = record.contract.l1_profile;
     if (record.contract.has_ui !== undefined) attempt.has_ui = record.contract.has_ui;
     if (record.contract.category !== undefined) attempt.category = record.contract.category;
-    if (record.contract.labels !== undefined) attempt.labels = record.contract.labels;
+    if (record.contract.allowed_paths !== undefined) attempt.allowed_paths = record.contract.allowed_paths;
+    if (record.contract.labels !== undefined) {
+      attempt.labels = Object.fromEntries(Object.entries(record.contract.labels)
+        .filter(([key]) => key !== 'allowed_paths'));
+    }
     if (typeof record.contract.specText === 'string') attempt.specText = record.contract.specText;
   }
   return attempt;
@@ -259,6 +268,17 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         receipt: { kind: 'feedback', feedbackId: intent.feedbackId, confirmed: 'reconciled' } });
       return visible();
     }
+    if (record.phase === 'claiming' && record.taskId === undefined) {
+      if (route.taskId === undefined) {
+        await save(null);
+        return { phase: 'idle' };
+      }
+      const looked = await board.lookup(route.taskId).catch(() => null);
+      if (looked?.state === 'ready') {
+        await save(null);
+        return { phase: 'idle' };
+      }
+    }
     // claiming/checking или отсутствующий intent: внешний эффект не доказан.
     return uncertain(`interrupted_${record.phase}`);
   };
@@ -329,9 +349,21 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         until: claim.until, ...(contract ? { contract } : {}),
         intent: { kind: 'spawn', attemptId: record.attemptId, epoch: claim.epoch,
           marker: record.attemptId } });
-      if (!await authorize('claimed', record.taskId)) {
-        await save({ phase: 'hold', reason: 'route_changed_before_spawn' });
+      const blockBeforeSpawn = async (reason, extraState = null) => {
+        const blockText = board.blockText?.(record.epoch, reason) ?? reason;
+        await save({ phase: 'blocking', ...(extraState ?? {}),
+          intent: { kind: 'block', attemptId: record.attemptId, epoch: record.epoch,
+            reason, blockText: blockText.slice(0, 1000) } });
+        try {
+          await board.block(record.taskId, record.epoch, blockText);
+          await save({ phase: 'hold', reason, receipt: { kind: 'block' } });
+        } catch {
+          return reconcileInFlight();
+        }
         return visible();
+      };
+      if (!await authorize('claimed', record.taskId)) {
+        return blockBeforeSpawn('route_changed_before_spawn');
       }
       const proof = await board.verifyHeld(record.taskId, claim.epoch).catch(() => null);
       if (proof?.epoch !== claim.epoch) {
@@ -354,8 +386,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           } catch {
             // Исключение пина — fail-closed: дефолтный воркер не запускается
             // на недоказанной триаде (ревью #1263 r2).
-            await save({ phase: 'hold', reason: 'route_pin_failed' });
-            return visible();
+            return blockBeforeSpawn('route_pin_failed');
           }
         }
         if (pinned?.outcome === 'rejected') {
@@ -407,9 +438,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           return reconcileInFlight('worker_launch_outcome_unknown');
         }
         if (selection.outcome !== 'spawned') {
-          await save({ phase: 'hold', reason: selection.reason ?? 'no_available_worker',
-            attemptedWorkers: selection.attemptedWorkers });
-          return visible();
+          return blockBeforeSpawn(selection.reason ?? 'no_available_worker',
+            { attemptedWorkers: selection.attemptedWorkers });
         }
         launched = { threadId: selection.threadId };
         workerTrail = { executor: selection.worker, fallbackReason: selection.fallbackReason ?? null,
@@ -479,6 +509,26 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   if (!after && record.seenShas.length && (!submission || record.seenShas.includes(submission.candidate_sha))) {
     return visible();
   }
+  const workerCrashed = observation.state === 'exited' && observation.exitCode !== 0 &&
+    (submission === undefined || submission === null);
+  if (workerCrashed) {
+    const crashResumes = Number.isSafeInteger(record.crashResumes) ? record.crashResumes : 0;
+    if (crashResumes < 2 && typeof bb.resume === 'function') {
+      let resumeFailed = false;
+      let resumed;
+      try {
+        resumed = await bb.resume({ attempt, turnSeq, reason: 'worker_crashed', crashResumes });
+      } catch {
+        resumeFailed = true;
+      }
+      if (!resumeFailed && resumed?.resumed !== false && resumed?.confirmed !== false &&
+          (resumed?.threadId === undefined || resumed.threadId === attempt.bb_thread_id)) {
+        await save({ phase: 'working', turnSeq, crashResumes: crashResumes + 1,
+          receipt: { kind: 'resume', confirmed: 'started' } });
+        return visible();
+      }
+    }
+  }
   const stopWith = async (reason, extraState = null, detail = '') => {
     const privateText = `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}.${detail ? ` ${detail}` : ''} Проверьте ход; повтор не отправлен.`;
     const blockText = board.blockText?.(attempt.epoch, privateText) ?? privateText;
@@ -532,7 +582,12 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       evidence: 'Проверки и seal пройдены.',
     } : { prompt: 'Передать проверенный кандидат в стадию допуска к выпуску?',
       evidence: 'Проверки и seal пройдены. Ответ не запускает выпуск.' }) });
-  if (!submission) return stopWith(after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
+  if (submission === undefined) {
+    return stopWith(after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
+  }
+  if (submission === null || typeof submission !== 'object' || Array.isArray(submission)) {
+    return stopWith('invalid_or_stale_submission');
+  }
   const taskId = Number.isSafeInteger(submission.task_id) ? String(submission.task_id) : submission.task_id;
   if (taskId !== attempt.task_id || submission.epoch !== attempt.epoch ||
       submission.attempt_id !== attempt.attempt_id || submission.worker_thread_id !== attempt.bb_thread_id) {
@@ -581,7 +636,24 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     ...(shaRE.test(lastL2?.sha ?? '') ? { prior_sha: lastL2.sha } : {}),
     ...(prepared ? { release_target: { finish: 'deployed', target_id: prepared.target,
       release_channel: 'isolated-static', previous_live_digest: prepared.previous.digest } } : {}) };
-  const result = await verify(verification, { ...submission, task_id: taskId });
+  let result;
+  try {
+    result = await verify(verification, { ...submission, task_id: taskId });
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    const leaseEvidence = `${error?.code ?? ''} ${message}`;
+    if (/lease[_ ]lost|claim_not_held|claim_lost|epoch_mismatch/i.test(leaseEvidence)) {
+      await save({ phase: 'lease_lost', reason: message.slice(0, 200) || 'lease_lost' });
+      return visible();
+    }
+    await save({ phase: 'uncertain', reason: 'verify_interrupted' });
+    if (error instanceof PilotDenied) throw error;
+    return visible();
+  }
+  if (result === null || typeof result !== 'object' || typeof result.outcome !== 'string') {
+    await save({ phase: 'uncertain', reason: 'verify_interrupted' });
+    return visible();
+  }
   if (result.outcome === 'rework') {
     let roundsHistory;
     let arbitrationUsed = record.arbitrationUsed ?? 0;
@@ -738,8 +810,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       attempt_id: attempt.attempt_id, epoch: attempt.epoch, reason: feedbackReason,
       round: roundsHistory?.filter(r => r.gate === 'l2').length ?? null });
   } else if (result.outcome === 'verified' && result.receipt?.settle === 'completed' && route.finish === 'verified') {
-    const settled = await board.lookup(attempt.task_id);
-    if (settled.state !== 'completed' || settled.result?.sha !== submission.candidate_sha) {
+    const settled = await board.lookup(attempt.task_id).catch(() => null);
+    if (settled?.state !== 'completed' || settled.result?.sha !== submission.candidate_sha) {
       await save({ phase: 'uncertain', reason: 'completed_sha_not_confirmed' });
     } else {
       await save({ phase: 'done' });
@@ -756,6 +828,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     } catch {
       return reconcileInFlight();
     }
+  } else if (/claim_not_held/.test(String(result.reason ?? ''))) {
+    await save({ phase: 'lease_lost', reason: result.reason ?? 'claim_not_held' });
   } else {
     await save({ phase: result.outcome === 'uncertain' ? 'uncertain' : 'hold', reason: result.reason ?? 'unverified' });
   }

@@ -206,7 +206,7 @@ export async function adaptiveLocalPlanCore({ trusted, readDiffPaths, readTeleme
 }
 
 export function buildWorkerTransport({ kind, policy, runtime, bbTransport, worktree,
-  prepareSpawn, prepareFeedback } = {}) {
+  prepareSpawn, prepareFeedback, permissionMode } = {}) {
   if (kind === undefined || kind === 'bb') return bbTransport;
   if (!['hc', 'subproc'].includes(kind)) throw new Error('worker_runtime_kind_invalid');
   if (runtime === null || typeof runtime !== 'object' ||
@@ -218,7 +218,29 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
     throw new Error('worker_transport_callbacks_invalid');
   }
   const runtimeIdFor = attempt => deterministicRuntimeId(kind, attempt.task_id, attempt.attempt_id);
-  const deliveredFeedback = new Map();
+  const effectivePermissionMode = permissionMode ?? policy?.bb?.permissionMode;
+  const turnActivity = new Map();
+  const activityFor = runtimeId => {
+    let activity = turnActivity.get(runtimeId);
+    if (!activity) {
+      activity = { seenActive: false };
+      turnActivity.set(runtimeId, activity);
+    }
+    return activity;
+  };
+  const workerInput = async ({ attempt, runtimeId, resume = false, reason, sessionId }) => {
+    const execSpec = attempt.executor ?? policy?.bb;
+    const handoff = { task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+      worker_thread_id: runtimeId, candidate_sha: '<полный Git SHA>' };
+    const promptFile = await prepareSpawn({ attempt, handoff, execSpec, runtimeId,
+      ...(resume ? { resume: true, reason } : {}) });
+    const input = { taskId: attempt.task_id, attemptId: attempt.attempt_id,
+      worktree: worktree ?? policy?.route?.worktree, promptFile, executor: execSpec,
+      spaceLabel: policy?.route?.herdrSpaceId ?? policy?.route?.repoId,
+      tabLabel: `DF #${attempt.task_id}`, runtimeId,
+      ...(sessionId === undefined ? {} : { sessionId }) };
+    return effectivePermissionMode === undefined ? input : { ...input, permissionMode: effectivePermissionMode };
+  };
   return Object.freeze({
     ...(typeof bbTransport?.inspectWorktree === 'function'
       ? { inspectWorktree: attempt => bbTransport.inspectWorktree(attempt) } : {}),
@@ -227,17 +249,34 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
     },
     async spawn(attempt) {
       const runtimeId = runtimeIdFor(attempt);
-      const execSpec = attempt.executor ?? policy?.bb;
-      const handoff = { task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
-        worker_thread_id: runtimeId, candidate_sha: '<полный Git SHA>' };
-      const promptFile = await prepareSpawn({ attempt, handoff, execSpec, runtimeId });
-      const launched = await runtime.spawn({ taskId: attempt.task_id, attemptId: attempt.attempt_id,
-        worktree: worktree ?? policy?.route?.worktree, promptFile, executor: execSpec,
-        spaceLabel: policy?.route?.herdrSpaceId ?? policy?.route?.repoId,
-        tabLabel: `DF #${attempt.task_id}`, runtimeId });
+      const input = await workerInput({ attempt, runtimeId });
+      const launched = await runtime.spawn(input);
       if (launched?.runtimeId !== runtimeId) throw new Error('worker_runtime_id_mismatch');
-      if (!deliveredFeedback.has(runtimeId)) deliveredFeedback.set(runtimeId, 0);
+      activityFor(runtimeId).seenActive = true;
       return { threadId: launched.runtimeId };
+    },
+    async resume(packet = {}) {
+      if (typeof runtime.resume !== 'function') {
+        return { resumed: false, reason: 'runtime_resume_unavailable' };
+      }
+      const attempt = packet.attempt ?? packet;
+      const runtimeId = attempt?.bb_thread_id ?? runtimeIdFor(attempt);
+      const input = await workerInput({ attempt, runtimeId, resume: true, reason: packet.reason,
+        sessionId: packet.sessionId });
+      const launched = await runtime.resume(input);
+      if (launched?.runtimeId !== runtimeId) throw new Error('worker_runtime_id_mismatch');
+      activityFor(runtimeId).seenActive = true;
+      return { resumed: true, threadId: launched.runtimeId };
+    },
+    async stop(runtimeId) {
+      if (typeof runtime.stop !== 'function') {
+        return { stopped: false, reason: 'runtime_stop_unavailable' };
+      }
+      try {
+        return await runtime.stop({ runtimeId });
+      } catch (error) {
+        return { stopped: false, reason: String(error?.message ?? error) };
+      }
     },
     async feedback(packet) {
       const prepared = await prepareFeedback(packet);
@@ -245,21 +284,31 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
       const delivered = await runtime.feedback({
         runtimeId: packet.attempt.bb_thread_id, message: messageText });
       if (delivered?.delivered === true) {
-        deliveredFeedback.set(packet.attempt.bb_thread_id,
-          (deliveredFeedback.get(packet.attempt.bb_thread_id) ?? 0) + 1);
+        const activity = activityFor(packet.attempt.bb_thread_id);
+        activity.seenActive = kind === 'subproc' || delivered.started === true ||
+          Number.isSafeInteger(delivered.turn);
       }
       return { confirmed: delivered?.delivered === true };
     },
     async observeTurn({ runtimeId, after = 0 } = {}) {
       let observed;
       try { observed = await runtime.observe({ runtimeId }); } catch { observed = null; }
-      if (!observed || !['idle', 'done', 'blocked', 'exited'].includes(observed.state)) return undefined;
-      const turnSeq = Number.isSafeInteger(observed.turn) ? observed.turn
-        : (deliveredFeedback.get(runtimeId) ?? 0) + 1;
-      if (turnSeq <= after) return undefined;
+      if (!observed) return undefined;
+      const terminal = ['idle', 'done', 'blocked', 'exited'].includes(observed.state);
+      const activity = activityFor(runtimeId);
+      if (!terminal) {
+        if (observed.state === 'working') activity.seenActive = true;
+        return undefined;
+      }
+      const observedTurn = Number.isSafeInteger(observed.turn) ? observed.turn : null;
+      if (observedTurn !== null && observedTurn <= after) return undefined;
+      if (observedTurn === null && activity.seenActive !== true && after !== 0) return undefined;
+      const turnSeq = observedTurn ?? after + 1;
+      activity.seenActive = false;
       const completed = observed.state === 'done' || observed.state === 'idle' ||
         (observed.state === 'exited' && observed.exitCode === 0);
       return { turnSeq, completed, state: observed.state,
+        ...(observed.exitCode === undefined ? {} : { exitCode: observed.exitCode }),
         ...(observed.tail === undefined ? {} : { tail: observed.tail }) };
     },
     async reconcileSpawn(attempt) {
@@ -277,10 +326,44 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
       }
       return { status: 'empty' };
     },
-    async reconcileFeedback() {
-      return { status: 'empty' };
+    async reconcileFeedback({ attempt, feedbackId, threadId, afterSeq } = {}) {
+      if (kind !== 'hc' || typeof feedbackId !== 'string' || feedbackId.length === 0) {
+        return { status: 'empty' };
+      }
+      let runtimeId;
+      try {
+        runtimeId = threadId ?? attempt?.bb_thread_id ?? runtimeIdFor(attempt);
+      } catch {
+        return { status: 'empty' };
+      }
+      let observed;
+      try { observed = await runtime.observe({ runtimeId }); } catch { observed = null; }
+      if (!observed) return { status: 'empty' };
+      const tail = typeof observed.tail === 'string' ? observed.tail : '';
+      const marked = tail.includes(`Замечание фабрики ${feedbackId}.`) || tail.includes(feedbackId);
+      const advanced = Number.isSafeInteger(observed.turn) && Number.isSafeInteger(afterSeq) &&
+        observed.turn > afterSeq;
+      if (!marked && !advanced) return { status: 'empty' };
+      return { status: 'delivered', threadId: runtimeId,
+        ...(Number.isSafeInteger(observed.turn) ? { turn: observed.turn } : {}) };
     },
   });
+}
+
+export async function readSubmissionEnvelope({ observed, source, lstatImpl = lstat,
+  realpathImpl = realpath, readJsonImpl = readJson } = {}) {
+  if (!observed) return undefined;
+  const base = { ...observed };
+  if (!base.completed) return base;
+  try {
+    const meta = await lstatImpl(source);
+    if (!meta.isFile() || meta.size > 8192 || basename(source) !== 'submission.json' ||
+        await realpathImpl(source) !== source) throw new Error('Invalid handoff file');
+    return { ...base, submission: await readJsonImpl(source) };
+  } catch (error) {
+    if (error.code === 'ENOENT') return base;
+    return { ...base, submission: null };
+  }
 }
 
 export function queueModeSpecInputs({ route, attempt, operatorBrief, reviewSpec }) {
@@ -886,7 +969,13 @@ async function execute() {
   };
   const bb = buildWorkerTransport({ kind: workerRuntimeKind, policy: p, runtime: portableRuntime,
     bbTransport, worktree: tree, prepareSpawn: prepareWorkerSpawn,
-    prepareFeedback: prepareWorkerFeedback });
+    prepareFeedback: prepareWorkerFeedback, permissionMode });
+  let liveThreadId = null;
+  const stopWorkerThread = async threadId => {
+    if (!threadId || typeof bb.stop !== 'function') return;
+    try { await bb.stop(threadId); } catch {}
+  };
+  const stopTerminalWorker = result => stopWorkerThread(result?.threadId ?? liveThreadId);
   // Daemon kill-switch: создаётся до verify, чтобы единственный повтор L2
   // проверял именно действующий стоп-файл, а не только activation switch.
   const daemonSwitchPath = values.switch ?? p.pilot?.killSwitch;
@@ -934,17 +1023,7 @@ async function execute() {
     telemetry.observe(attempt);
     const observed = await observedTurn(attempt.bb_thread_id, after);
     if (!observed) return;
-    const { turnSeq, completed } = observed;
-    if (!completed) return { turnSeq };
-    const source = handoffPath(attempt);
-    try {
-      const meta = await lstat(source);
-      if (!meta.isFile() || meta.size > 8192 || basename(source) !== 'submission.json' || await realpath(source) !== source) throw new Error('Invalid handoff file');
-      return { turnSeq, submission: await readJson(source) };
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      return { turnSeq };
-    }
+    return readSubmissionEnvelope({ observed, source: handoffPath(attempt) });
   } };
   async function stableCheckpoint(threadId, turnSeq) {
     await assertPinned();
@@ -983,6 +1062,15 @@ async function execute() {
     const specInputs = queueModeSpecInputs({ route, attempt,
       operatorBrief: pinned.inputs.get(brief).toString('utf8'), reviewSpec });
     const acceptanceAttempt = { ...attempt };
+    if (acceptanceAttempt.labels !== null && typeof acceptanceAttempt.labels === 'object' &&
+        !Array.isArray(acceptanceAttempt.labels)) {
+      if (acceptanceAttempt.allowed_paths === undefined &&
+          typeof acceptanceAttempt.labels.allowed_paths === 'string') {
+        acceptanceAttempt.allowed_paths = acceptanceAttempt.labels.allowed_paths;
+      }
+      acceptanceAttempt.labels = Object.fromEntries(Object.entries(acceptanceAttempt.labels)
+        .filter(([key]) => key !== 'allowed_paths'));
+    }
     delete acceptanceAttempt.specText;
     const reviewSpecText = reviewText(specInputs.reviewSpec);
     const reviewRules = [decisionSlice && decisionsPromptBlock(decisionSlice),
@@ -1427,6 +1515,7 @@ async function execute() {
   const observeTick = result => {
     recheck = false;
     lastResult = result;
+    if (result?.threadId) liveThreadId = result.threadId;
     const summary = telemetry.summaryLine();
     const line = JSON.stringify({
       ...(activation && result.reason ? { ...result, reason: 'see_private_attempt' } : result),
@@ -1454,6 +1543,7 @@ async function execute() {
           observeTick(result);
           if (result.phase === 'release_ready' && !releasePort) return 'stop';
           if (!TERMINAL_PHASES.has(result.phase)) return;
+          if (['done', 'hold', 'lease_lost'].includes(result.phase)) await stopTerminalWorker(result);
           // Закреплённая карточка: терминал завершает демон. Очередь: done/hold
           // освобождают слот для следующей карточки; неопределённый исход стопит.
           if (route.taskId !== undefined) {
@@ -1461,13 +1551,27 @@ async function execute() {
             return 'stop';
           }
           if (result.phase === 'done' || result.phase === 'hold') {
+            const closedRecord = await state.load();
+            if (!closedRecord?.taskId) {
+              process.exitCode = 1;
+              return 'stop';
+            }
             // Дистилляция уроков ревью до сброса записи попытки (#1263).
             await distillClosedAttempt();
             // Иначе сводка следующей карточки унаследует счётчики предыдущей.
             await finishTelemetry();
+            try {
+              await git('reset', '--hard', route.base);
+              await git('clean', '-fd');
+            } catch (error) {
+              process.exitCode = 1;
+              console.error(`queue worktree reset failed: ${String(error?.message ?? error).split('\n')[0]}`);
+              return 'stop';
+            }
             await state.save(null);
             telemetry = newTelemetry();
             lastResult = null;
+            liveThreadId = null;
             return;
           }
           process.exitCode = 1;
@@ -1482,6 +1586,7 @@ async function execute() {
       observeTick(result);
       if (result.phase === 'release_ready' && !releasePort) return;
       if (TERMINAL_PHASES.has(result.phase)) {
+        if (['done', 'hold', 'lease_lost'].includes(result.phase)) await stopTerminalWorker(result);
         if (result.phase !== 'done') process.exitCode = 1;
         return;
       }
@@ -1492,6 +1597,8 @@ async function execute() {
     throw new Error('Pilot wait elapsed; current attempt is preserved');
   } finally {
     try {
+      const shutdownRecord = await state.load().catch(() => null);
+      await stopWorkerThread(shutdownRecord?.threadId ?? liveThreadId);
       // Закрытая карточка с историей REWORK — источник уроков (#1263).
       if (['done', 'hold'].includes(lastResult?.phase)) await distillClosedAttempt();
       await finishTelemetry();
