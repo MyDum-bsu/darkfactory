@@ -14,6 +14,7 @@ import { isolatedNeonReviewRunner } from './neon-review.mjs';
 import { NEON_CRITIC } from './review-policy.mjs';
 import { parseReviewTranscript } from './review-runner.mjs';
 import { commitFile, neonFixture } from './review-test-fixture.mjs';
+import { memoryBoardSdk } from './board-test-fixture.mjs';
 import { loadSdk } from './sdk.mjs';
 import { aggregateTelemetry, createTelemetryRecorder, formatTelemetryReport, formatTelemetrySummary,
   normalizeUsage, roundGateOf, threadUsage, TELEMETRY_PHASES } from './telemetry.mjs';
@@ -482,12 +483,24 @@ test('neon-review: usage из потока попадает в квитанци�
 });
 
 // Минимальный стенд изолированной доски (как в accept-held.test.mjs).
-const { board, local } = loadSdk();
+// Детерминированный check-контейнер (rootless Docker, --network=none) не
+// содержит приватного host-SDK: там тесты идут на in-memory Board той же
+// формы. На хосте с установленным SDK — как и раньше через loadSdk.
+function sdk() {
+  try {
+    return loadSdk();
+  } catch (error) {
+    if (error?.code !== 'MODULE_NOT_FOUND' && error?.code !== 'ERR_MODULE_NOT_FOUND') throw error;
+    return memoryBoardSdk();
+  }
+}
+
 const BASE = '0'.repeat(40);
 const CAND = 'a'.repeat(40);
 const REVIEW_ROUTE = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
 
 async function isolated(t) {
+  const { board, local } = sdk();
   const backend = local({ memory: true });
   t.after(() => backend.close());
   const handle = board({ backend });
