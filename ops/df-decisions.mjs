@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // df-decisions — operator CLI for the approval-gated Unified Owner Decision Ledger.
 
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { rename, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { DEFAULT_MAX_CHARS, openUnifiedLedger } from '../board_pipeline/unified-ledger.mjs';
+import { openUnifiedLedger } from '../board_pipeline/unified-ledger.mjs';
 
 const USAGE = `usage:
   node ops/df-decisions.mjs propose --db PATH --scope SCOPE --topic TOPIC --decision DECISION [--rationale TEXT] [--applicability TEXT] --by ACTOR [--json]
@@ -164,71 +164,17 @@ function query(values, defaultDbPath) {
   }));
 }
 
-function renderDecisionMarkdown(rows, maxChars = DEFAULT_MAX_CHARS) {
-  const inline = text => text.replace(/\s+/g, ' ').trim();
-  const header = '# Owner Decision Ledger\n';
-  const byScope = new Map();
-  for (const row of rows) {
-    if (!byScope.has(row.scope)) byScope.set(row.scope, []);
-    byScope.get(row.scope).push(row);
-  }
-  const scopeOrder = [...byScope.keys()].sort((a, b) => {
-    if (a === 'global') return -1;
-    if (b === 'global') return 1;
-    return a < b ? -1 : 1;
-  });
-  const blocks = [];
-  for (const scope of scopeOrder) {
-    const entries = byScope.get(scope).map(row => [
-      `- **${inline(row.topic)}**: ${inline(row.decision)}`,
-      row.rationale ? `  - Rationale: ${inline(row.rationale)}` : null,
-      row.applicability ? `  - Applicability: ${inline(row.applicability)}` : null,
-      `  - ID: \`${row.id}\` — approved by ${inline(row.approved_by)} at ${row.approved_at}`,
-    ].filter(line => line !== null).join('\n')).join('\n');
-    blocks.push({ scope, text: `\n## ${scope}\n\n${entries}\n` });
-  }
-  const full = header + blocks.map(block => block.text).join('');
-  let markdown = full;
-  let truncated = false;
-  if (full.length > maxChars) {
-    truncated = true;
-    const included = [];
-    let idsCount = 0;
-    for (const block of blocks) {
-      const shown = included.length + 1;
-      const notice = `\n\n_Truncated: showing ${shown} of ${blocks.length} scope sections._\n`;
-      if ((header + included.join('') + block.text + notice).length <= maxChars) {
-        included.push(block.text);
-        idsCount += 1;
-      } else {
-        break;
-      }
-    }
-    if (included.length === 0) {
-      markdown = full.slice(0, maxChars);
-    } else {
-      const notice = `\n\n_Truncated: showing ${idsCount} of ${blocks.length} scope sections._\n`;
-      markdown = header + included.join('') + notice;
-      if (markdown.length > maxChars) markdown = markdown.slice(0, maxChars);
-    }
-  }
-  const digest = createHash('sha256').update(markdown).digest('hex');
-  return { markdown, digest, truncated, total: rows.length };
-}
-
 async function exportLedger(values, defaultDbPath) {
   const dbPath = requireDb(values, defaultDbPath, 'export');
   const projectId = projectOption(values);
-  const exported = withLedger(dbPath, ledger => {
-    if (values.area === undefined) {
-      return ledger.exportMarkdown({ projectId });
-    }
-    return renderDecisionMarkdown(ledger.queryRelevantDecisions({
-      projectId,
-      areas: values.area,
-      limit: Number.MAX_SAFE_INTEGER,
-    }));
-  });
+  // The ledger's own renderer is the single source of truth for export:
+  // it truncates strictly on whole decision-entry boundaries and reports
+  // exactly which decision ids made it into the emitted markdown. A second
+  // renderer here previously diverged and could slice entries mid-sentence.
+  const exported = withLedger(dbPath, ledger => ledger.exportMarkdown({
+    projectId,
+    areas: values.area,
+  }));
   if (values.out === undefined) return exported;
   const outPath = await writeFileAtomic(values.out, exported.markdown);
   return { ...exported, outPath };
