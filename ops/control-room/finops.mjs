@@ -124,13 +124,26 @@ const PUBLIC_FINOPS_ENTRY_KEYS = new Set([
   'model', 'quota', 'reset',
 ]);
 
+// A scalar allowlisted field accepts ONLY primitive values: strings are
+// terminal-sanitized, numbers/booleans/null pass through. Plain objects are
+// never forwarded. Array values are filtered down to primitive items —
+// strings sanitized, numbers/booleans verbatim — so nested objects or arrays
+// (and any unsanitized text they carry) can never leak into the public
+// snapshot through an allowlisted key such as `label`.
+const isForwardablePrimitive = value =>
+  typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+
 function publicEntry(entry, extra = {}) {
   const out = {};
   for (const [key, value] of Object.entries({ ...entry, ...extra })) {
     if (!PUBLIC_FINOPS_ENTRY_KEYS.has(key)) continue;
     if (typeof value === 'string') out[key] = clean(value);
     else if (typeof value === 'number' || typeof value === 'boolean' || value == null) out[key] = value;
-    else if (Array.isArray(value)) out[key] = value.map(item => typeof item === 'string' ? clean(item) : item);
+    else if (Array.isArray(value)) {
+      out[key] = value
+        .filter(isForwardablePrimitive)
+        .map(item => typeof item === 'string' ? clean(item) : item);
+    }
   }
   return out;
 }

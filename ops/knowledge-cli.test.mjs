@@ -481,3 +481,84 @@ test('df-archive: вход ingest обязан быть обычным файл�
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('df-decisions: export --area delegates to the ledger renderer — entry-boundary truncation, ids, no mid-sentence slicing', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'df-decisions-export-ledger-'));
+  try {
+    const dbPath = join(dir, 'ledger.db');
+    const activate = async (scope, topic, decision, rationale) => {
+      const proposal = await runJson(DECISIONS_CLI, [
+        'propose', '--db', dbPath, '--scope', scope, '--topic', topic,
+        '--decision', decision, ...(rationale ? ['--rationale', rationale] : []),
+        '--by', 'cto', '--json',
+      ]);
+      const active = await runJson(DECISIONS_CLI, [
+        'approve', '--db', dbPath, '--id', proposal.proposal_id, '--by', 'owner', '--json',
+      ]);
+      return active.id;
+    };
+
+    // Small ledger: export carries the ledger-native `ids` contract — the
+    // retired secondary renderer never emitted it.
+    const globalId = await activate('global', 'global gate', 'Global decision text');
+    const backendId = await activate('area:backend', 'backend gate', 'Backend decision text');
+    const small = await runJson(DECISIONS_CLI, [
+      'export', '--db', dbPath, '--area', 'backend', '--json',
+    ]);
+    assert.equal(small.digest, sha256(small.markdown));
+    assert.equal(small.truncated, false);
+    assert.equal(small.total, 2);
+    assert.deepEqual(small.ids.sort(), [globalId, backendId].sort());
+    assert.match(small.markdown, /^# Owner Decision Ledger\n/);
+
+    // Large ledger: enough long entries to exceed the 4000-char export
+    // budget. Truncation must happen strictly on whole decision-entry
+    // boundaries — an entry is either complete in the output or absent,
+    // never sliced mid-sentence.
+    const filler = 'x'.repeat(1500);
+    for (let i = 0; i < 6; i += 1) {
+      await activate('area:backend', `bulk topic ${i}`,
+        `Bulk decision ${i} body`, `rationale ${i} ${filler}`);
+    }
+    const exported = await runJson(DECISIONS_CLI, [
+      'export', '--db', dbPath, '--area', 'backend', '--json',
+    ]);
+    assert.equal(exported.digest, sha256(exported.markdown));
+    assert.equal(exported.truncated, true);
+    assert.equal(exported.total, 8);
+    assert.ok(exported.markdown.length <= 4000,
+      `markdown length ${exported.markdown.length} must respect the export budget`);
+    // Ledger-native truncation notice counts decision entries, never scope
+    // sections, and the output ends with that notice — not a sliced entry.
+    assert.match(exported.markdown, /_Truncated: showing \d+ of 8 decision entries\._\n$/);
+    assert.equal(exported.markdown.includes('scope sections'), false);
+    // ids pin exactly the entries present in the emitted markdown.
+    assert.ok(Array.isArray(exported.ids));
+    assert.ok(exported.ids.length < exported.total);
+    for (const id of exported.ids) {
+      assert.ok(exported.markdown.includes(`\`${id}\``), `id ${id} must appear in markdown`);
+    }
+    // Every entry that starts in the output is complete: each bullet header
+    // is matched by its ID line, so no entry is cut mid-sentence.
+    const entryHeaders = exported.markdown.match(/^- \*\*/gm) ?? [];
+    const idLines = exported.markdown.match(/^  - ID: `/gm) ?? [];
+    assert.equal(entryHeaders.length, idLines.length);
+    assert.equal(idLines.length, exported.ids.length);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('package.json: v1.0.0 release version and all hardening suites registered in scripts.test', async () => {
+  const pkg = JSON.parse(await readFile(join(OPS_DIR, '..', 'package.json'), 'utf8'));
+  assert.equal(pkg.version, '1.0.0');
+  for (const suite of [
+    'board_pipeline/pi-guard.test.mjs',
+    'ops/df-models.test.mjs',
+    'ops/factory-enqueue.test.mjs',
+    'ops/factory-run.test.mjs',
+  ]) {
+    assert.ok(pkg.scripts.test.split(/\s+/).includes(suite),
+      `scripts.test must register ${suite}`);
+  }
+});

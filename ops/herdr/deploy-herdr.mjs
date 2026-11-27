@@ -24,7 +24,7 @@ import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { copyFile, lstat, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { promisify } from 'node:util';
@@ -94,7 +94,8 @@ export async function planDeploy({ repoRoot, targetDir, sha, files, skipGitVerif
   // HEAD. Deploying bits that do not match the stamped commit would break
   // the audit chain. Non-git scratch directories (unit tests, temp staging)
   // skip verification, as does an explicit skipGitVerify opt-out.
-  if (!skipGitVerify && (await lstatOrNull(join(rootReal, '.git'))) !== null) {
+  const gitVerify = !skipGitVerify && (await lstatOrNull(join(rootReal, '.git'))) !== null;
+  if (gitVerify) {
     let head;
     try {
       const { stdout } = await execFileAsync('git', ['-C', rootReal, 'rev-parse', 'HEAD']);
@@ -136,6 +137,30 @@ export async function planDeploy({ repoRoot, targetDir, sha, files, skipGitVerif
       if (!syntax.ok) throw new Error(`source_syntax_invalid:${name}`);
     } else if (content.length === 0) {
       throw new Error(`source_empty:${name}`);
+    }
+
+    if (gitVerify) {
+      // Per-file provenance: a HEAD match alone proves nothing about the
+      // worktree — files may be dirty-modified, staged or untracked while
+      // rev-parse still passes. Every deployed source must byte-match the
+      // blob recorded at the stamped commit, so the bits landing on the
+      // host are exactly what the audit chain pinned. `git show` fails
+      // outright for untracked paths, and blob bytes diverge for modified
+      // ones; both are hard rejections. The git-side path is derived from
+      // the canonicalized source location, never from raw user input.
+      const repoRelative = relative(rootReal, sourceReal).split(sep).join('/');
+      let blob;
+      try {
+        const { stdout } = await execFileAsync(
+          'git', ['-C', rootReal, 'show', `${sha.toLowerCase()}:${repoRelative}`],
+          { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
+        blob = stdout;
+      } catch {
+        throw new Error(`git_blob_unreadable:${name}`);
+      }
+      if (!Buffer.isBuffer(blob) || !blob.equals(content)) {
+        throw new Error(`git_blob_mismatch:${name}`);
+      }
     }
 
     seen.add(nameKey);

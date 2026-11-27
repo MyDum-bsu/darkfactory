@@ -443,6 +443,84 @@ test('df-watch-task.sh slot matching uses only -s<N> or slot-?<N> suffixes', asy
   assert.match(slot3.stdout, /valid-s3/);
 });
 
+test('df-watch-task.sh discovers slots beyond S4 in numeric order with no slot cap', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'df-watch-many-slots-'));
+  const stateRoot = join(root, 'state');
+  for (const n of [1, 2, 8, 9, 10, 12]) {
+    const dir = join(stateRoot, `daemon-state-slot${n}`);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'attempt.json'), JSON.stringify({
+      task_id: `task-s${n}`, phase: 'implement',
+    }));
+  }
+
+  const script = join(HERE, 'df-watch-task.sh');
+  const all = await runFile(script, [
+    '--state-root', stateRoot, '--once', '--no-stream',
+  ], { timeout: 5000 });
+  assert.equal(all.code, 0, all.stderr);
+  for (const n of [1, 2, 8, 9, 10, 12]) {
+    assert.match(all.stdout, new RegExp(`task-s${n}\\b`));
+    assert.match(all.stdout, new RegExp(`^S${n}  \\(state root:`, 'm'));
+  }
+  // Numeric, not lexicographic ordering: S8 < S9 < S10 < S12. A capped or
+  // string-sorted renderer would drop or misorder the two-digit slots.
+  const at = marker => all.stdout.indexOf(marker);
+  assert.ok(at('S1  (') < at('S2  ('), 'S1 before S2');
+  assert.ok(at('S2  (') < at('S8  ('), 'S2 before S8');
+  assert.ok(at('S8  (') < at('S9  ('), 'S8 before S9');
+  assert.ok(at('S9  (') < at('S10  ('), 'S9 before S10');
+  assert.ok(at('S10  (') < at('S12  ('), 'S10 before S12');
+
+  // A two-digit --slot filter is accepted and renders only that slot.
+  const only10 = await runFile(script, [
+    '--state-root', stateRoot, '--slot', '10', '--once', '--no-stream',
+  ], { timeout: 5000 });
+  assert.equal(only10.code, 0, only10.stderr);
+  assert.match(only10.stdout, /task-s10/);
+  assert.equal(only10.stdout.includes('task-s9'), false);
+  assert.equal(only10.stdout.includes('task-s12'), false);
+
+  // Slot validation is a positive-integer contract, not a 1..4 cap.
+  for (const bad of ['0', '00', '-1', 'x', '1.5']) {
+    const rejected = await runFile(script, ['--slot', bad, '--once'], { timeout: 5000 });
+    assert.equal(rejected.code, 2, `--slot ${bad} should be a usage error`);
+    assert.match(rejected.stderr, /positive integer >= 1/);
+  }
+});
+
+test('df-watch-task.sh strips ANSI/OSC control characters from attempt metadata and controller log lines', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'df-watch-ansi-'));
+  const stateRoot = join(root, 'state');
+  const attemptDir = join(stateRoot, 'daemon-state-slot3');
+  await mkdir(attemptDir, { recursive: true });
+  await writeFile(join(attemptDir, 'attempt.json'), JSON.stringify({
+    task_id: 'T3\x1b[2J\x1b]0;evil-title\x07task',
+    phase: 'impl\x1b[31mred\x1b[0mement',
+    worktree: '/wt/\x1b[6ninjected',
+  }));
+  await writeFile(join(stateRoot, 'daemon-slot3.log'),
+    'log \x1b[31mred\x1b[0m line\n' +
+    'osc \x1b]52;c;aGVsbG8=\x07 payload\n' +
+    'erase \x1b[2J sequence\n');
+
+  const result = await runFile(join(HERE, 'df-watch-task.sh'), [
+    '--state-root', stateRoot, '--once', '--no-stream',
+  ], { timeout: 5000 });
+  assert.equal(result.code, 0, result.stderr);
+  // No ESC or BEL byte survives anywhere in the rendered output — neither
+  // from attempt metadata nor from the controller log tail.
+  assert.equal(result.stdout.includes('\x1b'), false);
+  assert.equal(result.stdout.includes('\x07'), false);
+  // The printable payloads survive sanitization.
+  assert.match(result.stdout, /T3task/);
+  assert.match(result.stdout, /implredement/);
+  assert.match(result.stdout, /\/wt\/injected/);
+  assert.match(result.stdout, /log red line/);
+  assert.match(result.stdout, /osc\s+payload/);
+  assert.match(result.stdout, /erase\s+sequence/);
+});
+
 // --- planDeploy / applyDeploy ------------------------------------------------
 
 async function makeSandbox() {
@@ -646,12 +724,16 @@ test('planDeploy verifies sha against git HEAD unless skipGitVerify is set', asy
     else process.env.HERDR_TEST_GIT_ARGS = originalGitArgs;
   });
 
-  const verified = await planDeploy({
+  // The fixture answers only rev-parse. A matching sha proceeds to the
+  // per-file blob verification, which the fixture cannot serve — the file
+  // looks untracked, so planning fails closed instead of deploying
+  // unverifiable bits.
+  await assert.rejects(planDeploy({
     repoRoot: repo, targetDir: target, sha: head, files: ['helper.mjs'],
-  });
-  assert.equal(verified.sha, head);
+  }), /git_blob_unreadable:helper\.mjs/);
   assert.deepEqual((await readFile(gitArgs, 'utf8')).trimEnd().split('\n'), [
     '-C', repo, 'rev-parse', 'HEAD',
+    '-C', repo, 'show', `${head}:helper.mjs`,
   ]);
 
   await assert.rejects(planDeploy({
@@ -685,6 +767,100 @@ test('planDeploy verifies sha against git HEAD unless skipGitVerify is set', asy
   assert.equal(cliCode, 0, cliErr);
   assert.match(cliOut, /dry-run/);
   assert.equal((await readFile(gitArgs, 'utf8')).trimEnd().split('\n').length, invocationsBeforeSkip);
+});
+
+test('planDeploy byte-verifies every source against git show blobs at the stamped sha', async (t) => {
+  const { root, repo, target } = await makeSandbox();
+  await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
+  await mkdir(join(repo, 'ops/herdr'), { recursive: true });
+  await writeFile(join(repo, 'ops/herdr/nested.mjs'), VALID_MJS);
+  await mkdir(join(repo, '.git'));
+  const head = '1'.repeat(40);
+
+  // Sandbox-local git shim: answers rev-parse with the pinned HEAD and
+  // serves `show <sha>:<relpath>` straight from the worktree, simulating a
+  // perfectly clean checkout. Every invocation is recorded one arg per line
+  // so the exact command contract is pinned.
+  const shimBin = join(root, 'shim-bin');
+  await mkdir(shimBin);
+  const gitArgs = join(root, 'git-args.txt');
+  await writeFile(join(shimBin, 'git'), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$@" >> '${gitArgs}'
+if [[ $# -eq 4 && "\${1}" == '-C' && "\${3}" == 'rev-parse' && "\${4}" == 'HEAD' ]]; then
+  printf '%s\\n' '${head}'
+  exit 0
+fi
+if [[ $# -eq 4 && "\${1}" == '-C' && "\${3}" == 'show' ]]; then
+  rel="\${4#${head}:}"
+  cat -- "\${2}/$rel"
+  exit 0
+fi
+exit 2
+`, { mode: 0o755 });
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${shimBin}:${originalPath ?? ''}`;
+  t.after(() => {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+  });
+
+  const plan = await planDeploy({
+    repoRoot: repo, targetDir: target, sha: head, files: ['helper.mjs', 'ops/herdr/nested.mjs'],
+  });
+  assert.equal(plan.sha, head);
+  assert.equal(plan.files.length, 2);
+  // rev-parse HEAD runs once, then each file is byte-verified through
+  // `git show <sha>:<relpath>` with the canonical repo-relative path —
+  // never the raw user-supplied spelling.
+  assert.deepEqual((await readFile(gitArgs, 'utf8')).trimEnd().split('\n'), [
+    '-C', repo, 'rev-parse', 'HEAD',
+    '-C', repo, 'show', `${head}:helper.mjs`,
+    '-C', repo, 'show', `${head}:ops/herdr/nested.mjs`,
+  ]);
+});
+
+test('planDeploy accepts a clean real git worktree and rejects dirty-modified and untracked sources', async () => {
+  const { repo, target } = await makeSandbox();
+  await execFileAsync('git', ['init', '-q', repo]);
+  await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
+  await writeFile(join(repo, 'watcher.sh'), VALID_SH);
+  await execFileAsync('git', ['-C', repo, 'add', 'helper.mjs', 'watcher.sh']);
+  await execFileAsync('git', [
+    '-C', repo, '-c', 'user.name=herdr-test', '-c', 'user.email=herdr-test@example.invalid',
+    'commit', '-q', '-m', 'init',
+  ]);
+  const { stdout } = await execFileAsync('git', ['-C', repo, 'rev-parse', 'HEAD']);
+  const sha = stdout.trim();
+  assert.match(sha, /^[0-9a-f]{40}$/);
+
+  // A byte-clean worktree passes the per-file provenance check.
+  const clean = await planDeploy({
+    repoRoot: repo, targetDir: target, sha, files: ['helper.mjs', 'watcher.sh'],
+  });
+  assert.equal(clean.files.length, 2);
+
+  // rev-parse HEAD still matches, but the modified worktree bytes diverge
+  // from the committed blob: the dirty file must not deploy.
+  await writeFile(join(repo, 'helper.mjs'), 'export const answer = 43;\n');
+  await assert.rejects(planDeploy({
+    repoRoot: repo, targetDir: target, sha, files: ['helper.mjs'],
+  }), /git_blob_mismatch:helper\.mjs/);
+
+  // Staging the modification does not launder it either: the worktree bytes
+  // are still not the bytes recorded at the stamped commit.
+  await execFileAsync('git', ['-C', repo, 'add', 'helper.mjs']);
+  await assert.rejects(planDeploy({
+    repoRoot: repo, targetDir: target, sha, files: ['helper.mjs'],
+  }), /git_blob_mismatch:helper\.mjs/);
+
+  // An untracked source has no blob at the stamped sha at all.
+  await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
+  await writeFile(join(repo, 'untracked.mjs'), VALID_MJS);
+  await assert.rejects(planDeploy({
+    repoRoot: repo, targetDir: target, sha, files: ['untracked.mjs'],
+  }), /git_blob_unreadable:untracked\.mjs/);
 });
 
 test('planDeploy rejects traversal, missing files, empty scripts and broken ESM', async () => {
