@@ -14,6 +14,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { assertCrossFamily, executorFamily } from './review-runner.mjs';
+import { weakensSecurityGate } from './rework-distiller.mjs';
 import { canonicalJson } from './subject.mjs';
 
 export const PROJECT_MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
@@ -55,6 +56,8 @@ const MAX_ENTRY_CHARS = 500;
 const MAX_MEMORY_BYTES = 4 * 1024 * 1024;
 const MAX_SYMLINK_HOPS = 40;
 const SUBSUMPTION_MIN_CHARS = 20;
+// Жёсткий LRU-cap закреплённых срезов в кэше pinProjectMemory.
+const PIN_CACHE_CAP = 64;
 
 const inside = (root, p) => {
   const rel = relative(root, p);
@@ -69,6 +72,36 @@ const sanitizeSnippet = (text, maxLen = 240) => {
   const clean = text.replace(/\s+/g, ' ').trim();
   return clean.length > maxLen ? `${clean.slice(0, maxLen - 1)}…` : clean;
 };
+
+// Санация любого текста, идущего в память: весь whitespace (включая переводы
+// строк) схлопывается в один пробел — многострочная инъекция поддельных
+// заголовков вида '\n[invariants]\n- forged' невозможна по построению.
+const sanitizeMemoryText = (text, maxLen = 240) => sanitizeSnippet(text, maxLen);
+
+// Fail-closed фильтр самоослабления: текст критика/ревью, предлагающий
+// отключить или обойти тесты, гейты, ревью, изоляцию или scope-fence, никогда
+// не становится памятью проекта — ни через явный memoryUpdates, ни через
+// автоматическую экстракцию.
+const gateWeakening = text => typeof text === 'string' && weakensSecurityGate(text);
+
+// Явный memoryUpdates — тот же недоверенный текст критика: каждая запись
+// санитизируется (схлопывание whitespace) и фильтруется через
+// weakensSecurityGate. Ослабляющие и пустые после санации записи удаляются;
+// неструктурные записи (не объект/не строковый text) проходят без изменений —
+// их отклоняет fail-closed валидация записи.
+function sanitizeExplicitUpdates(explicit) {
+  const cleaned = [];
+  for (const u of explicit) {
+    if (u === null || typeof u !== 'object' || Array.isArray(u) || typeof u.text !== 'string') {
+      cleaned.push(u);
+      continue;
+    }
+    const text = sanitizeMemoryText(u.text, MAX_ENTRY_CHARS);
+    if (!text || gateWeakening(u.text) || gateWeakening(text)) continue;
+    cleaned.push({ ...u, text });
+  }
+  return cleaned;
+}
 
 // Автоматическое извлечение компактных записей памяти из реального результата
 // acceptHeld / квитанции ревью, когда явный список memoryUpdates не передан.
@@ -85,12 +118,15 @@ export function extractPostReviewMemoryUpdates({
 }) {
   const res = result ?? outcome;
   const explicit = res?.memoryUpdates ?? reviewReceipt?.memoryUpdates;
-  if (Array.isArray(explicit) && explicit.length > 0) return explicit;
+  if (Array.isArray(explicit) && explicit.length > 0) return sanitizeExplicitUpdates(explicit);
 
   const updates = [];
   const seen = new Set();
   const push = (section, text) => {
     if (!text || seen.has(`${section}${text}`)) return;
+    // Любой кандидат, ослабляющий тесты/гейты/ревью/scope-fence, отклоняется —
+    // независимо от секции и источника текста.
+    if (gateWeakening(text)) return;
     seen.add(`${section}${text}`);
     updates.push({ section, text });
   };
@@ -305,6 +341,22 @@ async function resolveProjectFile(storeDir, projectId, worktree) {
 }
 
 async function readStoreDoc(file, projectId) {
+  // Размер и тип проверяются ДО чтения: многогигабайтный или не-файл не
+  // загружается в память процесса.
+  let st;
+  try { st = await stat(file); } catch (error) {
+    if (error.code === 'ENOENT') {
+      return {
+        schema: PROJECT_MEMORY_SCHEMA,
+        project_id: projectId,
+        updated_at: null,
+        sections: emptySections(),
+      };
+    }
+    throw error;
+  }
+  if (!st.isFile()) throw new Error('project_memory_corrupt');
+  if (st.size > MAX_MEMORY_BYTES) throw new Error('project_memory_oversized');
   let raw;
   try { raw = await readFile(file, 'utf8'); } catch (error) {
     if (error.code === 'ENOENT') {
@@ -338,10 +390,17 @@ const pidAlive = pid => {
 };
 
 // Восстановление после SIGKILL посреди записи: лок несёт JSON
-// { pid, createdAt }; лок старше staleLockMs или лок мёртвого pid снимается.
-// Нечитаемый/legacy-лок судится по mtime; свежий живой лок не трогается —
-// валидная конкурентная блокировка не ломается.
+// { pid, token, createdAt }. Мульти-слотовая гонка: истёкший лок ЖИВОГО pid
+// не снимается никогда — владелец может быть просто медленным, а рейп под ним
+// размыкает взаимное исключение. Лок снимается только когда он И просрочен
+// (старше staleLockMs), И владелец мёртв (либо pid не читается — legacy или
+// оборванная на создании запись, у которой живого владельца не существует).
+// Перед unlink идентичность лока перепроверяется по inode и точному контенту:
+// если конкурент успел снять и пересоздать лок, чужой валидный лок не трогаем.
 async function clearStaleStoreLock(lock, staleLockMs, now = Date.now()) {
+  let before;
+  try { before = await stat(lock); } catch { return false; }
+  if (!before.isFile()) return false;
   let raw;
   try { raw = await readFile(lock, 'utf8'); } catch { return false; }
   let meta = null;
@@ -352,18 +411,25 @@ async function clearStaleStoreLock(lock, staleLockMs, now = Date.now()) {
     if (typeof meta.createdAt === 'string') createdAtMs = Date.parse(meta.createdAt);
     if (Number.isSafeInteger(meta.pid) && meta.pid > 0) pid = meta.pid;
   }
-  if (!Number.isFinite(createdAtMs)) {
-    try { createdAtMs = (await stat(lock)).mtimeMs; } catch { return false; }
-  }
+  if (!Number.isFinite(createdAtMs)) createdAtMs = before.mtimeMs;
   const expired = Number.isFinite(createdAtMs) && (now - createdAtMs) > staleLockMs;
-  const dead = pid !== null && !pidAlive(pid);
-  if (!expired && !dead) return false;
+  if (!expired) return false;
+  if (pid !== null && pidAlive(pid)) return false;
+  let after;
+  try { after = await stat(lock); } catch { return false; }
+  if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) return false;
+  let rawAgain;
+  try { rawAgain = await readFile(lock, 'utf8'); } catch { return false; }
+  if (rawAgain !== raw) return false;
   await rm(lock, { force: true }).catch(() => {});
   return true;
 }
 
 async function withStoreLock(file, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } = {}) {
   const lock = `${file}.lock`;
+  // Уникальный токен владения: рейпер сверяет контент перед снятием, а
+  // владелец не удалит чужой лок, пересозданный после гонки.
+  const token = randomBytes(16).toString('hex');
   let fd;
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
@@ -377,11 +443,21 @@ async function withStoreLock(file, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } =
   }
   if (fd === undefined) throw new Error('project_memory_locked');
   try {
-    await fd.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+    await fd.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }));
     return await fn();
   } finally {
+    // Снятие лока только если файл по пути — тот же самый inode, что мы
+    // открыли: пересозданный конкурентом лок никогда не удаляется из-под него.
+    try {
+      const handleStat = await fd.stat();
+      let pathStat = null;
+      try { pathStat = await stat(lock); } catch { /* лок уже отсутствует */ }
+      if (pathStat !== null && pathStat.isFile() &&
+          pathStat.dev === handleStat.dev && pathStat.ino === handleStat.ino) {
+        await unlink(lock).catch(() => {});
+      }
+    } catch { /* fd недействителен — остаток снимет stale-рейп */ }
     await fd.close().catch(() => {});
-    await rm(lock, { force: true }).catch(() => {});
   }
 }
 
@@ -659,6 +735,10 @@ async function readTrustedReceiptFile(receiptPath, trustedReceiptDir, worktree, 
   if (!st.isFile()) {
     throw new Error('project_memory_untrusted_write');
   }
+  // Размер проверяется ДО чтения — oversized квитанция не грузится в память.
+  if (st.size > MAX_RECEIPT_BYTES) {
+    throw new Error('project_memory_untrusted_write');
+  }
   const resolved = await resolveLoose(receiptPath);
   // Квитанция обязана лежать строго внутри trustedReceiptDir (не просто «вне worktree»)
   // и не иметь подменённых симлинком промежуточных сегментов.
@@ -822,7 +902,16 @@ async function recordProjectMemoryUpdate({
     if (u === null || typeof u !== 'object' || Array.isArray(u) || !SECTION_SET.has(u.section)) {
       throw new Error('project_memory_section_invalid');
     }
-    if (typeof u.text !== 'string' || !u.text.trim() || u.text.trim().length > MAX_ENTRY_CHARS) {
+    if (typeof u.text !== 'string') {
+      throw new Error('project_memory_text_invalid');
+    }
+    // Запись памяти — строго одна строка: весь whitespace (включая переводы
+    // строк) схлопывается перед проверкой длины. Срез рендерится построчно,
+    // поэтому многострочная инъекция поддельных [section]-заголовков в текст
+    // среза невозможна независимо от пути, которым updates попали сюда —
+    // в том числе в обход extractPostReviewMemoryUpdates.
+    const text = u.text.replace(/\s+/g, ' ').trim();
+    if (!text || text.length > MAX_ENTRY_CHARS) {
       throw new Error('project_memory_text_invalid');
     }
     const id = u.id ?? randomUUID();
@@ -831,7 +920,7 @@ async function recordProjectMemoryUpdate({
     batchIds.add(id);
     const entry = {
       id,
-      text: u.text.trim(),
+      text,
       source_card: verified.sourceCard,
       verified_sha: verified.verifiedSha,
       timestamp: ts,
@@ -1097,50 +1186,66 @@ export function pinProjectMemory(resolve_, { persistDir, projectId: expectedProj
   return key => {
     if (typeof key !== 'string' || !key) throw new Error('project_memory_pin_key_invalid');
     let pin = pins.get(key);
-    if (pin === undefined) {
-      pin = (async () => {
-        const file = persistDir === undefined ? null : fileFor(key);
-        if (file !== null) {
-          const saved = await readPinned(file, key);
-          if (saved !== undefined) return saved;
-        }
-        const raw = (await resolve_()) ?? null;
-        let slice;
-        if (raw === null) {
-          slice = expectedProjectId !== undefined ? emptySlice(expectedProjectId, false) : null;
-        } else {
-          slice = { enabled: raw.enabled ?? true, ...raw };
-        }
-        if (file !== null && slice !== null) {
-          if (!isSliceContent(slice) || typeof slice.enabled !== 'boolean') {
-            throw new Error('project_memory_slice_invalid');
-          }
-          if (expectedProjectId !== undefined && slice.projectId !== expectedProjectId) {
-            throw new Error('project_memory_pin_invalid');
-          }
-          const { enabled, projectId, text, digest, ids, truncated, total, items } = slice;
-          const payload = { enabled, projectId, text, digest, ids, truncated, total, items };
-          const stored = { project_id: projectId, pin_key: key, ...payload };
-          stored.pin_sha256 = pinIntegrity(stored);
-          const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
-          try {
-            await writeFile(tmp, JSON.stringify(stored), { mode: 0o600 });
-            try {
-              await link(tmp, file);
-            } catch (error) {
-              if (error.code !== 'EEXIST') throw error;
-              const saved = await readPinned(file, key);
-              if (saved === undefined) throw new Error('project_memory_pin_invalid');
-              return saved;
-            }
-          } finally {
-            await unlink(tmp).catch(() => {});
-          }
-          return payload;
-        }
-        return slice;
-      })();
+    if (pin !== undefined) {
+      // LRU-освежение: затронутый ключ переставляется в конец порядка вставки.
+      pins.delete(key);
       pins.set(key, pin);
+      return pin;
+    }
+    pin = (async () => {
+      const file = persistDir === undefined ? null : fileFor(key);
+      if (file !== null) {
+        const saved = await readPinned(file, key);
+        if (saved !== undefined) return saved;
+      }
+      const raw = (await resolve_()) ?? null;
+      let slice;
+      if (raw === null) {
+        slice = expectedProjectId !== undefined ? emptySlice(expectedProjectId, false) : null;
+      } else {
+        slice = { enabled: raw.enabled ?? true, ...raw };
+      }
+      if (file !== null && slice !== null) {
+        if (!isSliceContent(slice) || typeof slice.enabled !== 'boolean') {
+          throw new Error('project_memory_slice_invalid');
+        }
+        if (expectedProjectId !== undefined && slice.projectId !== expectedProjectId) {
+          throw new Error('project_memory_pin_invalid');
+        }
+        const { enabled, projectId, text, digest, ids, truncated, total, items } = slice;
+        const payload = { enabled, projectId, text, digest, ids, truncated, total, items };
+        const stored = { project_id: projectId, pin_key: key, ...payload };
+        stored.pin_sha256 = pinIntegrity(stored);
+        const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+        try {
+          await writeFile(tmp, JSON.stringify(stored), { mode: 0o600 });
+          try {
+            await link(tmp, file);
+          } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+            const saved = await readPinned(file, key);
+            if (saved === undefined) throw new Error('project_memory_pin_invalid');
+            return saved;
+          }
+        } finally {
+          await unlink(tmp).catch(() => {});
+        }
+        return payload;
+      }
+      return slice;
+    })();
+    pins.set(key, pin);
+    // Отклонённый pin не закрепляется в кэше: повторный вызов того же ключа
+    // честно перезапускает resolve, а не возвращает навсегда битый Promise.
+    pin.catch(() => {
+      if (pins.get(key) === pin) pins.delete(key);
+    });
+    // Жёсткий LRU-cap: не больше PIN_CACHE_CAP ключей на фабрику — память
+    // процесса не растёт без ограничений от числа попыток.
+    while (pins.size > PIN_CACHE_CAP) {
+      const oldest = pins.keys().next().value;
+      if (oldest === undefined || oldest === key) break;
+      pins.delete(oldest);
     }
     return pin;
   };

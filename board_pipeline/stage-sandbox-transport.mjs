@@ -1,3 +1,8 @@
+/**
+ * @deprecated Legacy V2 module (Foreman/Playbooks era). Superseded by the Wave 2.0
+ * unified pipeline; retained for backward compatibility only — do not use in new code.
+ * See docs/DEPRECATED.md.
+ */
 // Аттестованный read-only транспорт Stage-станций (VS-5.2): жёсткий
 // контракт mode:'read-only' поверх двух доказуемых контуров:
 //   landlock-ro-v1 — host Agy-транспорт (agy-transport.mjs + agy-landlock.py,

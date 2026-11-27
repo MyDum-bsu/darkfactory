@@ -14,8 +14,20 @@ const IMAGE = /^sha256:[a-f0-9]{64}$/;
 // OCI-метка, которой доверенный образ L1-профиля аттестует себя.
 const L1_IMAGE_LABEL = 'df.l1.profile';
 
+// Inspect-порт опрашивает недоверенный worktree воркера: его репо-локальный
+// и глобальный конфиг не должны исполнять код от имени контроллера.
+// core.fsmonitor — команда, запускаемая git status; hooksPath и diff.external
+// глушатся тем же набором -c (командная строка сильнее репо-конфига), а
+// системный/глобальный конфиги отключаются переменными окружения.
 async function git(worktree, ...args) {
-  return (await exec('git', ['-C', worktree, ...args], { timeout: 20_000 })).stdout.trimEnd();
+  return (await exec('git', [
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'diff.external=',
+    '-C', worktree, ...args,
+  ], { timeout: 20_000,
+    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+  })).stdout.trimEnd();
 }
 
 export function worktreeInspector(policy) {
@@ -228,6 +240,26 @@ export function buildUiVisualL3Profile({ image, argv, cwd = 'tracker/web', timeo
   });
 }
 
+// Цель маунта node_modules внутри /candidate: канонический (уже
+// нормализованный) путь строго в /candidate с финальным сегментом
+// 'node_modules' — multi-repo раскладка JS/TS проектов (/candidate/node_modules
+// корня репозитория, /candidate/tracker/web/node_modules и
+// /candidate/web/node_modules вложенных пакетов). Тот же допуск, что у
+// candidateNodeModulesTarget в ops/factory-run.mjs: сегменты '..'/'.',
+// пустые сегменты ('//'), завершающий '/', управляющие символы и пути вне
+// /candidate отклоняются.
+export function isAllowedCandidateNodeModulesTarget(to) {
+  if (typeof to !== 'string' || !to.startsWith('/candidate/') || to.endsWith('/') ||
+      /[\x00-\x1f\x7f]/.test(to)) {
+    return false;
+  }
+  const segments = to.split('/').slice(1);
+  if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) {
+    return false;
+  }
+  return segments.at(-1) === 'node_modules';
+}
+
 async function sandboxExtras(recipe, source) {
   const args = [];
   for (const { from, to } of recipe.mounts ?? []) {
@@ -236,8 +268,21 @@ async function sandboxExtras(recipe, source) {
     }
     if ((to === '/deps' && basename(from) === 'site-packages') || (HOST_SYSTEM_DIRS.has(to) && from === to)) {
       args.push('--mount', `type=bind,src=${from},dst=${to},readonly`);
-    } else if (to === '/candidate/tracker/web/node_modules' && basename(from) === 'node_modules') {
-      const inside = join(source, 'tracker', 'web');
+    } else if (isAllowedCandidateNodeModulesTarget(to) && basename(from) === 'node_modules') {
+      // Родительская цепочка цели внутри снимка обязана состоять из
+      // реальных каталогов: симлинк-компонент уводил бы точку монтирования
+      // за пределы распакованного дерева. Недостающие каталоги создаются
+      // в scratch-копии, существующий не-каталог — отказ до docker.
+      const segments = to.split('/').slice(2, -1);
+      let inside = source;
+      for (const segment of segments) {
+        inside = join(inside, segment);
+        const st = await lstat(inside).catch(() => null);
+        if (st === null) await mkdir(inside);
+        else if (!st.isDirectory() || st.isSymbolicLink()) {
+          throw new Error('Dependency mount target crosses a symlink');
+        }
+      }
       if (await realpath(inside) !== inside) throw new Error('Dependency mount target crosses a symlink');
       await mkdir(join(inside, 'node_modules'));
       args.push('--mount', `type=bind,src=${from},dst=${to},readonly`);

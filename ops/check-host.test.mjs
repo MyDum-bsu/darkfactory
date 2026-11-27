@@ -24,13 +24,17 @@ test('doctor implementation preset accepts SWE-2.1 and legacy SWE-2 High, reject
   assert.equal(validateImplementationPreset({ provider: 'google', model: 'swe-2-1-medium' }), false);
 });
 
-test('doctor runtime resolution uses CLI, env, legacy routes and a modern no-routes default', () => {
+test('doctor runtime resolution uses CLI and env, defaulting to hc even when legacy routes exist', () => {
   const absent = () => false;
   const present = () => true;
   assert.equal(resolveRuntime({ argv: ['--runtime', 'subproc'], env: { DF_WORKER_RUNTIME: 'bb' }, exists: absent }), 'subproc');
   assert.equal(resolveRuntime({ argv: ['--runtime=bb'], env: {}, exists: absent }), 'bb');
+  assert.equal(resolveRuntime({ argv: [], env: { DF_WORKER_RUNTIME: 'bb' }, exists: absent }), 'bb');
+  assert.equal(resolveRuntime({ argv: [], env: { DF_WORKER_RUNTIME: 'bb' }, exists: present }), 'bb');
   assert.equal(resolveRuntime({ argv: [], env: { DF_WORKER_RUNTIME: 'hc' }, exists: present }), 'hc');
-  assert.equal(resolveRuntime({ argv: [], env: {}, exists: present }), 'bb');
+  // Legacy routes.json existence never implies bb: only an explicit
+  // --runtime bb or DF_WORKER_RUNTIME=bb selects the legacy runtime.
+  assert.equal(resolveRuntime({ argv: [], env: {}, exists: present }), 'hc');
   assert.equal(resolveRuntime({ argv: [], env: {}, exists: absent }), 'hc');
   assert.throws(() => resolveRuntime({ argv: ['--runtime'], env: {}, exists: absent }), /worker_runtime_kind_invalid/);
   assert.throws(() => resolveRuntime({ argv: ['--runtime', 'pty'], env: {}, exists: absent }), /worker_runtime_kind_invalid/);
@@ -85,7 +89,7 @@ test('portable doctor falls back to vb in PATH and fails closed when a worker CL
     /Node 22\.18\+ is required/);
 });
 
-test('runDoctor dispatches legacy bb only explicitly or when routes.json exists', () => {
+test('runDoctor dispatches legacy bb only on explicit flag or env selection', () => {
   const seen = [];
   const checkLegacy = options => {
     seen.push(['legacy', options]);
@@ -96,9 +100,12 @@ test('runDoctor dispatches legacy bb only explicitly or when routes.json exists'
     return { runtime: options.runtimeKind };
   };
   assert.equal(runDoctor({ argv: ['--runtime', 'bb'], env: {}, exists: () => false, checkLegacy, checkPortable }).runtime, 'bb');
-  assert.equal(runDoctor({ argv: [], env: {}, exists: () => true, checkLegacy, checkPortable }).runtime, 'bb');
+  assert.equal(runDoctor({ argv: [], env: { DF_WORKER_RUNTIME: 'bb' }, exists: () => true, checkLegacy, checkPortable }).runtime, 'bb');
+  // Existing legacy routes.json does not select bb on its own: the modern
+  // default is hc whether or not the legacy runtime files are present.
+  assert.equal(runDoctor({ argv: [], env: {}, exists: () => true, checkLegacy, checkPortable }).runtime, 'hc');
   assert.equal(runDoctor({ argv: [], env: {}, exists: () => false, checkLegacy, checkPortable }).runtime, 'hc');
   assert.equal(runDoctor({ argv: [], env: { DF_WORKER_RUNTIME: 'subproc' }, exists: () => true, checkLegacy, checkPortable }).runtime, 'subproc');
-  assert.deepEqual(seen.map(entry => entry[0]), ['legacy', 'legacy', 'portable', 'portable']);
-  assert.deepEqual(seen.filter(entry => entry[0] === 'portable').map(entry => entry[1]), ['hc', 'subproc']);
+  assert.deepEqual(seen.map(entry => entry[0]), ['legacy', 'legacy', 'portable', 'portable', 'portable']);
+  assert.deepEqual(seen.filter(entry => entry[0] === 'portable').map(entry => entry[1]), ['hc', 'hc', 'subproc']);
 });

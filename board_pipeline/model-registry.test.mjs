@@ -15,7 +15,9 @@ import {
   EXAMPLE_POLICY_PATH,
   effectiveStatus,
   isL2RunnableEntry,
+  L2_RUNNABLE_PROVIDERS,
   loadModelRegistry,
+  MODEL_FAMILIES,
   registrySnapshot,
   resolveRoleChain,
   resolveTriad,
@@ -521,19 +523,40 @@ const L2_DIRECT_ENTRIES = [
     status: 'active', cost_tier: 'subscription',
     capabilities: ['code', 'reasoning', 'review'],
     quota_source: 'manual', notes: 'direct openai sol fixture' },
+  { id: 'glm-direct', provider: 'glm', model: 'glm-5.3-flash', family: 'glm',
+    status: 'active', cost_tier: 'subscription',
+    capabilities: ['code', 'reasoning', 'review'],
+    quota_source: 'manual', notes: 'direct glm fixture' },
+  // Сырой 'anthropic' — каноничная форма P1-дефекта: у L2-раннера нет egress
+  // anthropic, запись неисполняема и обязана отфильтровываться мостом.
   { id: 'claude-direct', provider: 'anthropic', model: 'claude-opus-5.5', family: 'anthropic',
     status: 'active', cost_tier: 'subscription',
     capabilities: ['code', 'reasoning', 'review'],
     quota_source: 'manual', notes: 'direct anthropic claude fixture' },
 ];
 
-test('isL2RunnableEntry: позитивный список провайдеров, ACP-харнессы исключены', () => {
-  for (const provider of ['google', 'openai', 'anthropic', 'deepseek', 'pi', 'opencode-go']) {
+test('isL2RunnableEntry: ключи PROVIDER_EGRESS, ACP-харнессы и сырой anthropic исключены', () => {
+  // Позитивный список — точное зеркало ключей PROVIDER_EGRESS review-runner.
+  assert.deepEqual([...L2_RUNNABLE_PROVIDERS],
+    ['openai', 'google', 'deepseek', 'glm', 'cognition', 'opencode-go']);
+  assert.ok(MODEL_FAMILIES.includes('glm'));
+  for (const provider of ['openai', 'google', 'deepseek', 'glm', 'cognition', 'opencode-go']) {
     assert.equal(isL2RunnableEntry({ provider, model: 'm' }), true, provider);
   }
-  for (const provider of ['acp-devin', 'acp-zcode-start', 'codex-acp', 'bb',
-    'acp-antigravity-acp', 'agy', 'glm', 'cognition', '', 'Google']) {
+  // Сырой 'anthropic' неисполняем: у раннера нет egress anthropic — эмиссия
+  // такого провайдера в routing.allowlist отклоняется route_critic_not_runnable.
+  // Harness 'pi' без вложения и ACP-харнессы неисполняемы.
+  for (const provider of ['anthropic', 'pi', 'acp-devin', 'acp-zcode-start', 'codex-acp', 'bb',
+    'acp-antigravity-acp', 'agy', '', 'Google']) {
     assert.equal(isL2RunnableEntry({ provider, model: 'm' }), false, provider);
+  }
+  // pi-харнессы: исполняемость определяет вложение 'provider/model'.
+  for (const model of ['openai/gpt-6.2-sol', 'opencode-go/deepseek-v4.1-flash',
+    'google/gemini-4-neon', 'glm/glm-5.3-flash', 'OpenAI/gpt-6.2-sol']) {
+    assert.equal(isL2RunnableEntry({ provider: 'pi', model }), true, model);
+  }
+  for (const model of ['anthropic/claude-opus-5.5', 'm', '/gpt-6.2-sol', '', 42, null]) {
+    assert.equal(isL2RunnableEntry({ provider: 'pi', model }), false, String(model));
   }
   // Не-объект, пустой объект и нестроковый provider — неисполняемы.
   for (const bad of [null, undefined, {}, [], 'google', 42,
@@ -543,6 +566,9 @@ test('isL2RunnableEntry: позитивный список провайдеро�
   // Форма публичной записи цепочки (provider/model/family/...) — та же проверка.
   assert.equal(isL2RunnableEntry({ provider: 'pi', model: 'openai/gpt-6.2-sol',
     family: 'openai', status: 'active' }), true);
+  // Запись glm-семейства валидна схемой каталога и исполняема напрямую.
+  assert.equal(isL2RunnableEntry({ provider: 'glm', model: 'glm-5.3-flash',
+    family: 'glm', status: 'active' }), true);
 });
 
 test('resolveTriad strictL2: ACP-харнессы отфильтрованы, Neon поднимает Sol арбитром', async () => {
@@ -554,7 +580,7 @@ test('resolveTriad strictL2: ACP-харнессы отфильтрованы, Ne
       for (const mode of Object.values(policy.modes)) {
         mode.candidates.coder_default = ['deepseek-v4.1-flash'];
         mode.candidates.reviewer = ['claude-opus-5.5', 'neon-direct', 'claude-direct'];
-        mode.candidates.arbiter = ['claude-opus-5.5', 'claude-direct', 'sol-direct'];
+        mode.candidates.arbiter = ['claude-opus-5.5', 'glm-direct', 'claude-direct', 'sol-direct'];
       }
     });
     // Дефолт strictL2=false — прежний контракт: reviewer ACP-харнесса
@@ -570,18 +596,22 @@ test('resolveTriad strictL2: ACP-харнессы отфильтрованы, Ne
     assert.ok(strict.reviewer.chain.every(isL2RunnableEntry));
     assert.ok(!strict.reviewer.chain.some(entry => entry.provider === 'acp-devin'));
     assert.ok(strict.arbiter.chain.every(isL2RunnableEntry));
+    // Сырой anthropic неисполняем L2-раннером: claude-direct отфильтрован
+    // механически, несмотря на активный статус и подходящее семейство.
+    assert.ok(!strict.reviewer.chain.some(entry => entry.provider === 'anthropic'));
+    assert.ok(!strict.arbiter.chain.some(entry => entry.provider === 'anthropic'));
     // При reviewer Neon арбитр Sol идёт первым, хотя общий порядок
-    // кандидатов ставил claude-direct раньше.
+    // кандидатов ставил glm-direct раньше.
     assert.equal(strict.arbiter.id, 'sol-direct');
     assert.deepEqual(strict.arbiter.chain.map(entry => entry.id),
-      ['sol-direct', 'claude-direct']);
+      ['sol-direct', 'glm-direct']);
 
     // Sol на паузе по квоте — не допустим, приоритизация не действует:
     // арбитром остаётся следующий L2-исполняемый кандидат.
     const paused = resolveTriad(registry, { mode: 'balanced', now: NOW, strictL2: true,
       quotas: { 'sol-direct': 96 } });
     assert.equal(paused.reviewer.id, 'neon-direct');
-    assert.equal(paused.arbiter.id, 'claude-direct');
+    assert.equal(paused.arbiter.id, 'glm-direct');
   });
 });
 
@@ -592,14 +622,15 @@ test('resolveTriad strictL2: без reviewer Neon порядок арбитра 
     }, policy => {
       for (const mode of Object.values(policy.modes)) {
         mode.candidates.coder_default = ['deepseek-v4.1-flash'];
-        mode.candidates.reviewer = ['claude-direct', 'neon-direct'];
+        mode.candidates.reviewer = ['glm-direct', 'neon-direct'];
         mode.candidates.arbiter = ['neon-direct', 'sol-direct', 'claude-direct'];
       }
     });
     const strict = resolveTriad(registry, { mode: 'balanced', now: NOW, strictL2: true });
-    assert.equal(strict.reviewer.id, 'claude-direct');
+    assert.equal(strict.reviewer.id, 'glm-direct');
     // Reviewer не Neon: кандидатный порядок режима сохраняется, Sol
     // искусственно не поднимается — первый допустимый arbiter Neon.
+    // claude-direct (сырой anthropic) отфильтрован механически.
     assert.equal(strict.arbiter.id, 'neon-direct');
     assert.deepEqual(strict.arbiter.chain.map(entry => entry.id),
       ['neon-direct', 'sol-direct']);
@@ -631,8 +662,8 @@ test('toPipelineAllowlist: worker без фильтра, critic/arbiter толь
       catalog.models.push(...L2_DIRECT_ENTRIES.map(entry => ({ ...entry })));
     }, policy => {
       for (const mode of Object.values(policy.modes)) {
-        mode.candidates.reviewer.push('neon-direct', 'claude-direct', 'sol-direct');
-        mode.candidates.arbiter.push('neon-direct', 'claude-direct', 'sol-direct');
+        mode.candidates.reviewer.push('neon-direct', 'glm-direct', 'claude-direct', 'sol-direct');
+        mode.candidates.arbiter.push('neon-direct', 'glm-direct', 'claude-direct', 'sol-direct');
       }
     });
     const allowlist = toPipelineAllowlist(registry, { mode: 'balanced', now: NOW });
@@ -654,13 +685,17 @@ test('toPipelineAllowlist: worker без фильтра, critic/arbiter толь
     }
     // gpt-6.2-sol example-записи на квота-паузе до 2026-11-27 и в пул не
     // входит; прямая sol-direct active — входит. Порядок — кандидатный
-    // внутри status_priority.
+    // внутри status_priority. Сырой anthropic (claude-direct) в пул не
+    // эмитируется: раннер отклонил бы его route_critic_not_runnable и
+    // сломал всю политику роутинга — P1-дефект эмиссии устранён на мосту.
     assert.deepEqual(allowlist.critic, [
       { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
       { provider: 'google', model: 'gemini-4-neon' },
-      { provider: 'anthropic', model: 'claude-opus-5.5' },
+      { provider: 'glm', model: 'glm-5.3-flash' },
       { provider: 'openai', model: 'gpt-6.2-sol' },
     ]);
+    assert.ok(!allowlist.critic.some(spec => spec.provider === 'anthropic'));
+    assert.ok(!allowlist.arbiter.some(spec => spec.provider === 'anthropic'));
     // Детерминизм повторного вызова и изоляция результатов.
     const again = toPipelineAllowlist(registry, { mode: 'balanced', now: NOW });
     assert.deepEqual(again, allowlist);

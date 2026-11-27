@@ -13,6 +13,7 @@ const NPM_PREFIX = '.npm-global';
 const BUSY_PATTERNS = Object.freeze([
   /(^|[/\s])agy(?:\s|$)/,
   /(^|[/\s])devin(?:\s|$)/,
+  /(^|[/\s])pi(?:\s|$)/,
   /pi-acp/,
   /run-isolated\.mjs(?:\s|$)/,
   /factory-run\.mjs(?:\s|$)/,
@@ -23,6 +24,8 @@ const BUSY_PATTERNS = Object.freeze([
   // подстроки в 'which'/'dhcpcd' ложно блокировали бы обновление.
   /(^|[/\s])hc(?:\s|$)/,
 ]);
+const CONTROLLER_DAEMON_PATTERN = /(?:run-isolated|factory-run)\.mjs(?:\s|$)/;
+const DAEMON_FLAG_PATTERN = /(?:^|\s)--daemon(?:\s|$)/;
 
 function defaultHome(deps) {
   return deps.homedir ?? osHomedir();
@@ -163,6 +166,39 @@ export function findBusyProcesses(processText) {
     .filter(line => line && BUSY_PATTERNS.some(pattern => pattern.test(line)));
 }
 
+export function isControllerDaemonLine(line) {
+  const text = String(line ?? '');
+  return CONTROLLER_DAEMON_PATTERN.test(text) && DAEMON_FLAG_PATTERN.test(text);
+}
+
+export function controllerDaemonStateDir(line) {
+  if (!isControllerDaemonLine(line)) return null;
+  const match = /(?:^|\s)--state(?:=([^\s]+)|\s+([^\s]+))/.exec(String(line));
+  return match?.[1] ?? match?.[2] ?? null;
+}
+
+export function attemptRecordBusy(record) {
+  if (record === null || record === undefined) return false;
+  return record?.phase !== 'idle';
+}
+
+export async function controllerDaemonBusy(line, deps = {}) {
+  const stateDir = controllerDaemonStateDir(line);
+  if (!stateDir || !isAbsolute(stateDir)) return true;
+  const readAttempt = deps.readAttemptFile ?? deps.readFile ?? readFile;
+  let raw;
+  try {
+    raw = await readAttempt(join(stateDir, 'attempt.json'), 'utf8');
+  } catch (error) {
+    return error?.code !== 'ENOENT';
+  }
+  try {
+    return attemptRecordBusy(JSON.parse(raw));
+  } catch {
+    return true;
+  }
+}
+
 function baseComponent(name) {
   return { name, status: 'skipped_missing', before: null, after: null, durationMs: 0, error: null };
 }
@@ -237,10 +273,11 @@ async function npmPackageComponent(ctx, spec) {
   if (packageName === null) return result;
   const before = await readPackageVersion(ctx, packageFile);
   const installArgs = ['install', '-g', `${packageName}@latest`, '--prefix', prefix];
+  const restartServices = spec.restartServices ?? (spec.restartService ? [spec.restartService] : []);
   const planned = [
     commandLine('npm', ['view', packageName, 'version']),
     commandLine('npm', installArgs),
-    ...(spec.restartService ? [commandLine('systemctl', ['--user', 'restart', spec.restartService])] : []),
+    ...(restartServices.length ? [commandLine('systemctl', ['--user', 'restart', ...restartServices])] : []),
   ];
   if (ctx.dryRun) return finished(result, 'dry_run', before, before, { planned });
 
@@ -261,7 +298,7 @@ async function npmPackageComponent(ctx, spec) {
     }
   }
   const extra = { latest };
-  if (spec.restartService && ctx.role === 'hub' && before !== after) {
+  if (restartServices.length && ctx.role === 'hub' && before !== after) {
     let busyNow = ctx.activeBusy;
     if (typeof ctx.checkActiveBusy === 'function') {
       try {
@@ -274,7 +311,7 @@ async function npmPackageComponent(ctx, spec) {
       extra.restart = 'deferred_busy';
       extra.note = 'restart deferred: active work detected after install';
     } else {
-      await mustRun(ctx, 'systemctl', ['--user', 'restart', spec.restartService], { timeoutMs: 30_000 });
+      await mustRun(ctx, 'systemctl', ['--user', 'restart', ...restartServices], { timeoutMs: 30_000 });
     }
   }
   return finished(result, before !== after ? 'updated' : 'already_current', before, after, extra);
@@ -341,7 +378,7 @@ function componentSpecs(ctx) {
     ['bb', () => bbComponent(ctx)],
     ['bb-app', () => npmPackageComponent(ctx, {
       name: 'bb-app', packageName: 'bb-app', roles: ['laptop', 'hub'],
-      smokeCommand: 'bb', restartService: 'bb-hub.service',
+      smokeCommand: 'bb', restartServices: ['darkfactory-daemon*.service', 'control-room.service'],
     })],
     ['pi', () => npmPackageComponent(ctx, {
       name: 'pi', packageName: ['@mariozechner/pi-coding-agent', '@earendil-works/pi-coding-agent'], roles: ['laptop', 'brain', 'hub', 'worker'],
@@ -422,7 +459,14 @@ async function scanBusyProcesses(ctx, deps) {
       processScanFailed = true;
     }
   }
-  const busyProcesses = findBusyProcesses(processText);
+  const busyProcesses = [];
+  for (const line of findBusyProcesses(processText)) {
+    if (isControllerDaemonLine(line)) {
+      if (await controllerDaemonBusy(line, deps)) busyProcesses.push(line);
+    } else {
+      busyProcesses.push(line);
+    }
+  }
   if (processScanFailed) busyProcesses.unshift('process_scan_unavailable');
   return busyProcesses;
 }

@@ -148,7 +148,8 @@ async function nestedPolicyFile(path, treeAliases) {
 // завершающий '/' — не каноническая форма и отклоняются; сам /candidate
 // и пути вне него не проходят.
 function candidateNodeModulesTarget(to) {
-  if (typeof to !== 'string' || !to.startsWith('/candidate/') || to.endsWith('/')) {
+  if (typeof to !== 'string' || !to.startsWith('/candidate/') || to.endsWith('/') ||
+      /[\u0000-\u001f\u007f-\u009f]/.test(to)) {
     return false;
   }
   const segments = to.split('/').slice(1);
@@ -161,6 +162,7 @@ function candidateNodeModulesTarget(to) {
 const PASSTHROUGH_BOOL = ['stop-on-idle', 'daemon', 'allow-live-pilot',
   'recheck-rejected-handoff'];
 const PASSTHROUGH_VALUE = ['switch', 'interval-ms', 'runtime', 'event-socket'];
+const WORKER_RUNTIME_ENV = 'DF_WORKER_RUNTIME';
 const LEDGER_PATH_ENV = 'DF_DECISION_LEDGER_PATH';
 const MEMORY_DIR_ENV = 'DF_PROJECT_MEMORY_DIR';
 
@@ -232,6 +234,14 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
     fail('cli_spec_mismatch_policy_bb');
   }
   assertModelMatrix({ cli: values, policy });
+
+  // Без явного выбора оператора/политики фабрика работает на hc: тонкий
+  // запуск не наследует молчаливый legacy-дефолт bb контроллера.
+  const runtime = values.runtime !== undefined ? values.runtime
+    : policy.workerRuntime !== undefined ? policy.workerRuntime
+      : env[WORKER_RUNTIME_ENV] !== undefined ? env[WORKER_RUNTIME_ENV]
+        : 'hc';
+  if (!['bb', 'hc', 'subproc'].includes(runtime)) fail('worker_runtime_kind_invalid');
 
   // l1Profile — инвариант всех профилей политики (как матрица моделей):
   // неизвестное имя в любом profiles.* отклоняется fail-closed до
@@ -607,9 +617,11 @@ export async function buildRunPlan(values, { env = process.env } = {}) {
 
   // CLI-override без конфликта с политикой передаётся контроллеру через
   // тот же env-канал (DF_DECISION_LEDGER_PATH / DF_PROJECT_MEMORY_DIR):
-  // проверенный путь и есть используемый путь. В план попадают только
+  // проверенный путь и есть используемый путь. Разрешённый runtime тоже
+  // закрепляется env-override: implicit default не меняет argv контракт
+  // контроллера и не наследует его legacy-дефолт bb. В план попадают только
   // переопределения — унаследованное окружение (токены, ключи) не печатается.
-  const envOverrides = {};
+  const envOverrides = { [WORKER_RUNTIME_ENV]: runtime };
   if (values['ledger-path'] !== undefined) envOverrides[LEDGER_PATH_ENV] = values['ledger-path'];
   if (values['memory-dir'] !== undefined) envOverrides[MEMORY_DIR_ENV] = values['memory-dir'];
 
@@ -656,7 +668,14 @@ export async function ensureFilemodeGuard(worktree, { git = defaultGit } = {}) {
   const top = await git(['-C', worktree, 'rev-parse', '--show-toplevel'])
     .catch(() => fail('worktree_not_git'));
   if (top !== worktree) fail('worktree_not_git');
-  await git(['-C', worktree, 'config', '--local', 'core.fileMode', 'false']);
+  // Идемпотентная запись: при уже действующем --local core.fileMode=false
+  // повторная запись пропускается — одновременный запуск нескольких слотов
+  // не должен сталкиваться на .git/config.lock без необходимости записи.
+  const current = await git(['-C', worktree, 'config', '--local', '--get', 'core.fileMode'])
+    .catch(() => '');
+  if (current !== 'false') {
+    await git(['-C', worktree, 'config', '--local', 'core.fileMode', 'false']);
+  }
   // Эффективное значение важнее записанного: более приоритетный
   // worktree-конфиг (extensions.worktreeConfig) может перекрывать --local.
   // Запуск только при реально действующем core.fileMode=false.

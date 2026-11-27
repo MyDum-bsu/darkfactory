@@ -3,10 +3,13 @@
 // HTTP/SSE сервера на 127.0.0.1:<port> (дефолт 44110, --port /
 // DF_CONTROL_ROOM_PORT, 0 для ephemeral).
 //
-// СТРОГО READ-ONLY: только GET/HEAD (POST/PUT/PATCH/DELETE → 405), ноль
+// READ-ONLY ПО УМОЛЧАНИЮ: только GET/HEAD (POST/PUT/PATCH/DELETE → 405), ноль
 // mutating-запросов в Board, ноль записи в worktree/state. Host/Origin
 // guard против DNS-rebinding/CSRF, строгий CSP, все недоверенные строки
-// санитизируются.
+// санитизируются. Единственное исключение — Authenticated Owner Write-API
+// (POST /api/owner/answer|unblock|cancel): fail-closed, активно только при
+// заданном ownerWriteToken И ownerActions port; constant-time Bearer check,
+// строгий Origin/Host guard, тело ≤ 16 KiB, idempotency dedup.
 //
 // Агрегация по ключу (project, task_id, attempt_id, epoch):
 //   - push-события Unix socket + хвост events.ndjson (ring-buffer ≤ 2000);
@@ -18,26 +21,27 @@
 // Только Node stdlib.
 
 import { execFile } from 'node:child_process';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { lstat, mkdir, readFile, readdir, stat, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, realpath, unlink } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import { normalizeEvent } from '../../board_pipeline/event-bus.mjs';
 import { inspectWorktreesAndBranches } from '../../board_pipeline/branch-drift.mjs';
-import { isAllowedHost, isAllowedOrigin, sanitizeTerminalText,
+import { isAllowedHost, isAllowedOrigin, isAllowedFetchSite, sanitizeTerminalText,
   SECURITY_HEADERS } from './origin-guard.mjs';
 import { createNetHealthMonitor } from './net-health.mjs';
 import { createFinopsProvider } from './finops.mjs';
 import { loadModelRegistry, registrySnapshot } from '../../board_pipeline/model-registry.mjs';
 import { collectTelemetry } from '../../board_pipeline/telemetry-collector.mjs';
 import { normalizeCost, normalizeUsage, parseTelemetryLines } from '../../board_pipeline/telemetry.mjs';
-import { aggregateScorecard } from '../../board_pipeline/model-scorecard.mjs';
+import { modelKey, normalizeDomain, normalizeSize, roleInvoked,
+  SCORE_ROLES, SCORECARD_SCHEMA } from '../../board_pipeline/model-scorecard.mjs';
 import { buildAdaptiveGatesSummary } from '../../board_pipeline/adaptive-gates.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -53,6 +57,77 @@ const MAX_BODY_BYTES = 0; // тело не читается никогда (GET/
 const jsonHeaders = extra => ({
   'Content-Type': 'application/json; charset=utf-8',
   ...SECURITY_HEADERS, ...extra });
+
+// --- Authenticated Owner Write-API (fail-closed) ------------------------------
+//
+// Интерактивные действия владельца из Herdr Desktop/Mobile (и будущего
+// Telegram/Iva-моста). Write API существует только когда заданы И
+// ownerWriteToken, И ownerActions port — иначе любой POST /api/owner/*
+// отвечает 403 write_api_disabled, сохраняя read-only дефолт. Bearer-токен
+// сравнивается через SHA-256 + timingSafeEqual (constant-time, без утечки
+// длины). Idempotency-дедупликация по (endpoint, taskId, idempotencyKey):
+// повторный double-click или параллельная отправка из Herdr+Telegram
+// возвращает закэшированный ответ без повторного вызова ownerActions.
+export const OWNER_WRITE_MAX_BODY_BYTES = 16 * 1024;
+export const OWNER_IDEMPOTENCY_TTL_MS = 600_000;
+export const OWNER_IDEMPOTENCY_MAX_ENTRIES = 256;
+const OWNER_TASK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const OWNER_ENDPOINTS = new Map([
+  ['/api/owner/answer', 'answer'],
+  ['/api/owner/unblock', 'unblock'],
+  ['/api/owner/cancel', 'cancel'],
+]);
+
+function bearerTokenEqual(presented, expected) {
+  if (typeof presented !== 'string' || typeof expected !== 'string' ||
+      !presented || !expected) return false;
+  // SHA-256 выравнивает длину обеих сторон: timingSafeEqual не раскрывает
+  // ни длину токена, ни позицию первого несовпадения.
+  const a = createHash('sha256').update(presented, 'utf8').digest();
+  const b = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
+export const OWNER_WRITE_BODY_TIMEOUT_MS = 10_000;
+
+// Тело читается с жёстким потолком и коротким таймаутом. Переполнение или
+// зависший поток отклоняются немедленно, а request разрушается: медленный
+// клиент не может удерживать память/сокет Control Room неограниченно долго.
+export function readRequestBody(req, limit, { onDestroy } = {}) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+    const destroyWith = error => {
+      finish(reject, error);
+      // HTTP-handler может синхронно поставить короткий отказ в socket до
+      // destroy; само чтение при этом прекращается в том же data/tick.
+      try { onDestroy?.(error); } catch { /* noop */ }
+      req.destroy();
+    };
+    const timer = setTimeout(() => {
+      destroyWith(Object.assign(new Error('body_read_timeout'), { code: 'body_read_timeout' }));
+    }, OWNER_WRITE_BODY_TIMEOUT_MS);
+    timer.unref?.();
+    req.on('data', chunk => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > limit) {
+        destroyWith(Object.assign(new Error('body_too_large'), { code: 'body_too_large' }));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => finish(resolve, Buffer.concat(chunks).toString('utf8')));
+    req.on('error', error => finish(reject, error));
+  });
+}
 
 // --- провайдеры по умолчанию (read-only) -------------------------------------
 
@@ -463,10 +538,110 @@ async function readTailText(path, maxBytes, size) {
   return buffer.toString('utf8');
 }
 
+// Entries-only analogue of aggregateScorecard(lines, { seed: [] }). Telemetry
+// JSONL is parsed exactly once by createTelemetryProvider; collector,
+// scorecard and compact attempts all share the same parsed entries instead of
+// reparsing the same strings for every snapshot.
+function telemetryFirstPassOf(entry) {
+  return entry.open !== true && entry.outcome === 'done' && (entry.rounds?.rework ?? 0) === 0;
+}
+
+function telemetryIsClosed(entry) {
+  return entry.open !== true;
+}
+
+function telemetryTokensPerRound(entry, role) {
+  const usage = entry.tokens?.[role];
+  const rounds = entry.rounds?.total;
+  if (usage === null || typeof usage !== 'object' ||
+      !Number.isFinite(rounds) || rounds < 1) return null;
+  if (usage.input == null && usage.output == null) return null;
+  const sum = (usage.input ?? 0) + (usage.output ?? 0);
+  return Number.isFinite(sum) ? sum / rounds : null;
+}
+
+const emptyTelemetryScoreCell = () => ({
+  n: 0, seed_n: 0,
+  pass_n: 0, first_pass: 0,
+  rounds_sum: 0, rounds_n: 0,
+  wall_sum: 0, wall_n: 0,
+  token_sum: 0, token_n: 0,
+  catch_n: 0, caught: 0,
+});
+
+function addTelemetryScore(cell, { firstPass, rounds, wallMs, tokens, caught }) {
+  cell.n += 1;
+  if (firstPass !== null) { cell.pass_n += 1; if (firstPass) cell.first_pass += 1; }
+  if (Number.isFinite(rounds)) { cell.rounds_sum += rounds; cell.rounds_n += 1; }
+  if (Number.isFinite(wallMs)) { cell.wall_sum += wallMs; cell.wall_n += 1; }
+  if (Number.isFinite(tokens)) { cell.token_sum += tokens; cell.token_n += 1; }
+  if (caught !== null) { cell.catch_n += 1; if (caught) cell.caught += 1; }
+}
+
+function finalizeTelemetryScore(cell, meta) {
+  const rate = (num, den) => den > 0 ? num / den : null;
+  return {
+    ...meta,
+    observations: cell.n,
+    seed_observations: cell.seed_n,
+    measured: cell.n - cell.seed_n,
+    first_pass_rate: rate(cell.first_pass, cell.pass_n),
+    avg_rounds: rate(cell.rounds_sum, cell.rounds_n),
+    avg_wall_ms: rate(cell.wall_sum, cell.wall_n),
+    token_efficiency: rate(cell.token_sum, cell.token_n),
+    defect_catch_rate: rate(cell.caught, cell.catch_n),
+  };
+}
+
+function aggregateTelemetryScorecardEntries(entries, corrupt = 0) {
+  const buckets = new Map();
+  const report = { schema: SCORECARD_SCHEMA, corrupt, entries: 0, cells: {} };
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (entry?.kind !== 'attempt_summary') continue;
+    report.entries += 1;
+    const domain = normalizeDomain(entry?.labels?.domain ?? entry?.domain);
+    const size = normalizeSize(entry?.labels?.size ?? entry?.size);
+    const firstPass = telemetryFirstPassOf(entry);
+    const rounds = Number.isFinite(entry.rounds?.total) ? entry.rounds.total : null;
+    const wallMs = Number.isFinite(entry.phases_ms?.total) ? entry.phases_ms.total : null;
+    for (const role of SCORE_ROLES) {
+      const model = entry.models?.[role];
+      const key = modelKey(model);
+      if (key === null || !roleInvoked(entry, role)) continue;
+      const phaseKey = role === 'critic' ? 'l2_critic' : role === 'arbiter' ? 'arbiter' : null;
+      const roleWallMs = phaseKey !== null && Number.isFinite(entry.phases_ms?.[phaseKey])
+        ? entry.phases_ms[phaseKey] : wallMs;
+      const id = `${key}|${role}|${domain}|${size}`;
+      const slot = buckets.get(id) ?? { cell: emptyTelemetryScoreCell(),
+        meta: { model: { provider: model.provider, model: model.model }, role, domain, size } };
+      addTelemetryScore(slot.cell, {
+        firstPass: telemetryIsClosed(entry) ? firstPass : null,
+        rounds,
+        wallMs: roleWallMs,
+        tokens: telemetryTokensPerRound(entry, role),
+        caught: role === 'critic' ? (entry.rounds?.gates?.l2 ?? 0) > 0 : null,
+      });
+      buckets.set(id, slot);
+    }
+  }
+  for (const [id, slot] of [...buckets.entries()].sort(([a], [b]) => a < b ? -1 : 1)) {
+    report.cells[id] = finalizeTelemetryScore(slot.cell, slot.meta);
+  }
+  return report;
+}
+
+function boundedCacheSet(map, key, value, maxEntries) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > maxEntries) map.delete(map.keys().next().value);
+}
+
 // Safe read-only telemetry provider. It reads only regular telemetry*.jsonl
 // files, caps both file count and per-file tail bytes, ignores corrupt JSONL
 // rows, and returns null when no valid run record exists. Missing directories
 // and filesystem races are observation gaps, never server failures.
+// Parsed file tails are cached by path+mtime+size; unchanged rotated journals
+// are not parsed again on every 5s poll.
 export function createTelemetryProvider({
   telemetryDir,
   stateDirs = [],
@@ -474,6 +649,8 @@ export function createTelemetryProvider({
   maxFiles = TELEMETRY_MAX_FILES,
   now = () => Date.now(),
 } = {}) {
+  const fileCache = new Map();
+  const resultCache = new Map();
   return async () => {
     try {
       const validDirectory = async dir => {
@@ -505,27 +682,50 @@ export function createTelemetryProvider({
         }
       }
       files.sort((a, b) => join(a.dir, a.name).localeCompare(join(b.dir, b.name)));
-      const selected = files.slice(0, maxFiles);
+      const numericMaxFiles = Number(maxFiles);
+      const fileLimit = Number.isFinite(numericMaxFiles)
+        ? Math.max(0, Math.floor(numericMaxFiles)) : TELEMETRY_MAX_FILES;
+      const selected = fileLimit ? files.slice(-fileLimit) : [];
       if (!selected.length) return null;
 
-      const lines = [];
+      const parsedFiles = [];
       let latestMtimeMs = 0;
       for (const file of selected) {
         const path = join(file.dir, file.name);
         const fileStat = await lstat(path).catch(() => null);
         if (!fileStat?.isFile() || fileStat.isSymbolicLink()) continue;
         latestMtimeMs = Math.max(latestMtimeMs, fileStat.mtimeMs);
-        const text = await readTailText(path, maxBytes, fileStat.size).catch(() => '');
-        for (const line of text.split(/\r?\n/)) if (line.trim()) lines.push(line);
+        const signature = `${fileStat.mtimeMs}:${fileStat.size}`;
+        let cached = fileCache.get(path);
+        if (!cached || cached.signature !== signature) {
+          const text = await readTailText(path, maxBytes, fileStat.size).catch(() => '');
+          const lines = [];
+          for (const line of text.split(/\r?\n/)) if (line.trim()) lines.push(line);
+          const parsed = parseTelemetryLines(lines);
+          cached = { signature, entries: parsed.entries, corrupt: parsed.corrupt,
+            mtimeMs: fileStat.mtimeMs, size: fileStat.size };
+        }
+        boundedCacheSet(fileCache, path, cached, Math.max(fileLimit, 8));
+        parsedFiles.push({ path, ...cached });
       }
+      if (!parsedFiles.length) return null;
 
-      const collected = await collectTelemetry({ telemetryLines: lines, clock: now });
-      if (!collected.sources.telemetry_runs) return null;
-      const scorecard = aggregateScorecard(lines, { seed: [] });
-      const parsed = parseTelemetryLines(lines);
-      return {
+      const cacheKey = parsedFiles.map(file =>
+        `${file.path}:${file.mtimeMs}:${file.size}`).join('\n');
+      const cachedResult = resultCache.get(cacheKey);
+      if (cachedResult !== undefined) return cachedResult;
+
+      const entries = parsedFiles.flatMap(file => file.entries);
+      const corrupt = parsedFiles.reduce((sum, file) => sum + file.corrupt, 0);
+      const collected = await collectTelemetry({ telemetryRuns: entries, clock: now });
+      if (!collected.sources.telemetry_runs) {
+        boundedCacheSet(resultCache, cacheKey, null, 8);
+        return null;
+      }
+      const scorecard = aggregateTelemetryScorecardEntries(entries, corrupt);
+      const result = {
         runs: collected.sources.telemetry_runs,
-        attempts: parsed.entries.map(compactTelemetryAttempt).filter(Boolean).slice(-128),
+        attempts: entries.map(compactTelemetryAttempt).filter(Boolean).slice(-128),
         firstRoundPassRate: collected.portfolio.first_round_pass_rate,
         avgReworkRounds: collected.portfolio.avg_rework_rounds,
         medianWallClockMs: collected.portfolio.median_wall_clock_ms,
@@ -534,6 +734,8 @@ export function createTelemetryProvider({
           ? new Date(latestMtimeMs).toISOString()
           : collected.generated_at,
       };
+      boundedCacheSet(resultCache, cacheKey, result, 8);
+      return result;
     } catch {
       return null;
     }
@@ -744,26 +946,101 @@ export async function loadBbThreadsFromCli({ execImpl } = {}) {
 
 // --- чтение хвоста events.ndjson ----------------------------------------------
 
-async function readEventsTail(stateDirs, limit) {
-  const files = [];
-  for (const dir of stateDirs) {
-    for (const name of ['events.ndjson', 'events.1.ndjson', 'events.2.ndjson',
-      'events.3.ndjson'].reverse()) {
-      const path = join(dir, name);
-      const st = await stat(path).catch(() => null);
-      if (st?.isFile()) files.push(path);
+export const EVENTS_TAIL_CHUNK_BYTES = 64 * 1024;
+export const EVENTS_TAIL_MAX_BYTES_PER_FILE = 4 * 1024 * 1024;
+
+function eventFileGeneration(name) {
+  if (name === 'events.ndjson') return 0;
+  const rotated = /^events\.(\d+)\.ndjson$/.exec(name);
+  if (rotated) return Number(rotated[1]);
+  return /^events(?:\..+)?\.ndjson$/.test(name) ? Number.MAX_SAFE_INTEGER : null;
+}
+
+function countNewlines(buffer) {
+  let count = 0;
+  for (const byte of buffer) if (byte === 10) count += 1;
+  return count;
+}
+
+// Читает только хвост файла bounded chunks с конца к началу. Первый фрагмент
+// в середине файла всегда отбрасывается как потенциально неполная строка;
+// чтение останавливается, как только набрано достаточно завершённых строк,
+// либо по жёсткому байтовому потолку. Ротированный журнал объёмом сотни MiB
+// никогда не загружается в память целиком.
+async function readNdjsonTailLines(path, needed, {
+  chunkBytes = EVENTS_TAIL_CHUNK_BYTES,
+  maxBytes = EVENTS_TAIL_MAX_BYTES_PER_FILE,
+} = {}) {
+  if (!Number.isSafeInteger(needed) || needed <= 0) return [];
+  const handle = await open(path, 'r').catch(() => null);
+  if (!handle) return [];
+  try {
+    const st = await handle.stat().catch(() => null);
+    if (!st?.isFile() || st.size <= 0) return [];
+    const chunkLimit = Math.max(1024, Math.floor(chunkBytes));
+    const byteLimit = Math.max(chunkLimit, Math.floor(maxBytes));
+    let position = st.size;
+    let scanned = 0;
+    let newlineCount = 0;
+    const parts = [];
+    while (position > 0 && scanned < byteLimit && newlineCount <= needed) {
+      const amount = Math.min(chunkLimit, position, byteLimit - scanned);
+      position -= amount;
+      const buffer = Buffer.alloc(amount);
+      const { bytesRead } = await handle.read(buffer, 0, amount, position);
+      if (bytesRead <= 0) break;
+      const chunk = bytesRead === amount ? buffer : buffer.subarray(0, bytesRead);
+      parts.unshift(chunk);
+      scanned += bytesRead;
+      newlineCount += countNewlines(chunk);
     }
+    let text = Buffer.concat(parts).toString('utf8');
+    if (position > 0) {
+      const firstBreak = /\r?\n/.exec(text);
+      if (!firstBreak) return [];
+      text = text.slice(firstBreak.index + firstBreak[0].length);
+    }
+    return text.split(/\r?\n/).filter(line => line.trim()).slice(-needed);
+  } finally {
+    await handle.close().catch(() => {});
   }
+}
+
+async function listEventFilesNewestFirst(dir) {
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  const files = [];
+  for (const entry of entries) {
+    const generation = eventFileGeneration(entry.name);
+    if (generation === null) continue;
+    const path = join(dir, entry.name);
+    const st = await lstat(path).catch(() => null);
+    if (!st?.isFile() || st.isSymbolicLink()) continue;
+    files.push({ path, generation, name: entry.name });
+  }
+  files.sort((a, b) => a.generation - b.generation || a.name.localeCompare(b.name));
+  return files.map(file => file.path);
+}
+
+async function readEventsTail(stateDirs, limit) {
+  const cap = Math.max(0, Math.floor(limit));
+  if (!cap) return [];
   const events = [];
-  for (const path of files) {
-    const rl = createInterface({ input: createReadStream(path, 'utf8'), crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      try { events.push(JSON.parse(line)); } catch { /* пропуск битой строки */ }
+  for (const dir of Array.isArray(stateDirs) ? stateDirs : []) {
+    const collected = [];
+    for (const path of await listEventFilesNewestFirst(dir)) {
+      if (collected.length >= cap) break;
+      const fileEvents = [];
+      for (const line of await readNdjsonTailLines(path, cap - collected.length)) {
+        try { fileEvents.push(JSON.parse(line)); } catch { /* пропуск битой строки */ }
+      }
+      // Файлы обходятся newest→oldest только ради раннего stop; в журнале
+      // события остаются в хронологическом порядке даже без ts.
+      collected.unshift(...fileEvents);
     }
+    events.push(...collected);
   }
   events.sort((a, b) => String(a.ts ?? '').localeCompare(String(b.ts ?? '')));
-  return events.slice(-limit);
+  return events.slice(-cap);
 }
 
 // Read-only провайдер модельного реестра. Любая ошибка конфигурации —
@@ -1188,6 +1465,38 @@ export function buildRepoSlots(trees = []) {
   return { defaultMaxPerRepo: 1, activeByRepo, multiWriterWarnings };
 }
 
+// Наблюдаемое состояние операторского kill-switch: валидный файл `run\n`
+// означает false (стоп не включён); отсутствие, другое содержимое или ошибка
+// чтения — true. Без настроенного пути состояние честно неизвестно (null).
+export async function readKillSwitchState(path) {
+  if (typeof path !== 'string' || !path) return null;
+  try {
+    // Observer повторяет fail-closed инварианты createPilotSwitch: при любом
+    // ослаблении каталога/файла демон считает switch закрытым, поэтому пульт
+    // не имеет права показывать безопасное off по одному содержимому run\n.
+    const directory = dirname(path);
+    const canonicalDirectory = await realpath(directory).catch(() => null);
+    if (canonicalDirectory !== directory) return true;
+    const dirStat = await lstat(directory);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (!dirStat.isDirectory() || (dirStat.mode & 0o077) !== 0 ||
+        (uid !== null && dirStat.uid !== uid)) return true;
+    const st = await lstat(path);
+    if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1 || st.size !== 4 ||
+        (st.mode & 0o077) !== 0 || (uid !== null && st.uid !== uid)) return true;
+    const handle = await open(path, 'r');
+    try {
+      const buffer = Buffer.alloc(5);
+      const { bytesRead } = await handle.read(buffer, 0, 5, 0);
+      return bytesRead === 4 && buffer.subarray(0, 4).toString('utf8') === 'run\n' ? false : true;
+    } finally {
+      await handle.close().catch(() => {});
+    }
+  } catch {
+    return true;
+  }
+}
+
 // --- агрегатор -----------------------------------------------------------------
 
 export function createControlRoomAggregator({
@@ -1209,6 +1518,10 @@ export function createControlRoomAggregator({
   inspectProvider = async () => ({ text: '', artifacts: [] }),
   webDir = WEB_DIR,
   now = () => Date.now(),
+  ownerWriteToken = null,
+  ownerActions = null,
+  killSwitchPath = null,
+  snapshotCacheTtlMs = 0,
 } = {}) {
   const readTelemetry = telemetryProvider ?? createTelemetryProvider({ telemetryDir, stateDirs, now });
   const effectiveStateDir = stateDir ?? stateDirs[0] ?? null;
@@ -1222,6 +1535,11 @@ export function createControlRoomAggregator({
   let sockServer = null;
   let lastSeq = 0;
   let reconcileNeeded = false;
+  // Bounded idempotency cache Owner Write-API: key (action|taskId|key) →
+  // { at, response }. TTL + FIFO-eviction; кэшируются только успешные ответы.
+  const ownerIdempotencyCache = new Map();
+  const ownerIdempotencyInFlight = new Map();
+  const ownerWriteEnabled = Boolean(ownerWriteToken && ownerActions);
 
   const attemptKey = e => [e.project ?? '', e.task_id ?? '', e.attempt_id ?? '',
     e.epoch ?? ''].join('|');
@@ -1332,12 +1650,13 @@ export function createControlRoomAggregator({
     return { running, queued, needsOwner, recentlyCompleted };
   };
 
-  async function snapshot() {
-    const [board, threads, telemetry, fleetHosts] = await Promise.all([
+  async function buildSnapshot() {
+    const [board, threads, telemetry, fleetHosts, killSwitch] = await Promise.all([
       readBoardTasks(boardTasksProvider),
       bbThreadsProvider().catch(() => []),
       readTelemetry().catch(() => null),
-      readFleetHosts().catch(() => [])]);
+      readFleetHosts().catch(() => []),
+      readKillSwitchState(killSwitchPath)]);
     const tasks = board.tasks;
     const net = netHealth ? await netHealth.snapshot().catch(() => null) : null;
     const drift = branchDriftProvider
@@ -1364,6 +1683,8 @@ export function createControlRoomAggregator({
     return {
       ts: new Date(now()).toISOString(),
       reconcile: reconciled,
+      ownerWriteEnabled,
+      killSwitch,
       ...columns(tasks),
       boardStatus: board.boardStatus,
       health: { board: board.boardStatus },
@@ -1384,6 +1705,34 @@ export function createControlRoomAggregator({
     };
   }
 
+  // Одновременные /api/snapshot и SSE-подключения разделяют один in-flight
+  // snapshot: дорогие провайдеры не запускаются пачкой. TTL-кэш выключен по
+  // умолчанию, чтобы последовательные вызовы в тестах оставались строго
+  // детерминированными; оператор может включить короткий TTL явно.
+  let snapshotInFlight = null;
+  let snapshotCached = null;
+  let snapshotCachedAt = -Infinity;
+  function snapshot() {
+    const ttl = Number.isFinite(snapshotCacheTtlMs) && snapshotCacheTtlMs > 0
+      ? snapshotCacheTtlMs : 0;
+    const at = now();
+    if (ttl && snapshotCached !== null && at - snapshotCachedAt <= ttl) {
+      return Promise.resolve(snapshotCached);
+    }
+    if (snapshotInFlight) return snapshotInFlight;
+    const pending = buildSnapshot();
+    snapshotInFlight = pending;
+    const clear = () => { if (snapshotInFlight === pending) snapshotInFlight = null; };
+    pending.then(clear, clear);
+    if (ttl) {
+      pending.then(value => {
+        snapshotCached = value;
+        snapshotCachedAt = now();
+      }, () => {});
+    }
+    return pending;
+  }
+
   // --- HTTP ---------------------------------------------------------------
 
   const STATIC = new Map();
@@ -1392,6 +1741,140 @@ export function createControlRoomAggregator({
       STATIC.set(name, { body: await readFile(join(webDir, name)), type });
     }
     return STATIC.get(name);
+  };
+
+  // Authenticated Owner Write-API: строгий fail-closed порядок проверок —
+  // disabled → auth → content-type → body → payload → idempotency → вызов
+  // ownerActions. Проверки Host/Origin уже выполнены в respond для всех
+  // запросов. Ни один сбой не вызывает ownerActions частично.
+  const handleOwnerWrite = async (req, res, pathname) => {
+    const action = OWNER_ENDPOINTS.get(pathname);
+    const reply = (status, body) => {
+      res.writeHead(status, jsonHeaders());
+      res.end(JSON.stringify(body));
+    };
+    const portMethod = ownerActions !== null && typeof ownerActions === 'object'
+      ? ownerActions[action] : null;
+    if (!ownerWriteToken || typeof ownerWriteToken !== 'string' ||
+        typeof portMethod !== 'function') {
+      reply(403, { ok: false, error: 'write_api_disabled' });
+      return;
+    }
+    const auth = req.headers.authorization;
+    const presented = typeof auth === 'string' && auth.startsWith('Bearer ')
+      ? auth.slice('Bearer '.length) : null;
+    if (!bearerTokenEqual(presented, ownerWriteToken)) {
+      reply(401, { ok: false, error: 'unauthorized' });
+      return;
+    }
+    const contentType = req.headers['content-type'];
+    if (typeof contentType !== 'string' ||
+        !contentType.toLowerCase().startsWith('application/json')) {
+      reply(415, { ok: false, error: 'unsupported_media_type' });
+      return;
+    }
+    let bodyText;
+    try {
+      bodyText = await readRequestBody(req, OWNER_WRITE_MAX_BODY_BYTES, {
+        onDestroy: () => reply(413, { ok: false, error: 'body_too_large' }),
+      });
+    } catch {
+      if (!res.writableEnded) reply(413, { ok: false, error: 'body_too_large' });
+      return;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      reply(400, { ok: false, error: 'invalid_json' });
+      return;
+    }
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+      reply(400, { ok: false, error: 'invalid_payload' });
+      return;
+    }
+    const taskId = payload.taskId;
+    if (typeof taskId !== 'string' || !OWNER_TASK_ID_RE.test(taskId)) {
+      reply(400, { ok: false, error: 'invalid_task_id' });
+      return;
+    }
+    if (action === 'answer' &&
+        (typeof payload.answer !== 'string' || !payload.answer.trim())) {
+      reply(400, { ok: false, error: 'invalid_answer' });
+      return;
+    }
+    if (payload.idempotencyKey !== undefined &&
+        (typeof payload.idempotencyKey !== 'string' || !payload.idempotencyKey ||
+          payload.idempotencyKey.length > 128)) {
+      reply(400, { ok: false, error: 'invalid_idempotency_key' });
+      return;
+    }
+
+    const idemKey = typeof payload.idempotencyKey === 'string' && payload.idempotencyKey
+      ? `${action}|${taskId}|${payload.idempotencyKey}` : null;
+    if (idemKey) {
+      const at = now();
+      for (const [key, entry] of ownerIdempotencyCache) {
+        if (at - entry.at > OWNER_IDEMPOTENCY_TTL_MS) ownerIdempotencyCache.delete(key);
+      }
+      const hit = ownerIdempotencyCache.get(idemKey);
+      if (hit) {
+        reply(200, { ...hit.response, deduplicated: true });
+        return;
+      }
+    }
+
+    const actionPayload = {};
+    if (payload.answer !== undefined) actionPayload.answer = payload.answer;
+    if (payload.choice !== undefined) actionPayload.choice = payload.choice;
+    if (payload.reason !== undefined) actionPayload.reason = payload.reason;
+    if (payload.idempotencyKey !== undefined) actionPayload.idempotencyKey = payload.idempotencyKey;
+    const executeOwnerAction = async () => {
+      let result;
+      try {
+        result = await portMethod(taskId, actionPayload);
+      } catch (error) {
+        return { status: 502, body: { ok: false, error: 'action_failed',
+          message: sanitizeTerminalText(String(error?.message ?? error ?? 'action failed')) } };
+      }
+      const responseBody = { ok: true, action, taskId, result: result ?? null,
+        deduplicated: false };
+      if (idemKey) {
+        ownerIdempotencyCache.set(idemKey, { at: now(), response: responseBody });
+        while (ownerIdempotencyCache.size > OWNER_IDEMPOTENCY_MAX_ENTRIES) {
+          ownerIdempotencyCache.delete(ownerIdempotencyCache.keys().next().value);
+        }
+      }
+      return { status: 200, body: responseBody };
+    };
+
+    if (!idemKey) {
+      const outcome = await executeOwnerAction();
+      reply(outcome.status, outcome.body);
+      return;
+    }
+
+    // TOCTOU-защита idempotency: параллельные POST с одним ключом ждут один
+    // и тот же вызов ownerActions, а не проходят проверку кэша до записи и
+    // не исполняют side-effect дважды.
+    const existing = ownerIdempotencyInFlight.get(idemKey);
+    if (existing) {
+      const outcome = await existing;
+      reply(outcome.status, outcome.status === 200 && outcome.body?.ok === true
+        ? { ...outcome.body, deduplicated: true }
+        : outcome.body);
+      return;
+    }
+    const pending = executeOwnerAction();
+    ownerIdempotencyInFlight.set(idemKey, pending);
+    try {
+      const outcome = await pending;
+      reply(outcome.status, outcome.body);
+    } finally {
+      if (ownerIdempotencyInFlight.get(idemKey) === pending) {
+        ownerIdempotencyInFlight.delete(idemKey);
+      }
+    }
   };
 
   const respond = async (req, res) => {
@@ -1405,6 +1888,15 @@ export function createControlRoomAggregator({
     if (!isAllowedOrigin(req.headers.origin, activePort)) {
       res.writeHead(403, jsonHeaders());
       res.end(JSON.stringify({ error: 'forbidden_origin' }));
+      return;
+    }
+    if (!isAllowedFetchSite(req.headers['sec-fetch-site'])) {
+      res.writeHead(403, jsonHeaders());
+      res.end(JSON.stringify({ error: 'forbidden_fetch_site' }));
+      return;
+    }
+    if (req.method === 'POST' && OWNER_ENDPOINTS.has(url.pathname)) {
+      await handleOwnerWrite(req, res, url.pathname);
       return;
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -1425,11 +1917,21 @@ export function createControlRoomAggregator({
           res.end(JSON.stringify({ error: 'sse_full' }));
           return;
         }
+        // close-handler регистрируется до первого await: клиент, отключившийся
+        // во время дорогого snapshot(), не попадает в sseClients и не течёт.
+        let closed = false;
+        const cleanupSse = () => {
+          closed = true;
+          sseClients.delete(res);
+        };
+        req.on('close', cleanupSse);
+        res.on('close', cleanupSse);
         res.writeHead(200, { 'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache', Connection: 'keep-alive', ...SECURITY_HEADERS });
-        res.write(`data: ${JSON.stringify({ type: 'snapshot', data: await snapshot() })}\n\n`);
-        sseClients.add(res);
-        req.on('close', () => sseClients.delete(res));
+        const initial = await snapshot();
+        if (closed || req.destroyed || res.writableEnded) return;
+        res.write(`data: ${JSON.stringify({ type: 'snapshot', data: initial })}\n\n`);
+        if (!closed && !req.destroyed && !res.writableEnded) sseClients.add(res);
       } else if (url.pathname.startsWith('/api/inspect/')) {
         const taskId = decodeURIComponent(url.pathname.slice(13));
         const data = await inspectProvider(taskId).catch(() => ({ text: '', artifacts: [] }));
@@ -1549,7 +2051,9 @@ async function cli(argv) {
     'resources-budget': { type: 'string' },
     'worker-usage': { type: 'string' },
     'telemetry-dir': { type: 'string' },
-    'fleet-dir': { type: 'string' } } });
+    'fleet-dir': { type: 'string' },
+    'kill-switch': { type: 'string' },
+    'owner-write-token': { type: 'string' } } });
   const port = values.port !== undefined ? Number(values.port)
     : Number(process.env.DF_CONTROL_ROOM_PORT ?? DEFAULT_PORT);
   const socketPath = values.socket !== undefined ? values.socket
@@ -1590,7 +2094,14 @@ async function cli(argv) {
     finopsProvider: createFinopsProvider({
       budgetPath: values['resources-budget'],
       workerUsagePath: values['worker-usage'],
-      workerStatePath: cloudStatePath }) });
+      workerStatePath: cloudStatePath }),
+    // Owner Write-API: токен доступен из CLI/env, но ownerActions port — это
+    // программный мост (Herdr Desktop/Mobile, Telegram/Iva); без живого порта
+    // write API остаётся fail-closed write_api_disabled даже с токеном.
+    ownerWriteToken: values['owner-write-token'] ??
+      process.env.DF_CONTROL_ROOM_WRITE_TOKEN ?? null,
+    killSwitchPath: values['kill-switch'] ??
+      process.env.DF_CONTROL_ROOM_KILL_SWITCH ?? null });
   const { port: actual } = await aggregator.start();
   console.log(JSON.stringify({ control_room: 'listening', host: '127.0.0.1', port: actual,
     socket: socketPath, boardApi: observeBoard.boardUrl, boardChannels: channels,

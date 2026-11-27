@@ -106,9 +106,10 @@ export async function checkDiskPreflight(path, { minBytes = 1n, statfsImpl = sta
 //   lease          — { verifyHeld, taskId, epoch }, опционально;
 //   disk           — { path, minBytes }, опционально;
 //   pollMs         — период опроса kill-switch и lease (по умолчанию 5000);
-//   now / statfsImpl / setTimeoutImpl / setIntervalImpl — для инъекции.
+//   now / statfsImpl / random — для инъекции (random — источник джиттера опроса,
+//   по умолчанию Math.random).
 export function createAttemptSignals({ deadline, phaseBudgets, phaseSpent, assertOpen, lease, disk,
-  pollMs = 5000, now = () => Date.now(), statfsImpl = statfs } = {}) {
+  pollMs = 5000, now = () => Date.now(), statfsImpl = statfs, random = Math.random } = {}) {
   if (deadline !== undefined && !Number.isSafeInteger(deadline)) {
     throw new AttemptSignalError('attempt_signals_invalid');
   }
@@ -134,6 +135,17 @@ export function createAttemptSignals({ deadline, phaseBudgets, phaseSpent, asser
     arm(() => setTimeout(() => abort(abortError('deadline_exceeded')),
       Math.max(0, deadline - now())).unref?.());
   }
+  // Lease-RPC коалесцируются: в полёте не более одного verifyHeld на попытку.
+  // Пока предыдущий RPC не завершён, и опрос, и checkNow делят один shared
+  // promise — на 8-10+ слотах нет шторма дублирующих продлений в Board.
+  let leaseRpc = null;
+  const verifyLease = () => {
+    if (leaseRpc !== null) return leaseRpc;
+    leaseRpc = Promise.resolve()
+      .then(() => lease.verifyHeld(lease.taskId, lease.epoch))
+      .finally(() => { leaseRpc = null; });
+    return leaseRpc;
+  };
   // Живой опрос kill-switch и lease: любая неуспешная проверка абортит
   // signal. Опрос fail-closed: ошибка чтения — тоже срабатывание.
   const poll = async () => {
@@ -144,13 +156,28 @@ export function createAttemptSignals({ deadline, phaseBudgets, phaseSpent, asser
     }
     if (lease !== undefined) {
       try {
-        const live = await lease.verifyHeld(lease.taskId, lease.epoch);
+        const live = await verifyLease();
         if (live?.epoch !== lease.epoch) throw abortError('lease_lost');
       } catch (cause) { return abort(cause instanceof Error ? cause : abortError('lease_lost')); }
     }
   };
+  // Рекурсивный setTimeout вместо слепого setInterval: следующий опрос
+  // планируется только ПОСЛЕ завершения предыдущего async-прохода, с малым
+  // джиттером (до 10% pollMs) против синхронного шторма слотов. Медленный
+  // Board больше не накапливает перекрывающиеся in-flight RPC.
+  let disposed = false;
   if (assertOpen !== undefined || lease !== undefined) {
-    arm(() => setInterval(() => { poll().catch(error => abort(error)); }, pollMs).unref?.());
+    const jitter = () => Math.floor(random() * Math.max(1, Math.floor(pollMs / 10)));
+    const schedulePoll = () => {
+      if (disposed || signal.aborted) return;
+      const timer = setTimeout(() => {
+        timers.delete(timer);
+        poll().catch(error => abort(error)).then(schedulePoll);
+      }, pollMs + jitter());
+      timer.unref?.();
+      timers.add(timer);
+    };
+    schedulePoll();
   }
 
   // Таймер текущей вооружённой фазы: неиспользованный бюджет покинутой фазы
@@ -179,7 +206,7 @@ export function createAttemptSignals({ deadline, phaseBudgets, phaseSpent, asser
       }
       if (lease !== undefined) {
         try {
-          const live = await lease.verifyHeld(lease.taskId, lease.epoch);
+          const live = await verifyLease();
           if (live?.epoch !== lease.epoch) throw abortError('lease_lost');
         } catch (cause) {
           abort(cause instanceof Error ? cause : abortError('lease_lost'));
@@ -208,6 +235,7 @@ export function createAttemptSignals({ deadline, phaseBudgets, phaseSpent, asser
     checkDiskPreflight: () => checkDiskPreflight(disk?.path, { minBytes: disk?.minBytes ?? 1n, statfsImpl }),
     // Гарантированная очистка: все таймеры и опросы снимаются.
     dispose() {
+      disposed = true;
       for (const timer of timers) { clearTimeout(timer); clearInterval(timer); }
       timers.clear();
       budget?.leave();

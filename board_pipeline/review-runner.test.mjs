@@ -11,6 +11,7 @@ import {
   executorFamily, assertCrossFamily, parseReviewTranscript, parseReviewVerdict,
   hasValidFinding, isolatedArbiterRunner, isolatedPiReviewRunner, runInReadOnlySandbox, snapshotDigest,
   worktreeFingerprint, assertToolsAllowed, ReviewDenied, REVIEW_IMAGE, l2CriticSpec,
+  runnerReviewSpec,
 } from './review-runner.mjs';
 import { isNeonReview } from './review-policy.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
@@ -604,7 +605,7 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
     probe('sh', cp.spawnSync('sh', ['-c', 'echo hi']));
     probe('curl', cp.spawnSync('curl', ['-s', 'x'], { timeout: 3000 }));
     probe('findExec', cp.spawnSync('find', ['/tmp', '-exec', 'ls', ';']));
-    probe('findOk', cp.spawnSync('find', [], { timeout: 3000 }));
+    probe('findOk', cp.spawnSync('find', ['.', '-maxdepth', '0'], { timeout: 3000 }));
     probe('rgPiCfg', cp.spawnSync('rg', ['.', '/pi-cfg/auth.json']));
     probe('rgPre', cp.spawnSync('rg', ['--pre=sh', 'foo', '/candidate']));
     probe('findFollow', cp.spawnSync('find', ['-L', '/candidate']));
@@ -1304,4 +1305,402 @@ test('l2CriticSpec: google-критик без reasoningLevel наследует
 
   // Неисполняемый спек — null.
   assert.equal(l2CriticSpec({ provider: 'acp-devin', model: 'swe-2-high' }), null);
+});
+
+test('runnerReviewSpec: agy-арбитр исполняем, неизвестные провайдеры отклоняются', () => {
+  // agy (Anthropic Claude Opus 5.5) — escalation-слот Routing Policy v2 на
+  // Neon-роутах OpenAI/Astra: у провайдера есть egress-endpoint, спек
+  // нормализуется к исполняемой форме вместо null
+  // (route_base_arbiter_not_runnable при запуске pi + openai/gpt-6.2-astra).
+  const spec = { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'high' };
+  const runnable = runnerReviewSpec(spec);
+  assert.notEqual(runnable, null);
+  assert.equal(runnable.provider, 'agy');
+  assert.equal(runnable.model, 'claude-opus-5.5');
+  assert.equal(runnable.reasoningLevel, 'high');
+  // Входной объект не мутируется, повторный вызов детерминирован.
+  assert.deepEqual(spec, { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'high' });
+  assert.deepEqual(runnerReviewSpec(spec), runnable);
+
+  // Неизвестные провайдеры и сырой anthropic по-прежнему неисполняемы.
+  for (const bad of [
+    { provider: 'vendor', model: 'claude-opus-5.5', reasoningLevel: 'high' },
+    { provider: 'anthropic', model: 'claude-opus-5.5', reasoningLevel: 'high' },
+    { provider: 'acp-devin', model: 'swe-2-high' },
+    { provider: 'AGY', model: 'claude-opus-5.5' },
+  ]) {
+    assert.equal(runnerReviewSpec(bad), null, JSON.stringify(bad));
+  }
+  // Пустой и вырожденный вход — null, без исключений.
+  for (const degenerate of [null, undefined, {}, [], 'agy', 42,
+    { model: 'claude-opus-5.5' }, { provider: null, model: 'm' }]) {
+    assert.equal(runnerReviewSpec(degenerate), null, JSON.stringify(degenerate));
+  }
+  // Спек без модели не отклоняется нормализацией — пустая модель ловится
+  // раннером (arbiter/review_profile_not_approved) на nonEmpty-проверке.
+  assert.deepEqual(runnerReviewSpec({ provider: 'agy' }), { provider: 'agy', model: undefined });
+});
+
+// --- P1: hardened diff generation, symlink unpack rejection, mount injection ---
+
+async function gitRepo(dir, ...args) {
+  return (await exec('git', ['-C', dir, ...args], { timeout: 15_000 })).stdout.trim();
+}
+
+async function initRunnerRepo(repo) {
+  await gitRepo(repo, 'init', '-q', '-b', 'pilot');
+  await gitRepo(repo, 'config', 'user.email', 't@l');
+  await gitRepo(repo, 'config', 'user.name', 't');
+}
+
+const passStream = [
+  msg({ content: [{ type: 'text', text: '{"verdict":"PASS","summary":"ok"}' }] }),
+  settled,
+].join('\n');
+
+test('runner: diff base→candidate и round.diff не suppressируются атрибутами и не исполняют репо-конфиг', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'runner-diff-repo-'));
+  const journal = await mkdtemp(join(tmpdir(), 'runner-diff-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'runner-diff-pi-'));
+  const attack = await mkdtemp(join(tmpdir(), 'runner-diff-attack-'));
+  try {
+    await initRunnerRepo(repo);
+    await writeFile(join(repo, 'a.txt'), 'first\n');
+    await gitRepo(repo, 'add', 'a.txt');
+    await gitRepo(repo, 'commit', '-qm', 'base');
+    const base = await gitRepo(repo, 'rev-parse', 'HEAD');
+    await writeFile(join(repo, 'a.txt'), 'first\nsecond\n');
+    await gitRepo(repo, 'add', 'a.txt');
+    await gitRepo(repo, 'commit', '-qm', 'prior');
+    const prior = await gitRepo(repo, 'rev-parse', 'HEAD');
+    await writeFile(join(repo, 'a.txt'), 'first\nsecond\nthird\n');
+    // Атакующие атрибуты — в самом дереве кандидата ('* -diff' скрывает текст
+    // под «Binary files differ») и в info/attributes (textconv-драйвер на
+    // '*.txt'): оба вектора без защиты исполняются/suppressируют.
+    await writeFile(join(repo, '.gitattributes'), '* -diff\n');
+    await gitRepo(repo, 'add', 'a.txt', '.gitattributes');
+    await gitRepo(repo, 'commit', '-qm', 'candidate');
+    const sha = await gitRepo(repo, 'rev-parse', 'HEAD');
+    await mkdir(join(repo, '.git', 'info'), { recursive: true });
+    await writeFile(join(repo, '.git', 'info', 'attributes'), '*.txt diff=pwn\n');
+    // Репо-локальный конфиг воркера: внешний diff-драйвер и textconv пишут
+    // маркер при исполнении — с защитой ни один не запускается.
+    const markerExt = join(attack, 'pwned-external');
+    const markerTx = join(attack, 'pwned-textconv');
+    const evilDiff = join(attack, 'evil-diff.sh');
+    const evilTx = join(attack, 'evil-textconv.sh');
+    await writeFile(evilDiff, `#!/bin/sh\necho x >> "${markerExt}"\nexit 0\n`, { mode: 0o755 });
+    await writeFile(evilTx, `#!/bin/sh\necho x >> "${markerTx}"\nexit 0\n`, { mode: 0o755 });
+    await gitRepo(repo, 'config', 'diff.external', evilDiff);
+    await gitRepo(repo, 'config', 'diff.pwn.textconv', evilTx);
+    // Контроль атаки, вектор внешнего драйвера: незащищённый вызов исполняет
+    // diff.external из репо-конфига вместо генерации патча — маркер создан.
+    await exec('git', ['-C', repo, 'diff', `${base}..${sha}`], { timeout: 15_000 }).catch(() => {});
+    assert.ok(await lstat(markerExt).catch(() => null) !== null,
+      'контроль: diff.external не исполнился в незащищённом вызове');
+    // Контроль атаки, вектор атрибутов (без внешнего драйвера): '* -diff'
+    // скрывает текст патча, назначенный textconv-драйвер исполняется.
+    const attrsOnly = (await exec('git',
+      ['-c', 'diff.external=', '-C', repo, 'diff', '--no-ext-diff', `${base}..${sha}`],
+      { timeout: 15_000 })).stdout;
+    assert.match(attrsOnly, /Binary files .* differ/, 'атака атрибутов не воспроизвелась');
+    assert.ok(!attrsOnly.includes('+second'), 'незащищённый diff неожиданно текстовый');
+    assert.ok(await lstat(markerTx).catch(() => null) !== null,
+      'контроль: textconv не исполнился в незащищённом вызове');
+    // Маркеры сняты: их отсутствие после прогона раннера доказывает защиту.
+    await rm(markerExt, { force: true });
+    await rm(markerTx, { force: true });
+    await writeFile(join(piRoot, 'auth.json'), '{"openai":{"k":"v"}}');
+
+    const captured = {};
+    const runner = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async (opts) => {
+        for (const mount of opts.mounts) {
+          if (mount.dst === '/review/diff.patch') {
+            captured.diff = await readFile(mount.src, 'utf8');
+          }
+          if (mount.dst === '/review/round.diff') {
+            captured.round = await readFile(mount.src, 'utf8');
+          }
+        }
+        return { code: 0, stdout: passStream, stderr: '' };
+      } });
+    const receipt = await runner({ task_id: '1', candidate_sha: sha, worktree: repo,
+      base_sha: base, executor: 'acp-devin/swe-2-high',
+      review_round: 2, prior_sha: prior }, { review: CRITIC });
+    assert.equal(receipt.status, 'PASS');
+    // Ни атрибутная suppression, ни textconv-драйвер не действуют: точный
+    // текстовый diff смонтирован критику и в base-, и в round-патче.
+    assert.ok(captured.diff?.includes('+second'), `base diff не текстовый:\n${captured.diff}`);
+    assert.ok(captured.diff?.includes('+third'), `base diff неполный:\n${captured.diff}`);
+    assert.ok(!captured.diff?.includes('Binary files'), `base diff suppressирован:\n${captured.diff}`);
+    assert.ok(captured.round?.includes('+third'), `round diff не текстовый:\n${captured.round}`);
+    assert.ok(!captured.round?.includes('Binary files'), `round diff suppressирован:\n${captured.round}`);
+    assert.equal(await lstat(markerExt).catch(() => null), null,
+      'diff.external из репо-конфига исполнился');
+    assert.equal(await lstat(markerTx).catch(() => null), null,
+      'textconv из репо-конфига исполнился');
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+    await rm(attack, { recursive: true, force: true });
+  }
+});
+
+test('runner: симлинк кандидата, уводящий за /candidate — review_snapshot_unsafe_link до sandbox', async () => {
+  const journal = await mkdtemp(join(tmpdir(), 'runner-link-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'runner-link-pi-'));
+  try {
+    await writeFile(join(piRoot, 'auth.json'), '{"openai":{"k":"v"}}');
+    // Варианты враждебных ссылок: абсолютная, относительная с выходом за
+    // корень, битая, петля, резолвящаяся в сам корень снимка.
+    const variants = {
+      absolute: async (repo) => symlink('/etc/passwd', join(repo, 'evil')),
+      relativeEscape: async (repo) => symlink('../../../../etc/passwd', join(repo, 'evil')),
+      broken: async (repo) => symlink('no/such/target', join(repo, 'evil')),
+      loop: async (repo) => {
+        await symlink('loop-b', join(repo, 'loop-a'));
+        await symlink('loop-a', join(repo, 'loop-b'));
+      },
+      rootItself: async (repo) => symlink('.', join(repo, 'selflink')),
+    };
+    for (const [kind, plant] of Object.entries(variants)) {
+      const repo = await mkdtemp(join(tmpdir(), `runner-link-${kind}-`));
+      try {
+        await initRunnerRepo(repo);
+        await writeFile(join(repo, 'a.txt'), 'x\n');
+        await plant(repo);
+        await gitRepo(repo, 'add', '-A');
+        await gitRepo(repo, 'commit', '-qm', 'cand');
+        const sha = await gitRepo(repo, 'rev-parse', 'HEAD');
+        let sandboxCalls = 0;
+        const runner = isolatedPiReviewRunner({ journal, piRoot,
+          sandbox: async () => {
+            sandboxCalls++;
+            return { code: 0, stdout: passStream, stderr: '' };
+          } });
+        await assert.rejects(
+          runner({ task_id: '1', candidate_sha: sha, worktree: repo,
+            executor: 'acp-devin/swe-2-high' }, { review: CRITIC }),
+          (e) => e instanceof ReviewDenied && e.reason === 'review_snapshot_unsafe_link',
+          `${kind} не отклонён`);
+        assert.equal(sandboxCalls, 0, `${kind}: sandbox запущен`);
+      } finally {
+        await rm(repo, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+  }
+});
+
+test('runner: внутридревовые симлинки кандидата допустимы', async () => {
+  const repo = await mkdtemp(join(tmpdir(), 'runner-linkok-repo-'));
+  const journal = await mkdtemp(join(tmpdir(), 'runner-linkok-journal-'));
+  const piRoot = await mkdtemp(join(tmpdir(), 'runner-linkok-pi-'));
+  try {
+    await initRunnerRepo(repo);
+    await mkdir(join(repo, 'dir', 'sub'), { recursive: true });
+    await writeFile(join(repo, 'dir', 'real.txt'), 'x\n');
+    // Ссылка на файл внутри дерева, относительная ссылка из вложенного
+    // каталога через '..' внутрь дерева и ссылка на каталог дерева.
+    await symlink('dir/real.txt', join(repo, 'link.txt'));
+    await symlink('../real.txt', join(repo, 'dir', 'sub', 'rel.txt'));
+    await symlink('dir', join(repo, 'dirlink'));
+    await gitRepo(repo, 'add', '-A');
+    await gitRepo(repo, 'commit', '-qm', 'cand');
+    const sha = await gitRepo(repo, 'rev-parse', 'HEAD');
+    await writeFile(join(piRoot, 'auth.json'), '{"openai":{"k":"v"}}');
+    let sandboxCalls = 0;
+    const runner = isolatedPiReviewRunner({ journal, piRoot,
+      sandbox: async () => {
+        sandboxCalls++;
+        return { code: 0, stdout: passStream, stderr: '' };
+      } });
+    const receipt = await runner({ task_id: '1', candidate_sha: sha, worktree: repo,
+      executor: 'acp-devin/swe-2-high' }, { review: CRITIC });
+    assert.equal(receipt.status, 'PASS');
+    assert.equal(sandboxCalls, 1);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(journal, { recursive: true, force: true });
+    await rm(piRoot, { recursive: true, force: true });
+  }
+});
+
+test('sandbox: запятая или равно в путях --mount — sandbox_mount_invalid до вызова docker', async () => {
+  const scratch = await mkdtemp(join(tmpdir(), 'review-mountinj-'));
+  try {
+    const source = join(scratch, 'candidate');
+    await mkdir(source, { mode: 0o755 });
+    // Docker здесь не нужен совсем: валидация обязана идти до docker info.
+    const badMounts = [
+      { src: '/tmp/evil,rw', dst: '/x' },
+      { src: '/tmp/evil=x', dst: '/x' },
+      { src: '/tmp/x', dst: '/dst,rw' },
+      { src: '/tmp/x', dst: '/dst=x' },
+      { src: '/tmp/a,b', dst: '/c,d' },
+    ];
+    for (const bad of badMounts) {
+      await assert.rejects(
+        runInReadOnlySandbox({ snapshot: source, argv: ['true'], mounts: [bad], timeoutMs: 1000 }),
+        (e) => e instanceof ReviewDenied && e.reason === 'sandbox_mount_invalid',
+        JSON.stringify(bad));
+    }
+    // Относительные пути отклоняются той же причиной, что и раньше.
+    await assert.rejects(
+      runInReadOnlySandbox({ snapshot: source, argv: ['true'],
+        mounts: [{ src: 'relative', dst: '/x' }], timeoutMs: 1000 }),
+      (e) => e.reason === 'sandbox_mount_invalid');
+    // Сам snapshot — часть спецификации --mount: те же символы запрещены.
+    for (const badSnapshot of ['/tmp/snap,evil', '/tmp/snap=evil']) {
+      await assert.rejects(
+        runInReadOnlySandbox({ snapshot: badSnapshot, argv: ['true'], timeoutMs: 1000 }),
+        (e) => e.reason === 'sandbox_mount_invalid', badSnapshot);
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test('sandbox: канонические mount-пути без запятых проходят в docker run verbatim', async () => {
+  const scratch = await mkdtemp(join(tmpdir(), 'review-mountok-'));
+  const oldPath = process.env.PATH;
+  const oldLog = process.env.FAKE_DOCKER_LOG;
+  const oldNodeOptions = process.env.NODE_OPTIONS;
+  try {
+    const bin = join(scratch, 'bin');
+    const source = join(scratch, 'candidate');
+    const extra = join(scratch, 'extra-dir');
+    const log = join(scratch, 'docker-log.jsonl');
+    await mkdir(bin);
+    await mkdir(source, { mode: 0o755 });
+    await mkdir(extra);
+    const harness = await nodePreloadHarness(bin, 'docker', `
+const fs = require('fs');
+const path = require('path');
+const args = [path.basename(process.argv[1] ?? ''), ...process.argv.slice(2)];
+if (args[0] === 'info') {
+  process.stdout.write('["name=rootless"]\\n');
+  process.exit(0);
+}
+if (args[0] === 'rm') process.exit(0);
+if (args[0] !== 'run') process.exit(2);
+fs.appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify({ args }) + '\\n');
+process.exit(0);
+`);
+    process.env.PATH = `${bin}:${oldPath}`;
+    process.env.FAKE_DOCKER_LOG = log;
+    process.env.NODE_OPTIONS = harness.nodeOptions;
+    const run = await runInReadOnlySandbox({ snapshot: source, argv: ['true'],
+      mounts: [{ src: extra, dst: '/pi-ro/bin' }], timeoutMs: 10_000 });
+    assert.equal(run.code, 0);
+    const entries = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(entries.length, 1);
+    const spec = entries[0].args.filter((arg, i) => entries[0].args[i - 1] === '--mount');
+    assert.ok(spec.includes(`type=bind,src=${extra},dst=/pi-ro/bin,readonly`),
+      `extra mount missing: ${spec.join(' | ')}`);
+    assert.ok(spec.includes(`type=bind,src=${source},dst=/candidate,readonly`),
+      `snapshot mount missing: ${spec.join(' | ')}`);
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldLog === undefined) delete process.env.FAKE_DOCKER_LOG;
+    else process.env.FAKE_DOCKER_LOG = oldLog;
+    if (oldNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = oldNodeOptions;
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test('fingerprint: live git status/diff use hardened args and isolated git configuration', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'fp-hardened-'));
+  const envKeys = ['PATH', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'REAL_GIT', 'GIT_SHIM_LOG'];
+  const oldEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+  t.after(() => {
+    for (const key of envKeys) {
+      if (oldEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = oldEnv[key];
+    }
+  });
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const repo = join(root, 'repo');
+  const attack = join(root, 'attack');
+  const bin = join(root, 'bin');
+  await mkdir(bin, { recursive: true });
+  await mkdir(attack, { recursive: true });
+  await mkdir(repo, { recursive: true });
+  const realGit = (await exec('sh', ['-c', 'command -v git'], { timeout: 15_000 })).stdout.trim();
+  const git = async (...args) =>
+    (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
+  await git('init', '-q', '-b', 'pilot');
+  await git('config', 'user.email', 't@l');
+  await git('config', 'user.name', 't');
+  await writeFile(join(repo, 'a.txt'), 'one\n');
+  await git('add', 'a.txt');
+  await git('commit', '-qm', 'init');
+  await writeFile(join(repo, 'a.txt'), 'two\n');
+
+  const markerFs = join(attack, 'fsmonitor-ran');
+  const markerDiff = join(attack, 'external-diff-ran');
+  const evilFsmonitor = join(attack, 'evil-fsmonitor.sh');
+  const evilDiff = join(attack, 'evil-diff.sh');
+  await writeFile(evilFsmonitor, `#!/bin/sh\necho x >> "${markerFs}"\nexit 1\n`, { mode: 0o755 });
+  await writeFile(evilDiff, `#!/bin/sh\necho x >> "${markerDiff}"\nexit 0\n`, { mode: 0o755 });
+  await git('config', 'core.fsmonitor', evilFsmonitor);
+  await git('config', 'diff.external', evilDiff);
+  await exec('git', ['-C', repo, 'status', '--porcelain'], { timeout: 15_000 });
+  await exec('git', ['-C', repo, 'diff', 'HEAD'], { timeout: 15_000 }).catch(() => {});
+  assert.ok(await lstat(markerFs).catch(() => null) !== null,
+    'control: unhardened status did not execute core.fsmonitor');
+  assert.ok(await lstat(markerDiff).catch(() => null) !== null,
+    'control: unhardened diff did not execute diff.external');
+  await rm(markerFs, { force: true });
+  await rm(markerDiff, { force: true });
+
+  const log = join(attack, 'git-calls.ndjson');
+  const shim = join(bin, 'git');
+  await writeFile(shim, `#!/usr/bin/env node
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+fs.appendFileSync(process.env.GIT_SHIM_LOG, JSON.stringify({
+  args: process.argv.slice(2),
+  env: {
+    GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+    GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM,
+  },
+}) + '\\n');
+const result = spawnSync(process.env.REAL_GIT, process.argv.slice(2), {
+  stdio: 'inherit', env: process.env,
+});
+process.exit(result.status ?? 1);
+`, { mode: 0o755 });
+  process.env.PATH = `${bin}:${oldEnv.PATH ?? ''}`;
+  process.env.REAL_GIT = realGit;
+  process.env.GIT_SHIM_LOG = log;
+  process.env.GIT_CONFIG_GLOBAL = join(attack, 'attacker-global.gitconfig');
+  process.env.GIT_CONFIG_NOSYSTEM = '0';
+
+  const fingerprint = await worktreeFingerprint(repo);
+  assert.match(fingerprint.head, /^[a-f0-9]{40}$/);
+  assert.equal(await lstat(markerFs).catch(() => null), null,
+    'hardened live status executed core.fsmonitor');
+  assert.equal(await lstat(markerDiff).catch(() => null), null,
+    'hardened live diff executed diff.external');
+
+  const entries = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.ok(entries.length > 0, 'git shim saw no calls');
+  const hardening = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    '-c', 'diff.external='];
+  for (const entry of entries) {
+    assert.deepEqual(entry.args.slice(0, hardening.length), hardening);
+    assert.equal(entry.env.GIT_CONFIG_GLOBAL, '/dev/null');
+    assert.equal(entry.env.GIT_CONFIG_NOSYSTEM, '1');
+  }
+  assert.ok(entries.some(entry => entry.args.includes('status')),
+    'worktree fingerprint did not inspect live status');
+  assert.ok(entries.some(entry => entry.args.includes('diff')),
+    'worktree fingerprint did not inspect the live diff');
 });

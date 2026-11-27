@@ -553,6 +553,35 @@ test('AUDIT-0c regression: .fit()-метод и конфиг skip вне тес�
   assert.deepEqual(res.violations, []);
 });
 
+test('WAVE2-5a: удаление тест-файла с assert — test_file_deleted и assertion_weakened по умолчанию', async () => {
+  const res = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {\n  assert(x === 1);\n});\n' },
+    candidate: { 'tests/app.test.js': null },
+  });
+  assert.equal(res.ok, false);
+  const kinds = res.violations.map((v) => v.kind);
+  assert.ok(kinds.includes('test_file_deleted'), JSON.stringify(res.violations));
+  assert.ok(kinds.includes('assertion_weakened'), JSON.stringify(res.violations));
+});
+
+test('WAVE2-5a: удаление тест-файла с assert проходит чисто при allowTestDeletion: true', async () => {
+  const res = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {\n  assert(x === 1);\n  assert(y >= 2);\n});\n' },
+    candidate: { 'tests/app.test.js': null },
+  }, { allowTestDeletion: true });
+  assert.equal(res.ok, true, JSON.stringify(res.violations));
+  assert.equal(res.violations.length, 0, JSON.stringify(res.violations));
+});
+
+test('WAVE2-5a: ослабление assert в изменённом (не удалённом) тест-файле отклоняется даже при allowTestDeletion: true', async () => {
+  const res = await gate({
+    base: { 'tests/app.test.js': 'assert(x === 1);\nassert(y === 2);\nexport const z = 1;\n' },
+    candidate: { 'tests/app.test.js': 'export const z = 1;\n' },
+  }, { allowTestDeletion: true });
+  assert.equal(res.ok, false);
+  assert.ok(res.violations.some((v) => v.kind === 'assertion_weakened'), JSON.stringify(res.violations));
+});
+
 test('AUDIT-0c regression: .fit()/.xit() методы в тестовом файле — не фокусировка', async () => {
   const res = await gate({
     base: { 'tests/ml.test.js': 'test("a", () => {});\n' },
@@ -574,4 +603,189 @@ test('AUDIT-0c regression: .fit()/.xit() методы в тестовом фай
   });
   assert.ok(focus.violations.some((v) => v.kind === 'test_skipped'),
     JSON.stringify(focus.violations));
+});
+
+// --- v2.0 cross-review: ужесточение tamper-gate ------------------------------
+
+const syntheticDiff = (minusLines, plusLines, file = 'tests/app.test.js') => {
+  const body = [];
+  if (minusLines.length) {
+    body.push(`@@ -1,${minusLines.length} +0,0 @@`);
+    for (const line of minusLines) body.push(`-${line}`);
+  }
+  if (plusLines.length) {
+    body.push(`@@ -0,0 +1,${plusLines.length} @@`);
+    for (const line of plusLines) body.push(`+${line}`);
+  }
+  return `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${body.join('\n')}\n`;
+};
+
+test('v2: блочный комментарий внутри строкового литерала не маскирует удалённые тесты', () => {
+  const diff = 'diff --git a/tests/app.test.js b/tests/app.test.js\n' +
+    '--- a/tests/app.test.js\n+++ b/tests/app.test.js\n' +
+    '@@ -1,3 +0,0 @@\n' +
+    '-const s = "/' + '*";\n' +
+    '-test("b", () => {});\n' +
+    '-assert(x === 1);\n';
+  const violations = analyzeDiff(diff);
+  assert.ok(violations.some((v) => v.kind === 'test_deleted'),
+    JSON.stringify(violations));
+  assert.ok(violations.some((v) => v.kind === 'assertion_weakened'),
+    JSON.stringify(violations));
+});
+
+test('v2: состояние блочного комментария сбрасывается на каждом hunk header', () => {
+  // Открывающий комментарий первого hunk'а не должен маскировать удаления второго.
+  const diff = 'diff --git a/tests/app.test.js b/tests/app.test.js\n' +
+    '--- a/tests/app.test.js\n+++ b/tests/app.test.js\n' +
+    '@@ -1,1 +0,0 @@\n' +
+    '-/' + '*\n' +
+    '@@ -10,1 +9,0 @@\n' +
+    '-test("b", () => {});\n';
+  const violations = analyzeDiff(diff);
+  assert.ok(violations.some((v) => v.kind === 'test_deleted'),
+    JSON.stringify(violations));
+});
+
+test('v2: реальный блочный комментарий внутри одного hunk по-прежнему скрывает проверки', () => {
+  // Строка внутри настоящего блочного комментария — не действующая проверка:
+  // удаление закомментированной проверки не считается ослаблением.
+  const res = analyzeDiff(syntheticDiff([
+    '/' + '*',
+    'assert(y === 2);',
+    '*' + '/',
+    'assert(x === 1);',
+  ], ['assert(x === 1);'], 'src/lib.test.js'));
+  assert.deepEqual(res, [], JSON.stringify(res));
+});
+
+test('v2: ранний return с литералом/undefined в тестовом hunk отклоняется', async () => {
+  for (const [name, line] of [
+    ['literal zero return', 'ret' + 'urn 0;'],
+    ['literal true return', 'ret' + 'urn true;'],
+    ['literal null return', 'ret' + 'urn null;'],
+    ['undefined return', 'ret' + 'urn undefined;'],
+    ['bare return', 'ret' + 'urn;'],
+    ['process exit zero', 'process.' + 'exit(0);'],
+    ['process exit zero spaced', 'process.' + 'exit( 0 );'],
+    ['dead branch false', 'if ' + '(false) {'],
+    ['dead branch zero', 'if ' + '(0) {'],
+  ]) {
+    const violations = analyzeDiff(syntheticDiff([], [line]));
+    assert.ok(violations.some((v) => v.kind === 'assertion_weakened'),
+      `${name}: ${JSON.stringify(violations)}`);
+  }
+  // Контроль: обычный возврат значения и код вне тестов — не нарушение.
+  assert.deepEqual(analyzeDiff(syntheticDiff([], ['ret' + 'urn value;'])), []);
+  assert.deepEqual(analyzeDiff(syntheticDiff([], ['ret' + 'urn false;'])), []);
+  assert.deepEqual(analyzeDiff(syntheticDiff([], ['ret' + 'urn 0;'], 'src/app.js')), []);
+  assert.deepEqual(analyzeDiff(syntheticDiff([], ['process.' + 'exit(0);'], 'src/app.js')), []);
+  assert.deepEqual(analyzeDiff(syntheticDiff([], ['if ' + '(false) {'], 'src/app.js')), []);
+  assert.deepEqual(analyzeDiff(syntheticDiff([], ['process.' + 'exit(1);'])), []);
+});
+
+test('v2: тавтологии идентичных литералов в тестовом hunk отклоняются', () => {
+  for (const line of [
+    'ass' + 'ert.strictEqual(1, 1);',
+    'ass' + 'ert.equal("a", "a");',
+    'ass' + "ert.equal('a', \"a\");",
+    'ass' + 'ert.deepEqual(true, true);',
+    'ass' + 'ert.strictEqual(null, null);',
+    'exp' + 'ect(1).toBe(1);',
+    'exp' + 'ect("x").toBe("x");',
+    'exp' + 'ect(0.5).toEqual(0.5);',
+  ]) {
+    const violations = analyzeDiff(syntheticDiff([], [line]));
+    assert.ok(violations.some((v) => v.kind === 'assertion_weakened' &&
+      v.detail.includes('identical-literal')),
+      `${line}: ${JSON.stringify(violations)}`);
+  }
+  // Контроль: содержательные проверки — не тавтологии.
+  for (const line of [
+    'assert.strictEqual(x, 1);',
+    'assert.strictEqual(1, 2);',
+    'assert.equal("a", "b");',
+    'expect(count).toBe(1);',
+    'expect(1).toBe(2);',
+  ]) {
+    const violations = analyzeDiff(syntheticDiff([], [line]));
+    assert.equal(violations.filter((v) => v.detail?.includes('identical-literal')).length,
+      0, `${line}: ${JSON.stringify(violations)}`);
+  }
+});
+
+test('v2: добавленные test-filter флаги в scripts.test* — gate_bypass', async () => {
+  for (const [name, script] of [
+    ['--test-name-pattern', 'node --test --test-name-pattern=smoke'],
+    ['--test-name-pattern split', 'node --test --test-name-pattern smoke'],
+    ['--grep', 'jest --grep happy'],
+    ['-k', 'pytest -k smoke'],
+    ['-t', 'vitest -t smoke'],
+    ['--skip', 'node --test --skip=slow'],
+    ['filter in test:unit key', 'node --test --test-name-pattern=x'],
+  ]) {
+    const key = name === 'filter in test:unit key' ? 'test:unit' : 'test';
+    const base = { 'package.json': `{"scripts":{"${key}":"node --test"}}\n` };
+    const candidate = { 'package.json': `{"scripts":{"${key}":"${script}"}}\n` };
+    const res = await gate({ base, candidate });
+    assert.equal(res.ok, false, name);
+    assert.ok(res.violations.some((v) => v.kind === 'gate_bypass' &&
+      v.detail.includes('filter')), `${name}: ${JSON.stringify(res.violations)}`);
+  }
+});
+
+test('v2: неизменные/отсутствующие test-filter флаги — не нарушение', async () => {
+  const unchanged = await gate({
+    base: {
+      'package.json': '{"scripts":{"test":"node --test --test-name-pattern=x"}}\n',
+      'src/app.js': 'export const a = 1;\n',
+    },
+    candidate: {
+      'package.json': '{"scripts":{"test":"node --test --test-name-pattern=x","lint":"echo ok"}}\n',
+      'src/app.js': 'export const a = 2;\n',
+    },
+  });
+  // package.json изменился (новый lint), но фильтры scripts.test не добавлены —
+  // флаги были в base в том же виде.
+  assert.equal(unchanged.ok, true, JSON.stringify(unchanged.violations));
+  const plain = await gate({
+    base: { 'package.json': '{"scripts":{"test":"node --test"}}\n' },
+    candidate: { 'package.json': '{"scripts":{"test":"node --test tests/"}}\n' },
+  });
+  assert.equal(plain.ok, true, JSON.stringify(plain.violations));
+});
+
+test('v2: allowTestDeletion строго ограничен удалёнными файлами (status D)', async () => {
+  // Изменённый (не удалённый) тестовый файл с удалённым кейсом — нарушение
+  // даже при allowTestDeletion: true.
+  const modified = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {});\ntest("b", () => {});\n' },
+    candidate: { 'tests/app.test.js': 'test("a", () => {});\n' },
+  }, { allowTestDeletion: true });
+  assert.equal(modified.ok, false);
+  assert.ok(modified.violations.some((v) => v.kind === 'test_deleted'),
+    JSON.stringify(modified.violations));
+
+  // Переименование теста вне discovery — нарушение даже при допуске.
+  const repo = await mkdtemp(path.join(testRoot, 'repo-'));
+  git(repo, 'init', '--initial-branch=pilot');
+  await mkdir(path.join(repo, 'tests'));
+  await writeFile(path.join(repo, 'tests/app.test.js'), 'test("a", () => {});\n');
+  const base = commit(repo, 'Base');
+  await mkdir(path.join(repo, 'src'));
+  git(repo, 'mv', 'tests/app.test.js', 'src/app.js');
+  const candidate = commit(repo, 'Rename');
+  const renamed = await tamperGate(
+    { worktree: repo, base_sha: base, candidate_sha: candidate },
+    { allowTestDeletion: true });
+  assert.equal(renamed.ok, false);
+  assert.ok(renamed.violations.some((v) => v.kind === 'test_file_deleted'),
+    JSON.stringify(renamed.violations));
+
+  // Контроль: настоящее удаление файла со статусом D по-прежнему проходит.
+  const deleted = await gate({
+    base: { 'tests/app.test.js': 'test("a", () => {});\n' },
+    candidate: { 'tests/app.test.js': null },
+  }, { allowTestDeletion: true });
+  assert.equal(deleted.ok, true, JSON.stringify(deleted.violations));
 });

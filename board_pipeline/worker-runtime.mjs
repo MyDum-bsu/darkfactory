@@ -3,10 +3,17 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile as readFileDefault } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const execFileAsync = promisify(execFile);
 const TAIL_LIMIT = 8192;
 const MAX_TERMINAL_SUBPROC_SESSIONS = 32;
+// Короткое подтверждение фактического выхода процесса после сигнала: SIGTERM
+// даёт писателю шанс завершиться штатно, SIGKILL — uncatchable, его ожидание
+// строго короче. stopped: true выписывается только по событию exit, не по
+// факту отправки сигнала.
+export const SUBPROC_STOP_TERM_GRACE_MS = 1500;
+export const SUBPROC_STOP_KILL_GRACE_MS = 1000;
 
 export const EXECUTOR_COMMANDS = Object.freeze({
   'acp-devin': 'devin',
@@ -63,6 +70,9 @@ function permissionArguments(spec, permissionMode) {
   }
   if (spec.command === 'agy') {
     return mode === 'full' ? ['--dangerously-skip-permissions'] : ['--mode', 'accept-edits'];
+  }
+  if (spec.command === 'pi') {
+    return ['--approve'];
   }
   return [];
 }
@@ -172,6 +182,25 @@ function freshRuntimeId(kind) {
   if (kind === 'hc') return `df-r${hex.slice(0, 8)}-${hex.slice(8, 18)}`;
   if (kind === 'subproc') return `subproc-${hex.slice(0, 12)}`;
   fail('worker_runtime_kind_invalid');
+}
+
+// Секреты и привилегированные каналы контроллера никогда не наследуются
+// дочерним процессом воркера (defense-in-depth): воркеру нужен лишь его
+// собственный CLI/env, а не ssh-agent, токены Board или HMAC-ключ памяти.
+const CONTROLLER_SENSITIVE_ENV = new Set([
+  'SSH_AUTH_SOCK',
+  'BOARD_TOKEN',
+  'VB_TOKEN',
+  'DF_PROJECT_MEMORY_HMAC_KEY',
+  'DF_CONTROL_ROOM_WRITE_TOKEN',
+]);
+
+export function scrubbedWorkerChildEnv(env) {
+  const clean = {};
+  for (const [key, value] of Object.entries(env ?? {})) {
+    if (!CONTROLLER_SENSITIVE_ENV.has(key)) clean[key] = value;
+  }
+  return clean;
 }
 
 function terminalExitCode(terminal) {
@@ -325,7 +354,7 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
 
   function launchSubproc(session, built) {
     const child = spawnProcess(built.command, [...built.argv], {
-      cwd: session.worktree, env, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: session.worktree, env: scrubbedWorkerChildEnv(env), stdio: ['ignore', 'pipe', 'pipe'],
     });
     watchChild(session, child);
     return child;
@@ -361,13 +390,42 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     return kind === 'hc' ? spawnHc(input, prompt) : spawnSubproc(input, prompt);
   }
 
+  function hcProbeNotFound(error) {
+    const detail = `${error?.stderr ?? ''}\n${error?.stdout ?? ''}\n${error?.message ?? ''}`;
+    return detail.includes('"not_found"') || detail.includes('no terminal');
+  }
+
+  // Crash-resume под уже занятым именем: мёртвый терминал сначала убирается,
+  // иначе hc run создаст дубликат имени и observe/send/kill по имени станут
+  // неоднозначными. Живой терминал никогда не снимается — fail-closed, как
+  // worker_busy у subproc; неподтверждённый сбой probe пробрасывается, а не
+  // маскируется под чистое имя.
+  async function removeCrashedHcTerminal(runtimeId) {
+    let terminal;
+    try {
+      terminal = await hc(['get', '--json', '--', runtimeId]);
+    } catch (error) {
+      if (hcProbeNotFound(error)) return;
+      throw error;
+    }
+    if (terminal?.error?.kind === 'not_found') return;
+    if (hcState(terminal) !== 'exited') fail('worker_runtime_exists');
+    try {
+      await hc(['kill', '--json', '--', runtimeId], { timeout: 15_000 });
+    } catch { /* kill уже завершённого терминала идемпотентен — best-effort */ }
+    await hc(['rm', '--json', '--', runtimeId], { timeout: 15_000 });
+  }
+
   async function resumeWorker(rawInput) {
     const input = validateResumeInput(rawInput);
     const prompt = text(await promptFromFile(input.promptFile), 'worker_prompt_invalid');
     const built = buildResumeCommand(input.executor, { sessionId: input.sessionId, prompt,
       promptFile: input.promptFile, permissionMode: input.permissionMode,
       interactive: kind === 'hc' });
-    if (kind === 'hc') return runHc(input, built, { resumed: true });
+    if (kind === 'hc') {
+      if (input.runtimeId !== undefined) await removeCrashedHcTerminal(input.runtimeId);
+      return runHc(input, built, { resumed: true });
+    }
     const runtimeId = input.runtimeId ?? freshRuntimeId('subproc');
     return startSubprocSession(input, built, runtimeId, { replaceTerminal: true });
   }
@@ -433,18 +491,46 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
       ...(exitCode === undefined ? {} : { exitCode }) });
   }
 
+  // Подтверждение фактического выхода subproc-писателя: stopped: true
+  // выписывается только когда процесс реально завершился (событие exit уже
+  // наблюдено для терминальной сессии или дождались его после сигнала).
+  // Неизвестная сессия — stopped: false БЕЗ состояния exited: таблица
+  // sessions живёт в памяти процесса, после рестарта контроллера писатель
+  // может быть жив — «exited» был бы недоказанным утверждением.
+  async function waitSubprocExit(session, graceMs) {
+    const deadline = Date.now() + graceMs;
+    while (session.state === 'working' && Date.now() < deadline) {
+      await delay(10);
+    }
+    return session.state !== 'working';
+  }
+
+  function stoppedSubproc(session) {
+    return Object.freeze({ stopped: true, state: session.state,
+      ...(session.exitCode === undefined ? {} : { exitCode: session.exitCode }),
+      ...(session.signal === undefined ? {} : { signal: session.signal }) });
+  }
+
+  async function stopSubproc(session) {
+    if (session.state !== 'working') {
+      pruneTerminalSessions(session.runtimeId);
+      return stoppedSubproc(session);
+    }
+    session.child?.kill?.('SIGTERM');
+    if (!await waitSubprocExit(session, SUBPROC_STOP_TERM_GRACE_MS)) {
+      session.child?.kill?.('SIGKILL');
+      await waitSubprocExit(session, SUBPROC_STOP_KILL_GRACE_MS);
+    }
+    if (session.state !== 'working') return stoppedSubproc(session);
+    return Object.freeze({ stopped: false, state: session.state });
+  }
+
   async function stop({ runtimeId } = {}) {
     const id = validateRuntimeId(runtimeId);
     if (kind === 'hc') return stopHc(id);
     const session = sessions.get(id);
-    if (!session) return Object.freeze({ stopped: false, state: 'exited' });
-    if (session.state !== 'working') {
-      pruneTerminalSessions(id);
-      return Object.freeze({ stopped: false, state: session.state,
-        ...(session.exitCode === undefined ? {} : { exitCode: session.exitCode }) });
-    }
-    const killed = session.child?.kill?.('SIGTERM') === true;
-    return Object.freeze({ stopped: killed, state: session.state, ...(killed ? { signal: 'SIGTERM' } : {}) });
+    if (!session) return Object.freeze({ stopped: false });
+    return stopSubproc(session);
   }
 
   return Object.freeze({ kind, probeAvailability, spawn: spawnWorker, resume: resumeWorker,

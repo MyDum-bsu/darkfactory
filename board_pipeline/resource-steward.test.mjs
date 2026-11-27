@@ -9,8 +9,8 @@ import { join } from 'node:path';
 import {
   availableGiB, classifyTmpEntry, defaultCacheRoots, defaultJournalPath, DEFAULT_MOUNTS, DOCKER_ACTIONS,
   escalateViaCommand, evaluateDisk, evaluateRam, measureMount, openJournal, parseArgv,
-  parseBbThreadList, parseMemInfo, pruneCacheRoot, pruneExpiredTmp, raiseAlarm, runSteward,
-  selectIdleThreads,
+  parseBbThreadList, parseHcTerminalList, parseMemInfo, pruneCacheRoot, pruneExpiredTmp, raiseAlarm, runSteward,
+  selectIdleHcTerminals, selectIdleThreads,
 } from './resource-steward.mjs';
 
 const GiB = 1024n ** 3n;
@@ -99,6 +99,18 @@ test('tmp allowlist: only expired df-* entries are deletable', () => {
   assert.equal(classifyTmpEntry('pytest-of-fixture', dirStat(cutoff), { cutoffMs: cutoff }).action, 'keep');
   assert.equal(classifyTmpEntry('pytest-of-fixture', fileStat(cutoff - 1), { cutoffMs: cutoff }).action, 'keep');
   assert.equal(classifyTmpEntry('pytest-of-fixture', fileStat(cutoff - 1), { cutoffMs: cutoff }).reason, 'allowlist_dir_only');
+});
+
+test('tmp allowlist: expired board/review leftovers are directories-only and age-gated', () => {
+  const cutoff = now - 7 * DAY_MS;
+  for (const name of ['board-check-abc', 'board-review-abc', 'board-visual-abc', 'board-arbiter-abc', 'neon-review-abc']) {
+    assert.deepEqual(classifyTmpEntry(name, dirStat(cutoff - 1), { cutoffMs: cutoff }),
+      { action: 'delete', kind: 'dir' }, name);
+    assert.equal(classifyTmpEntry(name, dirStat(cutoff), { cutoffMs: cutoff }).reason, 'not_expired', name);
+    assert.equal(classifyTmpEntry(name, fileStat(cutoff - 1), { cutoffMs: cutoff }).reason, 'allowlist_dir_only', name);
+  }
+  assert.equal(classifyTmpEntry('board-other-abc', dirStat(cutoff - 1), { cutoffMs: cutoff }).action, 'keep');
+  assert.equal(classifyTmpEntry('neon-reviewx-abc', dirStat(cutoff - 1), { cutoffMs: cutoff }).action, 'keep');
 });
 
 test('tmp refuse: symlinks, special files and unsafe names are never deleted', () => {
@@ -320,6 +332,64 @@ test('parseBbThreadList accepts array, {threads} and fails on {ok:false}', () =>
   assert.deepEqual(parseBbThreadList('{"threads":[{"id":"thr_b"}]}'), [{ id: 'thr_b' }]);
   assert.throws(() => parseBbThreadList('{"ok":false,"error":{"code":"x","message":"boom"}}'), /boom/);
   assert.throws(() => parseBbThreadList('not json'), SyntaxError);
+});
+
+test('parseHcTerminalList accepts terminals object and compatibility array', () => {
+  assert.deepEqual(parseHcTerminalList('{"terminals":[{"name":"df-10286-af4c3b8f7d"}]}'),
+    [{ name: 'df-10286-af4c3b8f7d' }]);
+  assert.deepEqual(parseHcTerminalList('[{"name":"df-10286-af4c3b8f7d"}]'),
+    [{ name: 'df-10286-af4c3b8f7d' }]);
+  assert.throws(() => parseHcTerminalList('{"ok":false,"error":{"message":"hc down"}}'), /hc down/);
+  assert.throws(() => parseHcTerminalList('not json'), SyntaxError);
+});
+
+test('hc idle selection uses runtime names, protects ambiguous/live work and keeps kill addresses', () => {
+  const idle = 'df-10286-af4c3b8f7d';
+  const active = 'df-10286-0123456789';
+  const pinned = 'df-10286-aaaaaaaaaa';
+  const self = 'df-10286-bbbbbbbbbb';
+  const ambiguous = 'df-10286-cccccccccc';
+  const finished = 'df-10286-dddddddddd';
+  const internallyPinned = 'df-10286-eeeeeeeeee';
+  const { stoppable, skipped } = selectIdleHcTerminals([
+    { address: 't7', name: idle, state: 'live', status: 'idle' },
+    { address: 't8', name: active, state: 'live', status: 'working' },
+    { address: 't9', name: pinned, state: 'live', status: { state: 'idle' } },
+    { address: 't10', name: self, state: 'live', status: 'idle' },
+    { address: 't11', name: ambiguous, state: 'live' },
+    { address: 't12', name: finished, state: 'finished', status: 'idle' },
+    { address: 't13', name: internallyPinned, state: 'live', status: 'idle', pinnedAt: 42 },
+    { address: 't14', name: 'operator-shell', state: 'live', status: 'idle' },
+  ], { pinnedThreads: [pinned], selfThreadId: self });
+  assert.deepEqual(stoppable, [{ id: idle, address: 't7' }]);
+  const reasons = Object.fromEntries(skipped.map(s => [s.id, s.reason]));
+  assert.equal(reasons[active], 'status:working');
+  assert.equal(reasons[pinned], 'pinned_by_config');
+  assert.equal(reasons[self], 'self');
+  assert.equal(reasons[ambiguous], 'status:running');
+  assert.equal(reasons[finished], 'status:finished');
+  assert.equal(reasons[internallyPinned], 'pinned');
+  assert.equal(skipped.some(s => s.id === 'operator-shell'), false);
+});
+
+test('hc kill address stays with the matched live row when finished rows reuse a name', () => {
+  const id = 'df-10286-af4c3b8f7d';
+  const { stoppable, skipped } = selectIdleHcTerminals([
+    { address: 't-live', name: id, state: 'live', status: 'idle' },
+    { address: 't-finished', name: id, state: 'finished', status: 'idle' },
+  ]);
+  assert.deepEqual(stoppable, [{ id, address: 't-live' }]);
+  assert.deepEqual(skipped, [{ id, reason: 'status:finished' }]);
+
+  const duplicates = selectIdleHcTerminals([
+    { address: 't-first', name: id, state: 'live', status: 'idle' },
+    { address: 't-second', name: id, state: 'live', status: 'idle' },
+  ]);
+  assert.deepEqual(duplicates.stoppable, []);
+  assert.deepEqual(duplicates.skipped, [
+    { id, reason: 'duplicate_live_name' },
+    { id, reason: 'duplicate_live_name' },
+  ]);
 });
 
 // --- Журнал JSONL 0600 ----------------------------------------------------------
@@ -653,6 +723,120 @@ test('RAM stop failure is journaled and the tick continues with other threads', 
   }
 });
 
+test('RAM below 1.5 GiB with runtime hc: kills only clean idle terminals through hc', async () => {
+  const root = await sandbox('ramhc');
+  try {
+    const idle = 'df-10286-af4c3b8f7d';
+    const active = 'df-10286-0123456789';
+    const terminals = [
+      { address: 't7', name: idle, state: 'live', status: 'idle' },
+      { address: 't8', name: active, state: 'live', status: 'working' },
+      { address: 't9', name: 'operator-shell', state: 'live', status: 'idle' },
+    ];
+    const hcCalls = [];
+    const bbCalls = [];
+    const summary = await runSteward({
+      runtime: 'hc',
+      mounts: ['/data'], statfsImpl: mountStat(bytesGiB(9n)),
+      memInfoImpl: async () => bytesGiB(1n),
+      tmpRoot: join(root, 'tmp'), cacheRoots: [], journalPath: join(root, 'j.jsonl'),
+      execDocker: async () => ({ code: 0, stdout: '', stderr: '' }),
+      execHc: async args => {
+        hcCalls.push(args);
+        if (args[0] === 'ls') return { code: 0, stdout: JSON.stringify({ terminals }), stderr: '' };
+        return { code: 0, stdout: '{"state":"finished"}', stderr: '' };
+      },
+      execBb: async args => { bbCalls.push(args); return { code: 0, stdout: '[]', stderr: '' }; },
+    });
+    assert.equal(summary.ram.low, true);
+    assert.equal(summary.ram.runtime, 'hc');
+    assert.equal(summary.ram.stopped, 1);
+    assert.deepEqual(hcCalls, [['ls', '--json'], ['kill', '--json', '--', 't7']]);
+    assert.deepEqual(bbCalls, []);
+    assert.ok(summary.ram.skipped.some(s => s.id === active && s.reason === 'status:working'));
+    const events = (await readFile(join(root, 'j.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.ok(events.some(e => e.event === 'ram_plan' && e.runtime === 'hc' && e.stopCount === 1));
+    assert.ok(events.some(e => e.event === 'ram_stop' && e.runtime === 'hc' && e.threadId === idle));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('auto runtime falls back to legacy bb shedding when hc inspection is unavailable', async () => {
+  const root = await sandbox('ramfallback');
+  try {
+    const bbCalls = [];
+    const summary = await runSteward({
+      runtime: 'auto',
+      mounts: ['/data'], statfsImpl: mountStat(bytesGiB(9n)),
+      memInfoImpl: async () => bytesGiB(1n),
+      tmpRoot: join(root, 'tmp'), cacheRoots: [], journalPath: join(root, 'j.jsonl'),
+      execDocker: async () => ({ code: 0, stdout: '', stderr: '' }),
+      execHc: async () => ({ code: 127, stdout: '', stderr: 'hc not found' }),
+      execBb: async args => {
+        bbCalls.push(args);
+        if (args[0] === 'thread' && args[1] === 'list') {
+          return { code: 0, stdout: JSON.stringify([thread('thr_idle01')]), stderr: '' };
+        }
+        return { code: 0, stdout: '{}', stderr: '' };
+      },
+    });
+    assert.equal(summary.ram.runtime, 'bb');
+    assert.equal(summary.ram.stopped, 1);
+    assert.deepEqual(bbCalls, [['thread', 'list', '--json'], ['thread', 'stop', 'thr_idle01']]);
+    const events = (await readFile(join(root, 'j.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.ok(events.some(e => e.event === 'ram_runtime_fallback' && e.from === 'hc' && e.to === 'bb'));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('explicit runtime hc does not fall back to bb after an hc inspection failure', async () => {
+  const root = await sandbox('ramhcfail');
+  try {
+    let bbCalls = 0;
+    const summary = await runSteward({
+      runtime: 'hc',
+      mounts: ['/data'], statfsImpl: mountStat(bytesGiB(9n)),
+      memInfoImpl: async () => bytesGiB(1n),
+      tmpRoot: join(root, 'tmp'), cacheRoots: [], journalPath: join(root, 'j.jsonl'),
+      execDocker: async () => ({ code: 0, stdout: '', stderr: '' }),
+      execHc: async () => ({ code: 2, stdout: '', stderr: 'hc unavailable' }),
+      execBb: async () => { bbCalls++; return { code: 0, stdout: '[]', stderr: '' }; },
+    });
+    assert.equal(summary.ram.stopped, 0);
+    assert.equal(summary.ram.errors, 1);
+    assert.equal(bbCalls, 0);
+    assert.ok(summary.errors.some(e => /ram: hc ls: hc unavailable/.test(e)));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('dry-run with runtime hc lists planned terminal kills without killing', async () => {
+  const root = await sandbox('dryhc');
+  try {
+    const idle = 'df-10286-af4c3b8f7d';
+    const hcCalls = [];
+    const summary = await runSteward({
+      dryRun: true, runtime: 'hc',
+      mounts: ['/data'], statfsImpl: mountStat(bytesGiB(9n)),
+      memInfoImpl: async () => bytesGiB(1n),
+      tmpRoot: join(root, 'tmp'), cacheRoots: [], journalPath: join(root, 'j.jsonl'),
+      execDocker: async () => ({ code: 0, stdout: '', stderr: '' }),
+      execHc: async args => {
+        hcCalls.push(args);
+        return { code: 0, stdout: JSON.stringify({ terminals: [{ address: 't7', name: idle, state: 'live', status: 'idle' }] }), stderr: '' };
+      },
+    });
+    assert.equal(summary.ram.runtime, 'hc');
+    assert.deepEqual(summary.ram.plannedStops, [idle]);
+    assert.deepEqual(hcCalls, [['ls', '--json']]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // --- Dry-run ----------------------------------------------------------------------
 
 test('dry-run: plan without any effect — nothing deleted, no docker, no stops, no escalation, no journal', async () => {
@@ -823,17 +1007,21 @@ test('default cache roots pin pip, uv and npm _cacache; never homedir itself', (
 
 test('parseArgv: flags, mounts and unknown flag rejection', () => {
   const flags = parseArgv(['--dry-run', '--journal', '/tmp/j.jsonl', '--mount', '/x', '--tmp-days', '3',
-    '--cache-days', '14', '--no-docker', '--bb', '/usr/bin/bb', '--escalate-cmd', '/bin/hook']);
+    '--cache-days', '14', '--no-docker', '--runtime', 'hc', '--bb', '/usr/bin/bb', '--hc', '/usr/local/bin/hc',
+    '--escalate-cmd', '/bin/hook']);
   assert.equal(flags.dryRun, true);
   assert.equal(flags.journalPath, '/tmp/j.jsonl');
   assert.deepEqual(flags.mounts, ['/x']);
   assert.equal(flags.tmpDays, 3);
   assert.equal(flags.cacheDays, 14);
   assert.equal(flags.dockerEnabled, false);
+  assert.equal(flags.runtime, 'hc');
   assert.equal(flags.bbPath, '/usr/bin/bb');
+  assert.equal(flags.hcPath, '/usr/local/bin/hc');
   assert.equal(flags.escalateCmd, '/bin/hook');
   assert.throws(() => parseArgv(['--bogus']), /unknown flag/);
   assert.throws(() => parseArgv(['--journal']), /missing value/);
+  assert.throws(() => parseArgv(['--runtime', 'pty']), /worker_runtime_kind_invalid/);
   assert.equal(Number.isNaN(parseArgv(['--tmp-days', 'abc']).tmpDays), true); // отбракует runSteward
 });
 

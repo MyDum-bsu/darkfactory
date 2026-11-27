@@ -4,8 +4,8 @@
 // политики без подъёма всего контроллера.
 import { realpath } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
-import { agyKeyringEnrolled, defaultReviewRoles, isLegacyPiReview, isNeonReview, isReviewSkillList,
-  isSolArbiter, NEON_PI_ARBITER, SOL_ARBITER } from './review-policy.mjs';
+import { agyKeyringEnrolled, defaultReviewRoles, isLegacyPiReview, isNeonArbiter, isNeonReview,
+  isReviewSkillList, NEON_PI_ARBITER, SOL_ARBITER } from './review-policy.mjs';
 import { l2CriticSpec } from './review-runner.mjs';
 import * as workerSelector from './worker-selector.mjs';
 
@@ -23,10 +23,13 @@ export async function operatorReviewSetup(policy, { env = process.env } = {}) {
   // ослабления нет.
   if (!neon && !isLegacyPiReview(critic)) throw new Error('Review profile is not approved');
   // Арбитр по умолчанию — третье независимое семейство под фактического
-  // критика: Neon-критик требует Sol-арбитра (совместимость acceptHeld),
-  // Pi/Sol-критик — Neon-арбитр через pi.
+  // критика: Neon-критик допускает утверждённого Sol- или Opus-арбитра
+  // (Board #11994; совместимость acceptHeld для Sol сохраняется), Pi/Sol-критик —
+  // Neon-арбитр через pi. Конкретный выбор ограничен строгой независимостью
+  // триады: OpenAI-исполнитель под Neon требует Opus-арбитра, Sol остаётся
+  // допустимым для исполнителей не-openai семейств.
   const arbiter = policy.arbiter ?? (neon ? SOL_ARBITER : NEON_PI_ARBITER);
-  if (neon && (!isSolArbiter(arbiter) || policy.route.taskId !== undefined || policy.policyDigest !== undefined)) {
+  if (neon && (!isNeonArbiter(arbiter) || policy.route.taskId !== undefined || policy.policyDigest !== undefined)) {
     throw new Error('Neon requires a subject-bound queue route, fingerprinted policy and Sol arbiter');
   }
   // Незакреплённый список навыков Neon-критика: дефолт наследует все

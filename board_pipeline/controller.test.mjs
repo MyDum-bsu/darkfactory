@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { advance } from './controller.mjs';
+import { advance, MAX_TRANSIENT_LEASE_FAILURES } from './controller.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { memoryBoardSdk } from './board-test-fixture.mjs';
@@ -909,7 +909,7 @@ test('arbiter accept_with_notes completes the card only through a full seal', as
   assert.equal(head.result.sha, BAD2);
   const record = await x.cfg.state.load();
   assert.equal(record.arbitration.decision, 'accept_with_notes');
-  assert.deepEqual(record.arbitration.arbiter, { provider: 'openai', model: 'gpt-6.2-sol' });
+  assert.deepEqual(record.arbitration.arbiter, { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' });
 });
 
 // Пункт 1: арбитрованное принятие никогда не обходит seal — грязный worktree,
@@ -1476,4 +1476,658 @@ test('a typed invalid handoff blocks as invalid instead of crashing verification
   assert.equal(out.reason, 'invalid_or_stale_submission');
   assert.equal((await x.inspect()).state, 'blocked');
   assert.equal(x.effects.verify, 0);
+});
+
+test('crash-resume resets the turn watermark so the fresh terminal turn 1 is accepted', async t => {
+  const x = await lab(t);
+  x.cfg.bb.resume = async packet => ({ resumed: true, threadId: packet.attempt.bb_thread_id });
+  let mode = 'crashed';
+  x.cfg.submissions.read = async (attempt, after) => {
+    if (mode === 'crashed') return { turnSeq: 1, completed: false, state: 'exited', exitCode: 1 };
+    // Свежий возобновлённый терминал нумерует ходы заново с 1: без сброса
+    // watermark'а ход 1 masked бы старым after=1 и никогда не дошёл бы.
+    return { turnSeq: 1, completed: true, state: 'idle', submission: {
+      task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+      worker_thread_id: attempt.bb_thread_id, candidate_sha: 'c'.repeat(40) } };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  // Первый терминал падает на ходе 1 — контроллер возобновляет воркера.
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  assert.equal(record.turnSeq, 0, 'watermark сброшен для свежего терминала');
+  assert.equal(record.crashResumes, 1);
+  assert.equal(record.receipt.kind, 'resume');
+  mode = 'fresh';
+  // Ход 1 свежего терминала принимается немедленно: verify и settle проходят.
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(x.effects.verify, 1);
+  assert.equal((await x.inspect()).result.sha, 'c'.repeat(40));
+});
+
+test('crash-resume reset does not swallow a later missing handoff as a legacy record', async t => {
+  const x = await lab(t);
+  x.cfg.bb.resume = async packet => ({ resumed: true, threadId: packet.attempt.bb_thread_id });
+  x.cfg.submissions.read = async (attempt, after) => ({
+    turnSeq: after + 1, completed: false, state: 'exited', exitCode: 1 });
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.cfg.state.load()).turnSeq, 0);
+  // Третий обрыв без resume: диагностика обязана различать свежий ход без
+  // handoff и повторный ход — crashResumes сохраняет это различие при after=0.
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_turn_finished_without_new_handoff');
+});
+
+test('recoverInterruptedChecking re-runs verify once when the live claim matches the epoch', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  await x.tick();
+  // Вытеснение Spot VM между записью checking и завершением verify(): кандидат
+  // зафиксирован, исход проверки неизвестен, но захват всё ещё наш на той же epoch.
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)] });
+  const out = await x.tick();
+  assert.equal(out.phase, 'done');
+  assert.equal(x.effects.verify, 1, 'verify() повторён ровно один раз');
+  assert.equal((await x.inspect()).state, 'completed');
+  assert.equal((await x.inspect()).result.sha, 'c'.repeat(40));
+  assert.equal((await x.cfg.state.load()).checkingRecovered, true);
+});
+
+test('recoverInterruptedChecking stays uncertain when epoch, state diverged or lookup fails', async t => {
+  for (const mutate of ['epoch', 'state', 'lookup_fails']) {
+    const x = await lab(t);
+    x.cfg.recoverInterruptedChecking = true;
+    await x.tick();
+    const record = await x.cfg.state.load();
+    const checking = { ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+      seenShas: ['c'.repeat(40)] };
+    if (mutate === 'epoch') checking.epoch = record.epoch + 1;
+    if (mutate === 'state') {
+      // Карточка уже заблокирована: live.state !== 'claimed' — повтор verify()
+      // был бы вторым эффектом поверх чужого результата.
+      await x.cfg.board.block(x.cfg.route.taskId, record.epoch, 'external block');
+    }
+    if (mutate === 'lookup_fails') {
+      const lookup = x.cfg.board.lookup.bind(x.cfg.board);
+      x.cfg.board.lookup = async (...args) => {
+        if (String(args[0]) === String(x.cfg.route.taskId)) throw new Error('board read lost');
+        return lookup(...args);
+      };
+    }
+    await x.cfg.state.save(checking);
+    const out = await x.tick();
+    assert.equal(out.phase, 'uncertain', mutate);
+    assert.equal(out.reason, 'interrupted_checking', mutate);
+    assert.equal(x.effects.verify, 0, `verify() не повторяется при ${mutate}`);
+  }
+});
+
+test('a repeated interruption of the same checking round is not recovered twice', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  await x.tick();
+  const record = await x.cfg.state.load();
+  // Маркер checkingRecovered уже стоит: повторное вытеснение того же раунда —
+  // строгий uncertain, а не бесконечный цикл перепроверки.
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)], checkingRecovered: true });
+  const out = await x.tick();
+  assert.equal(out.phase, 'uncertain');
+  assert.equal(out.reason, 'interrupted_checking');
+  assert.equal(x.effects.verify, 0);
+});
+
+test('without recoverInterruptedChecking an interrupted checking stays strictly uncertain', async t => {
+  const x = await lab(t);
+  await x.tick();
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)] });
+  const out = await x.tick();
+  assert.equal(out.phase, 'uncertain');
+  assert.equal(out.reason, 'interrupted_checking');
+  assert.equal(x.effects.verify, 0);
+});
+
+test('a terminal receipt on the interrupted checking record blocks recovery', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  await x.tick();
+  const record = await x.cfg.state.load();
+  // Терминальная квитанция результата означает завершённую обработку:
+  // повтор verify() был бы вторым внешним эффектом.
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)], receipt: { kind: 'block' } });
+  const out = await x.tick();
+  assert.equal(out.phase, 'uncertain');
+  assert.equal(out.reason, 'interrupted_checking');
+  assert.equal(x.effects.verify, 0);
+});
+
+// ── Core P1-6/P1-7 + worker_working_timeout: кросс-ревью регрессии ──
+
+test('a non-lease denied verification result blocks the card instead of orphaning it', async t => {
+  const x = await lab(t);
+  await x.tick();
+  x.cfg.verify = async () => ({ outcome: 'denied', reason: 'journal_subject_mismatch' });
+  x.submit('c');
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'journal_subject_mismatch');
+  assert.equal((await x.inspect()).state, 'blocked', 'карточка видимо заблокирована, не бесхозный hold');
+  const record = await x.cfg.state.load();
+  assert.equal(record.receipt?.kind, 'block');
+});
+
+test('lease-related denied verification results still become lease_lost without a block', async t => {
+  for (const reason of ['claim_not_held:409', 'claim_lost_before_review:gone', 'epoch_mismatch:2']) {
+    const x = await lab(t);
+    await x.tick();
+    x.cfg.verify = async () => ({ outcome: 'denied', reason });
+    x.submit('c');
+    const out = await x.tick();
+    assert.equal(out.phase, 'lease_lost', reason);
+    assert.notEqual((await x.inspect()).state, 'blocked', `без board.block при потерянной аренде: ${reason}`);
+  }
+});
+
+test('recoverInterruptedChecking passes a monotonic recoverySeq to verify as a controller argument', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  const seen = [];
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    seen.push(options);
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)] });
+  const out = await x.tick();
+  assert.equal(out.phase, 'done');
+  assert.deepEqual(seen, [{ recoverySeq: 1 }], 'первое восстановление — recoverySeq 1');
+  assert.equal((await x.cfg.state.load()).recoverySeq, 1, 'счётчик персистентен в записи попытки');
+});
+
+test('recoverySeq increments monotonically across interrupted rounds of one attempt', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  let captured;
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    captured = options;
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  const record = await x.cfg.state.load();
+  // Ранняя прерванная проверка уже восстанавливалась однажды (recoverySeq 1):
+  // следующее восстановление обязано увеличить счётчик, а не начать заново.
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)], recoverySeq: 1 });
+  const out = await x.tick();
+  assert.equal(out.phase, 'done');
+  assert.deepEqual(captured, { recoverySeq: 2 });
+  assert.equal((await x.cfg.state.load()).recoverySeq, 2);
+});
+
+test('a plain working-phase verify call carries no recoverySeq argument', async t => {
+  const x = await lab(t);
+  let captured = { sentinel: true };
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    captured = options;
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(captured, undefined, 'первичная проверка не несёт счётчик восстановления');
+});
+
+test('a stuck worker is stopped and the card blocked once the working wall-clock budget is exceeded', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  x.cfg.workingTimeoutMs = 5_000;
+  const stopped = [];
+  x.cfg.bb.stop = async id => {
+    stopped.push(id);
+    return { stopped: true };
+  };
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.tick()).phase, 'working', 'свежая попытка в бюджете');
+  const record = await x.cfg.state.load();
+  assert.ok(Number.isFinite(record.workingSince), 'часы фазы working зафиксированы в записи');
+  t.mock.timers.tick(4_000);
+  assert.equal((await x.tick()).phase, 'working', 'бюджет ещё не исчерпан');
+  assert.equal(stopped.length, 0);
+  t.mock.timers.tick(2_000);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_working_timeout');
+  assert.deepEqual(stopped, ['thr_fixture'], 'зависший воркер остановлен до блока');
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('the working timeout default is ninety minutes and a submitted turn is never killed', async t => {
+  const x = await lab(t);
+  await x.tick();
+  assert.equal((await x.tick()).phase, 'working');
+  // Бюджет по умолчанию — 90 минут: часы записи отматываются детерминированно,
+  // без гонки с тридцатисекундной арендой фикстуры.
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, workingSince: Date.now() - 89 * 60 * 1000 });
+  assert.equal((await x.tick()).phase, 'working', '89 минут без хода — ещё в бюджете');
+  // Сдавшийся вовремя воркер не наказывается таймаутом ожидания: ход обрабатывается.
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+});
+
+test('the working timeout fires past the default ninety minutes for a silent worker', async t => {
+  const x = await lab(t);
+  await x.tick();
+  assert.equal((await x.tick()).phase, 'working');
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, workingSince: Date.now() - 91 * 60 * 1000 });
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_working_timeout');
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('a failing bb.stop does not cancel the working-timeout block', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  x.cfg.workingTimeoutMs = 1_000;
+  x.cfg.bb.stop = async () => { throw new Error('transport lost'); };
+  await x.tick();
+  await x.tick();
+  t.mock.timers.tick(2_000);
+  const out = await x.tick();
+  assert.equal(out.phase, 'hold');
+  assert.equal(out.reason, 'worker_working_timeout');
+  assert.equal((await x.inspect()).state, 'blocked');
+});
+
+test('the working clock survives a restart instead of resetting on adopt', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  x.cfg.workingTimeoutMs = 10_000;
+  await x.tick();
+  await x.tick();
+  const first = await x.cfg.state.load();
+  t.mock.timers.tick(6_000);
+  // Рестарт контроллера: адаптер пустой, запись та же — часы не обнуляются.
+  x.cfg.board = nativeBoardPort(x.handle, { channel: 'pilot' });
+  assert.equal((await x.tick()).phase, 'working');
+  const resumed = await x.cfg.state.load();
+  assert.equal(resumed.workingSince, first.workingSince, 'wall-clock монотонен через рестарт');
+  t.mock.timers.tick(5_000);
+  const out = await x.tick();
+  assert.equal(out.reason, 'worker_working_timeout');
+});
+
+test('an invalid workingTimeoutMs is rejected before any effect', async t => {
+  const x = await lab(t);
+  for (const bad of [0, -1, NaN, Infinity]) {
+    x.cfg.workingTimeoutMs = bad;
+    await assert.rejects(() => x.tick(), /enrolled route/);
+    assert.equal(x.effects.spawn, 0);
+  }
+});
+
+// --- Astra #15 (P1): policyDigest слота — часть queue-допуска ---
+test('queue mode with a pinned policyDigest never claims a card of a foreign policy', async t => {
+  // Карточка поставлена под policy_digest = 'b'×64 (CONTRACT): совпадение —
+  // захват, чужой дайджест слота — 0 эффектов, карточка остаётся ready.
+  const foreign = await queueLab(t);
+  foreign.route.policyDigest = 'f'.repeat(64);
+  assert.equal((await foreign.tick()).phase, 'idle');
+  assert.equal(foreign.seen.claim, 0, 'слот с чужой политикой не крадёт карточку');
+  assert.equal((await foreign.card(0)).state, 'ready');
+
+  const own = await queueLab(t);
+  own.route.policyDigest = CONTRACT.policy_digest;
+  assert.equal((await own.tick()).phase, 'working');
+  assert.equal(own.seen.claim, 1, 'совпадающий policy_digest допускается');
+  own.submit('c');
+  assert.equal((await own.tick()).phase, 'done');
+
+  // Без закреплённого policyDigest маршрута — прежний допуск (совместимость).
+  const legacy = await queueLab(t);
+  assert.equal((await legacy.tick()).phase, 'working');
+  assert.equal(legacy.seen.claim, 1);
+});
+
+// --- Astra #23 (P2): класс размера карточки доезжает до scorecard-роутинга ---
+test('queue mode pins canonical lowercase size classes into the contract labels', async t => {
+  for (const [label, expected] of [['S', 's'], ['M', 'm'], ['L', 'l'], ['s', 's']]) {
+    const x = await queueLab(t, { labels: { ...CONTRACT, size: label } });
+    await x.tick();
+    const record = await x.cfg.state.load();
+    assert.equal(record.contract.labels.size, expected, `size ${label} → ${expected}`);
+    x.submit('c');
+    await x.tick();
+    assert.equal(x.effects.attempts.at(-1).labels.size, expected);
+  }
+  // Неканоничный/мусорный размер не закрепляется — прежний откат в unknown.
+  for (const bad of ['XL', 'medium', '1', '']) {
+    const x = await queueLab(t, { labels: { ...CONTRACT, size: bad } });
+    await x.tick();
+    const record = await x.cfg.state.load();
+    assert.equal(record.contract.labels.size, undefined, `size ${JSON.stringify(bad)} не закрепляется`);
+  }
+  // Без метки размера labels пусты, как раньше.
+  const plain = await queueLab(t);
+  await plain.tick();
+  assert.deepEqual((await plain.cfg.state.load()).contract.labels, {});
+});
+
+// --- Astra #16 (P1): транзитные сбои обновления аренды не теряют попытку ---
+function transientBoardError(statusCode) {
+  const error = new Error(statusCode === null ? 'temporary network timeout' : `HTTP ${statusCode}`);
+  if (statusCode !== null) error.statusCode = statusCode;
+  return error;
+}
+
+function breakRenewal(x, failures) {
+  let left = failures;
+  const verifyHeld = x.cfg.board.verifyHeld.bind(x.cfg.board);
+  x.cfg.board.verifyHeld = async (...args) => {
+    if (left > 0) {
+      left--;
+      throw transientBoardError(left % 2 === 0 ? 503 : null);
+    }
+    return verifyHeld(...args);
+  };
+  return { verifyHeld };
+}
+
+test('a single transient 503/timeout renewal failure retains the attempt and recovers', async t => {
+  const x = await lab(t);
+  await x.tick();
+  assert.equal((await x.tick()).phase, 'working');
+  breakRenewal(x, 2);
+  // Два подряд транзитных сбоя: попытка остаётся working, карточка захвачена,
+  // счётчик растёт — никакого lease_lost и никакого второго spawn.
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 1);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 2);
+  assert.equal((await x.inspect()).state, 'claimed');
+  assert.equal(x.effects.spawn, 1);
+  assert.equal(x.effects.verify, 0);
+  // Board восстановился: обновление проходит, счётчик сброшен, сдача принимается.
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 0);
+  assert.equal((await x.inspect()).result.sha, 'c'.repeat(40));
+});
+
+test('definitive claim loss still journals lease_lost immediately on the first tick', async t => {
+  const x = await lab(t);
+  await x.tick();
+  const verifyHeld = x.cfg.board.verifyHeld.bind(x.cfg.board);
+  x.cfg.board.verifyHeld = async (...args) => {
+    const error = new Error('claim_lost');
+    error.code = 'claim_lost';
+    error.statusCode = 409;
+    throw error;
+  };
+  void verifyHeld;
+  assert.equal((await x.tick()).phase, 'lease_lost');
+  const record = await x.cfg.state.load();
+  assert.equal(record.phase, 'lease_lost');
+  assert.equal(record.reason, 'no_verified_claim_keep_worktree_reserved');
+});
+
+test('bounded consecutive transient failures end in lease_lost without ever verifying', async t => {
+  const x = await lab(t);
+  await x.tick();
+  breakRenewal(x, MAX_TRANSIENT_LEASE_FAILURES + 3);
+  for (let count = 1; count < MAX_TRANSIENT_LEASE_FAILURES; count++) {
+    assert.equal((await x.tick()).phase, 'working', `повтор ${count} ещё не терминален`);
+    assert.equal((await x.cfg.state.load()).transientLeaseFailures, count);
+  }
+  const out = await x.tick();
+  assert.equal(out.phase, 'lease_lost');
+  assert.equal(out.reason, 'lease_renewal_transient_failures_exhausted');
+  assert.equal(x.effects.spawn, 1);
+  assert.equal(x.effects.verify, 0);
+  // Повторный тик не воскрешает попытку.
+  assert.equal((await x.tick()).phase, 'lease_lost');
+});
+
+test('transient failures past the lease expiry journal lease_lost instead of endless retry', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  await x.tick();
+  breakRenewal(x, 100);
+  assert.equal((await x.tick()).phase, 'working');
+  // Аренда лаборатории — 30 секунд: после истечения повторять нечего.
+  t.mock.timers.tick(31_000);
+  const out = await x.tick();
+  assert.equal(out.phase, 'lease_lost');
+  assert.equal(out.reason, 'lease_expired_during_transient_renewal_failure');
+});
+
+// --- Review P1 (controller.mjs:556): fail-closed — повторяются только распознанные
+// транзитные сбои; потеря владения adopt() и не-транзитные 4xx терминальны сразу ---
+test('a lost-ownership adopt failure journals lease_lost on the very first tick', async t => {
+  // Реальная форма ошибки adopt() при потере карточки (release/block/complete или
+  // захват другой эпохой): даже без кода она не является транзитным сбоем Board.
+  for (const shape of [
+    () => new Error('Held epoch no longer owns the card'),
+    () => Object.assign(new Error('Held epoch no longer owns the card'), { code: 'epoch_mismatch' }),
+  ]) {
+    const y = await lab(t);
+    await y.tick();
+    y.cfg.board.adopt = async () => { throw shape(); };
+    const out = await y.tick();
+    assert.equal(out.phase, 'lease_lost', 'первый же тик — терминал, без 4 повторов в working');
+    assert.equal(out.reason, 'no_verified_claim_keep_worktree_reserved');
+    assert.equal((await y.cfg.state.load()).transientLeaseFailures ?? 0, 0);
+    assert.equal((await y.tick()).phase, 'lease_lost', 'терминал устойчив');
+  }
+});
+
+test('non-transient 4xx and capability errors are terminal immediately, never retried', async t => {
+  for (const [name, make] of [
+    ['HTTP 400', () => Object.assign(new Error('HTTP 400'), { statusCode: 400 })],
+    ['HTTP 401', () => Object.assign(new Error('HTTP 401'), { statusCode: 401 })],
+    ['HTTP 403', () => Object.assign(new Error('HTTP 403'), { statusCode: 403 })],
+    ['HTTP 404', () => Object.assign(new Error('HTTP 404'), { statusCode: 404 })],
+    ['capability revoked', () => new Error('no native claim is held for this attempt')],
+  ]) {
+    const x = await lab(t);
+    await x.tick();
+    const failure = make();
+    x.cfg.board.verifyHeld = async () => { throw failure; };
+    const out = await x.tick();
+    assert.equal(out.phase, 'lease_lost', `${name}: немедленный терминал`);
+    assert.equal(out.reason, 'no_verified_claim_keep_worktree_reserved', name);
+    assert.equal(x.effects.spawn, 1, `${name}: нет повторного spawn`);
+  }
+});
+
+// --- Review P1 (controller.mjs:559): record.until обновляется из proof.until ---
+test('successful renewals refresh record.until so a transient failure past the initial lease window retries', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  await x.tick();
+  const initial = (await x.cfg.state.load()).until;
+  assert.ok(Number.isFinite(Date.parse(initial)), 'until зафиксирован при захвате');
+  // Аренда лаборатории 30 секунд: через 20 секунд обновление продлевает её до t0+50.
+  t.mock.timers.tick(20_000);
+  assert.equal((await x.tick()).phase, 'working');
+  const renewed = (await x.cfg.state.load()).until;
+  assert.notEqual(renewed, initial, 'record.until следует за фактическим продлением аренды');
+  assert.ok(Date.parse(renewed) > Date.parse(initial), 'продление двигает истечение вперёд');
+  // Теперь за пределами ПЕРВОНАЧАЛЬНОГО окна (t0+30), но внутри продлённой аренды:
+  // одиночный транзитный 503/timeout обязан удержать попытку, а не истечь ложно.
+  t.mock.timers.tick(15_000); // t0+35: initial уже в прошлом
+  assert.ok(Date.now() >= Date.parse(initial), 'исходное окно аренды истекло');
+  assert.ok(Date.now() < Date.parse(renewed), 'продлённая аренда действует');
+  breakRenewal(x, 1);
+  assert.equal((await x.tick()).phase, 'working', 'транзитный сбой после первого окна — повтор, не терминал');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 1);
+  // Board восстановился: счётчик сброшен, until вновь продлевается, сдача проходит.
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 0);
+});
+
+test('record.until tracks every successful renewal monotonically with the lease window', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  await x.tick();
+  let previous = (await x.cfg.state.load()).until;
+  for (const step of [10_000, 10_000, 5_000]) {
+    t.mock.timers.tick(step);
+    assert.equal((await x.tick()).phase, 'working');
+    const current = (await x.cfg.state.load()).until;
+    assert.ok(Date.parse(current) > Date.parse(previous), 'каждое продление обновляет until');
+    previous = current;
+  }
+  // Без mock-времени until не протухает и без движения часов.
+  const plain = await lab(t);
+  await plain.tick();
+  const first = (await plain.cfg.state.load()).until;
+  await plain.tick();
+  assert.equal(typeof (await plain.cfg.state.load()).until, 'string');
+  assert.ok(Number.isFinite(Date.parse(first)));
+});
+
+// ── Astra post-fix audit: validated notes/dispute replay + writerStartedAt ──
+
+test('checking phase persists validated submission notes and dispute in the durable record', async t => {
+  const x = await lab(t);
+  await x.tick();
+  const envelopes = [];
+  x.cfg.submissions = { async read(attempt, after) {
+    if (after < 1) return { turnSeq: 1, submission: {
+      task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+      worker_thread_id: attempt.bb_thread_id, candidate_sha: 'c'.repeat(40),
+      notes: ['postоронняя\u0007 находка   с\tпробелами'],
+      dispute: { finding_ref: 'f1', justification: 'не воспроизводится', spec_evidence: 'пункт 2 спеки' },
+    } };
+  } };
+  const snapshots = [];
+  const save0 = x.cfg.state.save;
+  x.cfg.state.save = async value => {
+    if (value?.phase === 'checking') snapshots.push(structuredClone(value));
+    return save0(value);
+  };
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(snapshots.length, 1, 'запись checking зафиксирована ровно один раз');
+  assert.deepEqual(snapshots[0].submissionNotes, ['postоронняя находка с пробелами'],
+    'заметки закрепляются в валидированной санитизированной форме');
+  assert.deepEqual(snapshots[0].submissionDispute,
+    { finding_ref: 'f1', justification: 'не воспроизводится', spec_evidence: 'пункт 2 спеки' });
+});
+
+test('a checking round without notes or dispute clears the pinned values of the previous round', async t => {
+  const x = await lab(t);
+  await x.tick();
+  // Раунд 1: сдача с заметками и спором — красный L1 (sha 'b…'), rework.
+  // Раунд 2: сдача без них — ключи записи обязаны быть сброшены, иначе
+  // восстановление реконструировало бы конверт с чужими заметками.
+  let round = 1;
+  const envelope = (attempt, sha, extra = {}) => ({
+    task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+    worker_thread_id: attempt.bb_thread_id, candidate_sha: sha, ...extra,
+  });
+  x.cfg.submissions = { async read(attempt, after) {
+    if (round === 1 && after === 0) {
+      return { turnSeq: 1, submission: envelope(attempt, 'b'.repeat(40), {
+        notes: ['вне_scope находка'],
+        dispute: { finding_ref: 'f1', justification: 'j', spec_evidence: 's' } }) };
+    }
+    if (round === 2 && after === 1) {
+      return { turnSeq: 2, submission: envelope(attempt, 'c'.repeat(40)) };
+    }
+  } };
+  const snapshots = [];
+  const save0 = x.cfg.state.save;
+  x.cfg.state.save = async value => {
+    if (value?.phase === 'checking' && value.sha) snapshots.push(structuredClone(value));
+    return save0(value);
+  };
+  await x.tick(); // раунд 1: checking(b…) → rework → feedback
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(snapshots[0].submissionNotes, ['вне_scope находка']);
+  assert.deepEqual(snapshots[0].submissionDispute, { finding_ref: 'f1', justification: 'j', spec_evidence: 's' });
+  round = 2;
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(snapshots.length, 2);
+  assert.equal(snapshots[1].submissionNotes, undefined, 'заметки прошлого раунда сброшены');
+  assert.equal(snapshots[1].submissionDispute, undefined, 'спор прошлого раунда сброшен');
+  assert.equal(Object.hasOwn(snapshots[1], 'submissionNotes'), true,
+    'сброс пишется явным undefined-ключом патча, а не отсутствием ключа');
+});
+
+test('recoverInterruptedChecking replays validated notes and dispute into the re-run verify', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  const seen = [];
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    seen.push(structuredClone(submission));
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)],
+    submissionNotes: ['вне_scope находка передана заметкой'],
+    submissionDispute: { finding_ref: 'f3', justification: 'не относится к diff', spec_evidence: 'спека §3' } });
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(seen.length, 1, 'verify повторён ровно один раз');
+  assert.deepEqual(seen[0].notes, ['вне_scope находка передана заметкой']);
+  assert.deepEqual(seen[0].dispute,
+    { finding_ref: 'f3', justification: 'не относится к diff', spec_evidence: 'спека §3' });
+  assert.equal(seen[0].candidate_sha, 'c'.repeat(40));
+});
+
+test('a replayed checking recovery without pinned notes submits no notes at all', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  const seen = [];
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    seen.push(structuredClone(submission));
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)] });
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(Object.hasOwn(seen[0], 'notes'), false, 'без закреплённых заметок конверт их не несёт');
+  assert.equal(Object.hasOwn(seen[0], 'dispute'), false);
+});
+
+test('writerStartedAt is pinned once at launch and survives renewals and a restart', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  await x.tick();
+  const first = await x.cfg.state.load();
+  assert.ok(Number.isFinite(first.writerStartedAt), 'якорь писателя закреплён при запуске');
+  t.mock.timers.tick(9_000);
+  // Продление аренды двигает until, но никогда — writerStartedAt.
+  await x.tick();
+  const renewed = await x.cfg.state.load();
+  assert.equal(renewed.writerStartedAt, first.writerStartedAt, 'якорь неизменен при продлении аренды');
+  assert.notEqual(renewed.until, first.until, 'until продления действительно сдвинулся');
+  // Рестарт контроллера: адаптер пустой, запись та же — якорь не пересоздаётся.
+  x.cfg.board = nativeBoardPort(x.handle, { channel: 'pilot' });
+  t.mock.timers.tick(5_000);
+  await x.tick();
+  assert.equal((await x.cfg.state.load()).writerStartedAt, first.writerStartedAt);
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
 });

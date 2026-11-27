@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, readdir, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
@@ -9,6 +9,16 @@ const IMAGE = /^sha256:[a-f0-9]{64}$/;
 const HOLDOUT_MAX_FILES = 64;
 const HOLDOUT_MAX_FILE_BYTES = 1024 * 1024;
 const HOLDOUT_MAX_TOTAL_BYTES = 8 * 1024 * 1024;
+// Ресурсные рамки контейнера прогона: без них runaway-сценарий голодает
+// хост по памяти/pids/cpu, а при таймауте execFile убивает лишь docker
+// CLI — контейнер продолжает жить. Дефолты консервативны и перекрываются
+// вызывающим; имя уникально на прогон, чтобы cleanup в finally всегда
+// адресовал ровно этот контейнер.
+const HOLDOUT_MEMORY_DEFAULT = '2g';
+const HOLDOUT_PIDS_LIMIT_DEFAULT = 256;
+const HOLDOUT_CPUS_DEFAULT = 2;
+const HOLDOUT_MEMORY = /^[1-9][0-9]{0,5}[bkmg]$/i;
+const HOLDOUT_CONTAINER_NAME = /^df-holdout-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CONTROL = /[\x00-\x1f\x7f]/;
 const ANSI = /(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\))/g;
 const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
@@ -119,22 +129,40 @@ function safeDockerRecipe({ image, argv, cwd = '/candidate' } = {}) {
 }
 
 // Docker argv is data, never shell text. The private catalog is the only extra
-// mount and it is read-only at /holdouts.
-export function buildHoldoutDockerArgv({ holdoutDir, image, argv, cwd = '/candidate' } = {}) {
+// mount and it is read-only at /holdouts. Resource bounds are explicit on every
+// run and the container carries a unique df-holdout-<uuid> name so the finally
+// cleanup can address exactly this container even when the CLI is killed on
+// timeout. Bounds are validated as strict scalar shapes: they are data tokens
+// of argv, never shell text, and a malformed value fails closed before spawn.
+export function buildHoldoutDockerArgv({ holdoutDir, image, argv, cwd = '/candidate',
+  memory = HOLDOUT_MEMORY_DEFAULT, pidsLimit = HOLDOUT_PIDS_LIMIT_DEFAULT,
+  cpus = HOLDOUT_CPUS_DEFAULT, name } = {}) {
   if (!isAbsolute(holdoutDir ?? '') || /[\x00-\x1f\x7f,]/.test(holdoutDir)) throw fail('holdout_dir_invalid');
   const recipe = safeDockerRecipe({ image, argv, cwd });
+  if (!HOLDOUT_MEMORY.test(memory ?? '') ||
+      !Number.isSafeInteger(pidsLimit) || pidsLimit < 1 || pidsLimit > 65536 ||
+      typeof cpus !== 'number' || !Number.isFinite(cpus) || cpus <= 0 || cpus > 64) {
+    throw fail('holdout_recipe_invalid');
+  }
+  const container = name ?? `df-holdout-${randomUUID()}`;
+  if (!HOLDOUT_CONTAINER_NAME.test(container)) throw fail('holdout_recipe_invalid');
   return ['run', '--rm', '--pull=never', '--network=none', '--read-only',
     '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534',
+    `--memory=${memory}`, `--pids-limit=${pidsLimit}`, `--cpus=${cpus}`,
+    '--name', container,
     '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,size=64m', '-e', 'HOME=/tmp',
     '--mount', `type=bind,src=${holdoutDir},dst=/holdouts,readonly`,
     '--workdir', recipe.cwd, recipe.image, ...recipe.argv];
 }
 
 export async function runHoldoutL3({ holdoutDir, worktree, image, argv, cwd = '/candidate',
-  timeoutMs = 120_000, execDocker = exec } = {}) {
+  timeoutMs = 120_000, memory = HOLDOUT_MEMORY_DEFAULT, pidsLimit = HOLDOUT_PIDS_LIMIT_DEFAULT,
+  cpus = HOLDOUT_CPUS_DEFAULT, name, execDocker = exec } = {}) {
   const canonical = await validateHoldoutDir(holdoutDir, worktree);
   const provenance = await holdoutDigest(canonical);
-  const args = buildHoldoutDockerArgv({ holdoutDir: canonical, image, argv, cwd });
+  const container = name ?? `df-holdout-${randomUUID()}`;
+  const args = buildHoldoutDockerArgv({ holdoutDir: canonical, image, argv, cwd,
+    memory, pidsLimit, cpus, name: container });
   let exit = 0;
   let output = '';
   try {
@@ -143,6 +171,14 @@ export async function runHoldoutL3({ holdoutDir, worktree, image, argv, cwd = '/
   } catch (error) {
     exit = typeof error.code === 'number' ? error.code : null;
     output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+  } finally {
+    // Таймаут/отказ docker CLI оставляет контейнер живым даже с --rm:
+    // execFile убивает клиента, не контейнер. Уникальное имя адресует
+    // ровно этот прогон; сбой cleanup (контейнер уже удалён через --rm,
+    // daemon недоступен) не маскирует результат прогона.
+    try {
+      await execDocker('docker', ['rm', '-f', container], { timeout: 30_000, maxBuffer: 1024 * 1024 });
+    } catch { /* cleanup best-effort: контейнер уже удалён или daemon недоступен */ }
   }
   const feedback = sanitizeHoldoutFeedback(parseStructuredOutput(output));
   const workerFeedback = exit !== 0 && !feedback.failures.length

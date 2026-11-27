@@ -2,6 +2,13 @@ export const NEON_ISOLATION = 'docker-ro-pack+host-agy-rotools-v2';
 export const NEON_CRITIC = Object.freeze({ provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' });
 export const SOL_ARBITER = Object.freeze({ provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' });
 
+// Anthropic-арбитр Neon-маршрутов (Board #11994): допускает first-class
+// OpenAI-воркеров (pi + openai/gpt-6.2-astra) под Neon-критиком — семейство
+// anthropic независимо и от executor openai, и от critic google, поэтому
+// строгая триада трёх различных известных семейств сохраняется там, где
+// Sol-арбитр (openai) конфликтовал бы с OpenAI-исполнителем.
+export const OPUS_ARBITER = Object.freeze({ provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'medium' });
+
 // Дефолтная пара без зачисленного keyring: исторический Pi/Sol-критик и
 // Neon-арбитр через pi-egress (host-agy/keyring не нужен — арбитр идёт
 // изолированным pi-раннером на egress generativelanguage.googleapis.com).
@@ -41,6 +48,19 @@ export function isNeonReview(review) {
 export function isSolArbiter(arbiter) {
   return arbiter?.provider === SOL_ARBITER.provider && arbiter.model === SOL_ARBITER.model &&
     ['medium', 'high'].includes(arbiter.reasoningLevel);
+}
+
+export function isOpusArbiter(arbiter) {
+  return arbiter?.provider === OPUS_ARBITER.provider && arbiter.model === OPUS_ARBITER.model &&
+    ['medium', 'high'].includes(arbiter.reasoningLevel);
+}
+
+// Утверждённый арбитр Neon-reviewed маршрута: Sol (openai) или Opus
+// (anthropic), оба с reasoningLevel medium|high. Допуск арбитра здесь —
+// только разрешение формы; независимость триады из трёх различных известных
+// семейств по-прежнему доказывается assertTriadIndependent отдельно.
+export function isNeonArbiter(arbiter) {
+  return isSolArbiter(arbiter) || isOpusArbiter(arbiter);
 }
 
 export function isReviewSkillList(skills) {

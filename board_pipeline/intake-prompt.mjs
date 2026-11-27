@@ -108,13 +108,19 @@ export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQ
       'Only for one remaining product fork, pass question instead of candidate_sha: {"prompt":"one specific question","evidence":"brief justification"}. Do not include secrets or raw logs.');
   }
   const basePrompt = [...instructions, 'Do not touch other threads or boards.', ''].join('\n');
-  if (executor === undefined || executor === null) return basePrompt;
+  // Scope Fence эмитится безусловно при наличии allowedPaths (F-08): воркер
+  // без family-shaping (executor == null) получает тот же жёсткий периметр,
+  // а невалидный список путей отклоняется fail-closed в любом режиме.
+  const fence = allowedPaths === undefined || allowedPaths === null
+    ? null
+    : scopeFencePromptBlock(allowedPaths);
+  if (executor === undefined || executor === null) {
+    return fence === null ? basePrompt : `${basePrompt}\n${fence}\n`;
+  }
   return formatWorkerPrompt({
     family: resolveModelFamily(executor),
     basePrompt,
-    scopeFenceBlock: allowedPaths === undefined || allowedPaths === null
-      ? undefined
-      : scopeFencePromptBlock(allowedPaths),
+    scopeFenceBlock: fence ?? undefined,
   });
 }
 

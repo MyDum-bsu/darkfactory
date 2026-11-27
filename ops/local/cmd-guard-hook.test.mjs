@@ -58,12 +58,20 @@ test('--stdin-json accepts direct command and shell tool payload forms', async (
   for (const payload of [
     { command: 'npm test' },
     { toolCall: { name: 'shell', args: { command: 'npm test' } } },
-    { toolCall: { name: 'bash', args: { command: 'git push --force-with-lease' } } },
+    { toolCall: { name: 'bash', args: { command: 'git push origin feat/example --force-with-lease' } } },
   ]) {
     const result = await runHook(['--stdin-json'], JSON.stringify(payload));
     assert.equal(result.code, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), { decision: 'allow' });
   }
+});
+
+test('--stdin-json denies force-with-lease pushes without an explicit destination', async () => {
+  const result = await runHook(['--stdin-json'], JSON.stringify({
+    toolCall: { name: 'bash', args: { command: 'git push --force-with-lease' } },
+  }));
+  assert.equal(result.code, 2, result.stderr);
+  assert.equal(JSON.parse(result.stdout).decision, 'deny');
 });
 
 test('--stdin-json denies red-team shell payload before execution', async () => {

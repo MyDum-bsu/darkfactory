@@ -42,6 +42,27 @@ const STRONG_ASSERT = /\bassert[\w.]*\s*\([^)]*(?:==|!=|>=|<=|>|<|\b(?:not\s+)?i
 // Тривиальное утверждение на месте содержательного — ослабление, а не проверка.
 const TRIVIAL_ASSERT = /\bassert\s*\(\s*(?:true|1)\s*\)|\bassert\s+True\b|\bexpect\s*\(\s*true\s*\)|\.assertTrue\s*\(\s*True/;
 const ASSERT_TAUTOLOGY = /\|\|\s*(?:true|1)\b|\b(?:true|1)\b\s*\|\||\bor\s+True\b/;
+// Тавтология сравнения литерала с самим собой: assert.strictEqual(1, 1),
+// assert.equal("a", "a"), expect(1).toBe(1) — проверка не проверяет ничего.
+const LIT_SRC = String.raw`-?\d+(?:\.\d+)?|true|false|null|undefined|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'`;
+const ASSERT_SAME_LIT = new RegExp(
+  String.raw`\bassert\s*\.\s*(?:strictEqual|equal|deepEqual|deepStrictEqual)\s*\(\s*(${LIT_SRC})\s*,\s*(${LIT_SRC})\s*\)`);
+const EXPECT_SAME_LIT = new RegExp(
+  String.raw`\bexpect\s*\(\s*(${LIT_SRC})\s*\)\s*\.\s*(?:toBe|toEqual|toStrictEqual)\s*\(\s*(${LIT_SRC})\s*\)`);
+const canonLiteral = (lit) => {
+  const t = String(lit).trim();
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    return t.slice(1, -1);
+  }
+  return t;
+};
+const isIdenticalLiteralAssert = (text) => {
+  for (const rule of [ASSERT_SAME_LIT, EXPECT_SAME_LIT]) {
+    const m = rule.exec(text);
+    if (m && canonLiteral(m[1]) === canonLiteral(m[2])) return true;
+  }
+  return false;
+};
 // Сравнение с числовым порогом внутри проверки: `>= 10`, `=== 5`, `< 0.5`.
 const CMP_BOUND = /(===|!==|==|!=|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)/g;
 // Файлы, из которых запускаются проверки.
@@ -81,15 +102,35 @@ const operandKey = (text, index) => {
   return left.slice(cut + sepLen).replace(/\s+/g, '');
 };
 
+// Разбор блочных комментариев с учётом строковых литералов: '/*' внутри
+// "..." или '...' — содержимое строки, а не начало комментария, иначе
+// удалённая строка вида const s = "/*" маскировала бы все последующие
+// удалённые тесты и проверки под видом закомментированных.
 const stripBlockCommented = (text, inBlock) => {
   let out = '';
   let state = inBlock;
+  let quote = null;
   for (let i = 0; i < text.length; i++) {
     if (state) {
       if (text[i] === '*' && text[i + 1] === '/') {
         state = false;
         i++;
       }
+      continue;
+    }
+    if (quote !== null) {
+      out += text[i];
+      if (text[i] === '\\') {
+        if (i + 1 < text.length) out += text[i + 1];
+        i++;
+        continue;
+      }
+      if (text[i] === quote) quote = null;
+      continue;
+    }
+    if (text[i] === '"' || text[i] === "'" || text[i] === '`') {
+      quote = text[i];
+      out += text[i];
       continue;
     }
     if (text[i] === '/' && text[i + 1] === '*') {
@@ -124,15 +165,15 @@ function parseDiffTree(raw) {
 export function analyzeDiffTree(raw, { allowTestDeletion = false } = {}) {
   const violations = [];
   for (const { oldMode, newMode, status, oldPath, path } of parseDiffTree(raw)) {
-    if (!allowTestDeletion) {
-      if (status === 'D' && isTest(path)) {
-        violations.push({ kind: 'test_file_deleted', file: path, line: 0,
-          detail: `deleted test file ${path}` });
-      }
-      if (status === 'R' && isTest(oldPath) && !isTest(path)) {
-        violations.push({ kind: 'test_file_deleted', file: oldPath, line: 0,
-          detail: `test file ${oldPath} renamed to ${path}` });
-      }
+    // Допуск действует строго на удалённые файлы (status D): переименование
+    // теста вне discovery — не удаление по решению оператора, а маскировка.
+    if (!allowTestDeletion && status === 'D' && isTest(path)) {
+      violations.push({ kind: 'test_file_deleted', file: path, line: 0,
+        detail: `deleted test file ${path}` });
+    }
+    if (status === 'R' && isTest(oldPath) && !isTest(path)) {
+      violations.push({ kind: 'test_file_deleted', file: oldPath, line: 0,
+        detail: `test file ${oldPath} renamed to ${path}` });
     }
     const subject = isTest(path) ? path : isTest(oldPath) ? oldPath : null;
     if (subject !== null && newMode !== '000000' && oldMode !== newMode &&
@@ -155,6 +196,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
   let file = null;
   let inHunk = false;
   let testHunk = false;
+  let isDeletedFile = false;
   let oldLine = 0;
   let newLine = 0;
   let oldBlockComment = false;
@@ -186,6 +228,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       oldName = null;
       file = null;
       inHunk = false;
+      isDeletedFile = false;
       oldBlockComment = false;
       newBlockComment = false;
       continue;
@@ -200,7 +243,8 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
     }
     if (!inHunk && raw.startsWith('+++ ')) {
       const newName = raw.slice(4).trim();
-      file = newName === '/dev/null'
+      isDeletedFile = newName === '/dev/null';
+      file = isDeletedFile
         ? (typeof oldName === 'string' && oldName.startsWith('a/') ? oldName.slice(2) : oldName)
         : newName.replace(/^b\//, '');
       continue;
@@ -211,6 +255,11 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       testHunk = isTest(file) || isTest(oldName?.replace(/^a\//, ''));
       oldLine = Number(hunk[1]);
       newLine = Number(hunk[2]);
+      // При --unified=0 hunk'и разрознены: состояние блочного комментария
+      // не может переноситься через невидимый разрыв — иначе '/*' в одном
+      // hunk'е маскирует удалённые тесты всех последующих hunk'ов файла.
+      oldBlockComment = false;
+      newBlockComment = false;
       continue;
     }
     if (!inHunk || file === null) continue;
@@ -221,10 +270,15 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       const scanned = stripBlockCommented(rawText, oldBlockComment);
       oldBlockComment = scanned.state;
       const text = scanned.text;
-      if (!allowTestDeletion && isTestDef(text)) {
+      // Допуск удаления тестов действует строго на файлы со статусом D:
+      // в изменённых/переименованных тестовых файлах удаление кейсов и
+      // проверок отслеживается независимо от allowTestDeletion.
+      if (!(allowTestDeletion && isDeletedFile) && isTestDef(text)) {
         testDefTally(file).removed.push({ line: oldLine, text });
       }
-      if (testHunk && isAssert(text)) {
+      // При явном допуске удаления тестов удаляемый файл целиком уходит по
+      // решению оператора: его проверки не «ослабляются», а перестают существовать.
+      if (testHunk && isAssert(text) && !(allowTestDeletion && isDeletedFile)) {
         const tally = tallyFor(asserts, file);
         tally.removed.push(oldLine);
         if (STRONG_ASSERT.test(text)) tally.strongRemoved++;
@@ -240,7 +294,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       const scanned = stripBlockCommented(rawText, newBlockComment);
       newBlockComment = scanned.state;
       const text = scanned.text;
-      if (!allowTestDeletion && isTestDef(text)) {
+      if (!(allowTestDeletion && isDeletedFile) && isTestDef(text)) {
         testDefTally(file).added.push({ line: newLine, text });
       }
       // Skip/only-маркеры осмысленны только в тестовых hunks: в обычном коде
@@ -257,8 +311,17 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
         if (COMMENT_MARK.test(rawText) && (TEST_DEF.test(rawText) || ASSERT_MARK.test(rawText))) {
           push('assertion_weakened', newLine, 'test or assertion commented out');
         }
-        if (/\breturn\s*(?:;|$)/.test(text)) {
+        if (/\breturn\s*(?:;|$)/.test(text) ||
+            /\breturn\s+(?:0|true|null|undefined)\s*(?:;|$)/.test(text)) {
           push('assertion_weakened', newLine, 'early return added in test');
+        }
+        // process.exit(0) в тесте обрывает раннер до остальных проверок.
+        if (/\bprocess\s*\.\s*exit\s*\(\s*0\s*\)/.test(text)) {
+          push('assertion_weakened', newLine, 'process.exit(0) added in test');
+        }
+        // Мёртвая ветка прячет проверки за невыполнимым условием.
+        if (/\bif\s*\(\s*(?:false|0)\s*\)/.test(text)) {
+          push('assertion_weakened', newLine, 'dead branch wrapper added in test');
         }
       }
       if (testHunk && TRIVIAL_ASSERT.test(text)) {
@@ -266,6 +329,9 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       }
       if (testHunk && isAssert(text) && ASSERT_TAUTOLOGY.test(text)) {
         push('assertion_weakened', newLine, 'tautological assertion added');
+      }
+      if (testHunk && isIdenticalLiteralAssert(text)) {
+        push('assertion_weakened', newLine, 'identical-literal tautology assertion added');
       }
       for (const [rule, label] of SECRET_RULES) {
         if (rule.test(rawText)) push('secret_leak', newLine, label);
@@ -551,6 +617,43 @@ function commentOnlyNodeEval(command) {
   return compact === '' || ['true', '0', 'null', 'undefined'].includes(compact);
 }
 
+// Флаги фильтрации тестов в scripts.test*: добавленный фильтр прогоняет
+// лишь часть suite — скрытое ослабление гейта даже при неизменном раннере.
+const TEST_FILTER_LONG = new Set(['test-name-pattern', 'grep', 'skip']);
+
+function testFilterFlags(command) {
+  const found = new Set();
+  for (const segment of shellSegments(String(command))) {
+    for (const word of cleanScriptArgv(segment)) {
+      if (word.startsWith('--')) {
+        const name = word.slice(2).split('=', 1)[0];
+        if (TEST_FILTER_LONG.has(name)) found.add(`--${name}`);
+      } else if (/^-[kt]$/.test(word)) {
+        found.add(word);
+      }
+    }
+  }
+  return found;
+}
+
+function testFilterViolations(basePkg, candPkg, path) {
+  const violations = [];
+  const candScripts = candPkg?.scripts;
+  if (candScripts === null || typeof candScripts !== 'object') return violations;
+  for (const [key, value] of Object.entries(candScripts)) {
+    if (!key.startsWith('test') || typeof value !== 'string') continue;
+    const baseValue = basePkg?.scripts?.[key];
+    const candFlags = testFilterFlags(value);
+    const baseFlags = typeof baseValue === 'string' ? testFilterFlags(baseValue) : new Set();
+    const added = [...candFlags].filter((flag) => !baseFlags.has(flag)).sort();
+    if (added.length > 0) {
+      violations.push({ kind: 'gate_bypass', file: path, line: 0,
+        detail: `test filter flag(s) added in scripts.${key}: ${added.join(',')}` });
+    }
+  }
+  return violations;
+}
+
 // Семантика package.json: удалённый/пустой/ослабленный scripts.test — обход гейта.
 // Строковый разбор не ловит scripts.test на одной строке с metadata.test;
 // здесь сравниваются распарсенные объекты base и candidate.
@@ -562,12 +665,14 @@ async function packageJsonViolations(worktree, baseSha, candidateSha, path) {
   let candPkg = null;
   try { basePkg = JSON.parse(baseText ?? 'null'); } catch { basePkg = null; }
   try { candPkg = JSON.parse(candText ?? 'null'); } catch { candPkg = null; }
+  const filterViolations = testFilterViolations(basePkg, candPkg, path);
   const baseTest = basePkg?.scripts?.test;
   const candTest0 = candPkg?.scripts?.test;
   // Скрипт не изменился: соседние ключи (metadata.test и т.п.) — не ослабление.
-  if (candTest0 === baseTest) return [];
-  if (typeof baseTest !== 'string' || !baseTest.trim()) return [];
-  const push = (detail) => [{ kind: 'gate_bypass', file: path, line: 0, detail }];
+  if (candTest0 === baseTest) return filterViolations;
+  if (typeof baseTest !== 'string' || !baseTest.trim()) return filterViolations;
+  const push = (detail) => [...filterViolations,
+    { kind: 'gate_bypass', file: path, line: 0, detail }];
   const candTest = candPkg?.scripts?.test;
   if (typeof candTest !== 'string' || !candTest.trim()) {
     return push('scripts.test removed');
@@ -583,7 +688,7 @@ async function packageJsonViolations(worktree, baseSha, candidateSha, path) {
   if (lost.length > 0) {
     return push(`test runner weakened: dropped ${lost.join(',')}`);
   }
-  return [];
+  return filterViolations;
 }
 
 // Порт CheckPort: git diff base..candidate без выполнения кода кандидата.

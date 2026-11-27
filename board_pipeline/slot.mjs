@@ -36,6 +36,11 @@ export async function kernelLock(path) {
 }
 
 // The durable reservation is independent of the process lock. A dead CLI does not free a writer.
+// opts.stateDir/opts.journalDir: when provided, the canonical state directories are
+// exclusively locked too (keyed by realpath in the same registry). Two worktrees
+// accidentally sharing one state directory cannot overwrite each other's attempt.json
+// or kill each other's workers. When both options are omitted the behaviour is
+// exactly the historical one (backward compatible).
 export async function reserveWorktree(registry, tree, state, opts = {}) {
   await mkdir(registry, { mode: 0o700, recursive: true });
   const info = await lstat(registry);
@@ -43,8 +48,31 @@ export async function reserveWorktree(registry, tree, state, opts = {}) {
     throw new Error('Worktree registry must be private');
   }
   const path = join(registry, createHash('sha256').update(await realpath(tree)).digest('hex'));
+  const stateDirs = [];
+  for (const dir of [opts.stateDir, opts.journalDir]) {
+    if (dir === undefined) continue;
+    if (typeof dir !== 'string' || !dir) throw new Error('State directory option must be an absolute path');
+    const canonical = await realpath(dir);
+    if (!stateDirs.includes(canonical)) stateDirs.push(canonical);
+  }
+  // Deterministic acquisition order: worktree lock first, then canonical state
+  // directories in sorted order — concurrent reservations cannot interleave.
+  stateDirs.sort();
   const release = await kernelLock(`${path}.lock`);
+  const stateReleases = [];
+  const releaseAll = async () => {
+    for (const unlock of stateReleases.splice(0).reverse()) await unlock();
+    await release();
+  };
   try {
+    for (const dir of stateDirs) {
+      const key = createHash('sha256').update(dir).digest('hex');
+      try {
+        stateReleases.push(await kernelLock(join(registry, `state-${key}.lock`)));
+      } catch (cause) {
+        throw new Error(`State directory is already locked by another writer: ${dir}`, { cause });
+      }
+    }
     const identity = await lstat(state);
     const reservation = { state, device: identity.dev, inode: identity.ino };
     let old;
@@ -57,9 +85,9 @@ export async function reserveWorktree(registry, tree, state, opts = {}) {
       throw new Error('Prior writer is still reserved; reconcile before reusing this worktree');
     }
     if (!old) await saveState(`${path}.json`, reservation);
-    return release;
+    return releaseAll;
   } catch (error) {
-    await release();
+    await releaseAll();
     throw error;
   }
 }

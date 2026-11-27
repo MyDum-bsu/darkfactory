@@ -7,11 +7,19 @@ import { roundGate, roundSignature, effectiveL2ReworkLimit, l2ReworkLimitExceede
 import { partitionFindingsBySeverity } from './review-policy.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
 import { PilotDenied } from './pilot-gate.mjs';
+import { isTransientBoardError } from './native-board.mjs';
+import { validateSubmissionNotes } from './scope-fence.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
 const shaRE = /^[a-f0-9]{40}$/;
 const confirmedThreadId = value => isWorkerThreadId(value);
+
+// Верхняя граница подряд идущих транзитных сбоев обновления аренды, после
+// которой попытка всё же переводится в lease_lost: сеть/5xx не доказывают
+// потерю захвата, но и бесконечного ожидания восстановления Board нет —
+// реальное истечение аренды наступает раньше либо срабатывает эта граница.
+export const MAX_TRANSIENT_LEASE_FAILURES = 5;
 
 // Контракт приёмки, который карточка обязана нести в метках для захвата из очереди:
 // разрешённый профиль, identity репозитория и валидные хэши спеки/политики.
@@ -38,6 +46,27 @@ function projectPriorFinding(f) {
     }
   }
   return out;
+}
+
+// Та же закрытая форма спора, что validateSubmission приёмки: объект с тремя
+// непустыми строковыми полями. Невалидный спор не закрепляется в записи —
+// приёмка отклоняет такую сдачу на первичной проверке до любого восстановления.
+function validSubmissionDispute(d) {
+  return d !== null && typeof d === 'object' && !Array.isArray(d) &&
+    ['finding_ref', 'justification', 'spec_evidence'].every(
+      k => typeof d[k] === 'string' && d[k].trim().length > 0);
+}
+
+// Валидированные заметки сдачи в закрытой санитизированной форме либо
+// undefined: невалидные notes приёмка отклоняет на первичной проверке,
+// в долговременную запись попытки они не попадают никогда.
+function validatedSubmissionNotes(notes) {
+  if (notes === undefined) return undefined;
+  try {
+    return validateSubmissionNotes(notes);
+  } catch {
+    return undefined;
+  }
 }
 
 function isAllowlist(a) {
@@ -70,6 +99,9 @@ function checkRoute(r) {
 // Фильтр claimReady: канал закреплён адаптером, остальное — allowlist маршрута.
 // Контрактные метки обязательны всегда, профиль карточки сверяется с профилем маршрута:
 // неполный или чужой контракт даёт 0-эффектный захват (null).
+// Эффективный policyDigest маршрута, когда закреплён, — часть фильтра допуска:
+// карточка с чужим policy_digest не захватывается этим слотом, даже если
+// остальной контракт совпадает.
 function queueFilter(route) {
   return {
     owner: route.allowlist.owner,
@@ -78,6 +110,7 @@ function queueFilter(route) {
     profileId: route.checkProfile,
     required: [...new Set([...CONTRACT_LABELS, ...(route.allowlist.required ?? [])])],
     ...(route.allowlist.repoId !== undefined ? { repoId: route.allowlist.repoId } : {}),
+    ...(typeof route.policyDigest === 'string' ? { policyDigest: route.policyDigest } : {}),
   };
 }
 
@@ -88,6 +121,12 @@ function contractOf(labels) {
     ['has_ui', labels?.has_ui === 'true' ? true : labels?.has_ui === 'false' ? false : undefined],
     ['domain', typeof labels?.domain === 'string' && /^[a-z][a-z0-9-]{0,47}$/.test(labels.domain)
       ? labels.domain : undefined],
+    // Класс размера карточки для scorecard-роутинга (S/M/L): каноническая
+    // lowercase-форма проходит whitelist validateAttempt приёмки, а
+    // normalizeSize роутинга приводит её обратно к S/M/L вместо unknown.
+    // Неканоничное значение не закрепляется — поведение прежнее ('unknown').
+    ['size', typeof labels?.size === 'string' && /^[smlSML]$/.test(labels.size)
+      ? labels.size.toLowerCase() : undefined],
   ].filter(([, value]) => value !== undefined));
   const hasAllowedPaths = typeof labels?.allowed_paths === 'string' && labels.allowed_paths.length > 0;
   if (hasAllowedPaths) pinnedLabels.allowed_paths = labels.allowed_paths;
@@ -148,8 +187,15 @@ function attemptOf(record, route) {
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
 export async function advance({ route, state, board, bb, submissions, verify, authorize,
-  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger, eventBus }) {
+  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger, eventBus,
+  recoverInterruptedChecking = false, workingTimeoutMs = 90 * 60 * 1000 }) {
   checkRoute(route);
+  // Wall-clock бюджет фазы 'working': зависший воркер не может продлевать
+  // аренду бесконечно. Операторское значение обязано быть конечным
+  // положительным числом миллисекунд — иначе маршрут не исполняется.
+  if (!Number.isFinite(workingTimeoutMs) || workingTimeoutMs <= 0) {
+    throw new Error('A trusted, enrolled route is required');
+  }
   if (typeof authorize !== 'function') throw new Error('Route admission is required');
   const hazards = mutants ?? {};
   const binding = createHash('sha256').update(JSON.stringify(route)).digest('hex');
@@ -451,7 +497,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
       }
       if (!confirmedThreadId(launched?.threadId)) throw new Error('No confirmed BB thread');
-      await save({ phase: 'working', threadId: launched.threadId,
+      // Неизменный якорь старта писателя для фазового бюджета writer: один раз
+      // при запуске и никогда не перезаписывается кругами доработки/рестартами —
+      // в отличие от record.until, который движется каждым продлением аренды.
+      await save({ phase: 'working', threadId: launched.threadId, writerStartedAt: Date.now(),
         receipt: { kind: 'spawn', threadId: launched.threadId }, ...(workerTrail ?? {}) });
     } catch (e) {
       // Обрыв в любой точке claim/launch не повторяет эффект: та же сверка,
@@ -484,51 +533,88 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     }
     return visible();
   }
-  if (IN_FLIGHT.has(record.phase)) return reconcileInFlight();
-  if (record.phase !== 'working' && !recheck) throw new Error('Unknown attempt state');
+  // Охраняемое восстановление прерванной проверки (opt-in recoverInterruptedChecking,
+  // по умолчанию выключено — строгий uncertain сохраняется): Spot VM может быть
+  // вытеснена между записью checking и завершением verify(). Повтор verify()
+  // допустим, только когда Board всё ещё доказывает наш захват на той же epoch
+  // и нет терминальной квитанции результата; расхождение state/epoch или сбой
+  // lookup — строгий uncertain, как раньше.
+  const interruptedCheckingRecoverable = async () => {
+    // Повтор ровно один раз на раунд проверки: маркер checkingRecovered
+    // ставится при восстановлении и сбрасывается новым раундом checking.
+    if (record.checkingRecovered === true) return false;
+    if (typeof record.sha !== 'string' || !shaRE.test(record.sha)) return false;
+    // Терминальная квитанция означает завершённую обработку результата —
+    // повтор verify() был бы вторым внешним эффектом.
+    const receiptKind = record.receipt?.kind;
+    if (receiptKind !== undefined && !['spawn', 'feedback', 'resume'].includes(receiptKind)) return false;
+    const live = await board.lookup(record.taskId ?? route.taskId).catch(() => null);
+    return live?.state === 'claimed' && live?.epoch === record.epoch;
+  };
+  let recoveredChecking = false;
+  if (IN_FLIGHT.has(record.phase)) {
+    if (record.phase === 'checking' && recoverInterruptedChecking === true &&
+        await interruptedCheckingRecoverable()) {
+      recoveredChecking = true;
+    } else {
+      return reconcileInFlight();
+    }
+  }
+  if (record.phase !== 'working' && !recheck && !recoveredChecking) throw new Error('Unknown attempt state');
 
   // After process restart the adapter can recover the same held capability. It cannot re-claim.
+  // Fail-closed различение сбоев обновления аренды: повторяются ТОЛЬКО
+  // распознанные транзитные сбои Board (сеть/5xx по isTransientBoardError) —
+  // они не доказывают потерю захвата, попытка и capability сохраняются до
+  // истечения самой аренды или границы подряд идущих повторов. Любой другой
+  // сбой — окончательная потеря claim/эпохи, не-транзитный 4xx, отзыв
+  // capability или неизвестная ошибка — терминален сразу: неопределённость
+  // никогда не удерживает попытку в working.
+  let leaseError = null;
+  let epochMismatch = false;
+  let renewedUntil;
   try {
     await board.adopt(record.taskId ?? route.taskId, { epoch: record.epoch, token: record.token });
     const proof = await board.verifyHeld(record.taskId ?? route.taskId, record.epoch);
-    if (proof.epoch !== record.epoch) throw new Error('Wrong native claim epoch');
-  } catch {
+    if (proof.epoch !== record.epoch) epochMismatch = true;
+    else if (typeof proof.until === 'string' && Number.isFinite(Date.parse(proof.until))) {
+      renewedUntil = proof.until;
+    }
+  } catch (error) {
+    leaseError = error;
+  }
+  if (epochMismatch || leaseError !== null) {
+    if (!epochMismatch && leaseError !== null && isTransientBoardError(leaseError)) {
+      const failures = (Number.isSafeInteger(record.transientLeaseFailures)
+        ? record.transientLeaseFailures : 0) + 1;
+      const untilMs = Date.parse(record.until);
+      if (Number.isFinite(untilMs) && Date.now() >= untilMs) {
+        await save({ phase: 'lease_lost', reason: 'lease_expired_during_transient_renewal_failure' });
+        return visible();
+      }
+      if (failures >= MAX_TRANSIENT_LEASE_FAILURES) {
+        await save({ phase: 'lease_lost', reason: 'lease_renewal_transient_failures_exhausted' });
+        return visible();
+      }
+      await save({ transientLeaseFailures: failures });
+      return visible();
+    }
     await save({ phase: 'lease_lost', reason: 'no_verified_claim_keep_worktree_reserved' });
     return visible();
   }
+  // Успешное обновление сбрасывает счётчик подряд идущих транзитных сбоев и
+  // переносит фактическое истечение продлённой аренды в запись: без этого
+  // record.until навсегда оставался бы моментом первоначального захвата, и
+  // первый же транзитный сбой после исходного окна ложно истекал бы аренду.
+  const renewal = {};
+  if (renewedUntil !== undefined && renewedUntil !== record.until) renewal.until = renewedUntil;
+  if (record.transientLeaseFailures) renewal.transientLeaseFailures = 0;
+  if (Object.keys(renewal).length > 0) await save(renewal);
 
   const attempt = attemptOf(record, route);
   const after = record.turnSeq ?? 0;
-  const observation = await submissions.read(attempt, after);
-  // GUARD:NoWatermarkRegression — ход не новее watermark никогда не засчитывается
-  // за ответ на уже отправленный feedback.
-  if (!observation || !Number.isSafeInteger(observation.turnSeq) ||
-      (!hazards.staleTurnWatermark && observation.turnSeq <= after)) return visible();
-  const { submission, turnSeq } = observation;
-  // A legacy record remembers its checked SHA, but not which BB turn produced it.
-  if (!after && record.seenShas.length && (!submission || record.seenShas.includes(submission.candidate_sha))) {
-    return visible();
-  }
-  const workerCrashed = observation.state === 'exited' && observation.exitCode !== 0 &&
-    (submission === undefined || submission === null);
-  if (workerCrashed) {
-    const crashResumes = Number.isSafeInteger(record.crashResumes) ? record.crashResumes : 0;
-    if (crashResumes < 2 && typeof bb.resume === 'function') {
-      let resumeFailed = false;
-      let resumed;
-      try {
-        resumed = await bb.resume({ attempt, turnSeq, reason: 'worker_crashed', crashResumes });
-      } catch {
-        resumeFailed = true;
-      }
-      if (!resumeFailed && resumed?.resumed !== false && resumed?.confirmed !== false &&
-          (resumed?.threadId === undefined || resumed.threadId === attempt.bb_thread_id)) {
-        await save({ phase: 'working', turnSeq, crashResumes: crashResumes + 1,
-          receipt: { kind: 'resume', confirmed: 'started' } });
-        return visible();
-      }
-    }
-  }
+  let submission;
+  let turnSeq;
   const stopWith = async (reason, extraState = null, detail = '') => {
     const privateText = `${reason}: ${attempt.bb_thread_id}, BB event ${turnSeq}.${detail ? ` ${detail}` : ''} Проверьте ход; повтор не отправлен.`;
     const blockText = board.blockText?.(attempt.epoch, privateText) ?? privateText;
@@ -544,6 +630,92 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     }
     return visible();
   };
+  // Wall-clock бюджет фазы 'working' стартует с первого тика, наблюдающего
+  // фазу, и не сбрасывается кругами доработки: записанное значение переживает
+  // рестарты процесса, поэтому продление аренды не обнуляет часы. Тот же
+  // тик дописывает неизменный якорь writerStartedAt, если запуск восстановлен
+  // сверкой (reconcile) и прямой записи при spawn не было.
+  if (record.phase === 'working') {
+    const anchors = {};
+    if (!Number.isFinite(record.workingSince)) anchors.workingSince = Date.now();
+    if (!Number.isFinite(record.writerStartedAt)) anchors.writerStartedAt = Date.now();
+    if (Object.keys(anchors).length > 0) await save(anchors);
+  }
+  if (recoveredChecking) {
+    // Конверт уже прошёл проверку на исходном тике и зафиксирован в записи:
+    // verify() повторяется по реконструированному конверту того же кандидата,
+    // без повторного чтения хода воркера (терминал мог не пережить вытеснение).
+    // Валидированные notes/dispute восстанавливаются из той же записи: повтор
+    // проверяет тот же конверт, что прерванный запуск, — спор не теряет
+    // основание арбитража, а операторские заметки не пропадают из evidence.
+    turnSeq = record.turnSeq;
+    submission = { task_id: attempt.task_id, epoch: attempt.epoch,
+      attempt_id: attempt.attempt_id, worker_thread_id: attempt.bb_thread_id,
+      candidate_sha: record.sha,
+      ...(record.submissionNotes !== undefined ? { notes: record.submissionNotes } : {}),
+      ...(record.submissionDispute !== undefined ? { dispute: record.submissionDispute } : {}) };
+    // Монотонный recoverySeq (F-02 / Core P1-7): каждое восстановление
+    // прерванной проверки увеличивает счётчик в доверенной записи попытки.
+    // verify получает его отдельным контроллерным аргументом — приёмка
+    // перепроверяет кандидата под свежим ключом журнала, а не застревает
+    // на uncertain прерванного запуска.
+    const recoverySeq = (Number.isSafeInteger(record.recoverySeq) && record.recoverySeq >= 0
+      ? record.recoverySeq : 0) + 1;
+    await save({ checkingRecovered: true, recoverySeq });
+  } else {
+    const observation = await submissions.read(attempt, after);
+    // GUARD:NoWatermarkRegression — ход не новее watermark никогда не засчитывается
+    // за ответ на уже отправленный feedback.
+    if (!observation || !Number.isSafeInteger(observation.turnSeq) ||
+        (!hazards.staleTurnWatermark && observation.turnSeq <= after)) {
+      // Зависший воркер не продлевает аренду бесконечно: свежего хода нет,
+      // а wall-clock бюджет фазы 'working' исчерпан — воркер останавливается
+      // best-effort, карточка видимо блокируется для владельца.
+      if (record.phase === 'working' && Number.isFinite(record.workingSince) &&
+          Date.now() - record.workingSince > workingTimeoutMs) {
+        if (typeof bb.stop === 'function') {
+          try { await bb.stop(record.threadId); } catch { /* best effort: стоп не отменяет блок */ }
+        }
+        // Свежего хода нет: диагностика ссылается на watermark последнего
+        // подтверждённого хода, а не на несуществующий ответ воркера.
+        turnSeq = after;
+        return stopWith('worker_working_timeout');
+      }
+      return visible();
+    }
+    submission = observation.submission;
+    turnSeq = observation.turnSeq;
+    // A legacy record remembers its checked SHA, but not which BB turn produced it.
+    // Запись после crash-resume — не legacy: watermark там сброшен осознанно,
+    // и ход свежего терминала обязан обрабатываться обычным путём.
+    if (!after && !(record.crashResumes > 0) && record.seenShas.length &&
+        (!submission || record.seenShas.includes(submission.candidate_sha))) {
+      return visible();
+    }
+    const workerCrashed = observation.state === 'exited' && observation.exitCode !== 0 &&
+      (submission === undefined || submission === null);
+    if (workerCrashed) {
+      const crashResumes = Number.isSafeInteger(record.crashResumes) ? record.crashResumes : 0;
+      if (crashResumes < 2 && typeof bb.resume === 'function') {
+        let resumeFailed = false;
+        let resumed;
+        try {
+          resumed = await bb.resume({ attempt, turnSeq, reason: 'worker_crashed', crashResumes });
+        } catch {
+          resumeFailed = true;
+        }
+        if (!resumeFailed && resumed?.resumed !== false && resumed?.confirmed !== false &&
+            (resumed?.threadId === undefined || resumed.threadId === attempt.bb_thread_id)) {
+          // Свежий возобновлённый терминал нумерует ходы заново с 1: watermark
+          // упавшего терминала masked бы ход 1 (observeTurn(after=1) ждал бы ход
+          // 2, который никогда не наступит) — сброс до 0 при подтверждённом resume.
+          await save({ phase: 'working', turnSeq: 0, crashResumes: crashResumes + 1,
+            receipt: { kind: 'resume', confirmed: 'started' } });
+          return visible();
+        }
+      }
+    }
+  }
   const askOwner = async ({ kind, prompt, evidence, result, extraState, releasePlan }) => {
     const sha = await questionGate.capture({ attempt, turnSeq });
     const candidateSha = result?.receipt?.evidence?.sha;
@@ -583,7 +755,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     } : { prompt: 'Передать проверенный кандидат в стадию допуска к выпуску?',
       evidence: 'Проверки и seal пройдены. Ответ не запускает выпуск.' }) });
   if (submission === undefined) {
-    return stopWith(after ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
+    // После crash-resume watermark сброшен до 0, но воркер уже производил ходы:
+    // причина различается по crashResumes, а не только по after.
+    return stopWith(after || (record.crashResumes ?? 0) > 0
+      ? 'worker_turn_finished_without_new_handoff' : 'worker_turn_finished_without_handoff');
   }
   if (submission === null || typeof submission !== 'object' || Array.isArray(submission)) {
     return stopWith('invalid_or_stale_submission');
@@ -604,10 +779,20 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   if (typeof submission.candidate_sha !== 'string' || !shaRE.test(submission.candidate_sha)) {
     return stopWith('invalid_or_stale_submission');
   }
-  if (record.seenShas.includes(submission.candidate_sha)) return stopWith('worker_turn_finished_without_new_handoff');
-
-  await save({ phase: 'checking', reason: undefined, sha: submission.candidate_sha, turnSeq,
-    seenShas: [...record.seenShas, submission.candidate_sha] });
+  if (!recoveredChecking) {
+    if (record.seenShas.includes(submission.candidate_sha)) return stopWith('worker_turn_finished_without_new_handoff');
+    // Новый раунд проверки сбрасывает маркер восстановления: охраняемый повтор
+    // verify() допустим один раз на каждый прерванный раунд, а не один раз на попытку.
+    // Валидированные notes/dispute сдачи закрепляются в записи того же раунда
+    // (и сбрасываются для раунда без них): восстановление прерванной проверки
+    // реконструирует конверт того же кандидата с теми же операторскими заметками
+    // и спором — повтор verify() не теряет основание арбитража и не отличается
+    // от прерванного запуска.
+    await save({ phase: 'checking', reason: undefined, sha: submission.candidate_sha, turnSeq,
+      seenShas: [...record.seenShas, submission.candidate_sha], checkingRecovered: false,
+      submissionNotes: validatedSubmissionNotes(submission.notes),
+      submissionDispute: validSubmissionDispute(submission.dispute) ? submission.dispute : undefined });
+  }
   if (release && route.finish === 'deployed') {
     try { prepared = await release.prepare(submission.candidate_sha); }
     catch (cause) { return stopWith(cause instanceof ReleaseDenied ? cause.code : 'release_prepare_failed'); }
@@ -638,7 +823,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       release_channel: 'isolated-static', previous_live_digest: prepared.previous.digest } } : {}) };
   let result;
   try {
-    result = await verify(verification, { ...submission, task_id: taskId });
+    // При восстановлении прерванной проверки verify получает монотонный
+    // recoverySeq отдельным контроллерным аргументом: сдача воркера не может
+    // ни подменить, ни подавить счётчик восстановления.
+    result = await verify(verification, { ...submission, task_id: taskId },
+      recoveredChecking ? { recoverySeq: record.recoverySeq } : undefined);
   } catch (error) {
     const message = String(error?.message ?? error);
     const leaseEvidence = `${error?.code ?? ''} ${message}`;
@@ -828,8 +1017,19 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     } catch {
       return reconcileInFlight();
     }
+  } else if (result.outcome === 'denied' &&
+      /lease[_ ]lost|claim_not_held|claim_lost|epoch_mismatch/i.test(String(result.reason ?? ''))) {
+    // Отказ по аренде не блокирует карточку: lease уже потерян, board.block
+    // всё равно не пройдёт — фиксируется lease_lost, как при броске verify.
+    await save({ phase: 'lease_lost', reason: result.reason ?? 'claim_not_held' });
   } else if (/claim_not_held/.test(String(result.reason ?? ''))) {
     await save({ phase: 'lease_lost', reason: result.reason ?? 'claim_not_held' });
+  } else if (result.outcome === 'denied') {
+    // Не-lease отказ приёмки (Core P1-6): локальный hold без board.block
+    // оставлял карточку бесхозно захваченной до истечения аренды. Отказ
+    // проходит тот же видимый путь, что и прочие стопы верификации:
+    // причина пишется на карточку через board.block.
+    return stopWith(result.reason ?? 'denied');
   } else {
     await save({ phase: result.outcome === 'uncertain' ? 'uncertain' : 'hold', reason: result.reason ?? 'unverified' });
   }

@@ -38,34 +38,48 @@ export function memoryBoard({ actor = 'board:client' } = {}) {
     return doneId;
   };
 
-  const capability = task => {
-    const heldEpoch = task.epoch;
-    const token = task.claimRec.token;
+  const capability = (taskId, { epoch, token }) => {
+    const current = () => messages.get(taskId)?.task;
     const held = () => {
-      const rec = task.claimRec;
-      if (task.state !== 'claimed' || rec === null || rec.epoch !== heldEpoch ||
+      const task = current();
+      const rec = task?.claimRec;
+      if (!task || task.state !== 'claimed' || rec == null || rec.epoch !== epoch ||
           rec.token !== token || Date.now() >= Date.parse(rec.until)) throw CLAIM_LOST();
+      return task;
     };
     return {
-      epoch: heldEpoch,
-      until: task.claimRec.until,
+      epoch,
+      until: current()?.claimRec?.until ?? null,
       token,
       async renew(lease) {
-        held();
+        const task = held();
         task.claimRec.until = new Date(Date.now() + lease * 1000).toISOString();
         task.claim.until = task.claimRec.until;
         return { until: task.claim.until };
       },
+      async release() {
+        const task = held();
+        task.state = 'ready';
+        task.claim = null;
+        task.claimRec = null;
+      },
       async complete(result) {
-        held();
+        const task = held();
         task.state = 'completed';
         task.result = result;
         task.claim = null;
         task.claimRec = null;
         releaseDependents(task.id);
       },
+      async fail(reason) {
+        const task = held();
+        task.state = 'failed';
+        task.reason = reason;
+        task.claim = null;
+        task.claimRec = null;
+      },
       async block(reason, opts = {}) {
-        held();
+        const task = held();
         task.state = 'blocked';
         task.blocked = { kind: opts.kind ?? 'needs_input', reason };
         task.claim = null;
@@ -103,16 +117,10 @@ export function memoryBoard({ actor = 'board:client' } = {}) {
         until: new Date(Date.now() + lease * 1000).toISOString() };
       task.state = 'claimed';
       task.claim = { actor, until: task.claimRec.until };
-      return capability(task);
+      return capability(taskId, { epoch: task.epoch, token: task.claimRec.token });
     },
     held(taskId, { epoch, token } = {}) {
-      const task = messages.get(taskId)?.task;
-      const rec = task?.claimRec;
-      if (!task || task.state !== 'claimed' || rec === null ||
-          rec.epoch !== epoch || rec.token !== token || Date.now() >= Date.parse(rec.until)) {
-        throw CLAIM_LOST();
-      }
-      return capability(task);
+      return capability(taskId, { epoch, token });
     },
     async unblock(taskId) {
       const task = messages.get(taskId)?.task;

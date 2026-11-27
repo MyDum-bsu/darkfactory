@@ -8,13 +8,14 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
-import { evaluateAutoApprove, isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter,
+import { evaluateAutoApprove, isLegacyPiReview, isNeonArbiter, isNeonReview, isReviewSkillList,
   NEON_ISOLATION, parseApprovalPolicy, partitionFindingsBySeverity } from './review-policy.mjs';
 import { l2RunnableSpec, runnerReviewSpec } from './review-runner.mjs';
 import { assertTriadIndependent, opencodeGoPolicyViolation,
   retiredProviderViolation, workerFamily } from './worker-selector.mjs';
 import { isValidL1Profile } from './l1-profiles.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
+import { validateSubmissionNotes } from './scope-fence.mjs';
 
 const HANDOFF_KEYS = [
   'task_id',
@@ -65,7 +66,7 @@ const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous
 
 // Сдача воркера: типизированный результат, без worktree/профиля/команд/токена.
 const SUBMISSION_KEYS = ['task_id', 'epoch', 'attempt_id', 'worker_thread_id', 'candidate_sha'];
-const SUBMISSION_OPTIONAL = ['dispute'];
+const SUBMISSION_OPTIONAL = ['dispute', 'notes'];
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -432,6 +433,17 @@ function validateSubmission(submission, attempt) {
       ['finding_ref', 'justification', 'spec_evidence'].every(
         k => typeof d[k] === 'string' && d[k].trim().length > 0);
     if (!ok) throw new Denied('invalid_dispute');
+  }
+  // Операторские заметки сдачи (P1-5): воркер, следующий Scope Fence prompt,
+  // докладывает посторонние находки в notes. Допустимая форма — закрытый
+  // контракт validateSubmissionNotes: массив до 10 непустых строк до 200
+  // символов после санитаризации, иначе отказ до любого эффекта.
+  if (submission.notes !== undefined) {
+    try {
+      validateSubmissionNotes(submission.notes);
+    } catch {
+      throw new Denied('submission_notes_invalid');
+    }
   }
 }
 
@@ -1096,7 +1108,10 @@ export async function accept({ handoff, policy, journal, ports }) {
 
 // Приёмка по уже удерживаемому claim: второго claim нет, release→reclaim запрещён.
 // Доверенная привязка — attempt (только контроллер), сдача — submission (воркер).
-export async function acceptHeld({ attempt, submission, policy, journal, ports }) {
+// recoverySeq — монотонный счётчик восстановления из доверенного состояния
+// контроллера (Spot preemption, F-02): 0 — первичный запуск, > 0 — повтор
+// прерванной проверки того же кандидата под свежим ключом журнала.
+export async function acceptHeld({ attempt, submission, policy, journal, ports, recoverySeq = 0 }) {
   const journalStat = await stat(journal).catch(() => null);
   if (!journalStat || !journalStat.isDirectory()) {
     throw new Denied('journal_not_directory');
@@ -1109,6 +1124,11 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   try {
     validateAttempt(attempt);
     validateSubmission(submission, attempt);
+    // recoverySeq — контроллерный вход, не слово воркера: небезопасная форма
+    // отклоняется до любого порта, как и остальная доверенная привязка.
+    if (!Number.isSafeInteger(recoverySeq) || recoverySeq < 0) {
+      throw new Denied('invalid_recovery_seq');
+    }
     profile = validatePolicy(policy, attempt.check_profile,
       { allowNeon: true, pinned: attempt.triad !== undefined });
     validateEnrolled(attempt, profile);
@@ -1159,7 +1179,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       }
     }
     if (isNeonReview(profile.review)) {
-      if (!isSolArbiter(arbiter) || executor === undefined) throw new Denied('vs2_review_triad_not_approved');
+      if (!isNeonArbiter(arbiter) || executor === undefined) throw new Denied('vs2_review_triad_not_approved');
       if (attempt.policy_digest === undefined) throw new Denied('subject_contract_incomplete');
     }
     try {
@@ -1182,6 +1202,12 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
     }
     throw e;
   }
+  // Валидированные заметки сдачи восстанавливаются детерминированно из той же
+  // закрытой формы: validateSubmission уже отклонила невалидные notes до
+  // любого эффекта, повторная санитаризация здесь выбросить не может.
+  const validatedNotes = submission.notes === undefined
+    ? undefined
+    : validateSubmissionNotes(submission.notes);
   const key = contractKey(attempt, profile);
 
   const binding = {
@@ -1205,14 +1231,59 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
   // L1-выбор добавляется в хэш сам: вердикт под node не подтверждает запуск
   // под python-node, а повтор без выбора сохраняет прежнее имя файла.
   const unpinnedL1 = key === null ? contractL1Profile(attempt, profile) : null;
-  const id = journalId(runId(`${attempt.task_id}.${attempt.attempt_id}.${attempt.epoch}`,
+  // Ключ запуска производится от seq восстановления: первичный запуск (0)
+  // сохраняет прежнее имя файла, повтор прерванной проверки (F-02) получает
+  // свежий ключ — журнал вытесненного запуска никогда не блокирует перепроверку.
+  const journalKeyFor = (seq) => journalId(runId(`${attempt.task_id}.${attempt.attempt_id}.${attempt.epoch}`,
     submission.candidate_sha, policy.version) + (key ? `-s${key}` : '') +
+    (seq > 0 ? `-r${seq}` : '') +
     '-h' + createHash('sha256').update(JSON.stringify([
       attempt.task_id, attempt.attempt_id, attempt.epoch, submission.candidate_sha,
       policy.version, attempt.has_ui ?? null, key ?? null,
       ...(unpinnedL1 === null ? [] : [unpinnedL1]),
+      ...(seq > 0 ? [seq] : []),
     ])).digest('hex').slice(0, 16));
+  const id = journalKeyFor(recoverySeq);
   const file = path.join(journal, `${id}.jsonl`);
+
+  // Восстановление после вытеснения (recoverySeq > 0): прежние журналы той же
+  // приёмки сверяются до любого эффекта. Терминальный исход любого прошлого
+  // запуска переиспользуется (replay-idempotency); журнал с зафиксированным
+  // эффектом Board (complete/block) или порчей строк — неопределённый исход,
+  // перепроверка вслепую запрещена. Доказуемо незавершённая проверка (ни
+  // исхода, ни эффекта Board) не осела вовне — свежий запуск безопасен.
+  const settledBoardEffect = entries => entries.some(entry => entry?.kind === 'result' &&
+    entry.ok === true && (entry.phase === 'complete' || entry.phase === 'block'));
+  if (recoverySeq > 0) {
+    for (let seq = recoverySeq - 1; seq >= 0; seq--) {
+      const priorId = journalKeyFor(seq);
+      const entries = await readExistingRun(path.join(journal, `${priorId}.jsonl`));
+      if (entries === null) continue;
+      const done = terminalOutcome(entries);
+      if (done !== null) return { ...done, repeated: true, run: priorId };
+      const inconclusive = entries.some(entry => entry?.kind === 'corrupt') ||
+        (entries.length > 0 && !entries.find(entry => entry?.kind === 'run'));
+      if (inconclusive || settledBoardEffect(entries)) {
+        let boardState = null;
+        try {
+          boardState = (await ports.board.lookup(attempt.task_id))?.state ?? null;
+        } catch {
+          boardState = null;
+        }
+        return {
+          outcome: 'uncertain',
+          reason: 'interrupted_run',
+          run: priorId,
+          repeated: true,
+          phase: entries.filter((e) => e?.kind === 'intent').map((e) => e.phase).at(-1) ?? null,
+          board_state: boardState,
+          task_id: attempt.task_id,
+          attempt_id: attempt.attempt_id,
+          candidate_sha: submission.candidate_sha,
+        };
+      }
+    }
+  }
 
   let fh;
   try {
@@ -1339,6 +1410,10 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
         finish: attempt.finish,
         subject_digest: digest,
         outcome,
+        // Валидированные операторские заметки сдачи фиксируются в квитанции
+        // попытки: посторонние находки воркера доходят до владельца, не нарушая
+        // строгий конверт (P1-5).
+        ...(validatedNotes !== undefined ? { notes: validatedNotes } : {}),
         ...((attempt.fallback_reason !== undefined || attempt.attempted_workers !== undefined)
           ? { worker_trail: { fallback_reason: attempt.fallback_reason ?? null,
               attempted_workers: attempt.attempted_workers ?? [] } }
@@ -1587,7 +1662,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
       // и model — accept_with_notes от подменённого арбитра не принимается.
       // Сверка в runner-форме, как закреплённая триада: pi/openai/… пин и
       // openai/… квитанция описывают один spec. Для Neon-ревью арбитр обязан
-      // быть аттестованным Sol — независимо от содержимого квитанции.
+      // быть аттестованным арбитром Neon-маршрута (Sol или Opus, #11994) —
+      // независимо от содержимого квитанции.
       const pinnedArbiter = attempt.triad?.arbiter ?? attempt.arbiter ?? profile.arbiter;
       let arbiterOk = true;
       if (pinnedArbiter !== undefined && pinnedArbiter !== null) {
@@ -1606,7 +1682,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports }
           expected?.model === presented?.model;
       }
       if (arbiterOk && isNeonReview(profile.review)) {
-        arbiterOk = isSolArbiter(arbitrationReceipt.arbiter);
+        arbiterOk = isNeonArbiter(arbitrationReceipt.arbiter);
       }
       if (!arbiterOk) return hold('arbiter_mismatch');
       // AUDIT-0b (P1-11/P2-2): max harm и dod_violation вычисляются

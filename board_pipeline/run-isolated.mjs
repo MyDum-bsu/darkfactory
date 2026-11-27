@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, mkdir, open, readFile, realpath, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
@@ -9,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { acceptHeld } from './acceptance.mjs';
 import { reserveWorktree, saveState } from './slot.mjs';
 import { advanceWithProjection } from './controller.mjs';
-import { nativeBoardPort } from './native-board.mjs';
+import { isDefinitiveClaimLoss, nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
@@ -34,8 +35,8 @@ import { checkScopeFence, parseAllowedPaths } from './scope-fence.mjs';
 import { DEFAULT_MAX_CHARS, ledgerPolicyConfig, pinDecisions, recordDecision,
   resolveActiveDecisions, resolveLedgerPath } from './decision-ledger.mjs';
 import { createProjectMemoryWriter, DEFAULT_MAX_CHARS as DEFAULT_MEMORY_MAX_CHARS,
-  extractPostReviewMemoryUpdates, memoryPolicyConfig, pinProjectMemory, resolveMemoryStoreDir,
-  resolveProjectMemory, writeTrustedReviewReceipt } from './project-memory.mjs';
+  extractPostReviewMemoryUpdates, memoryPolicyConfig, pinProjectMemory, resolveMemoryHmacKey,
+  resolveMemoryStoreDir, resolveProjectMemory, writeTrustedReviewReceipt } from './project-memory.mjs';
 import { createTelemetryRecorder, parseTelemetryLines, readTelemetryLines, threadUsage } from './telemetry.mjs';
 import { evaluateAdaptiveGate } from './adaptive-gates.mjs';
 import { aggregateScorecard } from './model-scorecard.mjs';
@@ -58,7 +59,8 @@ const inside = (root, p) => {
 };
 // Routing Policy v2: зависимость от acp-zcode-start снята. Допущены
 // acp-devin/swe-2-1-* (плюс legacy swe-2-high) и
-// acp-antigravity-acp/gemini-4-neon; харнесс pi — только с моделями
+// acp-antigravity-acp/gemini-4-neon; харнесс pi — с аттестованными
+// openai/gpt-6.2-astra и openai/gpt-6.2-sol либо моделями
 // opencode-go/deepseek-* (см. opencodeGoPolicyViolation).
 const approved = [
   { provider: 'acp-devin', model: 'swe-2-high' },
@@ -67,6 +69,8 @@ const approved = [
   { provider: 'acp-devin', model: 'swe-2-1-xhigh' },
   { provider: 'acp-devin', model: 'swe-2-1-max' },
   { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' },
+  { provider: 'pi', model: 'openai/gpt-6.2-astra' },
+  { provider: 'pi', model: 'openai/gpt-6.2-sol' },
 ];
 export const isApprovedWorker = bb =>
   approved.some(e => e.provider === bb?.provider && e.model === bb?.model) ||
@@ -95,11 +99,23 @@ async function readOperatorInputs(paths) {
 const sha256Utf8 = value => createHash('sha256').update(Buffer.from(value, 'utf8')).digest('hex');
 
 export function resolveWorkerRuntimeKind({ cliRuntime, policy, env } = {}) {
+  // Дефолт — herdr-core (hc); bb остаётся явным opt-in через --runtime bb,
+  // policy.workerRuntime='bb' или DF_WORKER_RUNTIME=bb.
   const kind = cliRuntime !== undefined ? cliRuntime
     : policy?.workerRuntime !== undefined ? policy.workerRuntime
-      : env?.DF_WORKER_RUNTIME !== undefined ? env.DF_WORKER_RUNTIME : 'bb';
+      : env?.DF_WORKER_RUNTIME !== undefined ? env.DF_WORKER_RUNTIME : 'hc';
   if (!['bb', 'hc', 'subproc'].includes(kind)) throw new Error('worker_runtime_kind_invalid');
   return kind;
+}
+
+// P0-1 fail-closed: голый subproc не изолирует писателя (нет hc-контура
+// изоляции, нет удалённого bb-исполнения) и потому не исполняет живую
+// Board-очередь. Явный операторский opt-in — policy.allowUnsafeSubproc=true
+// или DF_ALLOW_UNSAFE_SUBPROC=1; любое иное значение не считается допуском.
+export function assertSubprocLiveAllowed({ kind, policy, env } = {}) {
+  if (kind !== 'subproc') return;
+  if (policy?.allowUnsafeSubproc === true || env?.DF_ALLOW_UNSAFE_SUBPROC === '1') return;
+  throw new Error('subproc_runtime_disabled');
 }
 
 // V2-9b Adaptive 2-Tier Verification Gates: чистый планировщик разбиения
@@ -302,14 +318,27 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
       }
       const observedTurn = Number.isSafeInteger(observed.turn) ? observed.turn : null;
       if (observedTurn !== null && observedTurn <= after) return undefined;
-      if (observedTurn === null && activity.seenActive !== true && after !== 0) return undefined;
+      if (observedTurn === null && activity.seenActive !== true && after !== 0) {
+        // hc-наблюдение без счётчика хода не различает новый и уже учтённый
+        // терминал, но ПОВТОРНОЕ чтение того же подтверждённого хода (reread
+        // checkpoint вопроса владельца с after = turnSeq - 1) обязано быть
+        // идемпотентным: пара (runtimeId, after) уже доказала этот ход —
+        // возвращается ровно тот же результат, а не провал в undefined.
+        // Новый ход после feedback так не подтверждается: memo не совпадает
+        // по after, и свежая активность всё ещё требуется.
+        const retained = activity.lastTurn;
+        if (retained !== undefined && retained.after === after) return retained.result;
+        return undefined;
+      }
       const turnSeq = observedTurn ?? after + 1;
       activity.seenActive = false;
       const completed = observed.state === 'done' || observed.state === 'idle' ||
         (observed.state === 'exited' && observed.exitCode === 0);
-      return { turnSeq, completed, state: observed.state,
+      const result = { turnSeq, completed, state: observed.state,
         ...(observed.exitCode === undefined ? {} : { exitCode: observed.exitCode }),
         ...(observed.tail === undefined ? {} : { tail: observed.tail }) };
+      activity.lastTurn = { after, result };
+      return result;
     },
     async reconcileSpawn(attempt) {
       let runtimeId;
@@ -350,16 +379,37 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
   });
 }
 
-export async function readSubmissionEnvelope({ observed, source, lstatImpl = lstat,
-  realpathImpl = realpath, readJsonImpl = readJson } = {}) {
+// Конверт сдачи воркера читается одним дескриптором: open с O_NOFOLLOW
+// (финальный компонент никогда не симлинк) и O_NONBLOCK (POSIX FIFO не
+// блокирует контроллер в open до появления писателя — fstat всё равно
+// отклонит не-файл проверкой isFile), fstat уже открытого fd — обычный
+// файл не больше 8192 байт — и ограниченное чтение не более 8193 байт из
+// того же дескриптора. Между проверкой и чтением нет окна подмены файла:
+// лишний байт или смена типа/размера — typed invalid, а не сбой приёмки.
+// Каноничность пути (промежуточные симлинки) сверяется realpath до open;
+// прочитанное содержимое всегда принадлежит проверенному fd.
+const SUBMISSION_MAX_BYTES = 8192;
+export async function readSubmissionEnvelope({ observed, source, realpathImpl = realpath,
+  openImpl = path => open(path,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK) } = {}) {
   if (!observed) return undefined;
   const base = { ...observed };
   if (!base.completed) return base;
   try {
-    const meta = await lstatImpl(source);
-    if (!meta.isFile() || meta.size > 8192 || basename(source) !== 'submission.json' ||
-        await realpathImpl(source) !== source) throw new Error('Invalid handoff file');
-    return { ...base, submission: await readJsonImpl(source) };
+    if (basename(source) !== 'submission.json' || await realpathImpl(source) !== source) {
+      throw new Error('Invalid handoff file');
+    }
+    const fd = await openImpl(source);
+    try {
+      const meta = await fd.stat();
+      if (!meta.isFile() || meta.size > SUBMISSION_MAX_BYTES) throw new Error('Invalid handoff file');
+      const buffer = Buffer.alloc(SUBMISSION_MAX_BYTES + 1);
+      const { bytesRead } = await fd.read(buffer, 0, SUBMISSION_MAX_BYTES + 1, 0);
+      if (bytesRead > SUBMISSION_MAX_BYTES) throw new Error('Invalid handoff file');
+      return { ...base, submission: JSON.parse(buffer.subarray(0, bytesRead).toString('utf8')) };
+    } finally {
+      await fd.close();
+    }
   } catch (error) {
     if (error.code === 'ENOENT') return base;
     return { ...base, submission: null };
@@ -419,6 +469,93 @@ export function scopeFenceReworkResult(violations, allowedPaths) {
       })),
     },
   };
+}
+
+// Ужесточение git на worker-writable worktree: конфигурация репозитория и
+// пользовательский/системный gitconfig никогда не исполняют код от имени
+// доверенного контроллера — ни fsmonitor, ни hooks, ни external diff.
+export const HARDENED_GIT_CONFIG = Object.freeze([
+  '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=',
+]);
+
+export function hardenedGitEnv(base = process.env) {
+  return { ...(base ?? {}), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+}
+
+// merge-base --is-ancestor завершается ненулевым кодом для не-предка: это
+// данные (нет стабильной точки), а не сбой — иначе выброс внутри capture
+// зацикливает попытку на одном и том же вопросе владельца.
+export async function ancestorOrNull(git, base, sha) {
+  try {
+    await git('merge-base', '--is-ancestor', base, sha);
+  } catch {
+    return null;
+  }
+  return sha;
+}
+
+// Активный in-flight воркер не убивается при graceful shutdown/SIGTERM и по
+// истечении pilot wait: остановка допустима только в терминальной фазе.
+export function shouldStopWorkerOnShutdown({ recordPhase, resultPhase } = {}) {
+  return TERMINAL_PHASES.has(recordPhase ?? resultPhase);
+}
+
+const REF_COMPONENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const refComponent = value => {
+  const text = typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : value;
+  return typeof text === 'string' && REF_COMPONENT_RE.test(text) && !text.includes('..') ? text : null;
+};
+
+// Долговременный ref закрытой попытки: verified-кандидат закрепляется под
+// refs/darkfactory/verified/<task_id>/<attempt_id>, held — под /held/. Без
+// компонентов или полного sha закреплять нечего — null, а не частичный ref.
+export function candidatePinRef({ phase, record } = {}) {
+  const kind = phase === 'done' ? 'verified' : phase === 'hold' ? 'held' : null;
+  if (kind === null) return null;
+  const sha = record?.sha;
+  if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/.test(sha)) return null;
+  const taskId = refComponent(record?.taskId);
+  const attemptId = refComponent(record?.attemptId);
+  if (taskId === null || attemptId === null) return null;
+  return { ref: `refs/darkfactory/${kind}/${taskId}/${attemptId}`, sha };
+}
+
+// Queue-режим: durable ref выписывается строго ДО reset --hard на base —
+// проверенный/удержанный candidate_sha никогда не осиротеет при сбросе
+// worktree. Сбой закрепления пробрасывается и останавливает сброс: потерять
+// verified-коммит хуже, чем остановить демон с нетронутым деревом.
+// Деструктивные reset --hard/clean -fd идут строго после доказательства,
+// что checkout — ожидаемая ветка слота (или отделённый HEAD ровно на base
+// либо candidate_sha попытки) и воркер остановлен: reset на чужой ветке
+// передвинул бы ЕЁ указатель на base, а clean -fd стёр бы чужую работу.
+// Расхождение — карантин: дерево не трогается, журналируется
+// branch_mismatch_quarantined/worker_not_stopped_quarantined и демон
+// останавливается с нетронутым checkout вместо разрушения чужой ветки.
+export const QUEUE_CHECKOUT_QUARANTINE = Object.freeze({
+  branch: 'branch_mismatch_quarantined',
+  worker: 'worker_not_stopped_quarantined',
+});
+export async function resetQueueWorktree({ git, base, phase, record, branch,
+  workerStopped = false, log = note => console.log(JSON.stringify(note)) } = {}) {
+  const pin = candidatePinRef({ phase, record });
+  if (pin !== null) await git('update-ref', pin.ref, pin.sha);
+  const currentBranch = await git('branch', '--show-current');
+  const head = await git('rev-parse', 'HEAD');
+  const candidate = typeof record?.sha === 'string' && /^[a-f0-9]{40}$/.test(record.sha)
+    ? record.sha : null;
+  const branchOk = typeof branch === 'string' && branch !== '' && currentBranch === branch;
+  const detachedOk = currentBranch === '' && (head === base || (candidate !== null && head === candidate));
+  if ((!branchOk && !detachedOk) || workerStopped !== true) {
+    const kind = !branchOk && !detachedOk
+      ? QUEUE_CHECKOUT_QUARANTINE.branch : QUEUE_CHECKOUT_QUARANTINE.worker;
+    const note = { kind, phase, branch: currentBranch, expectedBranch: branch ?? null,
+      head, base, task_id: record?.taskId ?? null, attempt_id: record?.attemptId ?? null,
+      workerStopped: workerStopped === true };
+    if (typeof log === 'function') log(note);
+    throw new Error(kind);
+  }
+  await git('reset', '--hard', base);
+  await git('clean', '-fd');
 }
 
 async function ownerAnswerSource(cfg, principal, tree, inbox) {
@@ -533,6 +670,10 @@ async function execute() {
   const p = JSON.parse(policyBytes);
   const workerRuntimeKind = resolveWorkerRuntimeKind({
     cliRuntime: values.runtime, policy: p, env: process.env });
+  // P0-1: живая Board-очередь на голом subproc отклоняется до любого
+  // эффекта — изоляции писателя нет, а неподтверждённая остановка процесса
+  // после рестарта контроллера недоказуема. Только явный opt-in оператора.
+  assertSubprocLiveAllowed({ kind: workerRuntimeKind, policy: p, env: process.env });
   const portableRuntime = workerRuntimeKind === 'bb' ? undefined : createWorkerRuntime({ kind: workerRuntimeKind });
   const activation = boardActivation(p, {
     allowLive: values['allow-live-pilot'], pilotChannel: process.env.DF_PILOT_CHANNEL,
@@ -616,7 +757,18 @@ async function execute() {
     models: { worker: { provider: p.bb.provider, model: p.bb.model },
       critic: reviewSetup.critic, arbiter: reviewSetup.arbiter } });
   let telemetry = newTelemetry();
-  const route = { ...p.route, policyDigest: pinned.digest };
+  // Эффективный дайджест политики слота — операторский override либо
+  // отпечаток закреплённых файлов (та же семантика, что digest на seal).
+  // Именно его несут метки policy_digest карточек при постановке и именно
+  // его сверяет queue-допуск: слот с другой политикой карточку не крадёт.
+  // Контроль неизменности входов идёт по отпечатку файлов отдельно: даже с
+  // override фактический стартовый отпечаток входов закрепляется в route и
+  // тем самым в binding записи попытки — изменённые prompt/skill/гейт-файлы
+  // между рестартами дают другой отпечаток, и возобновление попытки падает
+  // fail-closed на расхождении binding/пинов, а не исполняет подменённые входы.
+  const pinnedInputsDigest = pinned.digest;
+  const route = { ...p.route, policyDigest: p.policyDigest ?? pinnedInputsDigest,
+    inputsDigest: pinnedInputsDigest };
   // Queue-driven маршрут без route.taskId: карточку берёт board.claimReady по
   // allowlist оператора (owner + маршрутная метка + дополнительно требуемые метки).
   if (route.taskId === undefined) {
@@ -624,7 +776,7 @@ async function execute() {
       repoId: p.route.repoId, required: p.route.required ?? [] };
   }
   const assertPinned = async () => {
-    if ((await readOperatorInputs(files)).digest !== route.policyDigest) throw new Error('Operator inputs changed');
+    if ((await readOperatorInputs(files)).digest !== pinnedInputsDigest) throw new Error('Operator inputs changed');
     await ab?.assertOpen();
   };
   if (p.version !== route.policyVersion || !p.owner || !p.label?.key || !p.label?.value ||
@@ -688,6 +840,16 @@ async function execute() {
   // закреплённый срез; запись в память из контекста воркера запрещена.
   const memoryCfg = memoryPolicyConfig(p.projectMemory);
   const memoryStoreDir = ab ? null : resolveMemoryStoreDir({ policy: p.projectMemory });
+  // HMAC-ключ рецептов памяти резолвется без plaintext в policy JSON: явный
+  // ключ > DF_PROJECT_MEMORY_HMAC_KEY > приватный key-файл 0600. Доверенный
+  // каталог без любого источника ключа — fail-closed отказ на старте, а не
+  // поздний сбой writer при первой записи.
+  const memoryKeyNeeded = memoryStoreDir !== null &&
+    (memoryCfg.trustedReceiptDir !== undefined || memoryCfg.hmacKey !== undefined ||
+      memoryCfg.keyFile !== undefined);
+  const memoryHmacKey = memoryKeyNeeded
+    ? await resolveMemoryHmacKey({ hmacKey: memoryCfg.hmacKey, keyFile: memoryCfg.keyFile })
+    : undefined;
   const currentProjectMemory = async () => memoryStoreDir === null ? null : resolveProjectMemory({
     storeDir: memoryStoreDir, projectId: p.bb.project, worktree: tree,
     maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS });
@@ -699,12 +861,11 @@ async function execute() {
     const slice = await pinnedProjectMemory(key);
     return slice && slice.enabled !== false ? slice : undefined;
   };
-  const projectMemoryWriter = memoryStoreDir !== null &&
-      (memoryCfg.trustedReceiptDir !== undefined || memoryCfg.hmacKey !== undefined)
+  const projectMemoryWriter = memoryStoreDir !== null && memoryHmacKey !== undefined
     ? createProjectMemoryWriter({
         storeDir: memoryStoreDir,
         trustedReceiptDir: memoryCfg.trustedReceiptDir,
-        hmacKey: memoryCfg.hmacKey,
+        hmacKey: memoryHmacKey,
         worktree: tree,
         maxChars: memoryCfg.maxChars ?? DEFAULT_MEMORY_MAX_CHARS,
         ...(memoryCfg.maxEntriesPerSection !== undefined
@@ -793,7 +954,11 @@ async function execute() {
     }
   };
   const record = join(root, 'attempt.json');
-  const rawGit = async (...args) => (await exec('git', ['-C', tree, ...args], { timeout: 10000 })).stdout;
+  // Каждый git-вызов доверенного контроллера на worker-writable дереве
+  // ужесточён: явный maxBuffer на большие diff scope-fence/адаптивных гейтов,
+  // отключённые hooks/fsmonitor/external diff и изолированная конфигурация.
+  const rawGit = async (...args) => (await exec('git', ['-C', tree, ...HARDENED_GIT_CONFIG, ...args],
+    { timeout: 10000, maxBuffer: 16 * 1024 * 1024, env: hardenedGitEnv() })).stdout;
   const git = async (...args) => (await rawGit(...args)).trim();
   const authorize = async (state, taskId) => {
     await assertPinned();
@@ -966,16 +1131,39 @@ async function execute() {
       if (confirmed) telemetry.workerResume({ subject: packet.attempt });
       return { confirmed };
     },
+    // Подтверждённая остановка BB-треда: interrupt активной работы, затем
+    // read-only сверка инертного состояния — нет активных фоновых агентов и
+    // очереди сообщений. Только такое доказательство допускает деструктивную
+    // очистку очереди: stopped: true без него не выписывается, а сбой
+    // транспорта пробрасывается и трактуется как неподтверждённая остановка.
+    async stop(threadId) {
+      await exec('bb', ['thread', 'stop', threadId], { timeout: 15_000 });
+      const { stdout } = await exec('bb', ['thread', 'show', threadId, '--json'], { timeout: 9000 });
+      const thread = JSON.parse(stdout)?.thread;
+      const inert = thread !== null && typeof thread === 'object' &&
+        ['idle', 'failed', 'interrupted'].includes(thread.status) &&
+        thread.activeBackgroundAgentCount === 0 && thread.queuedMessageCount === 0;
+      return { stopped: inert === true,
+        ...(typeof thread?.status === 'string' ? { state: thread.status } : {}) };
+    },
   };
   const bb = buildWorkerTransport({ kind: workerRuntimeKind, policy: p, runtime: portableRuntime,
     bbTransport, worktree: tree, prepareSpawn: prepareWorkerSpawn,
     prepareFeedback: prepareWorkerFeedback, permissionMode });
   let liveThreadId = null;
   const stopWorkerThread = async threadId => {
-    if (!threadId || typeof bb.stop !== 'function') return;
-    try { await bb.stop(threadId); } catch {}
+    if (!threadId || typeof bb.stop !== 'function') return null;
+    try { return await bb.stop(threadId); } catch { return null; }
   };
   const stopTerminalWorker = result => stopWorkerThread(result?.threadId ?? liveThreadId);
+  // Доказательство «воркер остановлен» для деструктивной очистки очереди:
+  // воркера нет вовсе либо stop вернул подтверждённый stopped: true. Отсутствие
+  // метода stop, его сбой (outcome null) и любое stopped !== true —
+  // НЕПОДТВЕРЖДЁННАЯ остановка: декларируемое состояние результата stop не
+  // доказательство (post-restart amnesia subproc-сессий, живой писатель после
+  // reset --hard грязнил бы дерево следующей карточки) — очистка карантинится.
+  const workerStoppedEvidence = (threadId, outcome) =>
+    !threadId || outcome?.stopped === true;
   // Daemon kill-switch: создаётся до verify, чтобы единственный повтор L2
   // проверял именно действующий стоп-файл, а не только activation switch.
   const daemonSwitchPath = values.switch ?? p.pilot?.killSwitch;
@@ -1033,8 +1221,7 @@ async function execute() {
         await git('branch', '--show-current') !== p.profiles[route.checkProfile].branch ||
         await git('status', '--porcelain=v1', '--untracked-files=all')) return null;
     const sha = await git('rev-parse', 'HEAD');
-    await git('merge-base', '--is-ancestor', route.base, sha);
-    return sha;
+    return ancestorOrNull(git, route.base, sha);
   }
   const questionGate = ownerAnswers && { ...ownerAnswers,
     capture: ({ attempt, turnSeq }) => stableCheckpoint(attempt.bb_thread_id, turnSeq),
@@ -1052,7 +1239,11 @@ async function execute() {
   const beforeAttemptEffect = (taskId, epoch) => ab
     ? abEffectGuard(ab, { verifyHeld: port.verifyHeld, assertPinned }, taskId, epoch)
     : activation && (() => port.guardTask(taskId, epoch));
-  const verify = async (attempt, submission) => {
+  // Третий контроллерный аргумент несёт монотонный recoverySeq восстановления
+  // прерванной проверки (Spot preemption, F-02): приёмка перепроверяет
+  // кандидата под свежим ключом журнала того же восстановления, а не застревает
+  // на uncertain прерванного запуска. Сдача воркера счётчик подменить не может.
+  const verify = async (attempt, submission, controllerOptions) => {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
@@ -1100,15 +1291,17 @@ async function execute() {
     });
     const neon = isNeonReview(attemptCritic);
     // Уже прошедшая writer-фаза учитывается в её бюджете по фактическому
-    // времени: старт ≈ record.until минус аренда (момент claim). Якорь
-    // неизмерим — бюджет writer честно не применяется (аренда всё равно
-    // ограничивает попытку через lease-опрос).
+    // времени: неизменный writerStartedAt, записанный контроллером при входе
+    // писателя в working. Выводить старт из record.until минус аренда нельзя:
+    // until движется вперёд каждым успешным продлением аренды и занижал бы
+    // расход бюджета. Якорь неизмерим (старая запись) — бюджет writer честно
+    // не применяется (аренда всё равно ограничивает попытку через lease-опрос).
     let phaseSpent;
     if (foreman?.phaseBudgets?.writer !== undefined) {
       const saved = await state.load();
-      const claimedUntil = typeof saved?.until === 'string' ? Date.parse(saved.until) : NaN;
-      if (Number.isFinite(claimedUntil)) {
-        phaseSpent = { writer: Math.max(0, Date.now() - (claimedUntil - boardLeaseSec * 1000)) };
+      const writerStartedAt = Number.isFinite(saved?.writerStartedAt) ? saved.writerStartedAt : NaN;
+      if (Number.isFinite(writerStartedAt)) {
+        phaseSpent = { writer: Math.max(0, Date.now() - writerStartedAt) };
       }
     }
     let attemptSignals = null;
@@ -1205,9 +1398,13 @@ async function execute() {
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
       arbiter: attemptArbiter,
       review: { ...profile.review, ...attemptCritic, requireAttestation: true } } } };
+    // Транзитный сбой renew (сеть/5xx) не доказывает потерю аренды: capability
+    // в адаптере сохраняется, цикл повторяет обновление на следующих тиках.
+    // lost вооружается только окончательной потерей claim/эпохи — тогда повтор
+    // бессмысленен, а после истечения аренды renew сам отвечает claim_lost.
     const timer = setInterval(() => {
       renewal = renewal.then(() => { if (!lost) return port.verifyHeld(attempt.task_id, attempt.epoch); })
-        .catch(() => { lost = true; });
+        .catch(error => { if (isDefinitiveClaimLoss(error)) lost = true; });
     }, 20_000);
     try {
       // VS-5.2: единый сигнал попытки для Stage/Foreman — kill-switch, живая
@@ -1295,7 +1492,8 @@ async function execute() {
             console.log(JSON.stringify(note));
           } });
       };
-      const result = await acceptHeld({ attempt: acceptanceAttempt, submission, policy, journal: root, ports: {
+      const result = await acceptHeld({ attempt: acceptanceAttempt, submission, policy, journal: root,
+        recoverySeq: controllerOptions?.recoverySeq ?? 0, ports: {
         board: port, inspect: telemetry.port('inspect', inspect),
         local: telemetry.port('l1_local', async (binding, trusted) => {
           enterPhase('l1_l3');
@@ -1412,7 +1610,7 @@ async function execute() {
         const memResult = await recordPostReviewMemory({
           writer: projectMemoryWriter,
           trustedReceiptDir: memoryCfg.trustedReceiptDir,
-          hmacKey: memoryCfg.hmacKey,
+          hmacKey: memoryHmacKey,
           projectId: p.bb.project,
           worktree: tree,
           result,
@@ -1439,7 +1637,10 @@ async function execute() {
 
   const stateHome = process.env.XDG_STATE_HOME?.startsWith('/')
     ? process.env.XDG_STATE_HOME : join(homedir(), '.local', 'state');
-  const release = await reserveWorktree(join(stateHome, 'darkfactory-lab', 'slots'), tree, root);
+  // Бронь слота — и worktree, и каталог состояния эксклюзивно: два слота с
+  // общим state dir не перезаписывают attempt.json и не убивают чужих воркеров.
+  const release = await reserveWorktree(join(stateHome, 'darkfactory-lab', 'slots'), tree, root,
+    { stateDir: root });
   // Порт арбитра: реальный изолированный раннер третьего семейства в том же
   // rootless Docker read-only контуре, что и критик. Создаётся лениво —
   // только когда арбитраж действительно запрошен.
@@ -1448,10 +1649,14 @@ async function execute() {
     await beforeEffect?.();
     const specInputs = queueModeSpecInputs({ route, attempt: req,
       operatorBrief: pinned.inputs.get(brief).toString('utf8'), reviewSpec });
+    // Промпт арбитра форматируется под семейство фактического арбитра триады
+    // (тот же нормализованный спек, что исполнит раннер): без пятого аргумента
+    // семейственные правила промпта не применялись вообще.
     const arbiterRunner = isolatedArbiterRunner({ journal: root, beforeEffect,
       prompt: arbiterIntakePrompt(specInputs.reviewSpec, typeof p.arbiterPrompt === 'string' ? p.arbiterPrompt : '',
         await pinnedDecisions(`${req.task_id}:${req.epoch}`) ?? undefined,
-        await activeProjectMemory(`${req.task_id}:${req.attempt_id}:${req.epoch}`)) });
+        await activeProjectMemory(`${req.task_id}:${req.attempt_id}:${req.epoch}`),
+        runnerReviewSpec(req?.arbiter) ?? undefined) });
     const decision = await telemetry.phase('arbiter', () => arbiterRunner(req));
     telemetry.recordUsage('arbiter', decision?.usage, 'pi_stream');
     telemetry.recordArbitration();
@@ -1461,8 +1666,21 @@ async function execute() {
   let previous;
   let recheck = values['recheck-rejected-handoff'];
   const tick = guardedEffect(assertOpen, advanceWithProjection);
-  const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
-    release: releasePort, recheckRejectedHandoff: recheck, eventBus,
+  // Зонд активной попытки по долговременной записи: любая запись попытки —
+  // in-flight работа (lease maintenance, reconciliation или терминальная
+  // очистка), которая не должна молча пропускаться при деградированном
+  // дисковом preflight. Ошибка чтения пробрасывается — runDaemon трактует
+  // неопределённость в пользу сохранения lease.
+  const hasActiveAttempt = async () => Boolean(await state.load());
+  const runTick = async ({ preflightFailed = false } = {}) => {
+    // Деградированный preflight гейтует только НОВЫЕ захваты: без записи
+    // попытки тик пошёл бы в claim — пропускаем его, пока диск не восстановится.
+    // Активная попытка тикается обычным путём и продолжает продлевать lease.
+    if (preflightFailed && !await state.load()) {
+      return { phase: 'idle', reason: 'disk_preflight_failed' };
+    }
+    return tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
+    release: releasePort, recheckRejectedHandoff: recheck, eventBus, recoverInterruptedChecking: true,
     workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter,
       baseWorker: baseWorkerFromPolicy(p),
       ...(ab ? { selectWorker: () => [{ provider: p.bb.provider, model: p.bb.model }] } : {}), arbitrate,
@@ -1512,6 +1730,7 @@ async function execute() {
         return pinned;
       } },
     decisionLedger });
+  };
   const observeTick = result => {
     recheck = false;
     lastResult = result;
@@ -1538,12 +1757,15 @@ async function execute() {
       const journal = new RotatingJournal({ directory: root });
       await runDaemon({
         intervalMs, journal, diskPath: tree, assertOpen: daemonOpen,
-        tick: runTick, eventBus,
+        tick: runTick, eventBus, hasActiveAttempt,
         onTick: async result => {
           observeTick(result);
           if (result.phase === 'release_ready' && !releasePort) return 'stop';
           if (!TERMINAL_PHASES.has(result.phase)) return;
-          if (['done', 'hold', 'lease_lost'].includes(result.phase)) await stopTerminalWorker(result);
+          let terminalStop = null;
+          if (['done', 'hold', 'lease_lost'].includes(result.phase)) {
+            terminalStop = await stopTerminalWorker(result);
+          }
           // Закреплённая карточка: терминал завершает демон. Очередь: done/hold
           // освобождают слот для следующей карточки; неопределённый исход стопит.
           if (route.taskId !== undefined) {
@@ -1561,8 +1783,12 @@ async function execute() {
             // Иначе сводка следующей карточки унаследует счётчики предыдущей.
             await finishTelemetry();
             try {
-              await git('reset', '--hard', route.base);
-              await git('clean', '-fd');
+              // Деструктивная очистка — только на доказанной ветке слота (или
+              // отделённом HEAD base/candidate) при остановленном воркере; иначе
+              // карантин с журналированием внутри resetQueueWorktree.
+              await resetQueueWorktree({ git, base: route.base, phase: result.phase,
+                record: closedRecord, branch: p.profiles[route.checkProfile].branch,
+                workerStopped: workerStoppedEvidence(result?.threadId ?? liveThreadId, terminalStop) });
             } catch (error) {
               process.exitCode = 1;
               console.error(`queue worktree reset failed: ${String(error?.message ?? error).split('\n')[0]}`);
@@ -1598,7 +1824,11 @@ async function execute() {
   } finally {
     try {
       const shutdownRecord = await state.load().catch(() => null);
-      await stopWorkerThread(shutdownRecord?.threadId ?? liveThreadId);
+      // Активный in-flight воркер переживает graceful shutdown/SIGTERM и
+      // истёкший pilot wait: принудительная остановка — только терминальных фаз.
+      if (shouldStopWorkerOnShutdown({ recordPhase: shutdownRecord?.phase, resultPhase: lastResult?.phase })) {
+        await stopWorkerThread(shutdownRecord?.threadId ?? liveThreadId);
+      }
       // Закрытая карточка с историей REWORK — источник уроков (#1263).
       if (['done', 'hold'].includes(lastResult?.phase)) await distillClosedAttempt();
       await finishTelemetry();

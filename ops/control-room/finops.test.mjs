@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import { createFinopsProvider, EXAMPLE_BUDGET_PATH } from './finops.mjs';
+import { createFinopsProvider, analyzeDeadLoad, buildSpendDynamics,
+  EXAMPLE_BUDGET_PATH } from './finops.mjs';
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -330,6 +331,192 @@ workspace_links: {}
     await writeFile(usage, `{"runningMinutesMonth":600,"padding":"${'x'.repeat(263000)}"}`);
     const capped = await createFinopsProvider({ budgetPath: budget, workerStatePath: join(dir, 'missing-state.json'), workerUsagePath: usage })();
     assert.equal(capped.totals.runningMinutesMonth, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Spend Dynamics & Dead-Load Detector --------------------------------------
+
+test('analyzeDeadLoad: worker RUNNING >= 20m idle с 0 задач → dead_load_detected (bad)', () => {
+  const result = analyzeDeadLoad({
+    vmUsage: [
+      { id: 'cloud-bb-worker', pricing: 'spot', state: 'RUNNING',
+        runningMinutesToday: 90, activeMinutesToday: 0 },
+    ],
+    activeTasks: 0,
+    claimedTasks: 0,
+    idleMinutesSinceLastTask: 20,
+    deadLoadThresholdMinutes: 20,
+  });
+  assert.equal(result.deadLoadDetected, true);
+  const vm = result.vms.find(v => v.id === 'cloud-bb-worker');
+  assert.equal(vm.deadLoad, true);
+  assert.equal(vm.activeMinutes, 0);
+  assert.equal(vm.idleMinutes, 90);
+  assert.equal(vm.idleWastePct, 100);
+  const alert = result.alerts.find(a => a.code === 'dead_load_detected');
+  assert.equal(alert.severity, 'bad');
+  assert.equal(alert.resourceId, 'cloud-bb-worker');
+  assert.equal(result.idleWastePct, 100);
+});
+
+test('analyzeDeadLoad: активные/взятые задачи или остановленная VM — чисто', () => {
+  const runningWorker = { id: 'cloud-bb-worker', pricing: 'spot', state: 'running',
+    runningMinutesToday: 120, activeMinutesToday: 30 };
+  const withTasks = analyzeDeadLoad({ vmUsage: [runningWorker],
+    activeTasks: 1, claimedTasks: 0, idleMinutesSinceLastTask: 60 });
+  assert.equal(withTasks.deadLoadDetected, false);
+  assert.equal(withTasks.alerts.length, 0);
+  assert.equal(withTasks.vms[0].deadLoad, false);
+  assert.equal(withTasks.vms[0].activeMinutes, 30);
+  assert.equal(withTasks.vms[0].idleMinutes, 90);
+  assert.equal(withTasks.vms[0].idleWastePct, 75);
+
+  const claimedOnly = analyzeDeadLoad({ vmUsage: [runningWorker],
+    activeTasks: 0, claimedTasks: 2, idleMinutesSinceLastTask: 60 });
+  assert.equal(claimedOnly.deadLoadDetected, false);
+
+  const stopped = analyzeDeadLoad({ vmUsage: [
+    { ...runningWorker, state: 'stopped' }],
+    activeTasks: 0, claimedTasks: 0, idleMinutesSinceLastTask: 600 });
+  assert.equal(stopped.deadLoadDetected, false);
+  assert.equal(stopped.alerts.length, 0);
+
+  const belowThreshold = analyzeDeadLoad({ vmUsage: [runningWorker],
+    activeTasks: 0, claimedTasks: 0, idleMinutesSinceLastTask: 19,
+    deadLoadThresholdMinutes: 20 });
+  assert.equal(belowThreshold.deadLoadDetected, false);
+
+  const controlPlane = analyzeDeadLoad({ vmUsage: [
+    { id: 'cloud-brain', pricing: 'Always Free', state: 'running',
+      runningMinutesToday: 120 }],
+    activeTasks: 0, claimedTasks: 0, idleMinutesSinceLastTask: 600 });
+  assert.equal(controlPlane.deadLoadDetected, false,
+    'не-worker control-plane VM не флагается даже при длинном простое');
+});
+
+test('analyzeDeadLoad: worker распознаётся по id без spot-pricing, пустой вход — чисто', () => {
+  const byId = analyzeDeadLoad({
+    vmUsage: [{ id: 'ephemeral-worker-3', pricing: 'on-demand', state: 'RUNNING',
+      runningMinutesToday: 45 }],
+    idleMinutesSinceLastTask: 30 });
+  assert.equal(byId.deadLoadDetected, true);
+  const empty = analyzeDeadLoad({ vmUsage: [] });
+  assert.equal(empty.deadLoadDetected, false);
+  assert.equal(empty.idleWastePct, 0);
+  assert.deepEqual(empty.alerts, []);
+});
+
+test('buildSpendDynamics: проекция против €25 target, overTarget и тренды', () => {
+  // 6 дней по €1 → проекция €30 против target €25 → overTarget.
+  const over = buildSpendDynamics({
+    dailyHistory: [1, 1, 1, 1, 1], todayEur: 1,
+    monthlyTargetEur: 25, dayOfMonth: 6, daysInMonth: 30 });
+  assert.equal(over.daily.length, 6);
+  assert.equal(over.daily.at(-1).today, true);
+  assert.equal(over.avgDailyEur, 1);
+  assert.equal(over.projectedMonthEur, 30);
+  assert.equal(over.targetEur, 25);
+  assert.equal(over.overTarget, true);
+  assert.equal(over.trend, 'stable');
+
+  const under = buildSpendDynamics({
+    dailyHistory: [0.5, 0.5], todayEur: 0.5,
+    monthlyTargetEur: 25, dayOfMonth: 3, daysInMonth: 30 });
+  assert.equal(under.projectedMonthEur, 15);
+  assert.equal(under.overTarget, false);
+
+  const rising = buildSpendDynamics({
+    dailyHistory: [0.5, 0.5, 0.5], todayEur: 2,
+    monthlyTargetEur: 25, dayOfMonth: 4, daysInMonth: 30 });
+  assert.equal(rising.trend, 'rising');
+
+  const falling = buildSpendDynamics({
+    dailyHistory: [2, 2, 2], todayEur: 0.2,
+    monthlyTargetEur: 25, dayOfMonth: 4, daysInMonth: 30 });
+  assert.equal(falling.trend, 'falling');
+
+  const stable = buildSpendDynamics({
+    dailyHistory: [1, 1, 1], todayEur: 1,
+    monthlyTargetEur: 25, dayOfMonth: 4, daysInMonth: 30 });
+  assert.equal(stable.trend, 'stable');
+});
+
+test('buildSpendDynamics: записи {date, eur}, дефолтный target 25 и пустая история', () => {
+  const result = buildSpendDynamics({
+    dailyHistory: [{ date: '2026-11-01', eur: 2 }, { date: '2026-11-02', eur: '1.5' }],
+    todayEur: 0.5, dayOfMonth: 3, daysInMonth: 30 });
+  assert.equal(result.daily[0].date, '2026-11-01');
+  assert.equal(result.daily[1].eur, 1.5);
+  assert.equal(result.targetEur, 25);
+  assert.equal(result.avgDailyEur, 1.3333);
+  assert.equal(result.projectedMonthEur, 40);
+
+  const empty = buildSpendDynamics({});
+  assert.equal(empty.daily.length, 1); // только today-point
+  assert.equal(empty.overTarget, false);
+  assert.equal(empty.trend, 'stable');
+  assert.equal(empty.projectedMonthEur, 0);
+});
+
+test('finops snapshot: spendDynamics и dead_load_detected проводятся в snapshot и alerts', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-deadload-'));
+  try {
+    const budget = join(dir, 'budget.yaml');
+    const usage = join(dir, 'usage.json');
+    await writeFile(budget, `version: 1
+monthly_budget_eur: 25
+compute_vms:
+  - id: cloud-bb-worker
+    machine_type: e2-standard-8 Spot
+    hourly_cost_usd: 0.10
+    pricing: spot
+    metered: true
+workspace_links: {}
+`);
+    await writeFile(usage, JSON.stringify({
+      state: 'running', runningMinutesToday: 90, runningMinutesMonth: 90,
+      activeMinutesToday: 0, activeTasks: 0, claimedTasks: 0,
+      idleMinutesSinceLastTask: 45,
+      dailySpendEur: [{ date: '2026-11-23', eur: 2 }],
+      updatedAt: '2026-11-24T10:00:00Z' }));
+    const snap = await createFinopsProvider({ budgetPath: budget, workerUsagePath: usage,
+      now: new Date('2026-11-24T12:00:00Z') })();
+    assert.equal(snap.ok, true);
+    assert.equal(snap.deadLoad.deadLoadDetected, true);
+    assert.equal(snap.deadLoad.vms[0].deadLoad, true);
+    assert.equal(snap.deadLoad.idleMinutesSinceLastTask, 45);
+    assert.equal(snap.alerts.some(a => a.code === 'dead_load_detected' &&
+      a.severity === 'bad' && a.resourceId === 'cloud-bb-worker'), true);
+    assert.ok(Array.isArray(snap.spendDynamics.daily));
+    assert.equal(snap.spendDynamics.targetEur, 25);
+    assert.equal(typeof snap.spendDynamics.projectedMonthEur, 'number');
+    assert.equal(typeof snap.spendDynamics.overTarget, 'boolean');
+    assert.ok(['rising', 'falling', 'stable'].includes(snap.spendDynamics.trend));
+    assert.equal(snap.spendDynamics.daily[0].eur, 2);
+
+    // Свежая задача (idle < порога) → алертов мёртвой нагрузки нет.
+    await writeFile(usage, JSON.stringify({
+      state: 'running', runningMinutesToday: 90, runningMinutesMonth: 90,
+      activeTasks: 0, claimedTasks: 0, idleMinutesSinceLastTask: 5,
+      updatedAt: '2026-11-24T10:00:00Z' }));
+    const clean = await createFinopsProvider({ budgetPath: budget, workerUsagePath: usage,
+      now: new Date('2026-11-24T12:00:00Z') })();
+    assert.equal(clean.deadLoad.deadLoadDetected, false);
+    assert.equal(clean.alerts.some(a => a.code === 'dead_load_detected'), false);
+    // Активная работа: активные минуты снижают idle waste.
+    await writeFile(usage, JSON.stringify({
+      state: 'running', runningMinutesToday: 100, runningMinutesMonth: 100,
+      activeMinutesToday: 80, activeTasks: 1, claimedTasks: 1,
+      idleMinutesSinceLastTask: 0,
+      updatedAt: '2026-11-24T10:00:00Z' }));
+    const busy = await createFinopsProvider({ budgetPath: budget, workerUsagePath: usage,
+      now: new Date('2026-11-24T12:00:00Z') })();
+    assert.equal(busy.deadLoad.deadLoadDetected, false);
+    assert.equal(busy.deadLoad.vms[0].activeMinutes, 80);
+    assert.equal(busy.deadLoad.vms[0].idleMinutes, 20);
+    assert.equal(busy.deadLoad.vms[0].idleWastePct, 20);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

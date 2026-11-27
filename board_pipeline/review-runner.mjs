@@ -505,8 +505,70 @@ function canonicalVerdict(parsed) {
   };
 }
 
+// Общеизвестный пустой объект-дерево Git: чтение атрибутов из него
+// обезвреживает .gitattributes и info/attributes враждебного worktree —
+// ни '* -diff' (скрытие содержимого патча под «Binary files differ»), ни
+// назначение textconv/драйверов diff на пути кандидата не действуют.
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+const GIT_HARDENING = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+  '-c', 'diff.external='];
+
+// Diff кандидата генерируется по недоверенному worktree воркера: его
+// репо-локальный конфиг и глобальный конфиг пользователя не должны ни
+// исполнять код от имени контроллера (core.fsmonitor, hooks, diff.external,
+// textconv), ни влиять на состав патча. -c на командной строке сильнее
+// репо-конфига; атрибуты читаются только из пустого дерева.
+function hardenedGitEnv() {
+  return { ...process.env,
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_ATTR_SOURCE: EMPTY_TREE };
+}
+
 async function git(worktree, ...args) {
-  return (await exec('git', ['-C', worktree, ...args], { timeout: 20_000 })).stdout.trimEnd();
+  return (await exec('git', [...GIT_HARDENING, '-C', worktree, ...args],
+    { timeout: 20_000, env: hardenedGitEnv() })).stdout.trimEnd();
+}
+
+async function hardenedGitDiff(worktree, range) {
+  return exec('git', [...GIT_HARDENING, '-C', worktree, 'diff',
+    '--text', '--no-textconv', '--no-ext-diff', range],
+    { timeout: 30_000, maxBuffer: 16 * 1024 * 1024, env: hardenedGitEnv() });
+}
+
+// Симлинки распакованного снимка обязаны резолвиться строго внутрь него:
+// в контейнере снимок смонтирован как /candidate, и ссылка, уводящая за его
+// пределы (абсолютная, относительная с выходом за корень, битая или петля),
+// открыла бы критику чужие монтирования раннера (/pi-cfg, /pi-ro). Семантика
+// — как у инвентаризации neon-review.mjs: realpath обязан существовать и
+// начинаться с канонического корня снимка, сам корень не считается внутри.
+export async function assertSnapshotLinksBounded(source) {
+  const root = await realpath(source);
+  const inside = `${root}/`;
+  const walk = async (dir) => {
+    const { opendir } = await import('node:fs/promises');
+    for await (const entry of await opendir(dir)) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
+      }
+      if (!entry.isSymbolicLink()) continue;
+      const target = await readlink(full);
+      // Абсолютная цель — отказ даже без резолва: в контейнере она
+      // резолвится от корня контейнера, на хосте — от корня хоста;
+      // обе точки вне /candidate (как в neon-review inventory).
+      if (target.startsWith('/')) throw new ReviewDenied('review_snapshot_unsafe_link');
+      const resolved = await realpath(full).catch(() => null);
+      // Битая цель или петля — realpath невозможен (exit(3) neon-inventory);
+      // резолв в сам корень снимка или наружу — тот же отказ.
+      if (resolved === null || !resolved.startsWith(inside)) {
+        throw new ReviewDenied('review_snapshot_unsafe_link');
+      }
+    }
+  };
+  await walk(source);
 }
 
 // Побайтовый дайджест снимка: sha256 над упорядоченными (path, mode, sha1 байтов).
@@ -549,8 +611,9 @@ async function verifySnapshotUnchanged(source, before) {
 }
 
 async function gitRaw(worktree, ...args) {
-  return (await exec('git', ['-C', worktree, ...args],
-    { timeout: 20_000, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 })).stdout;
+  return (await exec('git', [...GIT_HARDENING, '-C', worktree, ...args],
+    { timeout: 20_000, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024,
+      env: hardenedGitEnv() })).stdout;
 }
 
 // Полный отпечаток рабочего дерева: HEAD, дерево HEAD, статус, байтовый diff
@@ -609,6 +672,20 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
       (input !== undefined && typeof input !== 'string' && !Buffer.isBuffer(input))) {
     throw new ReviewDenied('sandbox_request_invalid');
   }
+  // --mount — comma-separated key=value: ',' или '=' в пути src/dst разбивала
+  // бы спецификацию и инъецировала опции монтирования (rw вместо readonly).
+  // Вся валидация — до первого вызова docker, эффектов у отказа нет.
+  if (/[,=]/.test(snapshot)) throw new ReviewDenied('sandbox_mount_invalid');
+  for (const { src, dst } of mounts) {
+    if (!isAbsolute(src ?? '') || !isAbsolute(dst ?? '') || /[,=]/.test(src) || /[,=]/.test(dst)) {
+      throw new ReviewDenied('sandbox_mount_invalid');
+    }
+  }
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== 'string' || /[=]/.test(key)) {
+      throw new ReviewDenied('sandbox_env_invalid');
+    }
+  }
   if (signal?.aborted) throw signal.reason ?? new ReviewDenied('stage_aborted');
   const security = JSON.parse((await exec('docker', ['info', '--format', '{{json .SecurityOptions}}'], {
     timeout: 12_000,
@@ -624,15 +701,9 @@ export async function runInReadOnlySandbox({ snapshot, argv, image = REVIEW_IMAG
   args.push('--tmpfs=/tmp:rw,nosuid,nodev,size=64m', '-e', 'HOME=/tmp',
     '--mount', `type=bind,src=${snapshot},dst=/candidate,readonly`);
   for (const { src, dst } of mounts) {
-    if (!isAbsolute(src ?? '') || !isAbsolute(dst ?? '')) {
-      throw new ReviewDenied('sandbox_mount_invalid');
-    }
     args.push('--mount', `type=bind,src=${src},dst=${dst},readonly`);
   }
   for (const [key, value] of Object.entries(env)) {
-    if (typeof value !== 'string' || /[=]/.test(key)) {
-      throw new ReviewDenied('sandbox_env_invalid');
-    }
     args.push('-e', `${key}=${value}`);
   }
   args.push('--workdir', workdir, image, ...argv);
@@ -942,15 +1013,18 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
       await chmod(source, 0o755);
       // unpackExact из runtime.mjs: git archive + побайтовая сверка каждого blob.
       await unpackExact(binding.worktree, binding.candidate_sha, archive, source);
+      // Симлинк, уводящий за пределы /candidate, отклоняется до любого
+      // использования снимка — как инвентаризация neon-review.
+      await assertSnapshotLinksBounded(source);
 
       // Точный diff base→candidate: снимок read-only без .git, поэтому
       // ревьюеру монтируется готовый patch — иначе он реконструирует историю
-      // умозрительно и выдумывает находки.
+      // умозрительно и выдумывает находки. Генерация — только hardenedGitDiff:
+      // репо-конфиг и атрибуты воркера не исполняются и не скрывают патч.
       const diffFile = join(scratch, 'candidate.diff');
       try {
-        const { stdout: patch } = await exec('git',
-          ['-C', binding.worktree, 'diff', `${binding.base_sha}..${binding.candidate_sha}`],
-          { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+        const { stdout: patch } = await hardenedGitDiff(binding.worktree,
+          `${binding.base_sha}..${binding.candidate_sha}`);
         if (patch.trim()) await writeFile(diffFile, patch, { mode: 0o600 });
       } catch { /* без diff ревью всё равно идёт по снимку */ }
 
@@ -966,9 +1040,8 @@ export function isolatedPiReviewRunner({ journal, piRoot = join(homedir(), '.pi'
           throw new ReviewDenied('review_round_diff_missing');
         }
         try {
-          const { stdout: patch } = await exec('git',
-            ['-C', binding.worktree, 'diff', `${binding.prior_sha}..${binding.candidate_sha}`],
-            { timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
+          const { stdout: patch } = await hardenedGitDiff(binding.worktree,
+            `${binding.prior_sha}..${binding.candidate_sha}`);
           await writeFile(roundFile, patch, { mode: 0o600 });
         } catch (cause) {
           throw new ReviewDenied(`review_round_diff_failed:${String(cause?.message ?? cause)}`);
@@ -1182,6 +1255,7 @@ const PROVIDER_EGRESS = new Map([
   ['glm', ['open.bigmodel.cn:443']],
   ['cognition', ['api.cognition.ai:443']],
   ['opencode-go', ['opencode.ai:443']],
+  ['agy', ['daily-cloudcode-pa.googleapis.com:443']],
 ]);
 
 // Спек критика/арбитра в форме, реально исполняемой L2-раннером, либо
