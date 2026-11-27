@@ -272,19 +272,19 @@ async function npmPackageComponent(ctx, spec) {
   }
   if (packageName === null) return result;
   const before = await readPackageVersion(ctx, packageFile);
-  const installArgs = ['install', '-g', `${packageName}@latest`, '--prefix', prefix];
-  const restartServices = spec.restartServices ?? (spec.restartService ? [spec.restartService] : []);
-  const planned = [
-    commandLine('npm', ['view', packageName, 'version']),
-    commandLine('npm', installArgs),
-    ...(restartServices.length ? [commandLine('systemctl', ['--user', 'restart', ...restartServices])] : []),
-  ];
-  if (ctx.dryRun) return finished(result, 'dry_run', before, before, { planned });
-
-  const latestRun = await mustRun(ctx, 'npm', ['view', packageName, 'version'], { timeoutMs: 60_000 });
-  const latest = outputVersion(latestRun.stdout);
+  const viewArgs = ['view', packageName, 'version'];
+  const latestRun = await mustRun(ctx, 'npm', viewArgs, { timeoutMs: 60_000 });
+  const latest = latestRun.stdout.trim();
   if (!compareVersions(latest, before)) {
+    if (ctx.dryRun) return finished(result, 'dry_run', before, before, { planned: [commandLine('npm', viewArgs)] });
     return finished(result, 'already_current', before, before, { latest });
+  }
+  const installArgs = ['install', '-g', `${packageName}@${latest}`, '--prefix', prefix];
+  const restartServices = spec.restartServices ?? (spec.restartService ? [spec.restartService] : []);
+  if (ctx.dryRun) {
+    const planned = [commandLine('npm', viewArgs), commandLine('npm', installArgs)];
+    if (restartServices.length) planned.push(commandLine('systemctl', ['--user', 'restart', ...restartServices]));
+    return finished(result, 'dry_run', before, before, { planned });
   }
   await mustRun(ctx, 'npm', installArgs, { timeoutMs: 10 * 60_000 });
   const after = await readPackageVersion(ctx, packageFile);

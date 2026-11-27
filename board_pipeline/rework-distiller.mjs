@@ -10,10 +10,10 @@
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, readFile, realpath, rename, rm, stat, unlink,
-  writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative } from 'node:path';
+import { lstat, mkdir, open, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { inside, reapStaleLock } from './fs-safe.mjs';
 
 export const LESSONS_SCHEMA = 1;
 
@@ -308,12 +308,6 @@ export function validateDistilledLessons(candidates, { existing = [],
   return { accepted, pending, rejected, accumulated };
 }
 
-// path находится строго внутри root (как у изоляции run-isolated).
-const inside = (root, p) => {
-  const rel = relative(root, p);
-  return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
-};
-
 // Хранилище уроков — JSONL-файл в приватном каталоге состояния, вне
 // рабочего дерева воркера. Fail-closed границы чтения:
 // — сам файл обязан быть обычным файлом, НЕ симлинком (lstat, не stat):
@@ -344,7 +338,7 @@ async function assertLessonsPathAllowed(path, { allowedDir = null, outside = [] 
     throw new Error('lessons_store_dir_mismatch');
   }
   for (const dir of Array.isArray(outside) ? outside : []) {
-    if (typeof dir === 'string' && dir && inside(dir, real)) {
+    if (typeof dir === 'string' && dir && inside(resolve(dir), resolve(real))) {
       throw new Error('lessons_store_in_worktree');
     }
   }
@@ -396,51 +390,7 @@ export async function loadLessons(path, { allowedDir = null, outside = [] } = {}
   return lessons;
 }
 
-// Жив ли процесс: ESRCH — процесса нет (мёртвый лок); EPERM и прочие —
-// процесс существует, но принадлежит другому пользователю, лок живой.
-const pidAlive = pid => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code !== 'ESRCH';
-  }
-};
-
 export const LESSONS_STALE_LOCK_MS = 60_000;
-
-// Lockfile хранилища уроков — та же модель, что у project-memory/decision-
-// ledger: лок несёт JSON { pid, token, createdAt } и снимается рейпером
-// только когда он И просрочен, И владелец мёртв (либо pid не читается —
-// оборванная на создании запись). Перед unlink идентичность перепроверяется
-// по inode и точному контенту — чужой пересозданный лок не удаляется.
-async function clearStaleLessonsLock(lock, staleLockMs, now = Date.now()) {
-  let before;
-  try { before = await stat(lock); } catch { return false; }
-  if (!before.isFile()) return false;
-  let raw;
-  try { raw = await readFile(lock, 'utf8'); } catch { return false; }
-  let meta = null;
-  try { meta = JSON.parse(raw); } catch { /* legacy/пустой лок — судим по mtime */ }
-  let createdAtMs = NaN;
-  let pid = null;
-  if (meta !== null && typeof meta === 'object' && !Array.isArray(meta)) {
-    if (typeof meta.createdAt === 'string') createdAtMs = Date.parse(meta.createdAt);
-    if (Number.isSafeInteger(meta.pid) && meta.pid > 0) pid = meta.pid;
-  }
-  if (!Number.isFinite(createdAtMs)) createdAtMs = before.mtimeMs;
-  const expired = Number.isFinite(createdAtMs) && (now - createdAtMs) > staleLockMs;
-  if (!expired) return false;
-  if (pid !== null && pidAlive(pid)) return false;
-  let after;
-  try { after = await stat(lock); } catch { return false; }
-  if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) return false;
-  let rawAgain;
-  try { rawAgain = await readFile(lock, 'utf8'); } catch { return false; }
-  if (rawAgain !== raw) return false;
-  await rm(lock, { force: true }).catch(() => {});
-  return true;
-}
 
 // Эксклюзивная блокировка read-modify-write хранилища уроков: конкурентные
 // слоты не могут потерять чужие уроки гонкой «прочитали один снимок —
@@ -455,7 +405,7 @@ async function withLessonsLock(storePath, fn, { staleLockMs = LESSONS_STALE_LOCK
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      await clearStaleLessonsLock(lock, staleLockMs);
+      await reapStaleLock(lock, { staleMs: staleLockMs });
       await delay(50);
     }
   }
@@ -467,7 +417,7 @@ async function withLessonsLock(storePath, fn, { staleLockMs = LESSONS_STALE_LOCK
     try {
       const handleStat = await fd.stat();
       let pathStat = null;
-      try { pathStat = await stat(lock); } catch { /* лок уже отсутствует */ }
+      try { pathStat = await lstat(lock); } catch { /* лок уже отсутствует */ }
       if (pathStat !== null && pathStat.isFile() &&
           pathStat.dev === handleStat.dev && pathStat.ino === handleStat.ino) {
         await unlink(lock).catch(() => {});

@@ -7,12 +7,13 @@
 
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { lstatSync } from 'node:fs';
-import { link, lstat, mkdir, open, readFile, readlink, realpath, rename, rm,
+import { link, lstat, mkdir, open, readFile, readlink, realpath, rename,
   stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { inside, reapStaleLock } from './fs-safe.mjs';
 import { assertCrossFamily, executorFamily } from './review-runner.mjs';
 import { weakensSecurityGate } from './rework-distiller.mjs';
 import { canonicalJson } from './subject.mjs';
@@ -58,11 +59,6 @@ const MAX_SYMLINK_HOPS = 40;
 const SUBSUMPTION_MIN_CHARS = 20;
 // Жёсткий LRU-cap закреплённых срезов в кэше pinProjectMemory.
 const PIN_CACHE_CAP = 64;
-
-const inside = (root, p) => {
-  const rel = relative(root, p);
-  return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
-};
 
 const emptySections = () => Object.fromEntries(PROJECT_MEMORY_SECTIONS.map(s => [s, []]));
 
@@ -378,53 +374,6 @@ async function readStoreDoc(file, projectId) {
 
 export const DEFAULT_STALE_LOCK_MS = 60_000;
 
-// Жив ли процесс: ESRCH — процесса нет (мёртвый лок); EPERM и прочие —
-// процесс существует, но принадлежит другому пользователю, лок живой.
-const pidAlive = pid => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code !== 'ESRCH';
-  }
-};
-
-// Восстановление после SIGKILL посреди записи: лок несёт JSON
-// { pid, token, createdAt }. Мульти-слотовая гонка: истёкший лок ЖИВОГО pid
-// не снимается никогда — владелец может быть просто медленным, а рейп под ним
-// размыкает взаимное исключение. Лок снимается только когда он И просрочен
-// (старше staleLockMs), И владелец мёртв (либо pid не читается — legacy или
-// оборванная на создании запись, у которой живого владельца не существует).
-// Перед unlink идентичность лока перепроверяется по inode и точному контенту:
-// если конкурент успел снять и пересоздать лок, чужой валидный лок не трогаем.
-async function clearStaleStoreLock(lock, staleLockMs, now = Date.now()) {
-  let before;
-  try { before = await stat(lock); } catch { return false; }
-  if (!before.isFile()) return false;
-  let raw;
-  try { raw = await readFile(lock, 'utf8'); } catch { return false; }
-  let meta = null;
-  try { meta = JSON.parse(raw); } catch { /* legacy/пустой лок — судим по mtime */ }
-  let createdAtMs = NaN;
-  let pid = null;
-  if (meta !== null && typeof meta === 'object' && !Array.isArray(meta)) {
-    if (typeof meta.createdAt === 'string') createdAtMs = Date.parse(meta.createdAt);
-    if (Number.isSafeInteger(meta.pid) && meta.pid > 0) pid = meta.pid;
-  }
-  if (!Number.isFinite(createdAtMs)) createdAtMs = before.mtimeMs;
-  const expired = Number.isFinite(createdAtMs) && (now - createdAtMs) > staleLockMs;
-  if (!expired) return false;
-  if (pid !== null && pidAlive(pid)) return false;
-  let after;
-  try { after = await stat(lock); } catch { return false; }
-  if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) return false;
-  let rawAgain;
-  try { rawAgain = await readFile(lock, 'utf8'); } catch { return false; }
-  if (rawAgain !== raw) return false;
-  await rm(lock, { force: true }).catch(() => {});
-  return true;
-}
-
 async function withStoreLock(file, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } = {}) {
   const lock = `${file}.lock`;
   // Уникальный токен владения: рейпер сверяет контент перед снятием, а
@@ -437,7 +386,7 @@ async function withStoreLock(file, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } =
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      await clearStaleStoreLock(lock, staleLockMs);
+      await reapStaleLock(lock, { staleMs: staleLockMs });
       await delay(50);
     }
   }
@@ -451,7 +400,7 @@ async function withStoreLock(file, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } =
     try {
       const handleStat = await fd.stat();
       let pathStat = null;
-      try { pathStat = await stat(lock); } catch { /* лок уже отсутствует */ }
+      try { pathStat = await lstat(lock); } catch { /* лок уже отсутствует */ }
       if (pathStat !== null && pathStat.isFile() &&
           pathStat.dev === handleStat.dev && pathStat.ino === handleStat.ino) {
         await unlink(lock).catch(() => {});
