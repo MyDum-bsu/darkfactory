@@ -1,7 +1,7 @@
 import { mkdir, open, rename, statfs } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { checkBudget } from '../ops/local/check-workspace-space.mjs';
+import { checkBudget } from './workspace-budget.mjs';
 import { PilotDenied } from './pilot-gate.mjs';
 
 export const DEFAULT_INTERVAL_MS = 3500;
@@ -174,7 +174,13 @@ export async function runDaemon({ tick, intervalMs = DEFAULT_INTERVAL_MS, assert
         consecutiveErrors++;
         const backoffMs = Math.min(
           intervalMs * 2 ** Math.min(consecutiveErrors - 1, 10), maxTickErrorBackoffMs);
-        await report({ event: 'tick_error', message: error.message, consecutiveErrors, backoffMs });
+        const message = error?.message;
+        const code = typeof error?.code === 'string' && /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/.test(error.code)
+          ? error.code
+          : (typeof message === 'string' && message.match(/^[a-z][a-z0-9_]{2,}/)?.[0]) || 'tick_error';
+        const detail = { code, message, consecutiveErrors, backoffMs };
+        await report({ event: 'tick_error', ...detail });
+        emit('daemon.tick_error', detail);
         if (stopping) break;
         await wait(backoffMs);
         continue;
