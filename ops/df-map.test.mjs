@@ -97,7 +97,7 @@ test('analyzeWiring is deterministic on the real repository and formatArchitectu
   }
   assert.equal(report.wired.includes('board_pipeline/controller.mjs'), true);
   assert.equal(report.wired.includes('board_pipeline/worker-runtime.mjs'), true);
-  assert.equal(report.wired.includes('ops/local/check-workspace-space.mjs'), true);
+  assert.equal(report.wired.includes('board_pipeline/workspace-budget.mjs'), true);
   assert.equal(report.wired.some(path => path.includes('.test.')), false);
   assert.equal(report.wired.some(path => path.endsWith('-fixture.mjs')), false);
   assert.deepEqual(report.wired, [...report.wired].sort());

@@ -1715,9 +1715,7 @@ test('run: нестроковое значение приоритетного п
 
 test('run-isolated: заголовок DF #, без Пилот #', async () => {
   const source = await readFile(
-    join(fileURLToPath(new URL('.', import.meta.url)),
-      '..', 'board_pipeline', 'run-isolated.mjs'),
-    'utf8');
+    new URL('../board_pipeline/run-transport.mjs', import.meta.url), 'utf8');
   assert.match(source, /'--title', `DF #\$\{attempt\.task_id\}`,/);
   assert.doesNotMatch(source, /route\?\.ticket/);
   assert.doesNotMatch(source, /Пилот #\$\{attempt\.task_id\}/);

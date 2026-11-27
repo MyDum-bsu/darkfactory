@@ -8,24 +8,24 @@
 flowchart LR
   subgraph entries["Production entrypoints"]
     entry_pipeline["Pipeline entrypoints<br/>3 modules"]
-    entry_ops["Ops CLI entrypoints<br/>8 modules"]
+    entry_ops["Ops CLI entrypoints<br/>10 modules"]
     entry_control["Control Room entrypoints<br/>2 modules"]
   end
   subgraph modules["Reachable production modules"]
     core_pipeline["Core controller and runtime<br/>8 modules"]
-    board_support["Board pipeline support<br/>48 modules"]
-    ops_control["Control Room modules<br/>3 modules"]
-    ops_local["Operator/local modules<br/>1 module"]
+    board_support["Board pipeline support<br/>54 modules"]
+    ops_control["Control Room modules<br/>5 modules"]
   end
   entry_pipeline -->|8 static imports| core_pipeline
-  entry_pipeline -->|30 static imports| board_support
-  entry_pipeline -->|1 static import| ops_local
+  entry_pipeline -->|26 static imports| board_support
   entry_ops -->|1 static import| core_pipeline
-  entry_ops -->|9 static imports| board_support
-  entry_control -->|7 static imports| board_support
-  entry_control -->|4 static imports| ops_control
+  entry_ops -->|10 static imports| board_support
+  entry_control -->|2 static imports| board_support
+  entry_control -->|6 static imports| ops_control
   core_pipeline -->|19 static imports| board_support
-  board_support -->|10 static imports| core_pipeline
+  board_support -->|3 static imports| entry_pipeline
+  board_support -->|12 static imports| core_pipeline
+  ops_control -->|5 static imports| board_support
 ```
 
 The diagram aggregates cross-category static ESM edges so cycles and fan-out remain readable. The inventory below is the exact deterministic census; test files and `*-fixture.mjs` files are excluded from production counts.
@@ -34,15 +34,15 @@ The diagram aggregates cross-category static ESM edges so cycles and fan-out rem
 
 | Metric | Count |
 |---|---:|
-| Production modules scanned | 98 |
-| Entrypoints | 13 |
-| Wired production modules | 73 |
-| Unwired production modules under `board_pipeline/` and `ops/` | 24 |
-| `board_pipeline/` → `ops/` reverse leaks | 2 |
+| Production modules scanned | 106 |
+| Entrypoints | 15 |
+| Wired production modules | 82 |
+| Unwired production modules under `board_pipeline/` and `ops/` | 23 |
+| `board_pipeline/` → `ops/` reverse leaks | 0 |
 | Production files over 700 LOC | 15 |
-| Static production graph edges | 192 |
+| Static production graph edges | 223 |
 
-### Entrypoints (13)
+### Entrypoints (15)
 
 - `board_pipeline/daemon.mjs`
 - `board_pipeline/run-isolated.mjs`
@@ -52,13 +52,15 @@ The diagram aggregates cross-category static ESM edges so cycles and fan-out rem
 - `ops/control-room/df-herd.mjs`
 - `ops/df-archive.mjs`
 - `ops/df-decisions.mjs`
+- `ops/df-explain.mjs`
 - `ops/df-map.mjs`
 - `ops/df-models.mjs`
+- `ops/df-sentinel.mjs`
 - `ops/factory-enqueue.mjs`
 - `ops/factory-run.mjs`
 - `ops/herdr/deploy-herdr.mjs`
 
-### Wired production modules (73)
+### Wired production modules (82)
 
 - `board_pipeline/ab-pilot.mjs`
 - `board_pipeline/acceptance.mjs`
@@ -68,10 +70,12 @@ The diagram aggregates cross-category static ESM edges so cycles and fan-out rem
 - `board_pipeline/bb-reconcile.mjs`
 - `board_pipeline/bb-stage-adapter.mjs`
 - `board_pipeline/branch-drift.mjs`
+- `board_pipeline/config-compiler.mjs`
 - `board_pipeline/controller.mjs`
 - `board_pipeline/daemon.mjs`
 - `board_pipeline/decision-ledger.mjs`
 - `board_pipeline/event-bus.mjs`
+- `board_pipeline/fs-safe.mjs`
 - `board_pipeline/holdout-runner.mjs`
 - `board_pipeline/intake-prompt.mjs`
 - `board_pipeline/l1-profiles.mjs`
@@ -100,8 +104,10 @@ The diagram aggregates cross-category static ESM edges so cycles and fan-out rem
 - `board_pipeline/review-setup.mjs`
 - `board_pipeline/rework-distiller.mjs`
 - `board_pipeline/role-registry.mjs`
+- `board_pipeline/run-adaptive.mjs`
 - `board_pipeline/run-isolated.mjs`
 - `board_pipeline/run-release-watch.mjs`
+- `board_pipeline/run-transport.mjs`
 - `board_pipeline/runtime.mjs`
 - `board_pipeline/scope-fence.mjs`
 - `board_pipeline/sdk.mjs`
@@ -113,28 +119,33 @@ The diagram aggregates cross-category static ESM edges so cycles and fan-out rem
 - `board_pipeline/stage-verifier.mjs`
 - `board_pipeline/subject.mjs`
 - `board_pipeline/tamper-gate.mjs`
+- `board_pipeline/taste-profile.mjs`
 - `board_pipeline/telemetry-collector.mjs`
 - `board_pipeline/telemetry.mjs`
 - `board_pipeline/unified-ledger.mjs`
 - `board_pipeline/visual-captures.mjs`
 - `board_pipeline/worker-runtime.mjs`
 - `board_pipeline/worker-selector.mjs`
+- `board_pipeline/workspace-budget.mjs`
 - `ops/check-host.mjs`
 - `ops/control-room/aggregator.mjs`
+- `ops/control-room/board-observer.mjs`
 - `ops/control-room/df-herd.mjs`
 - `ops/control-room/finops.mjs`
 - `ops/control-room/net-health.mjs`
 - `ops/control-room/origin-guard.mjs`
+- `ops/control-room/telemetry-fleet.mjs`
 - `ops/df-archive.mjs`
 - `ops/df-decisions.mjs`
+- `ops/df-explain.mjs`
 - `ops/df-map.mjs`
 - `ops/df-models.mjs`
+- `ops/df-sentinel.mjs`
 - `ops/factory-enqueue.mjs`
 - `ops/factory-run.mjs`
 - `ops/herdr/deploy-herdr.mjs`
-- `ops/local/check-workspace-space.mjs`
 
-### Unwired production modules under board_pipeline/ and ops/ (24)
+### Unwired production modules under board_pipeline/ and ops/ (23)
 
 - `board_pipeline/agy-pre-tool.cjs`
 - `board_pipeline/agy-tools.cjs`
@@ -147,26 +158,22 @@ The diagram aggregates cross-category static ESM edges so cycles and fan-out rem
 - `board_pipeline/resource-steward.mjs`
 - `board_pipeline/scope-lock-scheduler.mjs`
 - `board_pipeline/submit.mjs`
-- `board_pipeline/taste-profile.mjs`
 - `board_pipeline/telemetry-report.mjs`
-- `board_pipeline/vs1-e2e-runner.mjs`
 - `ops/ab-pilot-compare.mjs`
 - `ops/ab-pilot-run.mjs`
 - `ops/control-room/web/app.js`
 - `ops/factory-benchmark.mjs`
 - `ops/herdr/telemetry-parsers.mjs`
 - `ops/local/board-review.mjs`
+- `ops/local/check-workspace-space.mjs`
 - `ops/local/cmd-guard-hook.mjs`
 - `ops/local/df-auto-update.mjs`
 - `ops/local/electron-app/main.cjs`
 - `ops/local/pick-personal-worker.mjs`
 
-### Reverse leaks (2)
+### Reverse leaks (0)
 
-| Importing file | Ops target | Specifier |
-|---|---|---|
-| `board_pipeline/daemon.mjs` | `ops/local/check-workspace-space.mjs` | `../ops/local/check-workspace-space.mjs` |
-| `board_pipeline/vs1-e2e-runner.mjs` | `ops/local/check-workspace-space.mjs` | `../ops/local/check-workspace-space.mjs` |
+_None._
 
 ### Production files over 700 LOC (15)
 
@@ -176,14 +183,14 @@ The diagram aggregates cross-category static ESM edges so cycles and fan-out rem
 | `board_pipeline/cmd-guard.mjs` | 932 |
 | `board_pipeline/controller.mjs` | 1051 |
 | `board_pipeline/pi-guard.cjs` | 756 |
-| `board_pipeline/project-memory.mjs` | 1376 |
+| `board_pipeline/project-memory.mjs` | 1325 |
 | `board_pipeline/resource-steward.mjs` | 755 |
 | `board_pipeline/review-runner.mjs` | 1432 |
-| `board_pipeline/run-isolated.mjs` | 1848 |
+| `board_pipeline/run-isolated.mjs` | 993 |
 | `board_pipeline/runtime.mjs` | 722 |
 | `board_pipeline/tamper-gate.mjs` | 726 |
 | `board_pipeline/telemetry-collector.mjs` | 1520 |
 | `board_pipeline/worker-selector.mjs` | 1032 |
-| `ops/control-room/aggregator.mjs` | 2116 |
+| `ops/control-room/aggregator.mjs` | 769 |
+| `ops/control-room/telemetry-fleet.mjs` | 984 |
 | `ops/control-room/web/app.js` | 1162 |
-| `ops/factory-run.mjs` | 749 |

@@ -29,15 +29,8 @@ test('analyzeWiring detects a board_pipeline to ops reverse leak on a synthetic 
   }]);
 });
 
-test('real repository has no board_pipeline to ops leaks beyond the transitional Wave 1 allowlist', () => {
+test('real repository has no board_pipeline to ops reverse leaks', () => {
   const root = fileURLToPath(new URL('../', import.meta.url));
   const report = analyzeWiring(root);
-  const transitionalAllowlist = new Set([
-    'board_pipeline/daemon.mjs\0ops/local/check-workspace-space.mjs',
-    'board_pipeline/vs1-e2e-runner.mjs\0ops/local/check-workspace-space.mjs',
-  ]);
-  const unexpected = report.reverseLeakEdges.filter(leak =>
-    !transitionalAllowlist.has(`${leak.path}\0${leak.target}`));
-  assert.deepEqual(unexpected, []);
-  assert.ok(report.reverseLeaks.length <= transitionalAllowlist.size);
+  assert.deepEqual(report.reverseLeaks, []);
 });
