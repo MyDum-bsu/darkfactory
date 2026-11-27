@@ -18,8 +18,9 @@
 
 ```bash
 npm ci --ignore-scripts
-npm test            # 1231 детерминированный тест; запускать на worker/dev-хосте
-                    # с достаточной RAM, не на малом control-plane
+npm test            # детерминированный регрессионный набор Darkfactory v1.0+;
+                    # запускать на worker/dev-хосте с достаточной RAM,
+                    # не на малом control-plane
 npm run test:tla    # инварианты протокола контроллера (нужен TLC и TLA_TOOLS_JAR)
 npm run doctor      # read-only диагностика хоста: рантаймы, обвязка, доступность
 ```
