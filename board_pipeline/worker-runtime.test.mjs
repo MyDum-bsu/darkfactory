@@ -325,12 +325,94 @@ test('subproc feedback starts a structured continuation turn and stop signals an
   assert.equal(followUp, buildFollowUpMessage({ taskId: '3840', attemptId: 'attempt-1', message: 'address L2 finding' }));
   assert.match(followUp, /task_id: 3840/);
   assert.match(followUp, /address L2 finding/);
+  // stop дожидается фактического выхода: SIGTERM отправлен, exit подтверждён —
+  // только тогда stopped: true. Состояние 'working' из отправки сигнала —
+  // недоказанная остановка и так не отчитывается никогда.
+  children[1].kill = signal => {
+    children[1].killed = signal;
+    setTimeout(() => children[1].emit('exit', null, 'SIGTERM'), 2);
+    return true;
+  };
   assert.deepEqual(await runtime.stop({ runtimeId: spawned.runtimeId }),
-    { stopped: true, state: 'working', signal: 'SIGTERM' });
+    { stopped: true, state: 'exited', signal: 'SIGTERM' });
   assert.equal(children[1].killed, 'SIGTERM');
-  children[1].emit('exit', 143, 'SIGTERM');
+  // Повторный stop терминальной сессии идемпотентно подтверждает выход:
+  // событие exit уже наблюдено в этом процессе.
   assert.deepEqual(await runtime.stop({ runtimeId: spawned.runtimeId }),
-    { stopped: false, state: 'exited', exitCode: 143 });
+    { stopped: true, state: 'exited', signal: 'SIGTERM' });
+});
+
+// Astra P1-4: subproc stop подтверждает фактический выход процесса — ожидание
+// после SIGTERM, fallback SIGKILL, stopped: false без подтверждения и для
+// неизвестных сессий (post-restart amnesia не выдаётся за exited).
+test('subproc stop falls back to SIGKILL when SIGTERM is ignored', async () => {
+  const children = [];
+  const spawn = () => {
+    const child = childProcess(6100 + children.length);
+    children.push(child);
+    return child;
+  };
+  const runtime = createWorkerRuntime({ kind: 'subproc', exec: async () => ({ stdout: '' }),
+    spawn, readFile: async () => 'prompt' });
+  const spawned = await runtime.spawn({ ...SPAWN,
+    executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } });
+  const child = children[0];
+  const signals = [];
+  child.kill = signal => {
+    signals.push(signal);
+    if (signal === 'SIGKILL') setTimeout(() => child.emit('exit', null, 'SIGKILL'), 2);
+    return true;
+  };
+  const outcome = await runtime.stop({ runtimeId: spawned.runtimeId });
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL'], 'SIGKILL только после игнорированного SIGTERM');
+  assert.deepEqual(outcome, { stopped: true, state: 'exited', signal: 'SIGKILL' });
+});
+
+test('subproc stop reports stopped false when the child never exits', async t => {
+  const children = [];
+  const spawn = () => {
+    const child = childProcess(6200 + children.length);
+    children.push(child);
+    return child;
+  };
+  const runtime = createWorkerRuntime({ kind: 'subproc', exec: async () => ({ stdout: '' }),
+    spawn, readFile: async () => 'prompt' });
+  const spawned = await runtime.spawn({ ...SPAWN,
+    executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } });
+  const signals = [];
+  children[0].kill = signal => { signals.push(signal); return true; };
+  const outcome = await runtime.stop({ runtimeId: spawned.runtimeId });
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(outcome.stopped, false, 'неподтверждённый выход — stopped: false, а не отправка сигнала');
+  assert.equal(outcome.state, 'working');
+});
+
+test('subproc stop of an unknown session is stopped false without an exited claim', async () => {
+  const runtime = createWorkerRuntime({ kind: 'subproc', exec: async () => ({ stdout: '' }),
+    spawn: () => childProcess(1), readFile: async () => 'prompt' });
+  const outcome = await runtime.stop({ runtimeId: 'subproc-000000000000' });
+  assert.deepEqual(outcome, { stopped: false });
+  assert.equal(Object.hasOwn(outcome, 'state'), false,
+    'неизвестная сессия не декларирует exited: писатель может жить после рестарта контроллера');
+  // Повторный вызов детерминирован и не бросает.
+  assert.deepEqual(await runtime.stop({ runtimeId: 'subproc-000000000000' }), { stopped: false });
+});
+
+test('subproc stop of an already terminal session confirms the observed exit', async () => {
+  const children = [];
+  const spawn = () => {
+    const child = childProcess(6300 + children.length);
+    children.push(child);
+    return child;
+  };
+  const runtime = createWorkerRuntime({ kind: 'subproc', exec: async () => ({ stdout: '' }),
+    spawn, readFile: async () => 'prompt' });
+  const spawned = await runtime.spawn({ ...SPAWN,
+    executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } });
+  children[0].emit('exit', 0, null);
+  assert.deepEqual(await runtime.stop({ runtimeId: spawned.runtimeId }),
+    { stopped: true, state: 'done', exitCode: 0 });
+  assert.equal(children[0].killed, undefined, 'сигнал завершённому процессу не отправляется');
 });
 
 test('subproc probe does not require hc and invalid input fails before a process starts', async () => {

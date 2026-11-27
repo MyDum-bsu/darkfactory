@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import test from 'node:test';
 import { adaptiveLocalPlanCore, allowedPathsFromAttempt, allowedPathsFromLabels, ancestorOrNull,
-  baseWorkerFromPolicy, buildWorkerTransport, candidatePinRef, filterAdaptiveTelemetry,
-  HARDENED_GIT_CONFIG, hardenedGitEnv, isApprovedWorker, planAdaptiveChecks,
+  assertSubprocLiveAllowed, baseWorkerFromPolicy, buildWorkerTransport, candidatePinRef,
+  filterAdaptiveTelemetry, HARDENED_GIT_CONFIG, hardenedGitEnv, isApprovedWorker, planAdaptiveChecks,
   queueModeSpecInputs, readSubmissionEnvelope, resetQueueWorktree, resolveWorkerRuntimeKind,
   scopeFenceReworkResult, shouldStopWorkerOnShutdown } from './run-isolated.mjs';
 import { deterministicRuntimeId } from './worker-runtime.mjs';
@@ -1210,4 +1215,73 @@ test('run-isolated controller wiring pins recovery, memory key resolution, arbit
   assert.match(source, /maxBuffer: 16 \* 1024 \* 1024/);
   assert.match(source, /shouldStopWorkerOnShutdown\(\{ recordPhase: shutdownRecord\?\.phase/);
   assert.match(source, /ancestorOrNull\(git, route\.base, sha\)/);
+});
+
+// ── Astra post-fix audit core v1.0.0 blockers: wiring regression pins ──
+
+test('run-isolated wiring pins subproc fail-closed gate, nonblocking handoff open and confirmed stop evidence', () => {
+  const source = readFileSync(new URL('./run-isolated.mjs', import.meta.url), 'utf8');
+  // P0-1: subproc отклоняется fail-closed до любого эффекта живой очереди.
+  assert.match(source, /assertSubprocLiveAllowed\(\{ kind: workerRuntimeKind, policy: p, env: process\.env \}\)/);
+  // P1-3: O_NONBLOCK — FIFO не блокирует контроллер в open до fstat.
+  assert.match(source, /fsConstants\.O_RDONLY \| fsConstants\.O_NOFOLLOW \| fsConstants\.O_NONBLOCK/);
+  // P1-4: доказательство остановки — только stopped: true, без доверия декларируемому state.
+  assert.match(source, /workerStoppedEvidence = \(threadId, outcome\) =>\s*\n?\s*!threadId \|\| outcome\?\.stopped === true/);
+  assert.match(source, /'thread', 'stop', threadId/);
+  // P1-5: recoverySeq контроллера доезжает до acceptHeld.
+  assert.match(source, /recoverySeq: controllerOptions\?\.recoverySeq \?\? 0/);
+  // P1-6: зонд активной попытки и preflightFailed подключены к циклу демона.
+  assert.match(source, /tick: runTick, eventBus, hasActiveAttempt/);
+  assert.match(source, /preflightFailed && !await state\.load\(\)/);
+  // P1-7/P2-1: отпечаток входов в binding маршрута и неизменный якорь writer.
+  assert.match(source, /inputsDigest: pinnedInputsDigest/);
+  assert.match(source, /writerStartedAt/);
+});
+
+// Astra P0-1: голый subproc не исполняет живую Board-очередь без явного opt-in.
+test('assertSubprocLiveAllowed refuses subproc fail-closed without an explicit unsafe opt-in', () => {
+  assert.throws(() => assertSubprocLiveAllowed({ kind: 'subproc' }), /subproc_runtime_disabled/);
+  assert.throws(() => assertSubprocLiveAllowed({ kind: 'subproc', policy: {}, env: {} }), /subproc_runtime_disabled/);
+  // Строковые/near-true значения opt-in не считаются: только строгие формы.
+  for (const weak of [
+    { policy: { allowUnsafeSubproc: 'true' } },
+    { policy: { allowUnsafeSubproc: 1 } },
+    { policy: { allowUnsafeSubproc: false } },
+    { env: { DF_ALLOW_UNSAFE_SUBPROC: 'true' } },
+    { env: { DF_ALLOW_UNSAFE_SUBPROC: '0' } },
+    { env: { DF_ALLOW_UNSAFE_SUBPROC: '' } },
+  ]) {
+    assert.throws(() => assertSubprocLiveAllowed({ kind: 'subproc', ...weak }),
+      /subproc_runtime_disabled/, JSON.stringify(weak));
+  }
+  // Явный допуск оператора — policy или env; hc и bb не ограничиваются.
+  assert.equal(assertSubprocLiveAllowed({ kind: 'subproc', policy: { allowUnsafeSubproc: true } }), undefined);
+  assert.equal(assertSubprocLiveAllowed({ kind: 'subproc', env: { DF_ALLOW_UNSAFE_SUBPROC: '1' } }), undefined);
+  for (const kind of ['hc', 'bb', undefined]) {
+    assert.equal(assertSubprocLiveAllowed({ kind }), undefined);
+    assert.equal(assertSubprocLiveAllowed({ kind, policy: {}, env: {} }), undefined);
+  }
+  // Пустые и минимальные входы тотальны, повторный вызов детерминирован.
+  assert.equal(assertSubprocLiveAllowed(), undefined);
+  assert.equal(assertSubprocLiveAllowed({}), undefined);
+  assert.throws(() => assertSubprocLiveAllowed({ kind: 'subproc' }), /subproc_runtime_disabled/);
+});
+
+// Astra P1-3: POSIX FIFO на месте submission.json не блокирует контроллер:
+// O_NONBLOCK пропускает open мгновенно, fstat-валидация isFile отклоняет
+// не-файл typed invalid. Реальный mkfifo — регрессия против зависания open.
+test('readSubmissionEnvelope never blocks the controller on a FIFO handoff path', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'df-fifo-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const source = join(dir, 'submission.json');
+  await promisify(execFile)('mkfifo', [source]);
+  const observed = { turnSeq: 3, completed: true, state: 'idle' };
+  const started = Date.now();
+  const result = await readSubmissionEnvelope({ observed, source });
+  assert.ok(Date.now() - started < 5000, 'open FIFO не заблокировал контроллер');
+  assert.equal(result.turnSeq, 3);
+  assert.equal(result.submission, null, 'FIFO — typed invalid, а не чтение или зависание');
+  // Повторное чтение детерминировано и так же не блокируется.
+  const again = await readSubmissionEnvelope({ observed, source });
+  assert.equal(again.submission, null);
 });

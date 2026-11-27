@@ -105,6 +105,16 @@ export function resolveWorkerRuntimeKind({ cliRuntime, policy, env } = {}) {
   return kind;
 }
 
+// P0-1 fail-closed: голый subproc не изолирует писателя (нет hc-контура
+// изоляции, нет удалённого bb-исполнения) и потому не исполняет живую
+// Board-очередь. Явный операторский opt-in — policy.allowUnsafeSubproc=true
+// или DF_ALLOW_UNSAFE_SUBPROC=1; любое иное значение не считается допуском.
+export function assertSubprocLiveAllowed({ kind, policy, env } = {}) {
+  if (kind !== 'subproc') return;
+  if (policy?.allowUnsafeSubproc === true || env?.DF_ALLOW_UNSAFE_SUBPROC === '1') return;
+  throw new Error('subproc_runtime_disabled');
+}
+
 // V2-9b Adaptive 2-Tier Verification Gates: чистый планировщик разбиения
 // проверок доверенного профиля на синхронные (L1 Docker) и отложенные
 // async. Без явного включения (profile.adaptiveGates.enabled или
@@ -367,15 +377,18 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
 }
 
 // Конверт сдачи воркера читается одним дескриптором: open с O_NOFOLLOW
-// (финальный компонент никогда не симлинк), fstat уже открытого fd —
-// обычный файл не больше 8192 байт — и ограниченное чтение не более 8193
-// байт из того же дескриптора. Между проверкой и чтением нет окна подмены
-// файла: лишний байт или смена типа/размера — typed invalid, а не сбой
-// приёмки. Каноничность пути (промежуточные симлинки) сверяется realpath
-// до open; прочитанное содержимое всегда принадлежит проверенному fd.
+// (финальный компонент никогда не симлинк) и O_NONBLOCK (POSIX FIFO не
+// блокирует контроллер в open до появления писателя — fstat всё равно
+// отклонит не-файл проверкой isFile), fstat уже открытого fd — обычный
+// файл не больше 8192 байт — и ограниченное чтение не более 8193 байт из
+// того же дескриптора. Между проверкой и чтением нет окна подмены файла:
+// лишний байт или смена типа/размера — typed invalid, а не сбой приёмки.
+// Каноничность пути (промежуточные симлинки) сверяется realpath до open;
+// прочитанное содержимое всегда принадлежит проверенному fd.
 const SUBMISSION_MAX_BYTES = 8192;
 export async function readSubmissionEnvelope({ observed, source, realpathImpl = realpath,
-  openImpl = path => open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW) } = {}) {
+  openImpl = path => open(path,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK) } = {}) {
   if (!observed) return undefined;
   const base = { ...observed };
   if (!base.completed) return base;
@@ -654,6 +667,10 @@ async function execute() {
   const p = JSON.parse(policyBytes);
   const workerRuntimeKind = resolveWorkerRuntimeKind({
     cliRuntime: values.runtime, policy: p, env: process.env });
+  // P0-1: живая Board-очередь на голом subproc отклоняется до любого
+  // эффекта — изоляции писателя нет, а неподтверждённая остановка процесса
+  // после рестарта контроллера недоказуема. Только явный opt-in оператора.
+  assertSubprocLiveAllowed({ kind: workerRuntimeKind, policy: p, env: process.env });
   const portableRuntime = workerRuntimeKind === 'bb' ? undefined : createWorkerRuntime({ kind: workerRuntimeKind });
   const activation = boardActivation(p, {
     allowLive: values['allow-live-pilot'], pilotChannel: process.env.DF_PILOT_CHANNEL,
@@ -741,9 +758,14 @@ async function execute() {
   // отпечаток закреплённых файлов (та же семантика, что digest на seal).
   // Именно его несут метки policy_digest карточек при постановке и именно
   // его сверяет queue-допуск: слот с другой политикой карточку не крадёт.
-  // Контроль неизменности входов идёт по отпечатку файлов отдельно.
+  // Контроль неизменности входов идёт по отпечатку файлов отдельно: даже с
+  // override фактический стартовый отпечаток входов закрепляется в route и
+  // тем самым в binding записи попытки — изменённые prompt/skill/гейт-файлы
+  // между рестартами дают другой отпечаток, и возобновление попытки падает
+  // fail-closed на расхождении binding/пинов, а не исполняет подменённые входы.
   const pinnedInputsDigest = pinned.digest;
-  const route = { ...p.route, policyDigest: p.policyDigest ?? pinnedInputsDigest };
+  const route = { ...p.route, policyDigest: p.policyDigest ?? pinnedInputsDigest,
+    inputsDigest: pinnedInputsDigest };
   // Queue-driven маршрут без route.taskId: карточку берёт board.claimReady по
   // allowlist оператора (owner + маршрутная метка + дополнительно требуемые метки).
   if (route.taskId === undefined) {
@@ -1106,6 +1128,21 @@ async function execute() {
       if (confirmed) telemetry.workerResume({ subject: packet.attempt });
       return { confirmed };
     },
+    // Подтверждённая остановка BB-треда: interrupt активной работы, затем
+    // read-only сверка инертного состояния — нет активных фоновых агентов и
+    // очереди сообщений. Только такое доказательство допускает деструктивную
+    // очистку очереди: stopped: true без него не выписывается, а сбой
+    // транспорта пробрасывается и трактуется как неподтверждённая остановка.
+    async stop(threadId) {
+      await exec('bb', ['thread', 'stop', threadId], { timeout: 15_000 });
+      const { stdout } = await exec('bb', ['thread', 'show', threadId, '--json'], { timeout: 9000 });
+      const thread = JSON.parse(stdout)?.thread;
+      const inert = thread !== null && typeof thread === 'object' &&
+        ['idle', 'failed', 'interrupted'].includes(thread.status) &&
+        thread.activeBackgroundAgentCount === 0 && thread.queuedMessageCount === 0;
+      return { stopped: inert === true,
+        ...(typeof thread?.status === 'string' ? { state: thread.status } : {}) };
+    },
   };
   const bb = buildWorkerTransport({ kind: workerRuntimeKind, policy: p, runtime: portableRuntime,
     bbTransport, worktree: tree, prepareSpawn: prepareWorkerSpawn,
@@ -1117,15 +1154,13 @@ async function execute() {
   };
   const stopTerminalWorker = result => stopWorkerThread(result?.threadId ?? liveThreadId);
   // Доказательство «воркер остановлен» для деструктивной очистки очереди:
-  // воркера нет вовсе, транспорт лишён stop (legacy bb — сессия удалённая,
-  // терминальный ход уже наблюден до done/hold), подтверждённый stop либо
-  // терминальное нерабочее состояние исполнителя. Активно пишущий воркер
-  // после reset --hard продолжил бы грязнить очищенное дерево следующей
-  // карточки — неподтверждённая остановка карантинит очистку.
-  const WORKER_STOPPED_STATES = new Set(['idle', 'done', 'blocked', 'exited']);
+  // воркера нет вовсе либо stop вернул подтверждённый stopped: true. Отсутствие
+  // метода stop, его сбой (outcome null) и любое stopped !== true —
+  // НЕПОДТВЕРЖДЁННАЯ остановка: декларируемое состояние результата stop не
+  // доказательство (post-restart amnesia subproc-сессий, живой писатель после
+  // reset --hard грязнил бы дерево следующей карточки) — очистка карантинится.
   const workerStoppedEvidence = (threadId, outcome) =>
-    !threadId || typeof bb.stop !== 'function' ||
-    outcome?.stopped === true || WORKER_STOPPED_STATES.has(outcome?.state);
+    !threadId || outcome?.stopped === true;
   // Daemon kill-switch: создаётся до verify, чтобы единственный повтор L2
   // проверял именно действующий стоп-файл, а не только activation switch.
   const daemonSwitchPath = values.switch ?? p.pilot?.killSwitch;
@@ -1201,7 +1236,11 @@ async function execute() {
   const beforeAttemptEffect = (taskId, epoch) => ab
     ? abEffectGuard(ab, { verifyHeld: port.verifyHeld, assertPinned }, taskId, epoch)
     : activation && (() => port.guardTask(taskId, epoch));
-  const verify = async (attempt, submission) => {
+  // Третий контроллерный аргумент несёт монотонный recoverySeq восстановления
+  // прерванной проверки (Spot preemption, F-02): приёмка перепроверяет
+  // кандидата под свежим ключом журнала того же восстановления, а не застревает
+  // на uncertain прерванного запуска. Сдача воркера счётчик подменить не может.
+  const verify = async (attempt, submission, controllerOptions) => {
     await assertPinned();
     const profile = p.profiles?.[attempt.check_profile];
     if (!profile) throw new Error('Missing approved checks');
@@ -1249,15 +1288,17 @@ async function execute() {
     });
     const neon = isNeonReview(attemptCritic);
     // Уже прошедшая writer-фаза учитывается в её бюджете по фактическому
-    // времени: старт ≈ record.until минус аренда (момент claim). Якорь
-    // неизмерим — бюджет writer честно не применяется (аренда всё равно
-    // ограничивает попытку через lease-опрос).
+    // времени: неизменный writerStartedAt, записанный контроллером при входе
+    // писателя в working. Выводить старт из record.until минус аренда нельзя:
+    // until движется вперёд каждым успешным продлением аренды и занижал бы
+    // расход бюджета. Якорь неизмерим (старая запись) — бюджет writer честно
+    // не применяется (аренда всё равно ограничивает попытку через lease-опрос).
     let phaseSpent;
     if (foreman?.phaseBudgets?.writer !== undefined) {
       const saved = await state.load();
-      const claimedUntil = typeof saved?.until === 'string' ? Date.parse(saved.until) : NaN;
-      if (Number.isFinite(claimedUntil)) {
-        phaseSpent = { writer: Math.max(0, Date.now() - (claimedUntil - boardLeaseSec * 1000)) };
+      const writerStartedAt = Number.isFinite(saved?.writerStartedAt) ? saved.writerStartedAt : NaN;
+      if (Number.isFinite(writerStartedAt)) {
+        phaseSpent = { writer: Math.max(0, Date.now() - writerStartedAt) };
       }
     }
     let attemptSignals = null;
@@ -1448,7 +1489,8 @@ async function execute() {
             console.log(JSON.stringify(note));
           } });
       };
-      const result = await acceptHeld({ attempt: acceptanceAttempt, submission, policy, journal: root, ports: {
+      const result = await acceptHeld({ attempt: acceptanceAttempt, submission, policy, journal: root,
+        recoverySeq: controllerOptions?.recoverySeq ?? 0, ports: {
         board: port, inspect: telemetry.port('inspect', inspect),
         local: telemetry.port('l1_local', async (binding, trusted) => {
           enterPhase('l1_l3');
@@ -1621,7 +1663,20 @@ async function execute() {
   let previous;
   let recheck = values['recheck-rejected-handoff'];
   const tick = guardedEffect(assertOpen, advanceWithProjection);
-  const runTick = () => tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
+  // Зонд активной попытки по долговременной записи: любая запись попытки —
+  // in-flight работа (lease maintenance, reconciliation или терминальная
+  // очистка), которая не должна молча пропускаться при деградированном
+  // дисковом preflight. Ошибка чтения пробрасывается — runDaemon трактует
+  // неопределённость в пользу сохранения lease.
+  const hasActiveAttempt = async () => Boolean(await state.load());
+  const runTick = async ({ preflightFailed = false } = {}) => {
+    // Деградированный preflight гейтует только НОВЫЕ захваты: без записи
+    // попытки тик пошёл бы в claim — пропускаем его, пока диск не восстановится.
+    // Активная попытка тикается обычным путём и продолжает продлевать lease.
+    if (preflightFailed && !await state.load()) {
+      return { phase: 'idle', reason: 'disk_preflight_failed' };
+    }
+    return tick({ route, state, board: port, bb, submissions, verify, authorize, questionGate,
     release: releasePort, recheckRejectedHandoff: recheck, eventBus, recoverInterruptedChecking: true,
     workerSelector: { ...workerSelector, critic: reviewSetup.critic, arbiter: reviewSetup.arbiter,
       baseWorker: baseWorkerFromPolicy(p),
@@ -1672,6 +1727,7 @@ async function execute() {
         return pinned;
       } },
     decisionLedger });
+  };
   const observeTick = result => {
     recheck = false;
     lastResult = result;
@@ -1698,7 +1754,7 @@ async function execute() {
       const journal = new RotatingJournal({ directory: root });
       await runDaemon({
         intervalMs, journal, diskPath: tree, assertOpen: daemonOpen,
-        tick: runTick, eventBus,
+        tick: runTick, eventBus, hasActiveAttempt,
         onTick: async result => {
           observeTick(result);
           if (result.phase === 'release_ready' && !releasePort) return 'stop';

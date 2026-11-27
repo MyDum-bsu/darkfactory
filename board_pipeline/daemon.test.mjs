@@ -388,6 +388,9 @@ test('run-isolated --daemon: pinned intake and separate telemetry for two cards'
   const fx = await daemonFixture(t, url);
   const cfg = JSON.parse(await readFile(fx.policy, 'utf8'));
   cfg.owner = (await handle.me()).principal;
+  // P1-12: тест написан под BB-транспорт (фейковый бинарь bb в PATH) — маршрут
+  // закрепляется явно, а не унаследованным дефолтом рантайма.
+  cfg.workerRuntime = 'bb';
   const answers = join(fx.base, 'answers');
   await mkdir(answers, { mode: 0o700 });
   cfg.questionGate = { exclusiveBoardOwner: true, inbox: answers, ttlMs: 60_000,
@@ -397,8 +400,16 @@ test('run-isolated --daemon: pinned intake and separate telemetry for two cards'
   await writeFile(cfg.brief, decision);
 
   const sha256 = text => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+  // Реальный отпечаток входов слота: тот же порядок файлов и та же схема, что
+  // readOperatorInputs — [policy, brief, reviewPrompt, reviewGate, routes, ...skills].
+  // Без совпадающего policy_digest queue-допуск справедливо не отдаёт карточки слоту.
+  const fileDigest = path => createHash('sha256').update(readFileSync(path)).digest('hex');
+  const digestPaths = [fx.policy, cfg.brief, cfg.reviewPrompt, cfg.reviewGate,
+    join(dirname(cfg.reviewGate), 'routes.json'), cfg.reviewSkillFiles.logika];
+  const policyDigest = createHash('sha256')
+    .update(JSON.stringify(digestPaths.map(fileDigest))).digest('hex');
   const labels = text => ({ queue: 'daemon-it', repo_id: 'repo-daemon-it', profile_id: 'pilot',
-    finish: 'verified', spec_digest: sha256(text), policy_digest: 'b'.repeat(64) });
+    finish: 'verified', spec_digest: sha256(text), policy_digest: policyDigest });
   const specs = ['Fixture 1 card specification', 'Fixture 2 card specification'];
   const first = (await handle.tasks.create('pilot', { text: specs[0], labels: labels(specs[0]) })).task.id;
   const second = (await handle.tasks.create('pilot', { text: specs[1], labels: labels(specs[1]) })).task.id;
@@ -414,6 +425,8 @@ if (action === 'spawn') {
   const prompt = readFileSync(process.argv[process.argv.indexOf('--prompt-file') + 1], 'utf8');
   appendFileSync(${JSON.stringify(prompts)}, JSON.stringify(prompt) + '\\n');
   out({ id: 'thr_fixture' });
+} else if (action === 'stop') {
+  out({ stopped: true });
 } else if (action === 'show') {
   out({ thread: { id, status: 'idle', activeBackgroundAgentCount: 0, queuedMessageCount: 0 },
     environment: { path: ${JSON.stringify(fx.tree)} } });
