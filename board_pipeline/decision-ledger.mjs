@@ -11,7 +11,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import { canonicalJson } from './subject.mjs';
+import { canonicalDigest } from './subject.mjs';
 
 export const LEDGER_PATH_ENV = 'DF_DECISION_LEDGER_PATH';
 export const LEDGER_SCHEMA = 'darkfactory.owner-decision.v1';
@@ -33,9 +33,82 @@ const inside = (root, p) => {
   return !rel || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
 
+export const ledgerTextDigest = text => createHash('sha256').update(text).digest('hex');
+
 export function recordDigest(record) {
   const { sha256, ...body } = record;
-  return createHash('sha256').update(canonicalJson(body)).digest('hex');
+  return canonicalDigest(body);
+}
+
+// Both transports commit the same checksummed JSONL record. The lock covers the
+// read/check/append operation, not just the final append. The adapter supplies
+// a file lock + durable append, or a synchronous SQLite write transaction.
+export function withLedgerWriter(withLock, appendLine, operation) {
+  return withLock(() => operation(body => appendLedgerRecord(body, appendLine)));
+}
+
+export function appendLedgerRecord(body, appendLine) {
+  const record = { ...body, sha256: recordDigest(body) };
+  return appendLine(`${JSON.stringify(record)}\n`, record);
+}
+
+export function decodeLedgerLine(line, validate) {
+  if (typeof line !== 'string' || !line.endsWith('\n') || line.indexOf('\n') !== line.length - 1) {
+    throw new Error('decision_ledger_corrupt');
+  }
+  let record;
+  try { record = JSON.parse(line); } catch { throw new Error('decision_ledger_corrupt'); }
+  validate?.(record);
+  if (!record || recordDigest(record) !== record.sha256) throw new Error('decision_ledger_tampered');
+  return record;
+}
+
+// SQLite transport for callers requiring a synchronous API, :memory:, and
+// atomic multi-record writes. Store the JSONL lines themselves, not another
+// checksum format. The generated index keys come from the checksummed body.
+// The caller seeds any legacy data under the initialization lock and may
+// maintain SQL projections inside write(); there is only one commit boundary.
+export function openSqliteLedgerJournal(db, seed) {
+  function locked(fn) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  let insert;
+  const write = fn => withLedgerWriter(locked, line => {
+    insert ??= db.prepare('INSERT INTO ledger_records(line) VALUES (?)');
+    insert.run(line);
+  }, fn);
+  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ledger_records'");
+  if (!exists.get()) write(append => {
+    if (exists.get()) return; // a competing initializer committed before us
+    db.exec(`CREATE TABLE ledger_records (
+      line TEXT NOT NULL,
+      collection TEXT GENERATED ALWAYS AS (json_extract(line, '$.collection')),
+      entity TEXT GENERATED ALWAYS AS (json_extract(line, '$.entity'))
+    ); CREATE INDEX idx_ledger_entity ON ledger_records(collection, entity);`);
+    seed(append);
+  });
+  const latest = db.prepare(`SELECT line FROM ledger_records WHERE collection=? AND entity=?
+    ORDER BY rowid DESC LIMIT 1`);
+  const heads = db.prepare(`SELECT r.line FROM (
+    SELECT min(rowid) AS first, max(rowid) AS last FROM ledger_records WHERE collection=? GROUP BY entity
+  ) h JOIN ledger_records r ON r.rowid=h.last ORDER BY h.first`);
+  return {
+    write,
+    get(collection, entity) {
+      const entry = latest.get(collection, entity);
+      return entry && decodeLedgerLine(entry.line);
+    },
+    // Latest revision of each entity, in original insertion order.
+    entries: collection => heads.all(collection).map(({ line }) => decodeLedgerLine(line)),
+  };
 }
 
 function validateRecord(rec) {
@@ -49,7 +122,6 @@ function validateRecord(rec) {
       !RECORDED_BY.test(rec.recorded_by ?? '') || !DIGEST.test(rec.sha256 ?? '')) {
     throw new Error('decision_ledger_record_invalid');
   }
-  if (recordDigest(rec) !== rec.sha256) throw new Error('decision_ledger_tampered');
 }
 
 async function resolveExisting(path) {
@@ -130,12 +202,9 @@ async function readEntries(ledgerPath) {
   // признак частичной записи; fail-closed, а не молчаливый append поверх неё.
   if (text !== '' && !text.endsWith('\n')) throw new Error('decision_ledger_corrupt');
   const entries = [];
-  for (const line of text.split('\n')) {
+  for (const line of text.split(/(?<=\n)/)) {
     if (!line.trim()) continue;
-    let rec;
-    try { rec = JSON.parse(line); } catch { throw new Error('decision_ledger_corrupt'); }
-    validateRecord(rec);
-    entries.push(rec);
+    entries.push(decodeLedgerLine(line, validateRecord));
   }
   return entries;
 }
@@ -185,7 +254,7 @@ export async function resolveActiveDecisions({ ledgerPath, projectId, maxChars =
     ids.push(rec.id);
   }
   const items = ids.map((id, i) => ({ id, scope: active[i].scope, rule: active[i].rule.trim() }));
-  const digest = createHash('sha256').update(canonicalJson(items)).digest('hex');
+  const digest = canonicalDigest(items);
   return { text: lines.join('\n'), digest, ids, truncated, total: active.length, items };
 }
 
@@ -240,7 +309,7 @@ async function clearStaleLedgerLock(lock, staleLockMs, now = Date.now()) {
 
 // Lockfile рядом с журналом: конкурентные recordDecision (в первую очередь
 // два supersedes одной цели) сериализуются, а не проходят оба по stale-снимку.
-async function withLedgerLock(ledgerPath, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } = {}) {
+export async function withLedgerLock(ledgerPath, fn, { staleLockMs = DEFAULT_STALE_LOCK_MS } = {}) {
   const lock = `${ledgerPath}.lock`;
   // Уникальный токен владения: рейпер сверяет контент перед снятием, а
   // владелец не удалит чужой лок, пересозданный после гонки.
@@ -276,6 +345,17 @@ async function withLedgerLock(ledgerPath, fn, { staleLockMs = DEFAULT_STALE_LOCK
   }
 }
 
+async function appendFileRecord(target, line, record) {
+  const handle = await open(target, 'a', 0o600);
+  try {
+    await handle.writeFile(line);
+    await handle.datasync();
+  } finally {
+    await handle.close();
+  }
+  return record;
+}
+
 // Append-only запись решения: одна атомарная строка. supersedes живёт в самой
 // новой записи и гасит цель при свёртке — промежуточного состояния «старое
 // погашено, нового нет» не существует по построению. Проверки противоречий:
@@ -294,7 +374,9 @@ export async function recordDecision({ ledgerPath, scope, rule, sourceCard, reco
   if (!RECORDED_BY.test(recordedBy ?? '')) throw new Error('decision_ledger_recorded_by_invalid');
   const target = await assertLedgerOutside(ledgerPath, worktree);
   await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-  return withLedgerLock(target, async () => {
+  const lock = fn => withLedgerLock(target, fn);
+  const persist = (line, record) => appendFileRecord(target, line, record);
+  return withLedgerWriter(lock, persist, async append => {
     const entries = await readEntries(target);
     const { byId, dead } = foldEntries(entries);
     const duplicate = entries.find(rec => rec.scope === scope && !dead.has(rec.id) &&
@@ -314,22 +396,9 @@ export async function recordDecision({ ledgerPath, scope, rule, sourceCard, reco
     // Повторный id в журнале недопустим (см. foldEntries): не доводить до
     // append, который необратимо испортил бы лог.
     if (byId.has(id)) throw new Error('decision_ledger_duplicate_id');
-    const record = { schema: LEDGER_SCHEMA, id, scope, status: 'active', rule: rule.trim(),
+    return append({ schema: LEDGER_SCHEMA, id, scope, status: 'active', rule: rule.trim(),
       source_card: card, timestamp: now.toISOString(), recorded_by: recordedBy,
-      ...(supersedes !== undefined ? { supersedes } : {}) };
-    record.sha256 = recordDigest(record);
-    // Долговечный fail-closed append: открытый дескриптор + запись +
-    // datasync перед закрытием — подтверждённая запись не теряется при
-    // падении машины сразу после ответа, а частичная запись обрывается на
-    // незавершённой строке и отклоняется при чтении.
-    const handle = await open(target, 'a', 0o600);
-    try {
-      await handle.writeFile(`${JSON.stringify(record)}\n`);
-      await handle.datasync();
-    } finally {
-      await handle.close();
-    }
-    return record;
+      ...(supersedes !== undefined ? { supersedes } : {}) });
   });
 }
 
@@ -337,13 +406,10 @@ const isSlice = s => s !== null && typeof s === 'object' && !Array.isArray(s) &&
   DIGEST.test(s.digest) && Array.isArray(s.ids) && s.ids.every(id => typeof id === 'string') &&
   typeof s.text === 'string' && typeof s.truncated === 'boolean' && Number.isSafeInteger(s.total);
 
-const sliceDigest = items => createHash('sha256').update(canonicalJson(items)).digest('hex');
-
 // pin_sha256 покрывает все поля pin-файла — подмена total/truncated/digest/
 // text/items не проходит сверку при чтении.
-const pinIntegrity = s => createHash('sha256').update(canonicalJson(
-  { digest: s.digest, ids: s.ids, items: s.items, truncated: s.truncated,
-    total: s.total })).digest('hex');
+const pinIntegrity = s => canonicalDigest({ digest: s.digest, ids: s.ids, items: s.items,
+  truncated: s.truncated, total: s.total });
 
 // Срез, пригодный к публикации: items согласованы с digest/text/ids/truncated/
 // total — pin-файл всегда самопроверяем.
@@ -354,7 +420,7 @@ const isSliceContent = s => isSlice(s) && Array.isArray(s.items) &&
     item.id === s.ids[i] && typeof item.scope === 'string' && typeof item.rule === 'string') &&
   s.text === s.items.map(item => `- [${item.scope}] ${item.rule} (${item.id})`).join('\n') &&
   s.truncated === (s.total > s.ids.length) &&
-  sliceDigest(s.items) === s.digest;
+  canonicalDigest(s.items) === s.digest;
 
 // Персистированный pin: валидное содержимое плюс pin_sha256, покрывающий все
 // поля — подмена любого поля без пересчёта не проходит.
