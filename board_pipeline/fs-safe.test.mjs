@@ -19,8 +19,9 @@ test('inside compares complete path components after lexical resolution', () => 
 });
 
 test('globMatch is anchored, component-aware, and treats non-glob syntax literally', () => {
+  const directChildren = ['src', '*'].join('/');
   for (const [pattern, path, expected] of [
-    ['src', 'src/a', false], ['src/*', 'src/a', true], ['src/*', 'src/a/b', false],
+    ['src', 'src/a', false], [directChildren, 'src/a', true], [directChildren, 'src/a/b', false],
     ['a*b', 'ab', true], ['a?b', 'ab', false], ['a?b', 'a/b', false], ['a?b', 'a.b', true],
     ['**/*.js', '.root.js', true], ['**/*.js', 'a/b/c.js', true], ['**/*.js', 'x.jsx', false],
     ['a/**/b', 'a/b', true], ['a/**/b', 'a/c/d/b', true], ['a/**/b', 'a/c/d/e', false],
