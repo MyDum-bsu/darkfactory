@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, appendFile, rm, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { accept, acceptHeld } from './acceptance.mjs';
+import { NEON_ISOLATION } from './review-policy.mjs';
 
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);
@@ -564,4 +566,254 @@ test('acceptHeld: журнал с осевшим эффектом Board не п�
   assert.equal(calls.inspect, 0);
   assert.equal(calls.complete + calls.block, 0);
   assert.equal((await runFiles(journal)).length, 1, 'свежий журнал не создаётся');
+});
+
+// ── Board #11994: OpenAI/Astra-воркер + Neon-критик + Opus-арбитр ──────────
+// Триада pi+openai/gpt-6.2-astra (openai) / gemini-4-neon (google) /
+// agy/claude-opus-5.5 (anthropic) — три независимых известных семейства;
+// Opus — утверждённый арбитр Neon-маршрута наряду с Sol.
+const NEON_REVIEW = { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'medium' };
+const OPUS_ARBITER = { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'medium' };
+const PI_ASTRA_WORKER = { provider: 'pi', model: 'openai/gpt-6.2-astra' };
+const NEON_TREE = 'c'.repeat(40);
+const NEON_SPEC_DIGEST = '1'.repeat(64);
+const NEON_POLICY_DIGEST = '2'.repeat(64);
+
+function neonPolicy() {
+  return {
+    version: '2',
+    profiles: {
+      pilot: {
+        task: HELD_TASK,
+        worker: 'thr_fixture',
+        worktree: '/tmp/wt',
+        base: SHA_BASE,
+        review: { ...NEON_REVIEW, skills: ['logika'] },
+        arbiter: { ...OPUS_ARBITER },
+      },
+    },
+  };
+}
+
+function neonAttempt(over = {}) {
+  return heldAttempt({
+    repo_id: 'repo-neon',
+    spec_digest: NEON_SPEC_DIGEST,
+    policy_digest: NEON_POLICY_DIGEST,
+    executor: { ...PI_ASTRA_WORKER },
+    arbiter: { ...OPUS_ARBITER },
+    triad: {
+      worker: { ...PI_ASTRA_WORKER },
+      critic: { ...NEON_REVIEW },
+      arbiter: { ...OPUS_ARBITER },
+    },
+    ...over,
+  });
+}
+
+function neonPorts(journal, { blocked = false } = {}) {
+  const calls = { inspect: 0, local: 0, review: 0, complete: 0, block: 0, verifyHeld: 0, labels: 0 };
+  const ports = {
+    inspect: async (binding) => {
+      calls.inspect++;
+      return { head: binding.candidate_sha, clean: true, baseAncestor: true, tree_sha: NEON_TREE };
+    },
+    local: async (binding) => {
+      calls.local++;
+      return { sha: binding.candidate_sha, ok: true, evidence: 'checks.json', exit: 0 };
+    },
+    tamper: async (binding) => ({
+      ok: true, sha: binding.candidate_sha, base_sha: binding.base_sha,
+      violations: [], digest: 't'.repeat(64),
+    }),
+    review: async (binding) => {
+      calls.review++;
+      const verdict = blocked ? 'REVIEW_BLOCKED' : 'REVIEW_OK';
+      const transcript = JSON.stringify({ verdict, sha: binding.candidate_sha });
+      await writeFile(path.join(journal, 'neon-l2.json'), transcript, { mode: 0o600 });
+      return {
+        task: binding.task_id,
+        sha: binding.candidate_sha,
+        actual: { ...NEON_REVIEW },
+        verdict,
+        checkpoint: 'feed80ab',
+        isolation: NEON_ISOLATION,
+        transcript_file: 'neon-l2.json',
+        transcript_sha256: createHash('sha256').update(transcript).digest('hex'),
+        subject_digest: binding.subject_digest,
+        ...(blocked
+          ? { findings: [{ file: 'a.js', line: 3, expected: 'spec', actual: 'impl', freq: 1 }] }
+          : {}),
+      };
+    },
+    board: {
+      verifyHeld: async (taskId, epoch) => {
+        calls.verifyHeld++;
+        return { epoch, until: '2026-01-01T00:00:00.000Z' };
+      },
+      lookup: async () => ({ state: 'claimed', epoch: 1 }),
+      labels: async () => {
+        calls.labels++;
+        return {
+          repo_id: 'repo-neon',
+          profile_id: 'pilot',
+          finish: 'verified',
+          spec_digest: NEON_SPEC_DIGEST,
+          policy_digest: NEON_POLICY_DIGEST,
+        };
+      },
+      block: async () => {
+        calls.block++;
+      },
+      complete: async () => {
+        calls.complete++;
+      },
+    },
+  };
+  return { ports, calls };
+}
+
+test('acceptHeld: OpenAI/Astra-воркер + Neon-критик + Opus-арбитр проходит приёмку (#11994)', async () => {
+  const journal = await tmpJournal();
+  const { ports, calls } = neonPorts(journal);
+  const res = await acceptHeld({
+    attempt: neonAttempt(),
+    submission: heldSubmission(),
+    policy: neonPolicy(),
+    journal,
+    ports,
+  });
+  assert.equal(res.outcome, 'verified', res.reason ?? '');
+  assert.equal(res.receipt.settle, 'completed');
+  assert.equal(calls.review, 1);
+  assert.equal(calls.complete, 1);
+  assert.equal(calls.block, 0);
+  // Повторный вызов идемпотентен: терминальный исход переиспользуется без эффектов.
+  const replay = await acceptHeld({
+    attempt: neonAttempt(),
+    submission: heldSubmission(),
+    policy: neonPolicy(),
+    journal,
+    ports: neonPorts(journal).ports,
+  });
+  assert.equal(replay.outcome, 'verified');
+  assert.equal(replay.repeated, true);
+});
+
+test('acceptHeld: неутверждённый арбитр Neon-маршрута отклоняется fail-closed (#11994)', async () => {
+  for (const arbiter of [
+    { provider: 'deepseek', model: 'deepseek-v4', reasoningLevel: 'medium' }, // не Sol и не Opus
+    { provider: 'agy', model: 'claude-opus-5.5' }, // Opus без reasoningLevel
+    { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'low' }, // недопустимый уровень
+    { provider: 'pi', model: 'agy/claude-opus-5.5', reasoningLevel: 'medium' }, // Opus вне agy
+  ]) {
+    const journal = await tmpJournal();
+    const { ports, calls } = neonPorts(journal);
+    const res = await acceptHeld({
+      attempt: neonAttempt({
+        arbiter: { ...arbiter },
+        triad: { worker: { ...PI_ASTRA_WORKER }, critic: { ...NEON_REVIEW }, arbiter: { ...arbiter } },
+      }),
+      submission: heldSubmission(),
+      policy: neonPolicy(),
+      journal,
+      ports,
+    });
+    assert.equal(res.outcome, 'denied', JSON.stringify(arbiter));
+    assert.equal(res.reason, 'vs2_review_triad_not_approved', JSON.stringify(arbiter));
+    assert.equal(calls.inspect, 0, 'отказ до любого порта приёмки');
+    assert.equal(calls.complete + calls.block, 0);
+  }
+});
+
+test('acceptHeld: Sol-арбитр с OpenAI-воркером отклоняется строгой триадой (#11994)', async () => {
+  // Sol (openai) формально утверждён для Neon-маршрута, но семейство совпадает
+  // с исполнителем pi+openai/gpt-6.2-astra: assertTriadIndependent не ослабляется.
+  const sol = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' };
+  const journal = await tmpJournal();
+  const { ports, calls } = neonPorts(journal);
+  const res = await acceptHeld({
+    attempt: neonAttempt({
+      arbiter: sol,
+      triad: { worker: { ...PI_ASTRA_WORKER }, critic: { ...NEON_REVIEW }, arbiter: sol },
+    }),
+    submission: heldSubmission(),
+    policy: neonPolicy(),
+    journal,
+    ports,
+  });
+  assert.equal(res.outcome, 'denied');
+  assert.equal(res.reason, 'invalid_triad:arbiter_family_not_independent');
+  assert.equal(calls.inspect, 0);
+  // Контроль: тот же Sol-арбитр с cognition-воркером — строгая триада, допуск
+  // сохраняется (прежний маршрут не сломан допуском Opus).
+  const devin = { provider: 'acp-devin', model: 'swe-2-1-medium' };
+  const controlJournal = await tmpJournal();
+  const control = neonPorts(controlJournal);
+  const ok = await acceptHeld({
+    attempt: neonAttempt({
+      executor: devin,
+      arbiter: sol,
+      triad: { worker: devin, critic: { ...NEON_REVIEW }, arbiter: sol },
+    }),
+    submission: heldSubmission(),
+    policy: neonPolicy(),
+    journal: controlJournal,
+    ports: control.ports,
+  });
+  assert.equal(ok.outcome, 'verified', ok.reason ?? '');
+});
+
+test('acceptHeld sealAndComplete: квитанция Opus-арбитра принимает Neon-ревью (#11994)', async () => {
+  const journal = await tmpJournal();
+  const { ports } = neonPorts(journal, { blocked: true });
+  const res = await acceptHeld({
+    attempt: neonAttempt(),
+    submission: heldSubmission(),
+    policy: neonPolicy(),
+    journal,
+    ports,
+  });
+  assert.equal(res.outcome, 'rework', res.reason ?? '');
+  assert.equal(typeof res.sealAndComplete, 'function');
+  const sealed = await res.sealAndComplete({
+    decision: 'accept_with_notes',
+    notes: 'единственная находка — P2 вне scope, принято арбитром',
+    max_harm: 1,
+    dod_violation: false,
+    subject_digest: res.subject_digest,
+    arbiter: { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'medium' },
+  });
+  assert.equal(sealed.outcome, 'verified', sealed.reason ?? '');
+  assert.equal(sealed.receipt.settle, 'completed');
+});
+
+test('acceptHeld sealAndComplete: неаттестованный арбитр квитанции отклоняется fail-closed (#11994)', async () => {
+  for (const arbiter of [
+    // Provider/model совпадают с пином Opus, но нет reasoningLevel — аттестации нет.
+    { provider: 'agy', model: 'claude-opus-5.5' },
+    // Недопустимый уровень reasoning — та же форма обхода.
+    { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'low' },
+  ]) {
+    const journal = await tmpJournal();
+    const { ports } = neonPorts(journal, { blocked: true });
+    const res = await acceptHeld({
+      attempt: neonAttempt(),
+      submission: heldSubmission(),
+      policy: neonPolicy(),
+      journal,
+      ports,
+    });
+    assert.equal(res.outcome, 'rework', res.reason ?? '');
+    const sealed = await res.sealAndComplete({
+      decision: 'accept_with_notes',
+      notes: 'принято арбитром',
+      max_harm: 1,
+      dod_violation: false,
+      subject_digest: res.subject_digest,
+      arbiter,
+    });
+    assert.equal(sealed.outcome, 'hold', JSON.stringify(arbiter));
+    assert.equal(sealed.reason, 'arbiter_mismatch', JSON.stringify(arbiter));
+  }
 });

@@ -19,15 +19,18 @@ import {
   opencodeGoPolicyViolation,
   PRIMARY_WORKER,
   resolveArbitration,
+  resolveTriad,
   retiredProviderViolation,
   roundGate,
   roundSignature,
+  routeRole,
   selectEscalationReviewer,
   selectWorker,
   workerFamily,
 } from './worker-selector.mjs';
 import { ReviewDenied } from './review-runner.mjs';
 import { createWorkerRuntime } from './worker-runtime.mjs';
+import { aggregateScorecard } from './model-scorecard.mjs';
 
 const BASE = 'a'.repeat(40);
 const ATTEMPT = { task_id: '7', epoch: 3, attempt_id: 'att-1', base_sha: BASE };
@@ -1160,4 +1163,119 @@ test('строковые id в plan: zcode и не-DeepSeek opencode-go откл
   assert.equal(opencodeGoPolicyViolation('pi/opencode-go/qwen3'), 'opencode_go_non_deepseek_disallowed');
   assert.equal(opencodeGoPolicyViolation('opencode-go/deepseek-v4'), null);
   assert.equal(opencodeGoPolicyViolation('pi/opencode-go/deepseek-v4'), null);
+});
+
+// ── Board #11994: Opus-арбитр (agy/claude-opus-5.5) на Neon-маршрутах ──────
+// First-class OpenAI-воркер (pi + openai/gpt-6.2-astra) под Neon-критиком:
+// Sol-арбитр (openai) конфликтовал бы с исполнителем по семейству, поэтому
+// утверждённый арбитр маршрута — Opus (anthropic). Роутинг обязан пропускать
+// такую триаду и по-прежнему отклонять неутверждённых арбитров.
+const PI_ASTRA = { provider: 'pi', model: 'openai/gpt-6.2-astra' };
+const OPUS_ARBITER = { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'medium' };
+const NEON_GOOGLE_CRITIC = DEFAULT_CRITIC; // google/gemini-4-neon
+const DS_ARBITER = { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' };
+
+const neonTriadJournal = (worker, critic, arbiter, n) =>
+  Array.from({ length: n }, () => JSON.stringify({
+    kind: 'attempt_summary', schema: 1,
+    models: { worker, critic, arbiter },
+    labels: { size: 'S', domain: 'backend' },
+    rounds: { total: 1, rework: 0, pass: 1, arbitration: 0, open: 0 },
+    phases_ms: { total: 60000 }, outcome: 'done', open: false }));
+
+test('resolveTriad: OpenAI-воркер + Neon + Opus-арбитр проходит базовую валидацию (#11994)', () => {
+  const base = { worker: PI_ASTRA, critic: NEON_GOOGLE_CRITIC, arbiter: OPUS_ARBITER };
+  for (const scorecard of [null, undefined, aggregateScorecard([], { seed: [] })]) {
+    const res = resolveTriad({ size: 'S', domain: 'backend',
+      policy: { routing: { mode: 'shadow' } }, scorecard, base });
+    assert.equal(res.outcome, 'shadow', res.reason ?? '');
+    assert.deepEqual(res.selected, base);
+    // План несёт первичного воркера; google-резерв отсутствует (семейство критика),
+    // deepseek-резерв независим от google/anthropic — допустим.
+    assert.deepEqual(res.plan[0], PI_ASTRA);
+    assert.ok(res.plan.every(w => workerFamily(w) !== 'google'));
+  }
+  // Повторный вызов детерминирован: тот же вход — тот же выход.
+  const again = resolveTriad({ size: 'S', domain: 'backend',
+    policy: { routing: { mode: 'shadow' } }, scorecard: null,
+    base: { worker: PI_ASTRA, critic: NEON_GOOGLE_CRITIC, arbiter: OPUS_ARBITER } });
+  assert.equal(again.outcome, 'shadow');
+});
+
+test('resolveTriad active: routed-триада OpenAI-воркер + Neon + Opus выходит без fallback (#11994)', () => {
+  const base = { worker: PI_ASTRA, critic: NEON_GOOGLE_CRITIC, arbiter: OPUS_ARBITER };
+  const scorecard = aggregateScorecard(
+    neonTriadJournal(PI_ASTRA, NEON_GOOGLE_CRITIC, OPUS_ARBITER, 6), { seed: [] });
+  const res = resolveTriad({ size: 'S', domain: 'backend',
+    policy: { routing: { mode: 'active', min_observations: 5, allowlist: {
+      worker: [PI_ASTRA], critic: [NEON_GOOGLE_CRITIC], arbiter: [OPUS_ARBITER] } } },
+    scorecard, base });
+  assert.equal(res.outcome, 'routed', res.reason ?? '');
+  assert.deepEqual(res.selected, base);
+  assert.deepEqual(res.plan[0], PI_ASTRA);
+});
+
+test('routeRole: Neon-критик допускает Opus-арбитра, неутверждённый арбитр отклоняется (#11994)', () => {
+  // Shadow-режим: базовый Opus-арбитр валиден под Neon-критиком и OpenAI-воркером.
+  const opusStep = routeRole({ role: 'arbiter', size: 'S', domain: 'backend',
+    policy: { routing: { mode: 'shadow', allowlist: { arbiter: [OPUS_ARBITER] } } },
+    scorecard: aggregateScorecard([], { seed: [] }),
+    base: OPUS_ARBITER, others: { executor: PI_ASTRA, critic: NEON_GOOGLE_CRITIC } });
+  assert.equal(opusStep.outcome, 'shadow', opusStep.reason ?? '');
+  assert.deepEqual(opusStep.selected, OPUS_ARBITER);
+  // DeepSeek-арбитр формально независим по семейству, но не утверждён для
+  // Neon-маршрута — та же триада отклоняется fail-closed.
+  const dsStep = routeRole({ role: 'arbiter', size: 'S', domain: 'backend',
+    policy: { routing: { mode: 'shadow', allowlist: { arbiter: [DS_ARBITER] } } },
+    scorecard: aggregateScorecard([], { seed: [] }),
+    base: DS_ARBITER, others: { executor: PI_ASTRA, critic: NEON_GOOGLE_CRITIC } });
+  assert.equal(dsStep.outcome, 'rejected');
+  assert.equal(dsStep.reason, 'route_base_triad_violation');
+  // Неон-shaped критик в любой google-форме (без reasoningLevel, agy-транспорт) —
+  // то же правило допуска.
+  for (const critic of [{ provider: 'google', model: 'gemini-4-neon' },
+      { provider: 'acp-antigravity-acp', model: 'gemini-4-neon', reasoningLevel: 'high' }]) {
+    const step = routeRole({ role: 'arbiter', size: 'S', domain: 'backend',
+      policy: { routing: { mode: 'shadow', allowlist: { arbiter: [OPUS_ARBITER] } } },
+      scorecard: aggregateScorecard([], { seed: [] }),
+      base: OPUS_ARBITER, others: { executor: PI_ASTRA, critic } });
+    assert.equal(step.outcome, 'shadow', `${critic.provider}: ${step.reason ?? ''}`);
+  }
+});
+
+test('resolveTriad: неутверждённые арбитры под Neon-критиком отклоняются fail-closed (#11994)', () => {
+  for (const arbiter of [
+    DS_ARBITER, // независимое семейство, но не Sol и не Opus
+    { provider: 'deepseek', model: 'deepseek-v4', reasoningLevel: 'medium' }, // прямой deepseek — то же
+    { provider: 'agy', model: 'claude-opus-5.5' }, // Opus без reasoningLevel
+    { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'low' }, // недопустимый уровень
+    { provider: 'pi', model: 'agy/claude-opus-5.5', reasoningLevel: 'medium' }, // Opus вне agy
+  ]) {
+    const res = resolveTriad({ size: 'S', domain: 'backend',
+      policy: { routing: { mode: 'shadow' } }, scorecard: null,
+      base: { worker: PI_ASTRA, critic: NEON_GOOGLE_CRITIC, arbiter } });
+    assert.equal(res.outcome, 'rejected', JSON.stringify(arbiter));
+    assert.equal(res.reason, 'route_base_acceptance_incompatible', JSON.stringify(arbiter));
+  }
+});
+
+test('resolveTriad: строгая триада трёх семейств сохраняется — Sol-арбитр с OpenAI-воркером отклоняется (#11994)', () => {
+  // Sol-арбитр формально утверждён для Neon-маршрута, но его семейство openai
+  // совпадает с исполнителем pi+openai/gpt-6.2-astra: независимость триады
+  // проверяется отдельно и не ослабляется допуском isNeonArbiter.
+  const res = resolveTriad({ size: 'S', domain: 'backend',
+    policy: { routing: { mode: 'shadow' } }, scorecard: null,
+    base: { worker: PI_ASTRA, critic: NEON_GOOGLE_CRITIC, arbiter: DEFAULT_ARBITER } });
+  assert.equal(res.outcome, 'rejected');
+  assert.equal(res.reason, 'route_base_triad_violation:arbiter_family_not_independent');
+  // Контроль: cognition-воркер + Neon + Sol — прежняя валидная комбинация проходит.
+  const legacy = resolveTriad({ size: 'S', domain: 'backend',
+    policy: { routing: { mode: 'shadow' } }, scorecard: null,
+    base: { worker: PRIMARY_WORKER, critic: NEON_GOOGLE_CRITIC, arbiter: DEFAULT_ARBITER } });
+  assert.equal(legacy.outcome, 'shadow', legacy.reason ?? '');
+  // И cognition-воркер + Neon + Opus — тоже строгая триада (cognition/google/anthropic).
+  const cognitionOpus = resolveTriad({ size: 'S', domain: 'backend',
+    policy: { routing: { mode: 'shadow' } }, scorecard: null,
+    base: { worker: PRIMARY_WORKER, critic: NEON_GOOGLE_CRITIC, arbiter: OPUS_ARBITER } });
+  assert.equal(cognitionOpus.outcome, 'shadow', cognitionOpus.reason ?? '');
 });

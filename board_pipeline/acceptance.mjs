@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { buildSubject, canonicalJson, subjectDigest } from './subject.mjs';
 import { assertCrossFamily, hasValidFinding, ReviewDenied } from './review-runner.mjs';
-import { evaluateAutoApprove, isLegacyPiReview, isNeonReview, isReviewSkillList, isSolArbiter,
+import { evaluateAutoApprove, isLegacyPiReview, isNeonArbiter, isNeonReview, isReviewSkillList,
   NEON_ISOLATION, parseApprovalPolicy, partitionFindingsBySeverity } from './review-policy.mjs';
 import { l2RunnableSpec, runnerReviewSpec } from './review-runner.mjs';
 import { assertTriadIndependent, opencodeGoPolicyViolation,
@@ -1179,7 +1179,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports, 
       }
     }
     if (isNeonReview(profile.review)) {
-      if (!isSolArbiter(arbiter) || executor === undefined) throw new Denied('vs2_review_triad_not_approved');
+      if (!isNeonArbiter(arbiter) || executor === undefined) throw new Denied('vs2_review_triad_not_approved');
       if (attempt.policy_digest === undefined) throw new Denied('subject_contract_incomplete');
     }
     try {
@@ -1662,7 +1662,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports, 
       // и model — accept_with_notes от подменённого арбитра не принимается.
       // Сверка в runner-форме, как закреплённая триада: pi/openai/… пин и
       // openai/… квитанция описывают один spec. Для Neon-ревью арбитр обязан
-      // быть аттестованным Sol — независимо от содержимого квитанции.
+      // быть аттестованным арбитром Neon-маршрута (Sol или Opus, #11994) —
+      // независимо от содержимого квитанции.
       const pinnedArbiter = attempt.triad?.arbiter ?? attempt.arbiter ?? profile.arbiter;
       let arbiterOk = true;
       if (pinnedArbiter !== undefined && pinnedArbiter !== null) {
@@ -1681,7 +1682,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports, 
           expected?.model === presented?.model;
       }
       if (arbiterOk && isNeonReview(profile.review)) {
-        arbiterOk = isSolArbiter(arbitrationReceipt.arbiter);
+        arbiterOk = isNeonArbiter(arbitrationReceipt.arbiter);
       }
       if (!arbiterOk) return hold('arbiter_mismatch');
       // AUDIT-0b (P1-11/P2-2): max harm и dod_violation вычисляются

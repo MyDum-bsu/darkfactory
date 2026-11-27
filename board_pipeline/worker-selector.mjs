@@ -10,7 +10,7 @@
 
 import { executorFamily, l2RunnableSpec, ReviewDenied } from './review-runner.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
-import { NEON_CRITIC, SOL_ARBITER, detectStalledReview, isSolArbiter } from './review-policy.mjs';
+import { NEON_CRITIC, SOL_ARBITER, detectStalledReview, isNeonArbiter } from './review-policy.mjs';
 import {
   DEFAULT_MIN_OBSERVATIONS,
   modelKey,
@@ -676,8 +676,9 @@ export function routeRole({ role, size, domain, policy, scorecard,
   }
   const skipped = [];
   // Полная совместимость с acceptHeld ДО запуска воркера: помимо трёх
-  // семейств, критик Neon допустим только с арбитром Sol — иначе
-  // acceptHeld отклонит триаду vs2_review_triad_not_approved уже после
+  // семейств, критик Neon допустим только с утверждённым арбитром
+  // Neon-маршрута (Sol или Opus, #11994) — иначе acceptHeld отклонит
+  // триаду vs2_review_triad_not_approved уже после
   // spawn. Несовместимые комбинации отфильтровываются здесь.
   const triadOk = candidate => {
     const families = { ...fixed };
@@ -689,9 +690,10 @@ export function routeRole({ role, size, domain, policy, scorecard,
     // сверка идёт по нормализованному спеку.
     // Любой критик google-семейства (Neon в любой форме — 'google',
     // 'acp-antigravity-acp', 'pi/google/…', независимо от reasoningLevel)
-    // требует арбитра Sol: acceptHeld отклонит Neon+не-Sol на приёмке
+    // требует утверждённого арбитра Neon-маршрута (Sol или Opus):
+    // acceptHeld отклонит Neon+неутверждённый арбитр на приёмке
     // уже после spawn (#1263 r5).
-    if (workerFamily(critic) === 'google' && !isSolArbiter(arbiter)) {
+    if (workerFamily(critic) === 'google' && !isNeonArbiter(arbiter)) {
       return false;
     }
     try {
@@ -857,8 +859,9 @@ export function resolveTriad({ size, domain, policy, scorecard,
       return `route_base_triad_violation:${e?.reason ?? e?.message ?? 'failed'}`;
     }
     // Совместимость с acceptHeld: любой критик google-семейства требует
-    // арбитра Sol — иначе триада отвалится на приёмке уже после spawn.
-    if (workerFamily(base.critic) === 'google' && !isSolArbiter(base.arbiter)) {
+    // утверждённого арбитра Neon-маршрута (Sol или Opus) — иначе триада
+    // отвалится на приёмке уже после spawn.
+    if (workerFamily(base.critic) === 'google' && !isNeonArbiter(base.arbiter)) {
       return 'route_base_acceptance_incompatible';
     }
     if ((routing.allowlist.worker.length && !inAllowlist(base.worker, routing.allowlist.worker)) ||
@@ -935,10 +938,10 @@ export function resolveTriad({ size, domain, policy, scorecard,
     return fallback('route_role_not_runnable');
   }
   // Полная совместимость с acceptHeld на финальной триаде: критик
-  // google-семейства без Sol-арбитра не выходит — безопасный fallback на
-  // проверенную базу.
+  // google-семейства без утверждённого арбитра Neon-маршрута (Sol или
+  // Opus) не выходит — безопасный fallback на проверенную базу.
   if (workerFamily(routed.selected.critic) === 'google' &&
-      !isSolArbiter(routed.selected.arbiter)) {
+      !isNeonArbiter(routed.selected.arbiter)) {
     return fallback('route_acceptance_incompatible');
   }
   return { outcome: 'routed', mode: 'active', selected: routed.selected,
