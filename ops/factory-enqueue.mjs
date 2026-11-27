@@ -374,8 +374,8 @@ export async function buildEnqueuePlan(values, deps = {}) {
     specDigest = briefDigest;
   }
   // --text — фактический текст карточки, который читает воркер: без явного
-  // --spec-digest дайджест закрепляет именно его (sha256 utf8), а не файл
-  // --brief. Иначе метка не сходилась бы с текстом карточки и run-isolated
+  // --spec-digest дайджест закрепляет именно его (sha256 utf8). Иначе метка
+  // не сходилась бы с текстом карточки и run-isolated
   // молча опускал бы спеку из промпта воркера (sha256(specText) !== spec_digest).
   // Явный --spec-digest — осознанное закрепление оператора, как и раньше.
   if (values.text !== undefined && values['spec-digest'] === undefined) {
@@ -527,6 +527,14 @@ export async function runEnqueue(argv, deps = {}) {
     touch: { type: 'string', multiple: true }, 'drift-base': { type: 'string' },
     'allow-drift': { type: 'boolean' }, 'check-drift': { type: 'boolean' },
     'dry-run': { type: 'boolean' }, json: { type: 'boolean' } } });
+  // CLI-контракт оператора: --brief и --text вместе не принимаются. При
+  // совместной передаче --brief молча терял бы всякий эффект (тело карточки
+  // и дайджест — из --text), поэтому неоднозначная команда отклоняется
+  // понятной ошибкой до сборки плана и до вызова vb. Программный контракт
+  // buildEnqueuePlan (первичность text) этим не меняется.
+  if (values.brief !== undefined && values.text !== undefined) {
+    fail('brief_text_conflict: pass either --brief or --text, not both');
+  }
   const plan = await buildEnqueuePlan(values, deps);
   if (values['dry-run']) {
     return { dryRun: true, plan };

@@ -1,28 +1,33 @@
 #!/usr/bin/env node
 // df-decisions — operator CLI for the approval-gated Unified Owner Decision Ledger.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { rename, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { openUnifiedLedger } from '../board_pipeline/unified-ledger.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import { DEFAULT_MAX_CHARS, openUnifiedLedger } from '../board_pipeline/unified-ledger.mjs';
 
 const USAGE = `usage:
   node ops/df-decisions.mjs propose --db PATH --scope SCOPE --topic TOPIC --decision DECISION [--rationale TEXT] [--applicability TEXT] --by ACTOR [--json]
   node ops/df-decisions.mjs approve --db PATH --id PROPOSAL_ID --by OWNER [--supersedes DECISION_ID] [--json]
   node ops/df-decisions.mjs reject --db PATH --id PROPOSAL_ID --by OWNER [--reason TEXT] [--json]
-  node ops/df-decisions.mjs query --db PATH [--project PROJECT] [--q KEYWORD] [--json]
-  node ops/df-decisions.mjs export --db PATH [--project PROJECT] [--out MARKDOWN_PATH] [--json]`;
+  node ops/df-decisions.mjs query --db PATH [--project PROJECT] [--area NAME ...] [--q KEYWORD] [--json]
+  node ops/df-decisions.mjs export --db PATH [--project PROJECT] [--area NAME ...] [--out MARKDOWN_PATH] [--json]
+  node ops/df-decisions.mjs pending --db PATH [--json]`;
 
-const COMMANDS = new Set(['propose', 'approve', 'reject', 'query', 'export']);
+const COMMANDS = new Set(['propose', 'approve', 'reject', 'query', 'export', 'pending']);
 const COMMAND_OPTIONS = {
   propose: new Set(['db', 'scope', 'topic', 'decision', 'rationale', 'applicability', 'by', 'json']),
   approve: new Set(['db', 'id', 'by', 'supersedes', 'json']),
   reject: new Set(['db', 'id', 'by', 'reason', 'json']),
-  query: new Set(['db', 'project', 'q', 'json']),
-  export: new Set(['db', 'project', 'out', 'json']),
+  query: new Set(['db', 'project', 'area', 'q', 'json']),
+  export: new Set(['db', 'project', 'area', 'out', 'json']),
+  pending: new Set(['db', 'json']),
 };
 const BOOLEAN_OPTIONS = new Set(['json']);
+const REPEATABLE_OPTIONS = new Set(['area']);
+const PROJECT_NAME = /^[a-z0-9_-]+$/i;
 
 function usageError(message) {
   return new Error(`df_decisions_usage: ${message}`);
@@ -44,7 +49,8 @@ function parseCommandArgs(args, command) {
     const key = equals === -1 ? body : body.slice(0, equals);
     const inlineValue = equals === -1 ? undefined : body.slice(equals + 1);
     if (!allowed.has(key)) throw usageError(`unknown option --${key} for command ${command}`);
-    if (Object.hasOwn(values, key)) throw usageError(`duplicate option --${key}`);
+    const repeatable = REPEATABLE_OPTIONS.has(key);
+    if (!repeatable && Object.hasOwn(values, key)) throw usageError(`duplicate option --${key}`);
     if (BOOLEAN_OPTIONS.has(key)) {
       if (inlineValue !== undefined) throw usageError(`option --${key} does not take a value`);
       values[key] = true;
@@ -59,7 +65,12 @@ function parseCommandArgs(args, command) {
       }
     }
     if (value.trim() === '') throw usageError(`option --${key} requires a non-empty value`);
-    values[key] = value;
+    if (repeatable) {
+      if (values[key] === undefined) values[key] = [];
+      values[key].push(value);
+    } else {
+      values[key] = value;
+    }
   }
   if (positional.length) {
     throw usageError(`command ${command} does not accept positional arguments: ${positional.join(' ')}`);
@@ -79,6 +90,13 @@ function requireDb(values, defaultDbPath, command) {
     throw usageError(`${command} requires --db`);
   }
   return dbPath;
+}
+
+function projectOption(values) {
+  if (values.project !== undefined && !PROJECT_NAME.test(values.project)) {
+    throw usageError('--project must match /^[a-z0-9_-]+$/i');
+  }
+  return values.project;
 }
 
 async function writeFileAtomic(path, content) {
@@ -140,19 +158,93 @@ function reject(values, defaultDbPath) {
 function query(values, defaultDbPath) {
   const dbPath = requireDb(values, defaultDbPath, 'query');
   return withLedger(dbPath, ledger => ledger.queryRelevantDecisions({
-    projectId: values.project,
+    projectId: projectOption(values),
+    areas: values.area,
     query: values.q,
   }));
 }
 
+function renderDecisionMarkdown(rows, maxChars = DEFAULT_MAX_CHARS) {
+  const inline = text => text.replace(/\s+/g, ' ').trim();
+  const header = '# Owner Decision Ledger\n';
+  const byScope = new Map();
+  for (const row of rows) {
+    if (!byScope.has(row.scope)) byScope.set(row.scope, []);
+    byScope.get(row.scope).push(row);
+  }
+  const scopeOrder = [...byScope.keys()].sort((a, b) => {
+    if (a === 'global') return -1;
+    if (b === 'global') return 1;
+    return a < b ? -1 : 1;
+  });
+  const blocks = [];
+  for (const scope of scopeOrder) {
+    const entries = byScope.get(scope).map(row => [
+      `- **${inline(row.topic)}**: ${inline(row.decision)}`,
+      row.rationale ? `  - Rationale: ${inline(row.rationale)}` : null,
+      row.applicability ? `  - Applicability: ${inline(row.applicability)}` : null,
+      `  - ID: \`${row.id}\` — approved by ${inline(row.approved_by)} at ${row.approved_at}`,
+    ].filter(line => line !== null).join('\n')).join('\n');
+    blocks.push({ scope, text: `\n## ${scope}\n\n${entries}\n` });
+  }
+  const full = header + blocks.map(block => block.text).join('');
+  let markdown = full;
+  let truncated = false;
+  if (full.length > maxChars) {
+    truncated = true;
+    const included = [];
+    let idsCount = 0;
+    for (const block of blocks) {
+      const shown = included.length + 1;
+      const notice = `\n\n_Truncated: showing ${shown} of ${blocks.length} scope sections._\n`;
+      if ((header + included.join('') + block.text + notice).length <= maxChars) {
+        included.push(block.text);
+        idsCount += 1;
+      } else {
+        break;
+      }
+    }
+    if (included.length === 0) {
+      markdown = full.slice(0, maxChars);
+    } else {
+      const notice = `\n\n_Truncated: showing ${idsCount} of ${blocks.length} scope sections._\n`;
+      markdown = header + included.join('') + notice;
+      if (markdown.length > maxChars) markdown = markdown.slice(0, maxChars);
+    }
+  }
+  const digest = createHash('sha256').update(markdown).digest('hex');
+  return { markdown, digest, truncated, total: rows.length };
+}
+
 async function exportLedger(values, defaultDbPath) {
   const dbPath = requireDb(values, defaultDbPath, 'export');
-  const exported = withLedger(dbPath, ledger => ledger.exportMarkdown({
-    projectId: values.project,
-  }));
+  const projectId = projectOption(values);
+  const exported = withLedger(dbPath, ledger => {
+    if (values.area === undefined) {
+      return ledger.exportMarkdown({ projectId });
+    }
+    return renderDecisionMarkdown(ledger.queryRelevantDecisions({
+      projectId,
+      areas: values.area,
+      limit: Number.MAX_SAFE_INTEGER,
+    }));
+  });
   if (values.out === undefined) return exported;
   const outPath = await writeFileAtomic(values.out, exported.markdown);
   return { ...exported, outPath };
+}
+
+function pending(values, defaultDbPath) {
+  const dbPath = requireDb(values, defaultDbPath, 'pending');
+  withLedger(dbPath, () => {});
+  const db = new DatabaseSync(dbPath);
+  try {
+    return db.prepare(`SELECT * FROM decision_proposals
+      WHERE status = 'pending'
+      ORDER BY created_at ASC, rowid ASC`).all();
+  } finally {
+    db.close();
+  }
 }
 
 async function executeDecisionsCli(argv, { defaultDbPath } = {}) {
@@ -168,6 +260,7 @@ async function executeDecisionsCli(argv, { defaultDbPath } = {}) {
   else if (command === 'approve') payload = approve(values, defaultDbPath);
   else if (command === 'reject') payload = reject(values, defaultDbPath);
   else if (command === 'query') payload = query(values, defaultDbPath);
+  else if (command === 'pending') payload = pending(values, defaultDbPath);
   else payload = await exportLedger(values, defaultDbPath);
   return { command, values, payload };
 }
@@ -189,6 +282,12 @@ function humanOutput(command, payload) {
     if (!payload.length) return 'no active decisions\n';
     return `${payload.map(row =>
       `- [${row.scope}] ${oneLine(row.topic)}: ${oneLine(row.decision)} (${row.id})`)
+      .join('\n')}\n`;
+  }
+  if (command === 'pending') {
+    if (!payload.length) return 'no pending proposals\n';
+    return `${payload.map(row =>
+      `- [${row.scope}] ${oneLine(row.topic)}: ${oneLine(row.decision)} (${row.proposal_id})`)
       .join('\n')}\n`;
   }
   if (payload.outPath !== undefined) {
