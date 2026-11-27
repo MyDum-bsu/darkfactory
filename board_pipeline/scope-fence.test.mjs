@@ -23,10 +23,11 @@ test('parseAllowedPaths rejects empty entries and unsafe path forms fail-closed'
 });
 
 test('checkScopeFence preserves unrestricted mode with explicit opt-in and no allowlist', () => {
-  for (const options of [{}, { allowedPaths: null }, { allowedPaths: undefined }]) {
-    assert.deepEqual(checkScopeFence({ changedPaths: ['anything'], ...options, allowUnrestricted: true }),
-      { ok: true, mode: 'unrestricted', violations: [] });
-  }
+  const optIn = { changedPaths: ['anything'], allowUnrestricted: true };
+  const unrestricted = { ok: true, mode: 'unrestricted', violations: [] };
+  assert.deepEqual(checkScopeFence(optIn), unrestricted);
+  assert.deepEqual(checkScopeFence({ ...optIn, allowedPaths: null }), unrestricted);
+  assert.deepEqual(checkScopeFence({ ...optIn, allowedPaths: undefined }), unrestricted);
 });
 
 test('checkScopeFence denies missing, null or undefined allowedPaths by default', () => {
