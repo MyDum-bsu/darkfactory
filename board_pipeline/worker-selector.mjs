@@ -576,7 +576,8 @@ export async function resolveArbitration({
         receipt: {
           kind: 'arbitration', task_id: attempt.task_id, epoch: attempt.epoch,
           attempt_id: attempt.attempt_id, subject_digest: subjectDigest,
-          arbiter: { provider: arbiter.provider, model: arbiter.model },
+          arbiter: { provider: arbiter.provider, model: arbiter.model,
+            ...(arbiter.reasoningLevel !== undefined ? { reasoningLevel: arbiter.reasoningLevel } : {}) },
           decision: 'accept_with_notes', notes: ruling.notes,
           max_harm: maxHarm, dod_violation: false,
         },

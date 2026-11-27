@@ -18,11 +18,11 @@ test('Neon ReviewPort: real offline Docker snapshot with a simulated Agy stream'
       assert.deepEqual(JSON.parse(await readFile(join(cwd, 'files.json'), 'utf8')), ['candidate/sum.js']);
       assert.match(await readFile(join(cwd, 'diff.patch'), 'utf8'), /\+export function sum/);
       return { code: 0, cwd, stdout: agyStreamFixture({ verdict: 'PASS', subject_digest, summary: 'Matches the spec',
-        findings: [], checked_invariants: ['sum'] }, { cwd, reads: ['candidate/sum.js'] }) };
+        findings: [], checked_invariants: ['sum'] }, { cwd, reads: ['candidate/sum.js', 'diff.patch'] }) };
     } });
   const receipt = await run({ ...binding, candidate_sha, subject_digest }, profile);
   assert.equal(receipt.verdict, 'REVIEW_OK');
   assert.equal(receipt.isolation, NEON_ISOLATION);
-  assert.equal(receipt.snapshot_reads, 1);
+  assert.equal(receipt.snapshot_reads, 2);
   assert.equal((await lstat(join(journal, receipt.transcript_file))).mode & 0o777, 0o600);
 });

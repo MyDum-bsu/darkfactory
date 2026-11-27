@@ -18,7 +18,7 @@ const verdict = { verdict: 'PASS', subject_digest, summary: 'Matches the spec',
   findings: [], checked_invariants: ['arithmetic'] };
 const snapshot = async () => ({ code: 0, stdout: '["candidate/sum.js"]' });
 const wire = (cwd, result = verdict, options) => ({ code: 0, cwd,
-  stdout: agyStreamFixture(result, { cwd, reads: ['candidate/sum.js'], ...options }) });
+  stdout: agyStreamFixture(result, { cwd, reads: ['diff.patch'], ...options }) });
 
 async function fixture(t) {
   const { repo, journal, binding, profile } = await neonFixture(t);
@@ -142,6 +142,42 @@ test('Neon never retries unavailable, mismatched or tool-using attempts', async 
     await assert.rejects(run(binding, profile), { reason });
     assert.equal(calls, 1);
   }
+});
+
+test('Neon PASS requires a successful file-content read of a published diff', async t => {
+  const { journal, binding, profile } = await fixture(t);
+  // Always include a successful source read. Replace the second tool event to
+  // distinguish its operation, target and completion from a generic snapshot read.
+  async function review(tool, { round = 1, result = verdict } = {}) {
+    const run = isolatedNeonReviewRunner({ journal, sandbox: snapshot,
+      transport: async ({ snapshot: cwd, publishSnapshot }) => {
+        await publishSnapshot();
+        const response = wire(cwd, result, { reads: ['candidate/sum.js', 'diff.patch'] });
+        const events = response.stdout.split('\n').map(line => JSON.parse(line));
+        const event = events.find(e => e.step_update?.step_index === 2).step_update;
+        Object.assign(event, { tool_name: tool.name, tool_info: tool });
+        return { ...response, stdout: events.map(e => JSON.stringify(e)).join('\n') };
+      } });
+    return run({ ...binding, review_round: round, prior_sha: binding.base_sha }, profile);
+  }
+  const unread = { reason: 'agy_diff_unread' };
+  for (const tool of [
+    { name: 'list_dir', parameters: { DirectoryPath: '.' } },
+    { name: 'find_by_name', parameters: { SearchDirectory: '.', Pattern: 'diff.patch' } },
+    { name: 'grep_search', parameters: { SearchPath: 'diff.patch', Query: 'sum' } },
+    { name: 'read_file', parameters: { Path: 'candidate/diff.patch' } },
+    { name: 'read_file', parameters: { Path: 'diff.patch' }, error: 'read failed' },
+  ]) await assert.rejects(review(tool), unread);
+
+  const roundRead = { name: 'view_file', parameters: { AbsolutePath: 'round.patch' } };
+  await assert.rejects(review(roundRead), unread);
+  assert.equal((await review(roundRead, { round: 2 })).verdict, 'REVIEW_OK');
+
+  const inventoryRead = { name: 'read_file', parameters: { Path: 'files.json' } };
+  const finding = { file: 'sum.js', expected: 'a+b', actual: 'a-b' };
+  const rework = severity => ({ ...verdict, verdict: 'REWORK', findings: [{ ...finding, severity }] });
+  await assert.rejects(review(inventoryRead, { result: rework('P2') }), unread);
+  assert.equal((await review(inventoryRead, { result: rework('P1') })).verdict, 'REVIEW_BLOCKED');
 });
 
 test('Neon rejects same-family and drifting worktree', async t => {

@@ -29,6 +29,7 @@ import {
   workerFamily,
 } from './worker-selector.mjs';
 import { ReviewDenied } from './review-runner.mjs';
+import { isNeonArbiter } from './review-policy.mjs';
 import { createWorkerRuntime } from './worker-runtime.mjs';
 import { aggregateScorecard } from './model-scorecard.mjs';
 
@@ -650,6 +651,20 @@ test('resolveArbitration: accept_with_notes фиксирует ArbitrationReceip
     arbitrate: async () => ({ decision: 'accept_with_notes', notes: ' ', subject_digest: DIGEST }),
   });
   assert.equal(noNotes.reason, 'arbiter_response_invalid');
+});
+
+test('accept_with_notes preserves the selected arbiter identity for the Neon seal', async () => {
+  for (const arbiter of [DEFAULT_ARBITER, { ...OPUS_ARBITER, reasoningLevel: 'high' },
+    { provider: DEFAULT_ARBITER.provider, model: DEFAULT_ARBITER.model }]) {
+    const result = await resolveArbitration({ attempt: arbAttempt, trigger: disputeTrigger,
+      subjectDigest: DIGEST, arbiter, verifyHeld: liveHeld,
+      arbitrate: async () => ({ decision: 'accept_with_notes', notes: 'minor style only',
+        subject_digest: DIGEST, reasoningLevel: 'low' }),
+    });
+    assert.equal(result.decision, 'accept_with_notes');
+    assert.deepEqual(result.receipt.arbiter, arbiter);
+    assert.equal(isNeonArbiter(result.receipt.arbiter), arbiter.reasoningLevel !== undefined);
+  }
 });
 
 // Пункт 8: accept_with_notes запрещён при DoD-нарушении и harm>=10.
