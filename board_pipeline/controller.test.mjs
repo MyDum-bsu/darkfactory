@@ -2001,3 +2001,133 @@ test('record.until tracks every successful renewal monotonically with the lease 
   assert.equal(typeof (await plain.cfg.state.load()).until, 'string');
   assert.ok(Number.isFinite(Date.parse(first)));
 });
+
+// ── Astra post-fix audit: validated notes/dispute replay + writerStartedAt ──
+
+test('checking phase persists validated submission notes and dispute in the durable record', async t => {
+  const x = await lab(t);
+  await x.tick();
+  const envelopes = [];
+  x.cfg.submissions = { async read(attempt, after) {
+    if (after < 1) return { turnSeq: 1, submission: {
+      task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+      worker_thread_id: attempt.bb_thread_id, candidate_sha: 'c'.repeat(40),
+      notes: ['postоронняя\u0007 находка   с\tпробелами'],
+      dispute: { finding_ref: 'f1', justification: 'не воспроизводится', spec_evidence: 'пункт 2 спеки' },
+    } };
+  } };
+  const snapshots = [];
+  const save0 = x.cfg.state.save;
+  x.cfg.state.save = async value => {
+    if (value?.phase === 'checking') snapshots.push(structuredClone(value));
+    return save0(value);
+  };
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(snapshots.length, 1, 'запись checking зафиксирована ровно один раз');
+  assert.deepEqual(snapshots[0].submissionNotes, ['postоронняя находка с пробелами'],
+    'заметки закрепляются в валидированной санитизированной форме');
+  assert.deepEqual(snapshots[0].submissionDispute,
+    { finding_ref: 'f1', justification: 'не воспроизводится', spec_evidence: 'пункт 2 спеки' });
+});
+
+test('a checking round without notes or dispute clears the pinned values of the previous round', async t => {
+  const x = await lab(t);
+  await x.tick();
+  // Раунд 1: сдача с заметками и спором — красный L1 (sha 'b…'), rework.
+  // Раунд 2: сдача без них — ключи записи обязаны быть сброшены, иначе
+  // восстановление реконструировало бы конверт с чужими заметками.
+  let round = 1;
+  const envelope = (attempt, sha, extra = {}) => ({
+    task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
+    worker_thread_id: attempt.bb_thread_id, candidate_sha: sha, ...extra,
+  });
+  x.cfg.submissions = { async read(attempt, after) {
+    if (round === 1 && after === 0) {
+      return { turnSeq: 1, submission: envelope(attempt, 'b'.repeat(40), {
+        notes: ['вне_scope находка'],
+        dispute: { finding_ref: 'f1', justification: 'j', spec_evidence: 's' } }) };
+    }
+    if (round === 2 && after === 1) {
+      return { turnSeq: 2, submission: envelope(attempt, 'c'.repeat(40)) };
+    }
+  } };
+  const snapshots = [];
+  const save0 = x.cfg.state.save;
+  x.cfg.state.save = async value => {
+    if (value?.phase === 'checking' && value.sha) snapshots.push(structuredClone(value));
+    return save0(value);
+  };
+  await x.tick(); // раунд 1: checking(b…) → rework → feedback
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(snapshots[0].submissionNotes, ['вне_scope находка']);
+  assert.deepEqual(snapshots[0].submissionDispute, { finding_ref: 'f1', justification: 'j', spec_evidence: 's' });
+  round = 2;
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(snapshots.length, 2);
+  assert.equal(snapshots[1].submissionNotes, undefined, 'заметки прошлого раунда сброшены');
+  assert.equal(snapshots[1].submissionDispute, undefined, 'спор прошлого раунда сброшен');
+  assert.equal(Object.hasOwn(snapshots[1], 'submissionNotes'), true,
+    'сброс пишется явным undefined-ключом патча, а не отсутствием ключа');
+});
+
+test('recoverInterruptedChecking replays validated notes and dispute into the re-run verify', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  const seen = [];
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    seen.push(structuredClone(submission));
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)],
+    submissionNotes: ['вне_scope находка передана заметкой'],
+    submissionDispute: { finding_ref: 'f3', justification: 'не относится к diff', spec_evidence: 'спека §3' } });
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(seen.length, 1, 'verify повторён ровно один раз');
+  assert.deepEqual(seen[0].notes, ['вне_scope находка передана заметкой']);
+  assert.deepEqual(seen[0].dispute,
+    { finding_ref: 'f3', justification: 'не относится к diff', spec_evidence: 'спека §3' });
+  assert.equal(seen[0].candidate_sha, 'c'.repeat(40));
+});
+
+test('a replayed checking recovery without pinned notes submits no notes at all', async t => {
+  const x = await lab(t);
+  x.cfg.recoverInterruptedChecking = true;
+  const seen = [];
+  const origVerify = x.cfg.verify;
+  x.cfg.verify = async (attempt, submission, options) => {
+    seen.push(structuredClone(submission));
+    return origVerify(attempt, submission, options);
+  };
+  await x.tick();
+  const record = await x.cfg.state.load();
+  await x.cfg.state.save({ ...record, phase: 'checking', sha: 'c'.repeat(40), turnSeq: 1,
+    seenShas: ['c'.repeat(40)] });
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal(Object.hasOwn(seen[0], 'notes'), false, 'без закреплённых заметок конверт их не несёт');
+  assert.equal(Object.hasOwn(seen[0], 'dispute'), false);
+});
+
+test('writerStartedAt is pinned once at launch and survives renewals and a restart', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  await x.tick();
+  const first = await x.cfg.state.load();
+  assert.ok(Number.isFinite(first.writerStartedAt), 'якорь писателя закреплён при запуске');
+  t.mock.timers.tick(9_000);
+  // Продление аренды двигает until, но никогда — writerStartedAt.
+  await x.tick();
+  const renewed = await x.cfg.state.load();
+  assert.equal(renewed.writerStartedAt, first.writerStartedAt, 'якорь неизменен при продлении аренды');
+  assert.notEqual(renewed.until, first.until, 'until продления действительно сдвинулся');
+  // Рестарт контроллера: адаптер пустой, запись та же — якорь не пересоздаётся.
+  x.cfg.board = nativeBoardPort(x.handle, { channel: 'pilot' });
+  t.mock.timers.tick(5_000);
+  await x.tick();
+  assert.equal((await x.cfg.state.load()).writerStartedAt, first.writerStartedAt);
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+});

@@ -8,6 +8,7 @@ import { partitionFindingsBySeverity } from './review-policy.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
 import { PilotDenied } from './pilot-gate.mjs';
 import { isTransientBoardError } from './native-board.mjs';
+import { validateSubmissionNotes } from './scope-fence.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
@@ -45,6 +46,27 @@ function projectPriorFinding(f) {
     }
   }
   return out;
+}
+
+// Та же закрытая форма спора, что validateSubmission приёмки: объект с тремя
+// непустыми строковыми полями. Невалидный спор не закрепляется в записи —
+// приёмка отклоняет такую сдачу на первичной проверке до любого восстановления.
+function validSubmissionDispute(d) {
+  return d !== null && typeof d === 'object' && !Array.isArray(d) &&
+    ['finding_ref', 'justification', 'spec_evidence'].every(
+      k => typeof d[k] === 'string' && d[k].trim().length > 0);
+}
+
+// Валидированные заметки сдачи в закрытой санитизированной форме либо
+// undefined: невалидные notes приёмка отклоняет на первичной проверке,
+// в долговременную запись попытки они не попадают никогда.
+function validatedSubmissionNotes(notes) {
+  if (notes === undefined) return undefined;
+  try {
+    return validateSubmissionNotes(notes);
+  } catch {
+    return undefined;
+  }
 }
 
 function isAllowlist(a) {
@@ -475,7 +497,10 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         launched = await bb.spawn({ ...attemptOf(record, route), bb_thread_id: undefined });
       }
       if (!confirmedThreadId(launched?.threadId)) throw new Error('No confirmed BB thread');
-      await save({ phase: 'working', threadId: launched.threadId,
+      // Неизменный якорь старта писателя для фазового бюджета writer: один раз
+      // при запуске и никогда не перезаписывается кругами доработки/рестартами —
+      // в отличие от record.until, который движется каждым продлением аренды.
+      await save({ phase: 'working', threadId: launched.threadId, writerStartedAt: Date.now(),
         receipt: { kind: 'spawn', threadId: launched.threadId }, ...(workerTrail ?? {}) });
     } catch (e) {
       // Обрыв в любой точке claim/launch не повторяет эффект: та же сверка,
@@ -607,18 +632,28 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   };
   // Wall-clock бюджет фазы 'working' стартует с первого тика, наблюдающего
   // фазу, и не сбрасывается кругами доработки: записанное значение переживает
-  // рестарты процесса, поэтому продление аренды не обнуляет часы.
-  if (record.phase === 'working' && !Number.isFinite(record.workingSince)) {
-    await save({ workingSince: Date.now() });
+  // рестарты процесса, поэтому продление аренды не обнуляет часы. Тот же
+  // тик дописывает неизменный якорь writerStartedAt, если запуск восстановлен
+  // сверкой (reconcile) и прямой записи при spawn не было.
+  if (record.phase === 'working') {
+    const anchors = {};
+    if (!Number.isFinite(record.workingSince)) anchors.workingSince = Date.now();
+    if (!Number.isFinite(record.writerStartedAt)) anchors.writerStartedAt = Date.now();
+    if (Object.keys(anchors).length > 0) await save(anchors);
   }
   if (recoveredChecking) {
     // Конверт уже прошёл проверку на исходном тике и зафиксирован в записи:
     // verify() повторяется по реконструированному конверту того же кандидата,
     // без повторного чтения хода воркера (терминал мог не пережить вытеснение).
+    // Валидированные notes/dispute восстанавливаются из той же записи: повтор
+    // проверяет тот же конверт, что прерванный запуск, — спор не теряет
+    // основание арбитража, а операторские заметки не пропадают из evidence.
     turnSeq = record.turnSeq;
     submission = { task_id: attempt.task_id, epoch: attempt.epoch,
       attempt_id: attempt.attempt_id, worker_thread_id: attempt.bb_thread_id,
-      candidate_sha: record.sha };
+      candidate_sha: record.sha,
+      ...(record.submissionNotes !== undefined ? { notes: record.submissionNotes } : {}),
+      ...(record.submissionDispute !== undefined ? { dispute: record.submissionDispute } : {}) };
     // Монотонный recoverySeq (F-02 / Core P1-7): каждое восстановление
     // прерванной проверки увеличивает счётчик в доверенной записи попытки.
     // verify получает его отдельным контроллерным аргументом — приёмка
@@ -748,8 +783,15 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     if (record.seenShas.includes(submission.candidate_sha)) return stopWith('worker_turn_finished_without_new_handoff');
     // Новый раунд проверки сбрасывает маркер восстановления: охраняемый повтор
     // verify() допустим один раз на каждый прерванный раунд, а не один раз на попытку.
+    // Валидированные notes/dispute сдачи закрепляются в записи того же раунда
+    // (и сбрасываются для раунда без них): восстановление прерванной проверки
+    // реконструирует конверт того же кандидата с теми же операторскими заметками
+    // и спором — повтор verify() не теряет основание арбитража и не отличается
+    // от прерванного запуска.
     await save({ phase: 'checking', reason: undefined, sha: submission.candidate_sha, turnSeq,
-      seenShas: [...record.seenShas, submission.candidate_sha], checkingRecovered: false });
+      seenShas: [...record.seenShas, submission.candidate_sha], checkingRecovered: false,
+      submissionNotes: validatedSubmissionNotes(submission.notes),
+      submissionDispute: validSubmissionDispute(submission.dispute) ? submission.dispute : undefined });
   }
   if (release && route.finish === 'deployed') {
     try { prepared = await release.prepare(submission.candidate_sha); }

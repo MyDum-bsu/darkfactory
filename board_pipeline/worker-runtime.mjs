@@ -3,10 +3,17 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile as readFileDefault } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const execFileAsync = promisify(execFile);
 const TAIL_LIMIT = 8192;
 const MAX_TERMINAL_SUBPROC_SESSIONS = 32;
+// Короткое подтверждение фактического выхода процесса после сигнала: SIGTERM
+// даёт писателю шанс завершиться штатно, SIGKILL — uncatchable, его ожидание
+// строго короче. stopped: true выписывается только по событию exit, не по
+// факту отправки сигнала.
+export const SUBPROC_STOP_TERM_GRACE_MS = 1500;
+export const SUBPROC_STOP_KILL_GRACE_MS = 1000;
 
 export const EXECUTOR_COMMANDS = Object.freeze({
   'acp-devin': 'devin',
@@ -481,18 +488,46 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
       ...(exitCode === undefined ? {} : { exitCode }) });
   }
 
+  // Подтверждение фактического выхода subproc-писателя: stopped: true
+  // выписывается только когда процесс реально завершился (событие exit уже
+  // наблюдено для терминальной сессии или дождались его после сигнала).
+  // Неизвестная сессия — stopped: false БЕЗ состояния exited: таблица
+  // sessions живёт в памяти процесса, после рестарта контроллера писатель
+  // может быть жив — «exited» был бы недоказанным утверждением.
+  async function waitSubprocExit(session, graceMs) {
+    const deadline = Date.now() + graceMs;
+    while (session.state === 'working' && Date.now() < deadline) {
+      await delay(10);
+    }
+    return session.state !== 'working';
+  }
+
+  function stoppedSubproc(session) {
+    return Object.freeze({ stopped: true, state: session.state,
+      ...(session.exitCode === undefined ? {} : { exitCode: session.exitCode }),
+      ...(session.signal === undefined ? {} : { signal: session.signal }) });
+  }
+
+  async function stopSubproc(session) {
+    if (session.state !== 'working') {
+      pruneTerminalSessions(session.runtimeId);
+      return stoppedSubproc(session);
+    }
+    session.child?.kill?.('SIGTERM');
+    if (!await waitSubprocExit(session, SUBPROC_STOP_TERM_GRACE_MS)) {
+      session.child?.kill?.('SIGKILL');
+      await waitSubprocExit(session, SUBPROC_STOP_KILL_GRACE_MS);
+    }
+    if (session.state !== 'working') return stoppedSubproc(session);
+    return Object.freeze({ stopped: false, state: session.state });
+  }
+
   async function stop({ runtimeId } = {}) {
     const id = validateRuntimeId(runtimeId);
     if (kind === 'hc') return stopHc(id);
     const session = sessions.get(id);
-    if (!session) return Object.freeze({ stopped: false, state: 'exited' });
-    if (session.state !== 'working') {
-      pruneTerminalSessions(id);
-      return Object.freeze({ stopped: false, state: session.state,
-        ...(session.exitCode === undefined ? {} : { exitCode: session.exitCode }) });
-    }
-    const killed = session.child?.kill?.('SIGTERM') === true;
-    return Object.freeze({ stopped: killed, state: session.state, ...(killed ? { signal: 'SIGTERM' } : {}) });
+    if (!session) return Object.freeze({ stopped: false });
+    return stopSubproc(session);
   }
 
   return Object.freeze({ kind, probeAvailability, spawn: spawnWorker, resume: resumeWorker,
