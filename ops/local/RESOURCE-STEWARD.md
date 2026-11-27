@@ -11,7 +11,7 @@
 
 1. **Измерение.** Свободное место на выбранных файловых системах (`statfs`), по умолчанию только `/`, и `MemAvailable`
    из `/proc/meminfo`. Ошибка измерения одного монта — ошибка в журнале, а не ноль байт.
-2. **Уборка Тира 1** — только если где-то **< 5 GiB**. Строго фиксированный allowlist:
+2. **Уборка Тира 1** — только если где-то **< 8 GiB**. Строго фиксированный allowlist:
    - Docker build cache: `docker builder prune -f`;
    - висячие образы: `docker image prune -f` (только dangling, ни `-a`, ни volumes);
    - просроченные `/tmp/df-*` и каталоги `/tmp/pytest-of-*` старше N дней (`--tmp-days`, дефолт 7);
@@ -19,9 +19,10 @@
      npm (`~/.npm/_cacache`) — пофайлово старше N дней (`--cache-days`, дефолт 7).
 3. **Повторное измерение.** Если после Тира 1 **< 2 GiB** → событие `alarm` в журнале и
    **ровно одна** эскалация за тик (по худшему монту) с одним вопросом владельцу.
-4. **RAM.** Если `MemAvailable < 1.5 GiB` → стоп **только однозначно idle** BB-тредов:
+4. **RAM.** Если `MemAvailable < 1.5 GiB` → стоп **только однозначно idle** `hc`-сессий/тредов
+   (в режиме `auto` сначала опрашивается `hc`; legacy `bb` — только запасной путь):
    `status === 'idle'`, без закрепления (`pinnedAt`), без очереди, без интеракции и фоновой
-   активности. Активные, закреплённые, свой тред (`BB_THREAD_ID`) и всё двусмысленное —
+   активности. Активные, закреплённые, свой runtime id/тред и всё двусмысленное —
    не останавливаются, причина пишется в журнал.
 
 ## Чего сторож не делает никогда
@@ -65,7 +66,7 @@ systemctl --user enable --now resource-steward.timer
 `journalctl --user -u resource-steward.service`, разовый прогон:
 `systemctl --user start resource-steward.service`.
 
-**Пути установки:** `DF_NODE` — абсолютный путь к Node ≥ 22.18, `DF_REPO` — абсолютный путь к чекауту. Значения хранятся только в операторском `EnvironmentFile`. Проверьте `command -v node`, `node --version` и доступность `bb` из `PATH` юнита. Чтобы следить за дополнительным томом, добавьте в операторскую копию `ExecStart` `--mount / --mount /path/to/volume`.
+**Пути установки:** `DF_NODE` — абсолютный путь к Node ≥ 22.18, `DF_REPO` — абсолютный путь к чекауту. Значения хранятся только в операторском `EnvironmentFile`. Проверьте `command -v node`, `node --version` и доступность `hc` из `PATH` юнита (`bb` — только для явного legacy-режима `--runtime bb`). Чтобы следить за дополнительным томом, добавьте в операторскую копию `ExecStart` `--mount / --mount /path/to/volume`.
 
 Удаление: `systemctl --user disable --now resource-steward.timer` и удалить юниты из
 `~/.config/systemd/user/`.
@@ -81,7 +82,9 @@ systemctl --user enable --now resource-steward.timer
 | `--cache-days <n>` | возраст просрочки кэшей pip/npm/uv (дефолт 7) |
 | `--escalate-cmd <exec>` | хук эскалации: payload JSON на stdin, без shell, таймаут 120 с |
 | `--no-docker` | не вызывать docker prune (например, на машине без docker) |
-| `--bb <path>` | путь к bb CLI (дефолт `bb` из PATH) |
+| `--runtime auto\|bb\|hc` | runtime для RAM-shedding (дефолт `auto`: сначала `hc`, затем legacy `bb` fallback) |
+| `--bb <path>` | путь к bb CLI для legacy fallback/режима (дефолт `bb` из PATH) |
+| `--hc <path>` | путь к hc CLI (дефолт `hc` из PATH) |
 
 ## Хук эскалации LLM
 

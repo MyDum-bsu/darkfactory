@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process';
 import { chmod, mkdtemp, mkdir, rm, writeFile, readFile, readdir, utimes } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { get, request } from 'node:http';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -16,6 +16,9 @@ import { test } from 'node:test';
 import { isAllowedHost, isAllowedOrigin, isAllowedFetchSite, sanitizeTerminalText,
   escapeHtml, SECURITY_HEADERS } from './origin-guard.mjs';
 import { createNetHealthMonitor } from './net-health.mjs';
+import * as aggregator from './aggregator.mjs';
+import * as board from './board-observer.mjs';
+import * as fleet from './telemetry-fleet.mjs';
 import { createControlRoomAggregator, createBoardObserver,
   createBranchDriftProvider, createModelsProvider, createTelemetryProvider,
   buildActiveTrees, buildFleetTelemetry, normalizeFleetHost, readKillSwitchState,
@@ -216,6 +219,40 @@ test('net-health: concurrent refreshes are deduplicated per probe name', async (
 });
 
 // --- aggregator -----------------------------------------------------------------
+
+test('aggregator: worker-state CLI flags override the environment and legacy default', () => {
+  const state = { XDG_STATE_HOME: '/xdg' };
+  const env = { ...state, DF_WORKER_STATE_FILE: '/env/state.json' };
+  const resolve = (argv, environment) => aggregator.parseControlRoomArgs(argv, environment).workerStatePath;
+  assert.equal(resolve([], {}), join(homedir(), '.local', 'state', 'darkfactory', 'cloud-worker-state.json'));
+  assert.equal(resolve([], state), '/xdg/darkfactory/cloud-worker-state.json');
+  assert.equal(resolve([], env), '/env/state.json');
+  assert.equal(resolve(['--cloud-state', '/legacy.json'], env), '/legacy.json');
+  assert.equal(resolve(['--worker-state-file', '/cli.json', '--cloud-state', '/legacy.json'], env), '/cli.json');
+});
+
+test('aggregator: existing public entry point preserves provider exports and server API', () => {
+  for (const [source, names] of [
+    [board, ['BOARD_API_PATH', 'normalizeBoardBaseUrl', 'loadBoardTasksFromApi', 'createBoardObserver',
+      'createBranchDriftProvider', 'buildBoardExplorer']],
+    [fleet, ['DEFAULT_TELEMETRY_DIR', 'TELEMETRY_MAX_BYTES', 'TELEMETRY_MAX_FILES',
+      'createTelemetryProvider', 'FLEET_STALE_MS', 'FLEET_MAX_FILE_BYTES', 'normalizeFleetHost',
+      'readFleetTelemetryFiles', 'createFleetHostsProvider', 'buildFleetTelemetry', 'createModelsProvider',
+      'EVENTS_TAIL_CHUNK_BYTES', 'EVENTS_TAIL_MAX_BYTES_PER_FILE', 'buildActiveTrees', 'buildRepoSlots']],
+  ]) {
+    for (const name of names) {
+      assert.ok(Object.hasOwn(source, name), name);
+      assert.equal(aggregator[name], source[name], name);
+    }
+  }
+  for (const name of ['loadBbThreadsFromCli', 'readRequestBody', 'readKillSwitchState', 'createControlRoomAggregator']) {
+    assert.equal(typeof aggregator[name], 'function', name);
+  }
+  for (const name of ['DEFAULT_PORT', 'RING_LIMIT', 'OWNER_WRITE_MAX_BODY_BYTES', 'OWNER_WRITE_BODY_TIMEOUT_MS',
+    'OWNER_IDEMPOTENCY_TTL_MS', 'OWNER_IDEMPOTENCY_MAX_ENTRIES']) {
+    assert.equal(typeof aggregator[name], 'number', name);
+  }
+});
 
 test('aggregator: GET/HEAD допускаются, мутирующие методы → 405', async () => {
   await withServer({}, async (server, base) => {

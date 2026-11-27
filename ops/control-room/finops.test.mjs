@@ -117,6 +117,69 @@ test('finops: estimatedMonthCostEur считается из worker usage minutes
   }
 });
 
+test('finops: monthly VM spend draws recurring credits before finite credits', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-credit-draw-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const budgetPath = join(dir, 'budget.yaml');
+  const workerUsagePath = join(dir, 'usage.json');
+  const snapshot = createFinopsProvider({ budgetPath, workerUsagePath, now: '2026-11-24T12:00:00Z' });
+  // Welcome is listed first and is already partially depleted. Both VMs cost
+  // €0.60/hour, so their combined running minutes give the spend in cents.
+  await writeFile(budgetPath, `cloud_credits:
+  - { id: gcp_welcome, total_eur: 100, remaining_eur: 90.75 }
+  - { id: gcp_ultra_monthly, monthly_eur: 10, remaining_eur: 10 }
+compute_vms:
+  - { id: a, metered: true, hourly_cost_eur: 0.60 }
+  - { id: b, metered: true, hourly_cost_eur: 0.60 }
+`);
+  for (const [name, minutes, ultraUsed, ultraLeft, welcomeUsed, welcomeLeft] of [
+    ['zero spend', 0, 0, 10, 0, 90.75],
+    ['below monthly allowance', 321, 3.21, 6.79, 0, 90.75],
+    ['exact monthly allowance', 1000, 10, 0, 0, 90.75],
+    ['monthly overflow', 1123, 10, 0, 1.23, 89.52],
+    ['both credits exhausted', 12000, 10, 0, 90.75, 0],
+  ]) {
+    await t.test(name, async () => {
+      const a = Math.floor(minutes / 2);
+      await writeFile(workerUsagePath, JSON.stringify({ vms: {
+        a: { runningMinutesMonth: a }, b: { runningMinutesMonth: minutes - a },
+      } }));
+      const snap = await snapshot();
+      assert.equal(snap.ok, true);
+      assert.equal(snap.totals.spentMonthCostEur, minutes / 100);
+      assert.deepEqual(snap.cloudCredits.map(c =>
+        [c.id, c.totalEur, c.monthlyEur, c.usedMonthEur, c.remainingEur]), [
+        ['gcp_welcome', 100, null, welcomeUsed, welcomeLeft],
+        ['gcp_ultra_monthly', null, 10, ultraUsed, ultraLeft],
+      ]);
+      assert.equal(snap.totals.remainingCreditsEur, welcomeLeft + ultraLeft);
+      assert.equal(snap.creditRunway.remainingCreditsEur, snap.totals.remainingCreditsEur);
+    });
+  }
+});
+
+test('finops: credit draw uses explicit balances (including zero) before face values', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-credit-base-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const budgetPath = join(dir, 'budget.yaml');
+  const workerUsagePath = join(dir, 'usage.json');
+  await writeFile(budgetPath, `cloud_credits:
+  - { id: finite, total_eur: 20 }
+  - { id: depleted, monthly_eur: 10, remaining_eur: 0 }
+  - { id: partial, monthly_eur: 10, remaining_eur: 2 }
+  - { id: full, monthly_eur: 3 }
+compute_vms:
+  - { id: worker, metered: true, hourly_cost_eur: 6.123 }
+`);
+  await writeFile(workerUsagePath, JSON.stringify({ runningMinutesMonth: 60 }));
+  const snap = await createFinopsProvider({ budgetPath, workerUsagePath, now: '2026-11-24T12:00:00Z' })();
+  assert.equal(snap.ok, true);
+  assert.equal(snap.totals.spentMonthCostEur, 6.123);
+  assert.deepEqual(snap.cloudCredits.map(c => [c.id, c.usedMonthEur, c.remainingEur]), [
+    ['finite', 1.12, 18.88], ['depleted', 0, 0], ['partial', 2, 0], ['full', 3, 0],
+  ]);
+});
+
 test('finops: underutilized Colab quota становится явным alert', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'finops-alert-'));
   try {

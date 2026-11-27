@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { validatePolicyContract } from '../board_pipeline/config-compiler.mjs';
 import { buildRunPlan, ensureFilemodeGuard, runFactory } from './factory-run.mjs';
 
 async function fixture(t) {
@@ -49,6 +50,22 @@ async function fixture(t) {
   });
   return { root, worktree, state, handoffDir, ops, policy, writePolicy, values, profile };
 }
+
+test('CLI and standalone validator reject the same invalid policy before effects', async t => {
+  const f = await fixture(t);
+  for (const [bad, reason] of [
+    [{ profiles: {} }, 'profile_required'],
+    [{ profiles: { default: f.profile({ checks: [] }) } }, 'profile_required'],
+    [{ reviewPrompt: f.worktree }, 'path_not_file'],
+    [{ arbiter: { provider: 'openai', model: 'unknown' } }, 'model_not_approved:arbiter'],
+    [{ routing: { allowlist: { critic: ['pi/openai/gpt-6.1-terra'] } } }, 'model_gpt_6_1_terra_disallowed:routing.allowlist.critic'],
+  ]) {
+    await f.writePolicy(bad);
+    const policy = JSON.parse(await readFile(f.policy, 'utf8'));
+    await assert.rejects(validatePolicyContract(policy), { message: reason });
+    await assert.rejects(buildRunPlan(f.values(), { env: {} }), { message: reason });
+  }
+});
 
 const runtimeArgvIndexes = plan =>
   plan.argv.flatMap((arg, index) => arg === '--runtime' ? [index] : []);

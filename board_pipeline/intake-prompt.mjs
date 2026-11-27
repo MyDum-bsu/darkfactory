@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { buildProjectContext, DEFAULT_MAX_CHARS as TASTE_MAX_CHARS } from './taste-profile.mjs';
 import { SAFE_CATALOG } from './rework-distiller.mjs';
 import { formatArbiterPrompt, formatWorkerPrompt, resolveModelFamily } from './model-prompt-profiles.mjs';
 import { scopeFencePromptBlock } from './scope-fence.mjs';
@@ -80,8 +82,40 @@ export function projectMemoryPromptBlock(slice) {
   return `${header}\n${body}${note}${guard}`;
 }
 
+// Input: an object of final rendered block strings, not slices or file paths.
+// Missing/null/empty blocks have no entry. Hash the exact UTF-8 bytes, without
+// leaking prompt text into the explain receipt. chars counts JS UTF-16 units,
+// the same unit used for prompt budgets.
+export function buildPromptBom(parts) {
+  if (!parts || typeof parts !== 'object' || Array.isArray(parts)) throw new Error('prompt_parts_invalid');
+  const bom = {};
+  for (const name of ['spec', 'decisions', 'memory', 'taste', 'skills', 'lessons', 'scope']) {
+    if (!Object.hasOwn(parts, name)) continue;
+    const text = parts[name];
+    if (text == null || text === '') continue;
+    if (typeof text !== 'string') throw new Error(`prompt_part_invalid:${name}`);
+    bom[name] = { bytes: Buffer.byteLength(text), chars: text.length,
+      sha256: createHash('sha256').update(text).digest('hex') };
+  }
+  return bom;
+}
+
+// Opt-in buildProjectContext options from the caller; the project layer is
+// always resolved inside this worker's tree. Never probe files when omitted.
+function tastePromptBlock(tree, tasteProfile) {
+  if (typeof tasteProfile !== 'object' || Array.isArray(tasteProfile)) {
+    throw new Error('prompt_input_invalid:tasteProfile');
+  }
+  const header = 'Owner/project taste (read-only conventions):\n';
+  const { maxChars = TASTE_MAX_CHARS } = tasteProfile;
+  if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error('taste_profile_maxchars_invalid');
+  const budget = Math.min(maxChars, TASTE_MAX_CHARS) - header.length;
+  const { text } = buildProjectContext({ ...tasteProfile, repoRoot: tree, maxChars: Math.max(budget, 1) });
+  return budget > 0 && text ? header + text : '';
+}
+
 export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions,
-  projectMemory, lessons, executor, allowedPaths, projectContext }) {
+  projectMemory, lessons, executor, allowedPaths, projectContext, tasteProfile }) {
   const instructions = [brief];
   // Read-only project conventions/taste (AGENTS.md or project guide excerpt),
   // embedded before the execution instructions; omitted when undefined/empty.
@@ -90,6 +124,10 @@ export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQ
     if (projectContext.trim() !== '') {
       instructions.push(`Project context (read-only conventions/taste):\n${projectContext}`);
     }
+  }
+  if (tasteProfile != null) {
+    const block = tastePromptBlock(tree, tasteProfile);
+    if (block) instructions.push(block);
   }
   instructions.push(`\nWorktree path: ${tree}. Write JSON atomically to ${handoffPath} and end the turn. Preserve field types: ${JSON.stringify(handoff)}`);
   if (decisions) {

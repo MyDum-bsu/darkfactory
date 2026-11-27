@@ -549,14 +549,21 @@ test('df-decisions: export --area delegates to the ledger renderer — entry-bou
   }
 });
 
-test('package.json: v1.0.0 release version and all hardening suites registered in scripts.test', async () => {
+test('package.json: v1.1.0 release version and all hardening and wiring suites registered in scripts.test', async () => {
   const pkg = JSON.parse(await readFile(join(OPS_DIR, '..', 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '1.0.0');
+  assert.equal(pkg.version, '1.1.0');
   for (const suite of [
     'board_pipeline/pi-guard.test.mjs',
     'ops/df-models.test.mjs',
     'ops/factory-enqueue.test.mjs',
     'ops/factory-run.test.mjs',
+    'board_pipeline/fs-safe.test.mjs',
+    'board_pipeline/config-compiler.test.mjs',
+    'ops/df-map.test.mjs',
+    'ops/core-purity.test.mjs',
+    'ops/docs-fresh.test.mjs',
+    'ops/df-explain.test.mjs',
+    'ops/df-sentinel.test.mjs',
   ]) {
     assert.ok(pkg.scripts.test.split(/\s+/).includes(suite),
       `scripts.test must register ${suite}`);

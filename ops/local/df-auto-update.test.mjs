@@ -70,8 +70,8 @@ function fakeHarness(env, overrides = {}) {
     }
     if (command === 'npm' && args[0] === 'view') return ok(`${versions[args[1]]}\n`);
     if (command === 'npm' && args[0] === 'install') {
-      const pkg = args[2].replace(/@latest$/, '');
-      await writePackage(pkg, versions[pkg]);
+      const at = args[2].lastIndexOf('@');
+      await writePackage(args[2].slice(0, at), args[2].slice(at + 1));
       return ok('installed\n');
     }
     if (command.endsWith('/bin/bb') && args[0] === '--version') return ok('bb-app smoke\n');
@@ -234,6 +234,7 @@ for (const role of ['laptop', 'brain', 'hub', 'worker']) {
       assert.equal(byName[name].status, 'dry_run', `${role}/${name}`);
     }
     assert.equal(byName['bb-app'].status, ['laptop', 'hub'].includes(role) ? 'dry_run' : 'skipped_role');
+    assert.ok(byName.pi.planned.includes(`npm install -g @mariozechner/pi-coding-agent@2.1.0 --prefix ${join(env.home, '.npm-global')}`));
     assert.equal(harness.calls.filter(isMutating).length, 0);
   });
 }
@@ -284,7 +285,7 @@ test('busy flip after npm install defers daemon/control-room restart at the fina
   const originalRunner = harness.runner;
   harness.runner = async (command, args = []) => {
     const result = await originalRunner(command, args);
-    if (command === 'npm' && args[0] === 'install' && args[2] === 'bb-app@latest') busy = true;
+    if (command === 'npm' && args[0] === 'install' && args[2] === 'bb-app@1.1.0') busy = true;
     return result;
   };
   const report = await runAutoUpdate(options(env, 'hub'), harness);
@@ -391,7 +392,21 @@ test('installed prerelease npm package updates to the released version', async t
   assert.equal(bbApp.before, '1.1.0-beta');
   assert.equal(bbApp.after, '1.1.0');
   assert.ok(harness.calls.some(([command, args]) =>
-    command === 'npm' && args[0] === 'install' && args.includes('bb-app@latest')));
+    command === 'npm' && args[0] === 'install' && args.includes('bb-app@1.1.0')));
+});
+
+test('npm installs only the exact version returned by the preceding lookup', async t => {
+  const env = await fixture(t);
+  const harness = fakeHarness(env);
+  await runAutoUpdate(options(env, 'hub'), harness);
+  const prefix = join(env.home, '.npm-global');
+  const npm = harness.calls.filter(([cmd]) => cmd === 'npm').map(([, args]) => args);
+  assert.deepEqual(npm.filter(([op]) => op === 'view' || op === 'install'), [
+    ['view', 'bb-app', 'version'],
+    ['install', '-g', 'bb-app@1.1.0', '--prefix', prefix],
+    ['view', '@mariozechner/pi-coding-agent', 'version'],
+    ['install', '-g', '@mariozechner/pi-coding-agent@2.1.0', '--prefix', prefix],
+  ]);
 });
 
 test('repeated invocation is idempotent: no reinstall when already current', async t => {
