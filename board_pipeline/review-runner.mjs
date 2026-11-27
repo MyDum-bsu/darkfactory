@@ -505,15 +505,14 @@ function canonicalVerdict(parsed) {
   };
 }
 
-async function git(worktree, ...args) {
-  return (await exec('git', ['-C', worktree, ...args], { timeout: 20_000 })).stdout.trimEnd();
-}
-
 // Общеизвестный пустой объект-дерево Git: чтение атрибутов из него
 // обезвреживает .gitattributes и info/attributes враждебного worktree —
 // ни '* -diff' (скрытие содержимого патча под «Binary files differ»), ни
 // назначение textconv/драйверов diff на пути кандидата не действуют.
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+const GIT_HARDENING = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+  '-c', 'diff.external='];
 
 // Diff кандидата генерируется по недоверенному worktree воркера: его
 // репо-локальный конфиг и глобальный конфиг пользователя не должны ни
@@ -527,8 +526,10 @@ function hardenedGitEnv() {
     GIT_ATTR_SOURCE: EMPTY_TREE };
 }
 
-const GIT_HARDENING = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
-  '-c', 'diff.external='];
+async function git(worktree, ...args) {
+  return (await exec('git', [...GIT_HARDENING, '-C', worktree, ...args],
+    { timeout: 20_000, env: hardenedGitEnv() })).stdout.trimEnd();
+}
 
 async function hardenedGitDiff(worktree, range) {
   return exec('git', [...GIT_HARDENING, '-C', worktree, 'diff',
@@ -610,8 +611,9 @@ async function verifySnapshotUnchanged(source, before) {
 }
 
 async function gitRaw(worktree, ...args) {
-  return (await exec('git', ['-C', worktree, ...args],
-    { timeout: 20_000, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 })).stdout;
+  return (await exec('git', [...GIT_HARDENING, '-C', worktree, ...args],
+    { timeout: 20_000, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024,
+      env: hardenedGitEnv() })).stdout;
 }
 
 // Полный отпечаток рабочего дерева: HEAD, дерево HEAD, статус, байтовый diff

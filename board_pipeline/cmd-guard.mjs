@@ -564,31 +564,65 @@ function ruleGit(args) {
     if (rest.slice(1).some(w => w.startsWith('+'))) {
       return hit(CRITICAL, 'git_push_plus', 'git push +refspec перезаписывает историю');
     }
+    const emptyDestination = w => {
+      const colon = w.indexOf(':');
+      return colon !== -1 && w.slice(colon + 1) === '';
+    };
     // push --delete / push origin :branch — удаление удалённой ветки.
-    if (rest.slice(1).some(w => w === '--delete' || w === '-d' || w.startsWith(':'))) {
+    if (rest.slice(1).some(w => w === '--delete' || w === '-d' || w.startsWith(':') || emptyDestination(w))) {
       return hit(ORDINARY, 'git_push_delete', 'git push удаляет удалённую ветку');
     }
     // Push в защищённую ветку запрещён политикой выпуска даже без force:
     // main/master/production/release/* в любой refspec-позиции (включая
     // refs/heads/main и HEAD:main). Первый позиционный аргумент — remote.
     const positionals = [];
+    const withValue = new Set(['-o', '--push-option', '--repo', '--rep',
+      '--receive-pack', '--exec', '--recurse-submodules']);
+    let endOfOptions = false;
+    let bulk = null;
+    let repositoryFlag = false;
     for (let i = 1; i < rest.length; i++) {
       const w = rest[i];
-      if (w === '--') continue;
-      if (w.startsWith('-')) {
-        if (['-o', '--push-option', '--repo', '--receive-pack', '--exec']
-            .includes(w.split('=')[0]) && !w.includes('=')) {
-          i++;
+      if (!endOfOptions && w === '--') {
+        endOfOptions = true;
+        continue;
+      }
+      if (!endOfOptions && w.startsWith('-')) {
+        const key = w.split('=')[0];
+        if (key === '--all' || key === '--branches') bulk = key;
+        if (key === '--repo' || key === '--rep' || key === '--no-repo' || key === '--no-rep') {
+          repositoryFlag = true;
         }
+        if (withValue.has(key) && !w.includes('=')) i++;
         continue;
       }
       positionals.push(w);
     }
+    if (bulk !== null) {
+      return hit(CRITICAL, 'git_push_bulk',
+        `git push ${bulk} отправляет refs без индивидуальной инспекции`);
+    }
+    if (repositoryFlag) {
+      return hit(CRITICAL, 'git_push_repository_ambiguous',
+        'git push --repo делает источник remote неоднозначным для статической проверки');
+    }
+    if (positionals.length < 2) {
+      return hit(CRITICAL, 'git_push_implicit',
+        'git push без явного remote и незащищённого refspec может попасть в защищённую ветку');
+    }
     for (const refspec of positionals.slice(1)) {
-      const dest = refspec.includes(':') ? refspec.split(':')[1] : refspec;
+      const colon = refspec.indexOf(':');
+      const dest = colon === -1 ? refspec : refspec.slice(colon + 1);
       if (PROTECTED_BRANCH.test(dest)) {
         return hit(CRITICAL, 'git_push_protected',
           `git push в защищённую ветку ${dest} запрещён политикой выпуска`);
+      }
+      const implicitSource = colon === -1 &&
+        (refspec === 'HEAD' || refspec === '@' || refspec.startsWith('@{') ||
+          ['FETCH_HEAD', 'ORIG_HEAD', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REBASE_HEAD'].includes(refspec));
+      if (implicitSource || dest.includes('*')) {
+        return hit(CRITICAL, 'git_push_implicit',
+          'git push с неявным или шаблонным назначением не доказывает незащищённую ветку');
       }
     }
     // --force-with-lease / --force-if-includes — безопасные форс-пуши.

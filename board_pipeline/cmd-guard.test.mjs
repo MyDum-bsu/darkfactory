@@ -201,7 +201,7 @@ const allowed = [
   'rm -rf ./node_modules',
   'rm -rf build .cache __pycache__ .pytest_cache target coverage .turbo tmp .vite',
   'git push --force-with-lease origin feature-x',
-  'git push --force-if-includes --force-with-lease',
+  'git push --force-if-includes --force-with-lease origin feature-x',
   'git push origin feature-x',
   'git checkout main',
   'git checkout -b new-branch',
@@ -222,7 +222,7 @@ test('0 FP: rm -rf node_modules и прочие REGEN_DIRS', () => {
 });
 test('0 FP: git push --force-with-lease / --force-if-includes в feature-ветку', () => {
   expectAllow('git push --force-with-lease origin feature-x');
-  expectAllow('git push --force-if-includes --force-with-lease');
+  expectAllow('git push --force-if-includes --force-with-lease origin feature-x');
   expectAllow('git push origin feature-x');
   expectAllow('git push origin feat/main-fix');
   expectAllow('git push upstream bugfix');
@@ -513,7 +513,7 @@ test('v2: push в защищённые ветки блокируется даж�
   }
 });
 
-test('v2: push в feature-ветки и без refspec остаётся разрешённым', () => {
+test('v2: push в явные feature-ветки остаётся разрешённым', () => {
   for (const cmd of [
     'git push origin feature-x',
     'git push origin feat/main-fix',
@@ -522,11 +522,36 @@ test('v2: push в feature-ветки и без refspec остаётся разр
     'git push -u origin feature-x',
     'git push --force-with-lease origin feature-x',
     'git push -o ci.skip origin feature-x',
-    'git push',
-    'git push origin',
     'git push origin feature-x:feature-y',
+    'git push origin HEAD:feature-x',
+    'git push -- origin feature-x',
   ]) {
     expectAllow(cmd);
+  }
+});
+
+test('P1-2: bare, implicit-destination, bulk and repository-flag pushes fail closed', () => {
+  for (const [cmd, rule] of [
+    ['git push', 'git_push_implicit'],
+    ['git push -u', 'git_push_implicit'],
+    ['git push origin', 'git_push_implicit'],
+    ['git push upstream', 'git_push_implicit'],
+    ['git push --tags', 'git_push_implicit'],
+    ['git push --force-if-includes --force-with-lease', 'git_push_implicit'],
+    ['git push origin HEAD', 'git_push_implicit'],
+    ['git push origin @', 'git_push_implicit'],
+    ['git push origin @{u}', 'git_push_implicit'],
+    ['git push origin refs/heads/' + '*', 'git_push_implicit'],
+    ['git push --all', 'git_push_bulk'],
+    ['git push origin --all', 'git_push_bulk'],
+    ['git push --branches origin feature-x', 'git_push_bulk'],
+    ['git push --mirror', 'git_push_force'],
+    ['git push --repo=origin feat/x', 'git_push_repository_ambiguous'],
+    ['git push --repo origin feat/x', 'git_push_repository_ambiguous'],
+    ['git push --rep=origin feat/x', 'git_push_repository_ambiguous'],
+    ['git push --no-repo origin feat/x', 'git_push_repository_ambiguous'],
+  ]) {
+    assert.equal(expectBlock(cmd, 'critical').rule, rule, cmd);
   }
 });
 
