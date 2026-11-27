@@ -14,6 +14,9 @@ import {
   EXAMPLE_CATALOG_PATH,
   EXAMPLE_POLICY_PATH,
   effectiveStatus,
+  assertPolicyModelMatrix,
+  isApprovedModel,
+  isForbiddenModel,
   isL2RunnableEntry,
   L2_RUNNABLE_PROVIDERS,
   loadModelRegistry,
@@ -67,6 +70,46 @@ async function runCli(args, env = {}) {
     return { code: error.code, stdout: error.stdout ?? '', stderr: error.stderr ?? '' };
   }
 }
+
+test('static matrix checks all locations, including inactive profiles and routing candidates', () => {
+  const terra = { provider: 'pi', model: 'openai/GPT-6.1-TERRA' };
+  for (const spec of [terra, 'PI\\GPT-6.1-TERRA/model', 'pi/opencode-go/not-deepseek']) {
+    assert.equal(isForbiddenModel(spec), true);
+    assert.equal(isApprovedModel(spec), false);
+  }
+  for (const spec of [null, undefined, '', {}, 'other/swe-2-high', 'acp-devin/unknown']) {
+    assert.equal(isApprovedModel(spec), false);
+  }
+  assert.equal(isApprovedModel('pi/openai/gpt-6.2-astra'), true);
+  const reviewOnly = { provider: 'openai', model: 'gpt-6.2-sol' };
+  assert.doesNotThrow(() => assertPolicyModelMatrix({ policy: { arbiter: reviewOnly } }));
+  assert.throws(() => assertPolicyModelMatrix({ policy: { bb: reviewOnly } }), /model_not_approved:policy.bb/);
+  for (const [location, args] of [
+    ['cli', { cli: terra }], ['policy.bb', { policy: { bb: terra } }],
+    ['arbiter', { policy: { arbiter: terra } }], ['route.critic', { policy: { route: { critic: terra } } }],
+    ['route.arbiter', { policy: { route: { arbiter: terra } } }],
+    ['profiles.other', { policy: { profiles: { other: { review: terra } } } }],
+    ...['worker', 'critic', 'arbiter'].map(role => [`routing.allowlist.${role}`,
+      { policy: { routing: { allowlist: { [role]: [terra] } } } }]),
+  ]) assert.throws(() => assertPolicyModelMatrix(args), { message: `model_gpt_6_1_terra_disallowed:${location}` });
+  assert.throws(() => assertPolicyModelMatrix({ policy: { routing: { allowlist: { worker: null } } } }), /model_allowlist_invalid/);
+});
+
+test('a pinned registry restricts exact pairs and effective status; a catalog cannot lift hard bans', async () => {
+  await tmp(async dir => {
+    const registry = await loadFixture(dir, catalog => { catalog.models[1].model = 'gpt-6.1-terra'; });
+    const good = registry.catalog.models[0];
+    const banned = registry.catalog.models[1];
+    assert.equal(isApprovedModel(good, registry), true);
+    assert.equal(isApprovedModel(`${good.provider}/${good.model}`, registry), true);
+    assert.equal(isApprovedModel({ ...good, provider: 'pi' }, registry), false);
+    assert.equal(isApprovedModel(banned, registry), false);
+    assert.equal(isApprovedModel(registry.modelById.get('gpt-6.2-sol'), registry), false, 'quota pause at pinned loadedAt');
+    assert.ok(!resolveRoleChain(registry, 'coder_default', { now: NOW }).some(e => e.id === banned.id));
+    assert.throws(() => assertPolicyModelMatrix({ registry, cli: 'openai/gpt-6.2-astra' }), /model_not_approved:cli/);
+    assert.doesNotThrow(() => assertPolicyModelMatrix({ registry, cli: good }));
+  });
+});
 
 test('example registry загружается: 9 моделей, строгая схема, balanced mode', async () => {
   await tmp(async dir => {

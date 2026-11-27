@@ -8,6 +8,8 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
+import { opencodeGoPolicyViolation, retiredProviderViolation, workerFamily } from './worker-selector.mjs';
+import { isApprovedWorker } from './run-isolated.mjs';
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(MODULE_DIR, '..');
@@ -53,6 +55,60 @@ const isRecord = value => value !== null && typeof value === 'object' && !Array.
 const nonEmptyString = value => typeof value === 'string' && value.trim().length > 0;
 const uniqueStrings = value => Array.isArray(value) &&
   value.every(nonEmptyString) && new Set(value).size === value.length;
+
+// The reason-returning API is also the legacy operator CLI contract.
+export function forbiddenModelViolation(spec) {
+  const ids = typeof spec === 'string' ? [spec] : [spec?.provider, spec?.model];
+  return ids.some(id => typeof id === 'string' &&
+    id.toLowerCase().split(/[/\\]/).includes('gpt-6.1-terra'))
+    ? 'model_gpt_6_1_terra_disallowed' : null;
+}
+
+export function modelViolation(spec) {
+  return forbiddenModelViolation(spec) ?? retiredProviderViolation(spec) ?? opencodeGoPolicyViolation(spec);
+}
+
+export const isForbiddenModel = spec => modelViolation(spec) !== null;
+
+// By default use the pipeline's attested provider/model table. A pinned catalog
+// restricts admission to its exact pairs; it cannot lift a hard prohibition.
+export function isApprovedModel(spec, registry) {
+  if (isForbiddenModel(spec)) return false;
+  if (registry === undefined) return workerFamily(spec) !== null;
+  const slash = typeof spec === 'string' ? spec.indexOf('/') : -1;
+  const pair = slash < 0 ? spec : { provider: spec.slice(0, slash), model: spec.slice(slash + 1) };
+  return isRecord(pair) && Array.isArray(registry?.catalog?.models) && registry.catalog.models.some(entry =>
+    entry.provider === pair.provider && entry.model === pair.model &&
+    ELIGIBLE_STATUSES.includes(effectiveStatus(entry, registry.loadedAt)));
+}
+
+export function assertPolicyModelMatrix({ cli, policy, registry }) {
+  function check(where, spec) {
+    if (spec === undefined) return;
+    const reason = modelViolation(spec);
+    if (reason) throw new Error(`${reason}:${where}`);
+    if (!isApprovedModel(spec, registry)) throw new Error(`model_not_approved:${where}`);
+  }
+  check('cli', cli);
+  check('policy.bb', policy?.bb);
+  // A known review model is not necessarily an enrolled startup worker.
+  // Reuse the controller's admission predicate rather than copying its list.
+  if (policy?.bb !== undefined && !isApprovedWorker(policy.bb)) throw new Error('model_not_approved:policy.bb');
+  check('arbiter', policy?.arbiter);
+  check('route.critic', policy?.route?.critic);
+  check('route.arbiter', policy?.route?.arbiter);
+  for (const [name, profile] of Object.entries(policy?.profiles ?? {})) {
+    check(`profiles.${name}`, profile?.review);
+  }
+  const allowlist = policy?.routing?.allowlist;
+  if (allowlist !== undefined && !isRecord(allowlist)) throw new Error('model_allowlist_invalid');
+  for (const [role, entries] of Object.entries(allowlist ?? {})) {
+    if (!['worker', 'critic', 'arbiter'].includes(role) || !Array.isArray(entries)) {
+      throw new Error(`model_allowlist_invalid:${role}`);
+    }
+    for (const entry of entries) check(`routing.allowlist.${role}`, entry ?? null);
+  }
+}
 
 function exactKeys(value, required, optional = []) {
   if (!isRecord(value)) return false;
@@ -400,7 +456,7 @@ export function resolveRoleChain(registry, role, {
 
   candidates.forEach((id, index) => {
     const entry = registry.modelById.get(id);
-    if (!entry) return;
+    if (!entry || isForbiddenModel(entry)) return;
     const quota = quotaForEntry(quotas, entry);
     const status = effectiveStatus(entry, now, quota);
     if (status === 'disabled' || status === 'quota_paused') return;
