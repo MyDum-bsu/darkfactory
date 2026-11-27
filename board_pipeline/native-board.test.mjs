@@ -453,3 +453,28 @@ test('isDefinitiveClaimLoss classifies 409/claim loss definitively and 5xx/netwo
   assert.equal(isTransientBoardError(withStatus(404)), false);
   assert.equal(isTransientBoardError(new Error('boom')), false);
 });
+
+// --- Review P1: adopt() маркирует потерю владения кодом окончательной потери ---
+test('adopt tags lost ownership as definitive claim loss, never as an untransparent plain error', async t => {
+  const { handle, ported } = await claimedBoard(t);
+  const { task } = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  const picked = await port.claimReady(FILTER);
+  const token = 'a'.repeat(43);
+  // Чужая эпоха: код epoch_mismatch — окончательная потеря, не транзитный сбой.
+  const epochLoss = await port.adopt(task.id, { epoch: picked.epoch + 1, token }).catch(error => error);
+  assert.equal(epochLoss.message, 'Held epoch no longer owns the card');
+  assert.equal(epochLoss.code, 'epoch_mismatch');
+  assert.equal(isDefinitiveClaimLoss(epochLoss), true);
+  assert.equal(isTransientBoardError(epochLoss), false);
+  // Карточка не в claimed (завершена честным путём): код claim_lost.
+  await port.complete(task.id, picked.epoch, { sha: 'c'.repeat(40) });
+  const stateLoss = await port.adopt(task.id, { epoch: picked.epoch, token }).catch(error => error);
+  assert.equal(stateLoss.code, 'claim_lost');
+  assert.equal(isDefinitiveClaimLoss(stateLoss), true);
+  assert.equal(isTransientBoardError(stateLoss), false);
+  // Корректный adopt по-прежнему восстанавливает capability.
+  const { task: fresh } = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const claim = await port.claim(fresh.id, {});
+  await port.adopt(fresh.id, { epoch: claim.epoch, token });
+});

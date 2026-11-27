@@ -1914,3 +1914,90 @@ test('transient failures past the lease expiry journal lease_lost instead of end
   assert.equal(out.phase, 'lease_lost');
   assert.equal(out.reason, 'lease_expired_during_transient_renewal_failure');
 });
+
+// --- Review P1 (controller.mjs:556): fail-closed — повторяются только распознанные
+// транзитные сбои; потеря владения adopt() и не-транзитные 4xx терминальны сразу ---
+test('a lost-ownership adopt failure journals lease_lost on the very first tick', async t => {
+  // Реальная форма ошибки adopt() при потере карточки (release/block/complete или
+  // захват другой эпохой): даже без кода она не является транзитным сбоем Board.
+  for (const shape of [
+    () => new Error('Held epoch no longer owns the card'),
+    () => Object.assign(new Error('Held epoch no longer owns the card'), { code: 'epoch_mismatch' }),
+  ]) {
+    const y = await lab(t);
+    await y.tick();
+    y.cfg.board.adopt = async () => { throw shape(); };
+    const out = await y.tick();
+    assert.equal(out.phase, 'lease_lost', 'первый же тик — терминал, без 4 повторов в working');
+    assert.equal(out.reason, 'no_verified_claim_keep_worktree_reserved');
+    assert.equal((await y.cfg.state.load()).transientLeaseFailures ?? 0, 0);
+    assert.equal((await y.tick()).phase, 'lease_lost', 'терминал устойчив');
+  }
+});
+
+test('non-transient 4xx and capability errors are terminal immediately, never retried', async t => {
+  for (const [name, make] of [
+    ['HTTP 400', () => Object.assign(new Error('HTTP 400'), { statusCode: 400 })],
+    ['HTTP 401', () => Object.assign(new Error('HTTP 401'), { statusCode: 401 })],
+    ['HTTP 403', () => Object.assign(new Error('HTTP 403'), { statusCode: 403 })],
+    ['HTTP 404', () => Object.assign(new Error('HTTP 404'), { statusCode: 404 })],
+    ['capability revoked', () => new Error('no native claim is held for this attempt')],
+  ]) {
+    const x = await lab(t);
+    await x.tick();
+    const failure = make();
+    x.cfg.board.verifyHeld = async () => { throw failure; };
+    const out = await x.tick();
+    assert.equal(out.phase, 'lease_lost', `${name}: немедленный терминал`);
+    assert.equal(out.reason, 'no_verified_claim_keep_worktree_reserved', name);
+    assert.equal(x.effects.spawn, 1, `${name}: нет повторного spawn`);
+  }
+});
+
+// --- Review P1 (controller.mjs:559): record.until обновляется из proof.until ---
+test('successful renewals refresh record.until so a transient failure past the initial lease window retries', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  await x.tick();
+  const initial = (await x.cfg.state.load()).until;
+  assert.ok(Number.isFinite(Date.parse(initial)), 'until зафиксирован при захвате');
+  // Аренда лаборатории 30 секунд: через 20 секунд обновление продлевает её до t0+50.
+  t.mock.timers.tick(20_000);
+  assert.equal((await x.tick()).phase, 'working');
+  const renewed = (await x.cfg.state.load()).until;
+  assert.notEqual(renewed, initial, 'record.until следует за фактическим продлением аренды');
+  assert.ok(Date.parse(renewed) > Date.parse(initial), 'продление двигает истечение вперёд');
+  // Теперь за пределами ПЕРВОНАЧАЛЬНОГО окна (t0+30), но внутри продлённой аренды:
+  // одиночный транзитный 503/timeout обязан удержать попытку, а не истечь ложно.
+  t.mock.timers.tick(15_000); // t0+35: initial уже в прошлом
+  assert.ok(Date.now() >= Date.parse(initial), 'исходное окно аренды истекло');
+  assert.ok(Date.now() < Date.parse(renewed), 'продлённая аренда действует');
+  breakRenewal(x, 1);
+  assert.equal((await x.tick()).phase, 'working', 'транзитный сбой после первого окна — повтор, не терминал');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 1);
+  // Board восстановился: счётчик сброшен, until вновь продлевается, сдача проходит.
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 0);
+});
+
+test('record.until tracks every successful renewal monotonically with the lease window', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  await x.tick();
+  let previous = (await x.cfg.state.load()).until;
+  for (const step of [10_000, 10_000, 5_000]) {
+    t.mock.timers.tick(step);
+    assert.equal((await x.tick()).phase, 'working');
+    const current = (await x.cfg.state.load()).until;
+    assert.ok(Date.parse(current) > Date.parse(previous), 'каждое продление обновляет until');
+    previous = current;
+  }
+  // Без mock-времени until не протухает и без движения часов.
+  const plain = await lab(t);
+  await plain.tick();
+  const first = (await plain.cfg.state.load()).until;
+  await plain.tick();
+  assert.equal(typeof (await plain.cfg.state.load()).until, 'string');
+  assert.ok(Number.isFinite(Date.parse(first)));
+});

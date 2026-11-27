@@ -295,7 +295,15 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
         throw new Error('A trusted held capability is required');
       }
       const root = await lookup(taskId);
-      if (root.state !== 'claimed' || root.epoch !== epoch) throw new Error('Held epoch no longer owns the card');
+      // Ошибка потери владения маркируется кодом окончательной потери: без кода
+      // isDefinitiveClaimLoss не распознал бы её, а контроллер fail-closed
+      // классифицирует любой не-транзитный сбой как терминал — но точный код
+      // делает потерю claim/эпохи явной для всех потребителей адаптера.
+      if (root.state !== 'claimed' || root.epoch !== epoch) {
+        const error = new Error('Held epoch no longer owns the card');
+        error.code = root.epoch !== epoch ? 'epoch_mismatch' : 'claim_lost';
+        throw error;
+      }
       const capability = handle.tasks.held(taskId, { epoch, token });
       held.set(taskId, { epoch, until: null, renew: () => capability.renew(lease),
         complete: result => capability.complete(result), block: (reason, opts) => capability.block(reason, opts) });

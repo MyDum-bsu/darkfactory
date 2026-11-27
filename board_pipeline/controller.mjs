@@ -7,7 +7,7 @@ import { roundGate, roundSignature, effectiveL2ReworkLimit, l2ReworkLimitExceede
 import { partitionFindingsBySeverity } from './review-policy.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
 import { PilotDenied } from './pilot-gate.mjs';
-import { isDefinitiveClaimLoss } from './native-board.mjs';
+import { isTransientBoardError } from './native-board.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
@@ -538,22 +538,28 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   if (record.phase !== 'working' && !recheck && !recoveredChecking) throw new Error('Unknown attempt state');
 
   // After process restart the adapter can recover the same held capability. It cannot re-claim.
-  // Транзитный сбой Board (сеть/5xx при adopt/renew) не доказывает потерю
-  // захвата: попытка и capability сохраняются, обновление повторяется на
-  // следующих тиках — до истечения самой аренды или границы подряд идущих
-  // транзитных сбоев. Терминальный lease_lost журналируется только по
-  // окончательной потере claim/эпохи либо по исчерпании транзитных повторов.
+  // Fail-closed различение сбоев обновления аренды: повторяются ТОЛЬКО
+  // распознанные транзитные сбои Board (сеть/5xx по isTransientBoardError) —
+  // они не доказывают потерю захвата, попытка и capability сохраняются до
+  // истечения самой аренды или границы подряд идущих повторов. Любой другой
+  // сбой — окончательная потеря claim/эпохи, не-транзитный 4xx, отзыв
+  // capability или неизвестная ошибка — терминален сразу: неопределённость
+  // никогда не удерживает попытку в working.
   let leaseError = null;
   let epochMismatch = false;
+  let renewedUntil;
   try {
     await board.adopt(record.taskId ?? route.taskId, { epoch: record.epoch, token: record.token });
     const proof = await board.verifyHeld(record.taskId ?? route.taskId, record.epoch);
     if (proof.epoch !== record.epoch) epochMismatch = true;
+    else if (typeof proof.until === 'string' && Number.isFinite(Date.parse(proof.until))) {
+      renewedUntil = proof.until;
+    }
   } catch (error) {
     leaseError = error;
   }
   if (epochMismatch || leaseError !== null) {
-    if (!epochMismatch && !isDefinitiveClaimLoss(leaseError)) {
+    if (!epochMismatch && leaseError !== null && isTransientBoardError(leaseError)) {
       const failures = (Number.isSafeInteger(record.transientLeaseFailures)
         ? record.transientLeaseFailures : 0) + 1;
       const untilMs = Date.parse(record.until);
@@ -571,8 +577,14 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     await save({ phase: 'lease_lost', reason: 'no_verified_claim_keep_worktree_reserved' });
     return visible();
   }
-  // Успешное обновление сбрасывает счётчик подряд идущих транзитных сбоев.
-  if (record.transientLeaseFailures) await save({ transientLeaseFailures: 0 });
+  // Успешное обновление сбрасывает счётчик подряд идущих транзитных сбоев и
+  // переносит фактическое истечение продлённой аренды в запись: без этого
+  // record.until навсегда оставался бы моментом первоначального захвата, и
+  // первый же транзитный сбой после исходного окна ложно истекал бы аренду.
+  const renewal = {};
+  if (renewedUntil !== undefined && renewedUntil !== record.until) renewal.until = renewedUntil;
+  if (record.transientLeaseFailures) renewal.transientLeaseFailures = 0;
+  if (Object.keys(renewal).length > 0) await save(renewal);
 
   const attempt = attemptOf(record, route);
   const after = record.turnSeq ?? 0;
