@@ -34,6 +34,21 @@ test('isApprovedWorker rejects unapproved SWE-2.1 variants and provider/model mi
   }
 });
 
+test('isApprovedWorker accepts attested pi openai workers and rejects unattested variants', () => {
+  assert.equal(isApprovedWorker({ provider: 'pi', model: 'openai/gpt-6.2-astra' }), true);
+  assert.equal(isApprovedWorker({ provider: 'pi', model: 'openai/gpt-6.2-sol' }), true);
+  for (const spec of [
+    { provider: 'pi', model: 'openai/gpt-6.1-terra' },
+    { provider: 'pi', model: 'openai/gpt-6.2-fake' },
+    { provider: 'pi', model: 'openai-fake/gpt-6.2-astra' },
+    { provider: 'openai', model: 'gpt-6.2-astra' },
+    { provider: 'openai', model: 'gpt-6.2-sol' },
+    { provider: 'pi', model: 'openai/gpt-6.2-astra-extra' },
+  ]) {
+    assert.equal(isApprovedWorker(spec), false);
+  }
+});
+
 
 const sha256 = text => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
 

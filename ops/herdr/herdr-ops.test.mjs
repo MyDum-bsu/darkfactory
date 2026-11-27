@@ -769,56 +769,47 @@ test('planDeploy verifies sha against git HEAD unless skipGitVerify is set', asy
   assert.equal((await readFile(gitArgs, 'utf8')).trimEnd().split('\n').length, invocationsBeforeSkip);
 });
 
-test('planDeploy byte-verifies every source against git show blobs at the stamped sha', async (t) => {
-  const { root, repo, target } = await makeSandbox();
+test('planDeploy byte-verifies every source against git show blobs at the stamped sha', async () => {
+  const { repo, target } = await makeSandbox();
   await writeFile(join(repo, 'helper.mjs'), VALID_MJS);
   await mkdir(join(repo, 'ops/herdr'), { recursive: true });
   await writeFile(join(repo, 'ops/herdr/nested.mjs'), VALID_MJS);
-  await mkdir(join(repo, '.git'));
-  const head = '1'.repeat(40);
 
-  // Sandbox-local git shim: answers rev-parse with the pinned HEAD and
-  // serves `show <sha>:<relpath>` straight from the worktree, simulating a
-  // perfectly clean checkout. Every invocation is recorded one arg per line
-  // so the exact command contract is pinned.
-  const shimBin = join(root, 'shim-bin');
-  await mkdir(shimBin);
-  const gitArgs = join(root, 'git-args.txt');
-  await writeFile(join(shimBin, 'git'), `#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\\n' "$@" >> '${gitArgs}'
-if [[ $# -eq 4 && "\${1}" == '-C' && "\${3}" == 'rev-parse' && "\${4}" == 'HEAD' ]]; then
-  printf '%s\\n' '${head}'
-  exit 0
-fi
-if [[ $# -eq 4 && "\${1}" == '-C' && "\${3}" == 'show' ]]; then
-  rel="\${4#${head}:}"
-  cat -- "\${2}/$rel"
-  exit 0
-fi
-exit 2
-`, { mode: 0o755 });
+  // Real git worktree, exactly like the clean-worktree test below — never
+  // a PATH shim written into the mkdtemp sandbox: inside the Docker L1
+  // image /tmp is a noexec tmpfs (docker mounts --tmpfs noexec unless
+  // explicitly told otherwise), so no script created there can execute and
+  // the shimmed variant of this test failed closed with git_verify_failed.
+  // Real git runs from the image rootfs and `git show <sha>:<relpath>`
+  // serves the true recorded blobs — a strictly stronger byte verification
+  // than the cat-from-worktree shim. The exact argv contract (rev-parse
+  // once, then one `show` per file) stays pinned by the test-fixtures shim
+  // test above, which executes a committed fixture from the repo tree.
+  await execFileAsync('git', ['init', '-q', repo]);
+  await execFileAsync('git', ['-C', repo, 'add', 'helper.mjs', 'ops/herdr/nested.mjs']);
+  await execFileAsync('git', [
+    '-C', repo, '-c', 'user.name=herdr-test', '-c', 'user.email=herdr-test@example.invalid',
+    'commit', '-q', '-m', 'init',
+  ]);
+  const { stdout } = await execFileAsync('git', ['-C', repo, 'rev-parse', 'HEAD']);
+  const head = stdout.trim();
+  assert.match(head, /^[0-9a-f]{40}$/);
 
-  const originalPath = process.env.PATH;
-  process.env.PATH = `${shimBin}:${originalPath ?? ''}`;
-  t.after(() => {
-    if (originalPath === undefined) delete process.env.PATH;
-    else process.env.PATH = originalPath;
-  });
-
+  // A byte-clean worktree passes the per-file provenance check for every
+  // source, nested repo-relative paths included.
   const plan = await planDeploy({
     repoRoot: repo, targetDir: target, sha: head, files: ['helper.mjs', 'ops/herdr/nested.mjs'],
   });
   assert.equal(plan.sha, head);
   assert.equal(plan.files.length, 2);
-  // rev-parse HEAD runs once, then each file is byte-verified through
-  // `git show <sha>:<relpath>` with the canonical repo-relative path —
-  // never the raw user-supplied spelling.
-  assert.deepEqual((await readFile(gitArgs, 'utf8')).trimEnd().split('\n'), [
-    '-C', repo, 'rev-parse', 'HEAD',
-    '-C', repo, 'show', `${head}:helper.mjs`,
-    '-C', repo, 'show', `${head}:ops/herdr/nested.mjs`,
-  ]);
+
+  // The byte comparison is real, not a formality: worktree bytes diverging
+  // from the blob recorded at the stamped sha are rejected by the canonical
+  // nested repo-relative spelling, never the raw user-supplied path.
+  await writeFile(join(repo, 'ops/herdr/nested.mjs'), 'export const answer = 43;\n');
+  await assert.rejects(planDeploy({
+    repoRoot: repo, targetDir: target, sha: head, files: ['ops/herdr/nested.mjs'],
+  }), /git_blob_mismatch:ops\/herdr\/nested\.mjs/);
 });
 
 test('planDeploy accepts a clean real git worktree and rejects dirty-modified and untracked sources', async () => {

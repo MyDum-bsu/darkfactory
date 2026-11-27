@@ -59,7 +59,8 @@ const inside = (root, p) => {
 };
 // Routing Policy v2: зависимость от acp-zcode-start снята. Допущены
 // acp-devin/swe-2-1-* (плюс legacy swe-2-high) и
-// acp-antigravity-acp/gemini-4-neon; харнесс pi — только с моделями
+// acp-antigravity-acp/gemini-4-neon; харнесс pi — с аттестованными
+// openai/gpt-6.2-astra и openai/gpt-6.2-sol либо моделями
 // opencode-go/deepseek-* (см. opencodeGoPolicyViolation).
 const approved = [
   { provider: 'acp-devin', model: 'swe-2-high' },
@@ -68,6 +69,8 @@ const approved = [
   { provider: 'acp-devin', model: 'swe-2-1-xhigh' },
   { provider: 'acp-devin', model: 'swe-2-1-max' },
   { provider: 'acp-antigravity-acp', model: 'gemini-4-neon' },
+  { provider: 'pi', model: 'openai/gpt-6.2-astra' },
+  { provider: 'pi', model: 'openai/gpt-6.2-sol' },
 ];
 export const isApprovedWorker = bb =>
   approved.some(e => e.provider === bb?.provider && e.model === bb?.model) ||
