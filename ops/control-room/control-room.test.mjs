@@ -2475,7 +2475,7 @@ test('web index: model CLI hint uses df-models set <id> <status>', async () => {
   assert.equal(html.includes('df-models set &lt;role&gt; &lt;model&gt;'), false);
 });
 
-test('finops publicEntry: scalar fields reject nested objects/arrays-in-objects and array items are primitive-only sanitized', async () => {
+test('finops publicEntry: scalar fields reject nested objects and arrays wholesale, primitives survive sanitized', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cr-finops-tighten-'));
   try {
     const budget = join(dir, 'budget.yaml');
@@ -2501,6 +2501,11 @@ cloud_credits:
     status:
       - payload: status-object-secret
     total_eur: 10
+  - id: credit-scalar-control
+    provider: gcp
+    label: "plain\\x1b[2Jlabel"
+    status: active
+    total_eur: 10
 compute_vms: []
 compute_quotas: []
 ai_subscriptions: []
@@ -2515,15 +2520,21 @@ workspace_links: {}
     const objectLabel = snap.cloudCredits.find(c => c.id === 'credit-object-label');
     assert.equal('label' in objectLabel, false);
 
-    // Array items are filtered down to primitives: nested objects and
-    // nested arrays drop out entirely, strings survive terminal-sanitized.
+    // An array in a scalar field is rejected wholesale exactly like an
+    // object — even when every item is a harmless primitive. Scalar keys
+    // accept only primitive string/number/boolean values, never arrays;
+    // no array-typed key exists in the public contract.
     const arrayLabel = snap.cloudCredits.find(c => c.id === 'credit-array-label');
-    assert.deepEqual(arrayLabel.label, ['clean-string', 7, true, 'ctrltext']);
-
-    // An array made only of objects degrades to an empty array — never a
-    // passthrough of the raw hostile structure.
+    assert.equal('label' in arrayLabel, false);
     const arrayStatus = snap.cloudCredits.find(c => c.id === 'credit-array-status');
-    assert.deepEqual(arrayStatus.status, []);
+    assert.equal('status' in arrayStatus, false);
+
+    // Scalar primitives still pass through: strings terminal-sanitized,
+    // numbers verbatim.
+    const scalarControl = snap.cloudCredits.find(c => c.id === 'credit-scalar-control');
+    assert.equal(scalarControl.label, 'plainlabel');
+    assert.equal(scalarControl.status, 'active');
+    assert.equal(scalarControl.totalEur, 10);
 
     // No nested secret payload or control byte survives anywhere in the
     // serialized snapshot.

@@ -124,12 +124,16 @@ const PUBLIC_FINOPS_ENTRY_KEYS = new Set([
   'model', 'quota', 'reset',
 ]);
 
-// A scalar allowlisted field accepts ONLY primitive values: strings are
-// terminal-sanitized, numbers/booleans/null pass through. Plain objects are
-// never forwarded. Array values are filtered down to primitive items —
-// strings sanitized, numbers/booleans verbatim — so nested objects or arrays
-// (and any unsanitized text they carry) can never leak into the public
-// snapshot through an allowlisted key such as `label`.
+// The public contract is scalar: every key above accepts ONLY primitive
+// values — strings terminal-sanitized, numbers/booleans/null verbatim.
+// Plain objects are never forwarded, and arrays in a scalar field such as
+// `label` or `status` are rejected wholesale: the key is omitted from the
+// public entry rather than coerced. No array-typed key exists in the
+// contract today; when one is introduced it must be registered explicitly
+// in PUBLIC_FINOPS_ENTRY_ARRAY_KEYS — arrays are accepted only on those
+// keys, and even there only primitive items survive (strings sanitized),
+// so nested objects/arrays can never leak into the public snapshot.
+const PUBLIC_FINOPS_ENTRY_ARRAY_KEYS = new Set([]);
 const isForwardablePrimitive = value =>
   typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
 
@@ -137,12 +141,15 @@ function publicEntry(entry, extra = {}) {
   const out = {};
   for (const [key, value] of Object.entries({ ...entry, ...extra })) {
     if (!PUBLIC_FINOPS_ENTRY_KEYS.has(key)) continue;
-    if (typeof value === 'string') out[key] = clean(value);
-    else if (typeof value === 'number' || typeof value === 'boolean' || value == null) out[key] = value;
-    else if (Array.isArray(value)) {
+    if (Array.isArray(value)) {
+      if (!PUBLIC_FINOPS_ENTRY_ARRAY_KEYS.has(key)) continue;
       out[key] = value
         .filter(isForwardablePrimitive)
         .map(item => typeof item === 'string' ? clean(item) : item);
+    } else if (typeof value === 'string') {
+      out[key] = clean(value);
+    } else if (typeof value === 'number' || typeof value === 'boolean' || value == null) {
+      out[key] = value;
     }
   }
   return out;
