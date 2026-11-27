@@ -668,7 +668,14 @@ export async function ensureFilemodeGuard(worktree, { git = defaultGit } = {}) {
   const top = await git(['-C', worktree, 'rev-parse', '--show-toplevel'])
     .catch(() => fail('worktree_not_git'));
   if (top !== worktree) fail('worktree_not_git');
-  await git(['-C', worktree, 'config', '--local', 'core.fileMode', 'false']);
+  // Идемпотентная запись: при уже действующем --local core.fileMode=false
+  // повторная запись пропускается — одновременный запуск нескольких слотов
+  // не должен сталкиваться на .git/config.lock без необходимости записи.
+  const current = await git(['-C', worktree, 'config', '--local', '--get', 'core.fileMode'])
+    .catch(() => '');
+  if (current !== 'false') {
+    await git(['-C', worktree, 'config', '--local', 'core.fileMode', 'false']);
+  }
   // Эффективное значение важнее записанного: более приоритетный
   // worktree-конфиг (extensions.worktreeConfig) может перекрывать --local.
   // Запуск только при реально действующем core.fileMode=false.

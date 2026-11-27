@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, mkdir, open, readFile, realpath, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
@@ -9,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { acceptHeld } from './acceptance.mjs';
 import { reserveWorktree, saveState } from './slot.mjs';
 import { advanceWithProjection } from './controller.mjs';
-import { nativeBoardPort } from './native-board.mjs';
+import { isDefinitiveClaimLoss, nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { offlineProfileRunner, offlineVisualRunner, readJson,
   worktreeInspector } from './runtime.mjs';
@@ -304,14 +305,27 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
       }
       const observedTurn = Number.isSafeInteger(observed.turn) ? observed.turn : null;
       if (observedTurn !== null && observedTurn <= after) return undefined;
-      if (observedTurn === null && activity.seenActive !== true && after !== 0) return undefined;
+      if (observedTurn === null && activity.seenActive !== true && after !== 0) {
+        // hc-наблюдение без счётчика хода не различает новый и уже учтённый
+        // терминал, но ПОВТОРНОЕ чтение того же подтверждённого хода (reread
+        // checkpoint вопроса владельца с after = turnSeq - 1) обязано быть
+        // идемпотентным: пара (runtimeId, after) уже доказала этот ход —
+        // возвращается ровно тот же результат, а не провал в undefined.
+        // Новый ход после feedback так не подтверждается: memo не совпадает
+        // по after, и свежая активность всё ещё требуется.
+        const retained = activity.lastTurn;
+        if (retained !== undefined && retained.after === after) return retained.result;
+        return undefined;
+      }
       const turnSeq = observedTurn ?? after + 1;
       activity.seenActive = false;
       const completed = observed.state === 'done' || observed.state === 'idle' ||
         (observed.state === 'exited' && observed.exitCode === 0);
-      return { turnSeq, completed, state: observed.state,
+      const result = { turnSeq, completed, state: observed.state,
         ...(observed.exitCode === undefined ? {} : { exitCode: observed.exitCode }),
         ...(observed.tail === undefined ? {} : { tail: observed.tail }) };
+      activity.lastTurn = { after, result };
+      return result;
     },
     async reconcileSpawn(attempt) {
       let runtimeId;
@@ -352,16 +366,34 @@ export function buildWorkerTransport({ kind, policy, runtime, bbTransport, workt
   });
 }
 
-export async function readSubmissionEnvelope({ observed, source, lstatImpl = lstat,
-  realpathImpl = realpath, readJsonImpl = readJson } = {}) {
+// Конверт сдачи воркера читается одним дескриптором: open с O_NOFOLLOW
+// (финальный компонент никогда не симлинк), fstat уже открытого fd —
+// обычный файл не больше 8192 байт — и ограниченное чтение не более 8193
+// байт из того же дескриптора. Между проверкой и чтением нет окна подмены
+// файла: лишний байт или смена типа/размера — typed invalid, а не сбой
+// приёмки. Каноничность пути (промежуточные симлинки) сверяется realpath
+// до open; прочитанное содержимое всегда принадлежит проверенному fd.
+const SUBMISSION_MAX_BYTES = 8192;
+export async function readSubmissionEnvelope({ observed, source, realpathImpl = realpath,
+  openImpl = path => open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW) } = {}) {
   if (!observed) return undefined;
   const base = { ...observed };
   if (!base.completed) return base;
   try {
-    const meta = await lstatImpl(source);
-    if (!meta.isFile() || meta.size > 8192 || basename(source) !== 'submission.json' ||
-        await realpathImpl(source) !== source) throw new Error('Invalid handoff file');
-    return { ...base, submission: await readJsonImpl(source) };
+    if (basename(source) !== 'submission.json' || await realpathImpl(source) !== source) {
+      throw new Error('Invalid handoff file');
+    }
+    const fd = await openImpl(source);
+    try {
+      const meta = await fd.stat();
+      if (!meta.isFile() || meta.size > SUBMISSION_MAX_BYTES) throw new Error('Invalid handoff file');
+      const buffer = Buffer.alloc(SUBMISSION_MAX_BYTES + 1);
+      const { bytesRead } = await fd.read(buffer, 0, SUBMISSION_MAX_BYTES + 1, 0);
+      if (bytesRead > SUBMISSION_MAX_BYTES) throw new Error('Invalid handoff file');
+      return { ...base, submission: JSON.parse(buffer.subarray(0, bytesRead).toString('utf8')) };
+    } finally {
+      await fd.close();
+    }
   } catch (error) {
     if (error.code === 'ENOENT') return base;
     return { ...base, submission: null };
@@ -476,9 +508,36 @@ export function candidatePinRef({ phase, record } = {}) {
 // проверенный/удержанный candidate_sha никогда не осиротеет при сбросе
 // worktree. Сбой закрепления пробрасывается и останавливает сброс: потерять
 // verified-коммит хуже, чем остановить демон с нетронутым деревом.
-export async function resetQueueWorktree({ git, base, phase, record } = {}) {
+// Деструктивные reset --hard/clean -fd идут строго после доказательства,
+// что checkout — ожидаемая ветка слота (или отделённый HEAD ровно на base
+// либо candidate_sha попытки) и воркер остановлен: reset на чужой ветке
+// передвинул бы ЕЁ указатель на base, а clean -fd стёр бы чужую работу.
+// Расхождение — карантин: дерево не трогается, журналируется
+// branch_mismatch_quarantined/worker_not_stopped_quarantined и демон
+// останавливается с нетронутым checkout вместо разрушения чужой ветки.
+export const QUEUE_CHECKOUT_QUARANTINE = Object.freeze({
+  branch: 'branch_mismatch_quarantined',
+  worker: 'worker_not_stopped_quarantined',
+});
+export async function resetQueueWorktree({ git, base, phase, record, branch,
+  workerStopped = false, log = note => console.log(JSON.stringify(note)) } = {}) {
   const pin = candidatePinRef({ phase, record });
   if (pin !== null) await git('update-ref', pin.ref, pin.sha);
+  const currentBranch = await git('branch', '--show-current');
+  const head = await git('rev-parse', 'HEAD');
+  const candidate = typeof record?.sha === 'string' && /^[a-f0-9]{40}$/.test(record.sha)
+    ? record.sha : null;
+  const branchOk = typeof branch === 'string' && branch !== '' && currentBranch === branch;
+  const detachedOk = currentBranch === '' && (head === base || (candidate !== null && head === candidate));
+  if ((!branchOk && !detachedOk) || workerStopped !== true) {
+    const kind = !branchOk && !detachedOk
+      ? QUEUE_CHECKOUT_QUARANTINE.branch : QUEUE_CHECKOUT_QUARANTINE.worker;
+    const note = { kind, phase, branch: currentBranch, expectedBranch: branch ?? null,
+      head, base, task_id: record?.taskId ?? null, attempt_id: record?.attemptId ?? null,
+      workerStopped: workerStopped === true };
+    if (typeof log === 'function') log(note);
+    throw new Error(kind);
+  }
   await git('reset', '--hard', base);
   await git('clean', '-fd');
 }
@@ -678,7 +737,13 @@ async function execute() {
     models: { worker: { provider: p.bb.provider, model: p.bb.model },
       critic: reviewSetup.critic, arbiter: reviewSetup.arbiter } });
   let telemetry = newTelemetry();
-  const route = { ...p.route, policyDigest: pinned.digest };
+  // Эффективный дайджест политики слота — операторский override либо
+  // отпечаток закреплённых файлов (та же семантика, что digest на seal).
+  // Именно его несут метки policy_digest карточек при постановке и именно
+  // его сверяет queue-допуск: слот с другой политикой карточку не крадёт.
+  // Контроль неизменности входов идёт по отпечатку файлов отдельно.
+  const pinnedInputsDigest = pinned.digest;
+  const route = { ...p.route, policyDigest: p.policyDigest ?? pinnedInputsDigest };
   // Queue-driven маршрут без route.taskId: карточку берёт board.claimReady по
   // allowlist оператора (owner + маршрутная метка + дополнительно требуемые метки).
   if (route.taskId === undefined) {
@@ -686,7 +751,7 @@ async function execute() {
       repoId: p.route.repoId, required: p.route.required ?? [] };
   }
   const assertPinned = async () => {
-    if ((await readOperatorInputs(files)).digest !== route.policyDigest) throw new Error('Operator inputs changed');
+    if ((await readOperatorInputs(files)).digest !== pinnedInputsDigest) throw new Error('Operator inputs changed');
     await ab?.assertOpen();
   };
   if (p.version !== route.policyVersion || !p.owner || !p.label?.key || !p.label?.value ||
@@ -1047,10 +1112,20 @@ async function execute() {
     prepareFeedback: prepareWorkerFeedback, permissionMode });
   let liveThreadId = null;
   const stopWorkerThread = async threadId => {
-    if (!threadId || typeof bb.stop !== 'function') return;
-    try { await bb.stop(threadId); } catch {}
+    if (!threadId || typeof bb.stop !== 'function') return null;
+    try { return await bb.stop(threadId); } catch { return null; }
   };
   const stopTerminalWorker = result => stopWorkerThread(result?.threadId ?? liveThreadId);
+  // Доказательство «воркер остановлен» для деструктивной очистки очереди:
+  // воркера нет вовсе, транспорт лишён stop (legacy bb — сессия удалённая,
+  // терминальный ход уже наблюден до done/hold), подтверждённый stop либо
+  // терминальное нерабочее состояние исполнителя. Активно пишущий воркер
+  // после reset --hard продолжил бы грязнить очищенное дерево следующей
+  // карточки — неподтверждённая остановка карантинит очистку.
+  const WORKER_STOPPED_STATES = new Set(['idle', 'done', 'blocked', 'exited']);
+  const workerStoppedEvidence = (threadId, outcome) =>
+    !threadId || typeof bb.stop !== 'function' ||
+    outcome?.stopped === true || WORKER_STOPPED_STATES.has(outcome?.state);
   // Daemon kill-switch: создаётся до verify, чтобы единственный повтор L2
   // проверял именно действующий стоп-файл, а не только activation switch.
   const daemonSwitchPath = values.switch ?? p.pilot?.killSwitch;
@@ -1279,9 +1354,13 @@ async function execute() {
       executor: attempt.executor ?? { provider: p.bb.provider, model: p.bb.model },
       arbiter: attemptArbiter,
       review: { ...profile.review, ...attemptCritic, requireAttestation: true } } } };
+    // Транзитный сбой renew (сеть/5xx) не доказывает потерю аренды: capability
+    // в адаптере сохраняется, цикл повторяет обновление на следующих тиках.
+    // lost вооружается только окончательной потерей claim/эпохи — тогда повтор
+    // бессмысленен, а после истечения аренды renew сам отвечает claim_lost.
     const timer = setInterval(() => {
       renewal = renewal.then(() => { if (!lost) return port.verifyHeld(attempt.task_id, attempt.epoch); })
-        .catch(() => { lost = true; });
+        .catch(error => { if (isDefinitiveClaimLoss(error)) lost = true; });
     }, 20_000);
     try {
       // VS-5.2: единый сигнал попытки для Stage/Foreman — kill-switch, живая
@@ -1513,7 +1592,10 @@ async function execute() {
 
   const stateHome = process.env.XDG_STATE_HOME?.startsWith('/')
     ? process.env.XDG_STATE_HOME : join(homedir(), '.local', 'state');
-  const release = await reserveWorktree(join(stateHome, 'darkfactory-lab', 'slots'), tree, root);
+  // Бронь слота — и worktree, и каталог состояния эксклюзивно: два слота с
+  // общим state dir не перезаписывают attempt.json и не убивают чужих воркеров.
+  const release = await reserveWorktree(join(stateHome, 'darkfactory-lab', 'slots'), tree, root,
+    { stateDir: root });
   // Порт арбитра: реальный изолированный раннер третьего семейства в том же
   // rootless Docker read-only контуре, что и критик. Создаётся лениво —
   // только когда арбитраж действительно запрошен.
@@ -1621,7 +1703,10 @@ async function execute() {
           observeTick(result);
           if (result.phase === 'release_ready' && !releasePort) return 'stop';
           if (!TERMINAL_PHASES.has(result.phase)) return;
-          if (['done', 'hold', 'lease_lost'].includes(result.phase)) await stopTerminalWorker(result);
+          let terminalStop = null;
+          if (['done', 'hold', 'lease_lost'].includes(result.phase)) {
+            terminalStop = await stopTerminalWorker(result);
+          }
           // Закреплённая карточка: терминал завершает демон. Очередь: done/hold
           // освобождают слот для следующей карточки; неопределённый исход стопит.
           if (route.taskId !== undefined) {
@@ -1639,7 +1724,12 @@ async function execute() {
             // Иначе сводка следующей карточки унаследует счётчики предыдущей.
             await finishTelemetry();
             try {
-              await resetQueueWorktree({ git, base: route.base, phase: result.phase, record: closedRecord });
+              // Деструктивная очистка — только на доказанной ветке слота (или
+              // отделённом HEAD base/candidate) при остановленном воркере; иначе
+              // карантин с журналированием внутри resetQueueWorktree.
+              await resetQueueWorktree({ git, base: route.base, phase: result.phase,
+                record: closedRecord, branch: p.profiles[route.checkProfile].branch,
+                workerStopped: workerStoppedEvidence(result?.threadId ?? liveThreadId, terminalStop) });
             } catch (error) {
               process.exitCode = 1;
               console.error(`queue worktree reset failed: ${String(error?.message ?? error).split('\n')[0]}`);

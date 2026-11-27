@@ -7,11 +7,18 @@ import { roundGate, roundSignature, effectiveL2ReworkLimit, l2ReworkLimitExceede
 import { partitionFindingsBySeverity } from './review-policy.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
 import { PilotDenied } from './pilot-gate.mjs';
+import { isTransientBoardError } from './native-board.mjs';
 
 const TERMINAL = new Set(['done', 'hold', 'uncertain', 'lease_lost']);
 const IN_FLIGHT = new Set(['claiming', 'launching', 'checking', 'returning', 'blocking']);
 const shaRE = /^[a-f0-9]{40}$/;
 const confirmedThreadId = value => isWorkerThreadId(value);
+
+// Верхняя граница подряд идущих транзитных сбоев обновления аренды, после
+// которой попытка всё же переводится в lease_lost: сеть/5xx не доказывают
+// потерю захвата, но и бесконечного ожидания восстановления Board нет —
+// реальное истечение аренды наступает раньше либо срабатывает эта граница.
+export const MAX_TRANSIENT_LEASE_FAILURES = 5;
 
 // Контракт приёмки, который карточка обязана нести в метках для захвата из очереди:
 // разрешённый профиль, identity репозитория и валидные хэши спеки/политики.
@@ -70,6 +77,9 @@ function checkRoute(r) {
 // Фильтр claimReady: канал закреплён адаптером, остальное — allowlist маршрута.
 // Контрактные метки обязательны всегда, профиль карточки сверяется с профилем маршрута:
 // неполный или чужой контракт даёт 0-эффектный захват (null).
+// Эффективный policyDigest маршрута, когда закреплён, — часть фильтра допуска:
+// карточка с чужим policy_digest не захватывается этим слотом, даже если
+// остальной контракт совпадает.
 function queueFilter(route) {
   return {
     owner: route.allowlist.owner,
@@ -78,6 +88,7 @@ function queueFilter(route) {
     profileId: route.checkProfile,
     required: [...new Set([...CONTRACT_LABELS, ...(route.allowlist.required ?? [])])],
     ...(route.allowlist.repoId !== undefined ? { repoId: route.allowlist.repoId } : {}),
+    ...(typeof route.policyDigest === 'string' ? { policyDigest: route.policyDigest } : {}),
   };
 }
 
@@ -88,6 +99,12 @@ function contractOf(labels) {
     ['has_ui', labels?.has_ui === 'true' ? true : labels?.has_ui === 'false' ? false : undefined],
     ['domain', typeof labels?.domain === 'string' && /^[a-z][a-z0-9-]{0,47}$/.test(labels.domain)
       ? labels.domain : undefined],
+    // Класс размера карточки для scorecard-роутинга (S/M/L): каноническая
+    // lowercase-форма проходит whitelist validateAttempt приёмки, а
+    // normalizeSize роутинга приводит её обратно к S/M/L вместо unknown.
+    // Неканоничное значение не закрепляется — поведение прежнее ('unknown').
+    ['size', typeof labels?.size === 'string' && /^[smlSML]$/.test(labels.size)
+      ? labels.size.toLowerCase() : undefined],
   ].filter(([, value]) => value !== undefined));
   const hasAllowedPaths = typeof labels?.allowed_paths === 'string' && labels.allowed_paths.length > 0;
   if (hasAllowedPaths) pinnedLabels.allowed_paths = labels.allowed_paths;
@@ -521,14 +538,53 @@ export async function advance({ route, state, board, bb, submissions, verify, au
   if (record.phase !== 'working' && !recheck && !recoveredChecking) throw new Error('Unknown attempt state');
 
   // After process restart the adapter can recover the same held capability. It cannot re-claim.
+  // Fail-closed различение сбоев обновления аренды: повторяются ТОЛЬКО
+  // распознанные транзитные сбои Board (сеть/5xx по isTransientBoardError) —
+  // они не доказывают потерю захвата, попытка и capability сохраняются до
+  // истечения самой аренды или границы подряд идущих повторов. Любой другой
+  // сбой — окончательная потеря claim/эпохи, не-транзитный 4xx, отзыв
+  // capability или неизвестная ошибка — терминален сразу: неопределённость
+  // никогда не удерживает попытку в working.
+  let leaseError = null;
+  let epochMismatch = false;
+  let renewedUntil;
   try {
     await board.adopt(record.taskId ?? route.taskId, { epoch: record.epoch, token: record.token });
     const proof = await board.verifyHeld(record.taskId ?? route.taskId, record.epoch);
-    if (proof.epoch !== record.epoch) throw new Error('Wrong native claim epoch');
-  } catch {
+    if (proof.epoch !== record.epoch) epochMismatch = true;
+    else if (typeof proof.until === 'string' && Number.isFinite(Date.parse(proof.until))) {
+      renewedUntil = proof.until;
+    }
+  } catch (error) {
+    leaseError = error;
+  }
+  if (epochMismatch || leaseError !== null) {
+    if (!epochMismatch && leaseError !== null && isTransientBoardError(leaseError)) {
+      const failures = (Number.isSafeInteger(record.transientLeaseFailures)
+        ? record.transientLeaseFailures : 0) + 1;
+      const untilMs = Date.parse(record.until);
+      if (Number.isFinite(untilMs) && Date.now() >= untilMs) {
+        await save({ phase: 'lease_lost', reason: 'lease_expired_during_transient_renewal_failure' });
+        return visible();
+      }
+      if (failures >= MAX_TRANSIENT_LEASE_FAILURES) {
+        await save({ phase: 'lease_lost', reason: 'lease_renewal_transient_failures_exhausted' });
+        return visible();
+      }
+      await save({ transientLeaseFailures: failures });
+      return visible();
+    }
     await save({ phase: 'lease_lost', reason: 'no_verified_claim_keep_worktree_reserved' });
     return visible();
   }
+  // Успешное обновление сбрасывает счётчик подряд идущих транзитных сбоев и
+  // переносит фактическое истечение продлённой аренды в запись: без этого
+  // record.until навсегда оставался бы моментом первоначального захвата, и
+  // первый же транзитный сбой после исходного окна ложно истекал бы аренду.
+  const renewal = {};
+  if (renewedUntil !== undefined && renewedUntil !== record.until) renewal.until = renewedUntil;
+  if (record.transientLeaseFailures) renewal.transientLeaseFailures = 0;
+  if (Object.keys(renewal).length > 0) await save(renewal);
 
   const attempt = attemptOf(record, route);
   const after = record.turnSeq ?? 0;

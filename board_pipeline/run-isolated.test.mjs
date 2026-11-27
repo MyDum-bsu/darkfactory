@@ -764,33 +764,150 @@ test('portable observeTurn does not reuse stale idle after feedback without a ne
 test('readSubmissionEnvelope returns typed invalid handoffs for malformed, oversized and symlink files', async () => {
   const observed = { turnSeq: 4, completed: true, state: 'idle' };
   const source = '/private/inbox/attempt/submission.json';
-  const deps = overrides => ({
+  const fakeFd = ({ size = 32, file = true, content = JSON.stringify({ candidate_sha: 'c'.repeat(40) }),
+    closeError } = {}) => {
+    const closed = [];
+    return { closed, calls: [],
+      async stat() { return { isFile: () => file, size }; },
+      async read(buffer, offset, length, position) {
+        const payload = Buffer.from(content, 'utf8');
+        const slice = payload.subarray(position, position + length);
+        slice.copy(buffer, offset);
+        return { bytesRead: slice.length };
+      },
+      async close() { closed.push(true); if (closeError) throw closeError; } };
+  };
+  const deps = (overrides = {}, fdOverrides = {}) => ({
     observed,
     source,
-    lstatImpl: async () => ({ isFile: () => true, size: 32 }),
     realpathImpl: async () => source,
-    readJsonImpl: async () => ({ candidate_sha: 'c'.repeat(40) }),
+    openImpl: async () => fakeFd(fdOverrides),
     ...overrides,
   });
-  const malformed = await readSubmissionEnvelope(deps({
-    readJsonImpl: async () => { throw new SyntaxError('bad json'); },
-  }));
+  const malformed = await readSubmissionEnvelope(deps({}, { content: '{bad json' }));
   assert.equal(malformed.turnSeq, 4);
   assert.equal(malformed.submission, null);
-  const oversized = await readSubmissionEnvelope(deps({
-    lstatImpl: async () => ({ isFile: () => true, size: 8193 }),
-  }));
+  const oversized = await readSubmissionEnvelope(deps({}, { size: 8193 }));
   assert.equal(oversized.submission, null);
+  const notFile = await readSubmissionEnvelope(deps({}, { file: false }));
+  assert.equal(notFile.submission, null);
   const symlink = await readSubmissionEnvelope(deps({
     realpathImpl: async () => '/outside/submission.json',
   }));
   assert.equal(symlink.submission, null);
   const missing = await readSubmissionEnvelope(deps({
-    lstatImpl: async () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; },
+    openImpl: async () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; },
   }));
   assert.equal(Object.hasOwn(missing, 'submission'), false);
   const valid = await readSubmissionEnvelope(deps());
   assert.deepEqual(valid.submission, { candidate_sha: 'c'.repeat(40) });
+});
+
+test('readSubmissionEnvelope reads the handoff from one opened descriptor with a bounded read', async () => {
+  const observed = { turnSeq: 2, completed: true, state: 'idle' };
+  const source = '/private/inbox/attempt/submission.json';
+  // Файл вырос между fstat и чтением: ограниченное чтение отсекает лишнее —
+  // typed invalid, а не разбор подменённого содержимого.
+  const grown = {
+    async stat() { return { isFile: () => true, size: 32 }; },
+    async read(buffer, offset, length) {
+      const payload = Buffer.alloc(8193, 97);
+      payload.copy(buffer, offset, 0, length);
+      return { bytesRead: Math.min(length, payload.length) };
+    },
+    async close() {},
+  };
+  const raced = await readSubmissionEnvelope({ observed, source,
+    realpathImpl: async () => source, openImpl: async () => grown });
+  assert.equal(raced.submission, null);
+  // Граница ровно 8192 байт содержимого читается и разбирается честно.
+  const exactObject = { candidate_sha: 'c'.repeat(40),
+    pad: 'x'.repeat(8192 - JSON.stringify({ candidate_sha: 'c'.repeat(40), pad: '' }).length) };
+  const exactPayload = JSON.stringify(exactObject);
+  assert.equal(Buffer.byteLength(exactPayload, 'utf8'), 8192);
+  const exact = {
+    async stat() { return { isFile: () => true, size: exactPayload.length }; },
+    async read(buffer, offset, length, position) {
+      const payload = Buffer.from(exactPayload, 'utf8');
+      const slice = payload.subarray(position, position + length);
+      slice.copy(buffer, offset);
+      return { bytesRead: slice.length };
+    },
+    async close() {},
+  };
+  const atLimit = await readSubmissionEnvelope({ observed, source,
+    realpathImpl: async () => source, openImpl: async () => exact });
+  assert.equal(atLimit.submission.candidate_sha, 'c'.repeat(40));
+  // O_NOFOLLOW отклоняет симлинк финального компонента: open падает с ELOOP.
+  const eloop = await readSubmissionEnvelope({ observed, source,
+    realpathImpl: async () => source,
+    openImpl: async () => { const error = new Error('too many symlinks'); error.code = 'ELOOP'; throw error; } });
+  assert.equal(eloop.submission, null);
+  // Без завершённого хода конверт не читается вовсе.
+  let opened = 0;
+  const incomplete = await readSubmissionEnvelope({ observed: { turnSeq: 2, completed: false }, source,
+    realpathImpl: async () => source, openImpl: async () => { opened++; return exact; } });
+  assert.equal(opened, 0);
+  assert.equal(Object.hasOwn(incomplete, 'submission'), false);
+});
+
+// Astra #11 (P1): hc-наблюдение без счётчика хода — повторное чтение того же
+// подтверждённого хода (reread checkpoint вопроса владельца с after = turnSeq - 1)
+// идемпотентно и не проваливается в owner_question_checkpoint_unconfirmed.
+test('portable observeTurn rereads the same completed turn idempotently when hc omits the turn counter', async () => {
+  const runtime = {
+    probeAvailability: async () => ({ status: 'available' }),
+    spawn: async input => ({ runtimeId: input.runtimeId }),
+    feedback: async () => ({ delivered: true }),
+    observe: async () => ({ state: 'idle' }), // счётчик хода опущен, как в hc без turn
+  };
+  const transport = buildWorkerTransport({ kind: 'hc',
+    policy: { bb: { provider: 'acp-devin', model: 'swe-2-1-medium' }, route: {} },
+    runtime, bbTransport: {}, prepareSpawn: async () => '/tmp/prompt', prepareFeedback: async () => 'rework' });
+  const attempt = { task_id: '6242', epoch: 1, attempt_id: 'attempt-reread' };
+  const runtimeId = deterministicRuntimeId('hc', attempt.task_id, attempt.attempt_id);
+  await transport.spawn(attempt);
+  // Ход 1 подтверждён с watermark after=0 (seenActive от spawn пропускает гейт).
+  const first = await transport.observeTurn({ runtimeId, after: 0 });
+  assert.deepEqual(first, { turnSeq: 1, completed: true, state: 'idle' });
+  // Немедленный reread checkpoint с after = turnSeq - 1 = 0: тот же результат,
+  // а не undefined — capture вопроса владельца подтверждается.
+  assert.deepEqual(await transport.observeTurn({ runtimeId, after: 0 }), first);
+  assert.deepEqual(await transport.observeTurn({ runtimeId, after: 0 }), first);
+  // Чужой watermark не подтверждается memo: ход 2 без свежей активности не считается.
+  assert.equal(await transport.observeTurn({ runtimeId, after: 1 }), undefined);
+});
+
+test('portable observeTurn rereads a post-feedback turn for the checkpoint after turn 1', async () => {
+  let working = true;
+  const runtime = {
+    probeAvailability: async () => ({ status: 'available' }),
+    spawn: async input => ({ runtimeId: input.runtimeId }),
+    feedback: async () => ({ delivered: true, started: true }),
+    observe: async () => working ? { state: 'working' } : { state: 'idle' },
+  };
+  const transport = buildWorkerTransport({ kind: 'hc',
+    policy: { bb: { provider: 'acp-devin', model: 'swe-2-1-medium' }, route: {} },
+    runtime, bbTransport: {}, prepareSpawn: async () => '/tmp/prompt', prepareFeedback: async () => 'rework' });
+  const attempt = { task_id: '6242', epoch: 1, attempt_id: 'attempt-turn2-reread' };
+  const runtimeId = deterministicRuntimeId('hc', attempt.task_id, attempt.attempt_id);
+  await transport.spawn(attempt);
+  // Ход 1 подтверждён; feedback переводит watermark на 1, воркер активен.
+  working = false;
+  assert.deepEqual(await transport.observeTurn({ runtimeId, after: 0 }),
+    { turnSeq: 1, completed: true, state: 'idle' });
+  await transport.feedback({ attempt: { ...attempt, bb_thread_id: runtimeId }, feedbackId: 'fb-1' });
+  // Воркер отработал ход 2: активность была подтверждена (working + started).
+  working = true;
+  assert.equal(await transport.observeTurn({ runtimeId, after: 1 }), undefined);
+  working = false;
+  const second = await transport.observeTurn({ runtimeId, after: 1 });
+  assert.deepEqual(second, { turnSeq: 2, completed: true, state: 'idle' });
+  // Reread checkpoint вопроса владельца после хода 2 (after = turnSeq - 1 = 1):
+  // seenActive уже сброшен первичным чтением, но memo делает reread идемпотентным.
+  assert.deepEqual(await transport.observeTurn({ runtimeId, after: 1 }), second);
+  // Ход 3 без новой активности по-прежнему не фабрикуется.
+  assert.equal(await transport.observeTurn({ runtimeId, after: 2 }), undefined);
 });
 
 test('portable observeTurn never fabricates a new turn from an explicit stale watermark', async () => {
@@ -913,15 +1030,31 @@ test('candidatePinRef maps done/hold records to durable verified/held refs fail-
     'refs/darkfactory/verified/9912/aa85e3cc-0bf2-468b-a624-5d24cfcdd946');
 });
 
+// Детерминированный git-double для resetQueueWorktree: checkout — ожидаемая
+// ветка слота на заданном HEAD, пока сценарий не переопределит ответы.
+function queueGitDouble({ branch = 'feat/df-slot', head = 'c'.repeat(40), mutate } = {}) {
+  const calls = [];
+  const git = async (...args) => {
+    calls.push(args);
+    if (args[0] === 'branch') return branch;
+    if (args[0] === 'rev-parse') return head;
+    if (mutate) return mutate(args);
+    return '';
+  };
+  return { calls, git };
+}
+
 test('resetQueueWorktree pins the durable ref strictly before resetting the queue worktree', async () => {
   const sha = 'a'.repeat(40);
   const base = 'b'.repeat(40);
   for (const [phase, kind] of [['done', 'verified'], ['hold', 'held']]) {
-    const calls = [];
-    const git = async (...args) => { calls.push(args); return ''; };
-    await resetQueueWorktree({ git, base, phase, record: { sha, taskId: '9912', attemptId: 'att-1' } });
+    const { calls, git } = queueGitDouble();
+    await resetQueueWorktree({ git, base, phase, record: { sha, taskId: '9912', attemptId: 'att-1' },
+      branch: 'feat/df-slot', workerStopped: true, log: null });
     assert.deepEqual(calls, [
       ['update-ref', `refs/darkfactory/${kind}/9912/att-1`, sha],
+      ['branch', '--show-current'],
+      ['rev-parse', 'HEAD'],
       ['reset', '--hard', base],
       ['clean', '-fd'],
     ], phase);
@@ -936,7 +1069,8 @@ test('resetQueueWorktree never resets when pinning fails, keeping the verified c
     return '';
   };
   await assert.rejects(() => resetQueueWorktree({ git, base: 'b'.repeat(40), phase: 'done',
-    record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' } }), /ref write failed/);
+    record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' },
+    branch: 'feat/df-slot', workerStopped: true, log: null }), /ref write failed/);
   assert.deepEqual(calls.map(args => args[0]), ['update-ref']);
 });
 
@@ -947,17 +1081,99 @@ test('resetQueueWorktree resets without pinning when the record has nothing dura
     { sha: 'not-a-sha', taskId: '9912', attemptId: 'att-1' },
     { sha: 'a'.repeat(40) },
   ]) {
-    const calls = [];
-    const git = async (...args) => { calls.push(args); return ''; };
-    await resetQueueWorktree({ git, base, phase: 'done', record });
-    assert.deepEqual(calls, [['reset', '--hard', base], ['clean', '-fd']]);
+    const { calls, git } = queueGitDouble();
+    await resetQueueWorktree({ git, base, phase: 'done', record,
+      branch: 'feat/df-slot', workerStopped: true, log: null });
+    assert.deepEqual(calls, [
+      ['branch', '--show-current'],
+      ['rev-parse', 'HEAD'],
+      ['reset', '--hard', base],
+      ['clean', '-fd'],
+    ]);
   }
   // Нетерминальная фаза никогда не закрепляет — reset идёт сразу.
-  const calls = [];
-  const git = async (...args) => { calls.push(args); return ''; };
+  const { calls, git } = queueGitDouble();
   await resetQueueWorktree({ git, base, phase: 'working',
-    record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' } });
-  assert.deepEqual(calls, [['reset', '--hard', base], ['clean', '-fd']]);
+    record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' },
+    branch: 'feat/df-slot', workerStopped: true, log: null });
+  assert.deepEqual(calls, [
+    ['branch', '--show-current'],
+    ['rev-parse', 'HEAD'],
+    ['reset', '--hard', base],
+    ['clean', '-fd'],
+  ]);
+});
+
+// Astra #1 (P0): чужая ветка или неподтверждённая остановка воркера —
+// карантин без reset --hard/clean -fd, дерево сохраняется нетронутым.
+test('resetQueueWorktree quarantines a foreign branch instead of destroying it', async () => {
+  const base = 'b'.repeat(40);
+  for (const [branch, head] of [
+    ['main', 'c'.repeat(40)],
+    ['feat/other-slot', 'c'.repeat(40)],
+    ['', 'd'.repeat(40)], // отделённый HEAD не на base и не на candidate
+  ]) {
+    const { calls, git } = queueGitDouble({ branch, head });
+    const notes = [];
+    await assert.rejects(() => resetQueueWorktree({ git, base, phase: 'hold',
+      record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' },
+      branch: 'feat/df-slot', workerStopped: true, log: note => notes.push(note) }),
+      /branch_mismatch_quarantined/);
+    assert.deepEqual(calls.map(args => args[0]), ['update-ref', 'branch', 'rev-parse'],
+      `нет reset/clean на чужой ветке ${branch}@${head.slice(0, 4)}`);
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0].kind, 'branch_mismatch_quarantined');
+    assert.equal(notes[0].branch, branch);
+    assert.equal(notes[0].expectedBranch, 'feat/df-slot');
+    assert.equal(notes[0].task_id, '9912');
+    assert.equal(notes[0].workerStopped, true);
+  }
+});
+
+test('resetQueueWorktree accepts a detached HEAD exactly at base or at the attempt candidate', async () => {
+  const base = 'b'.repeat(40);
+  const sha = 'a'.repeat(40);
+  for (const head of [base, sha]) {
+    const { calls, git } = queueGitDouble({ branch: '', head });
+    await resetQueueWorktree({ git, base, phase: 'done',
+      record: { sha, taskId: '9912', attemptId: 'att-1' },
+      branch: 'feat/df-slot', workerStopped: true, log: null });
+    assert.deepEqual(calls.map(args => args[0]), ['update-ref', 'branch', 'rev-parse', 'reset', 'clean']);
+  }
+});
+
+test('resetQueueWorktree quarantines when the worker is not confirmed stopped', async () => {
+  const base = 'b'.repeat(40);
+  for (const workerStopped of [undefined, false]) {
+    const { calls, git } = queueGitDouble();
+    const notes = [];
+    await assert.rejects(() => resetQueueWorktree({ git, base, phase: 'hold',
+      record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' },
+      branch: 'feat/df-slot', workerStopped, log: note => notes.push(note) }),
+      /worker_not_stopped_quarantined/);
+    assert.deepEqual(calls.map(args => args[0]), ['update-ref', 'branch', 'rev-parse'],
+      'нет reset/clean при живом воркере');
+    assert.equal(notes[0].kind, 'worker_not_stopped_quarantined');
+    assert.equal(notes[0].workerStopped, false);
+  }
+  // Отсутствующее/пустое имя ветки не даёт доказательства — тот же карантин.
+  for (const branch of [undefined, '']) {
+    const { calls, git } = queueGitDouble();
+    await assert.rejects(() => resetQueueWorktree({ git, base, phase: 'done',
+      record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' },
+      branch, workerStopped: true, log: null }), /branch_mismatch_quarantined/);
+    assert.deepEqual(calls.map(args => args[0]), ['update-ref', 'branch', 'rev-parse']);
+  }
+});
+
+test('resetQueueWorktree still pins the durable ref before the quarantine probe', async () => {
+  // Закрепление verified/held ref недеструктивно и идёт до сверки ветки:
+  // кандидат сохраняется даже когда checkout карантинится.
+  const { calls, git } = queueGitDouble({ branch: 'main' });
+  await assert.rejects(() => resetQueueWorktree({ git, base: 'b'.repeat(40), phase: 'done',
+    record: { sha: 'a'.repeat(40), taskId: '9912', attemptId: 'att-1' },
+    branch: 'feat/df-slot', workerStopped: true, log: null }), /branch_mismatch_quarantined/);
+  assert.deepEqual(calls[0], ['update-ref', 'refs/darkfactory/verified/9912/att-1', 'a'.repeat(40)]);
 });
 
 test('arbiterIntakePrompt formats per model family only when the arbiter spec is passed', () => {
@@ -986,7 +1202,11 @@ test('run-isolated controller wiring pins recovery, memory key resolution, arbit
   assert.match(source, /resolveMemoryHmacKey\(\{ hmacKey: memoryCfg\.hmacKey, keyFile: memoryCfg\.keyFile \}\)/);
   assert.match(source, /hmacKey: memoryHmacKey/);
   assert.match(source, /runnerReviewSpec\(req\?\.arbiter\) \?\? undefined/);
-  assert.match(source, /resetQueueWorktree\(\{ git, base: route\.base, phase: result\.phase, record: closedRecord \}\)/);
+  assert.match(source, /resetQueueWorktree\(\{ git, base: route\.base, phase: result\.phase,\s*\n?\s*record: closedRecord, branch: p\.profiles\[route\.checkProfile\]\.branch,/);
+  assert.match(source, /workerStopped: workerStoppedEvidence\(result\?\.threadId \?\? liveThreadId, terminalStop\)/);
+  assert.match(source, /reserveWorktree\(join\(stateHome, 'darkfactory-lab', 'slots'\), tree, root,\s*\n?\s*\{ stateDir: root \}\)/);
+  assert.match(source, /isDefinitiveClaimLoss\(error\)\) lost = true/);
+  assert.match(source, /O_RDONLY \| fsConstants\.O_NOFOLLOW/);
   assert.match(source, /maxBuffer: 16 \* 1024 \* 1024/);
   assert.match(source, /shouldStopWorkerOnShutdown\(\{ recordPhase: shutdownRecord\?\.phase/);
   assert.match(source, /ancestorOrNull\(git, route\.base, sha\)/);
