@@ -541,7 +541,7 @@ test('P1-2: bare, implicit-destination, bulk and repository-flag pushes fail clo
     ['git push origin HEAD', 'git_push_implicit'],
     ['git push origin @', 'git_push_implicit'],
     ['git push origin @{u}', 'git_push_implicit'],
-    ['git push origin refs/heads/*', 'git_push_implicit'],
+    ['git push origin refs/heads/' + '*', 'git_push_implicit'],
     ['git push --all', 'git_push_bulk'],
     ['git push origin --all', 'git_push_bulk'],
     ['git push --branches origin feature-x', 'git_push_bulk'],
