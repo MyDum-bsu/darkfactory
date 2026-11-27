@@ -33,4 +33,5 @@ test('real repository has no board_pipeline to ops reverse leaks', () => {
   const root = fileURLToPath(new URL('../', import.meta.url));
   const report = analyzeWiring(root);
   assert.deepEqual(report.reverseLeaks, []);
+  assert.deepEqual(report.reverseLeakEdges, []);
 });
