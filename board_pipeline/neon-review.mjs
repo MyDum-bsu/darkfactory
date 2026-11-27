@@ -161,7 +161,7 @@ async function prepareSnapshot(binding, scratch, sandbox, beforeEffect, signal, 
   const fingerprint = await snapshotDigest(staged);
   let published = false;
   return {
-    view, files, captures, published: () => published,
+    view, files, captures, hasRoundDiff: names.includes('round.patch'), published: () => published,
     async publish() {
       if (published) throw new ReviewDenied('review_snapshot_already_published');
       // The host can populate the directory; Agy's Landlock rule stays read-only.
@@ -228,6 +228,12 @@ export function isolatedNeonReviewRunner({ journal, prompt = '', timeoutMs = 480
       const verdict = await applySeverityGating(neonVerdict(observed.text, binding.subject_digest),
         { journal, taskId: binding.task_id, candidateSha: binding.candidate_sha,
           round: binding.review_round ?? 1 });
+      // Check the effective verdict: severity gating can promote a non-blocking review to PASS.
+      if (verdict.status === 'PASS' && !observed.verifiedReads.some(({ name, path }) =>
+        (name === 'read_file' || name === 'view_file') &&
+        (path === 'diff.patch' || (snapshot.hasRoundDiff && path === 'round.patch')))) {
+        throw new ReviewDenied('agy_diff_unread');
+      }
       return { ...verdict, sidecar_findings: verdict.sidecar_findings ?? [],
         severity_gated: verdict.severity_gated === true,
         task: binding.task_id, sha: binding.candidate_sha, tree_sha: before.tree,
