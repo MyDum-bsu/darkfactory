@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { advance } from './controller.mjs';
+import { advance, MAX_TRANSIENT_LEASE_FAILURES } from './controller.mjs';
 import { nativeBoardPort } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 import { memoryBoardSdk } from './board-test-fixture.mjs';
@@ -1778,4 +1778,139 @@ test('an invalid workingTimeoutMs is rejected before any effect', async t => {
     await assert.rejects(() => x.tick(), /enrolled route/);
     assert.equal(x.effects.spawn, 0);
   }
+});
+
+// --- Astra #15 (P1): policyDigest слота — часть queue-допуска ---
+test('queue mode with a pinned policyDigest never claims a card of a foreign policy', async t => {
+  // Карточка поставлена под policy_digest = 'b'×64 (CONTRACT): совпадение —
+  // захват, чужой дайджест слота — 0 эффектов, карточка остаётся ready.
+  const foreign = await queueLab(t);
+  foreign.route.policyDigest = 'f'.repeat(64);
+  assert.equal((await foreign.tick()).phase, 'idle');
+  assert.equal(foreign.seen.claim, 0, 'слот с чужой политикой не крадёт карточку');
+  assert.equal((await foreign.card(0)).state, 'ready');
+
+  const own = await queueLab(t);
+  own.route.policyDigest = CONTRACT.policy_digest;
+  assert.equal((await own.tick()).phase, 'working');
+  assert.equal(own.seen.claim, 1, 'совпадающий policy_digest допускается');
+  own.submit('c');
+  assert.equal((await own.tick()).phase, 'done');
+
+  // Без закреплённого policyDigest маршрута — прежний допуск (совместимость).
+  const legacy = await queueLab(t);
+  assert.equal((await legacy.tick()).phase, 'working');
+  assert.equal(legacy.seen.claim, 1);
+});
+
+// --- Astra #23 (P2): класс размера карточки доезжает до scorecard-роутинга ---
+test('queue mode pins canonical lowercase size classes into the contract labels', async t => {
+  for (const [label, expected] of [['S', 's'], ['M', 'm'], ['L', 'l'], ['s', 's']]) {
+    const x = await queueLab(t, { labels: { ...CONTRACT, size: label } });
+    await x.tick();
+    const record = await x.cfg.state.load();
+    assert.equal(record.contract.labels.size, expected, `size ${label} → ${expected}`);
+    x.submit('c');
+    await x.tick();
+    assert.equal(x.effects.attempts.at(-1).labels.size, expected);
+  }
+  // Неканоничный/мусорный размер не закрепляется — прежний откат в unknown.
+  for (const bad of ['XL', 'medium', '1', '']) {
+    const x = await queueLab(t, { labels: { ...CONTRACT, size: bad } });
+    await x.tick();
+    const record = await x.cfg.state.load();
+    assert.equal(record.contract.labels.size, undefined, `size ${JSON.stringify(bad)} не закрепляется`);
+  }
+  // Без метки размера labels пусты, как раньше.
+  const plain = await queueLab(t);
+  await plain.tick();
+  assert.deepEqual((await plain.cfg.state.load()).contract.labels, {});
+});
+
+// --- Astra #16 (P1): транзитные сбои обновления аренды не теряют попытку ---
+function transientBoardError(statusCode) {
+  const error = new Error(statusCode === null ? 'temporary network timeout' : `HTTP ${statusCode}`);
+  if (statusCode !== null) error.statusCode = statusCode;
+  return error;
+}
+
+function breakRenewal(x, failures) {
+  let left = failures;
+  const verifyHeld = x.cfg.board.verifyHeld.bind(x.cfg.board);
+  x.cfg.board.verifyHeld = async (...args) => {
+    if (left > 0) {
+      left--;
+      throw transientBoardError(left % 2 === 0 ? 503 : null);
+    }
+    return verifyHeld(...args);
+  };
+  return { verifyHeld };
+}
+
+test('a single transient 503/timeout renewal failure retains the attempt and recovers', async t => {
+  const x = await lab(t);
+  await x.tick();
+  assert.equal((await x.tick()).phase, 'working');
+  breakRenewal(x, 2);
+  // Два подряд транзитных сбоя: попытка остаётся working, карточка захвачена,
+  // счётчик растёт — никакого lease_lost и никакого второго spawn.
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 1);
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 2);
+  assert.equal((await x.inspect()).state, 'claimed');
+  assert.equal(x.effects.spawn, 1);
+  assert.equal(x.effects.verify, 0);
+  // Board восстановился: обновление проходит, счётчик сброшен, сдача принимается.
+  x.submit('c');
+  assert.equal((await x.tick()).phase, 'done');
+  assert.equal((await x.cfg.state.load()).transientLeaseFailures, 0);
+  assert.equal((await x.inspect()).result.sha, 'c'.repeat(40));
+});
+
+test('definitive claim loss still journals lease_lost immediately on the first tick', async t => {
+  const x = await lab(t);
+  await x.tick();
+  const verifyHeld = x.cfg.board.verifyHeld.bind(x.cfg.board);
+  x.cfg.board.verifyHeld = async (...args) => {
+    const error = new Error('claim_lost');
+    error.code = 'claim_lost';
+    error.statusCode = 409;
+    throw error;
+  };
+  void verifyHeld;
+  assert.equal((await x.tick()).phase, 'lease_lost');
+  const record = await x.cfg.state.load();
+  assert.equal(record.phase, 'lease_lost');
+  assert.equal(record.reason, 'no_verified_claim_keep_worktree_reserved');
+});
+
+test('bounded consecutive transient failures end in lease_lost without ever verifying', async t => {
+  const x = await lab(t);
+  await x.tick();
+  breakRenewal(x, MAX_TRANSIENT_LEASE_FAILURES + 3);
+  for (let count = 1; count < MAX_TRANSIENT_LEASE_FAILURES; count++) {
+    assert.equal((await x.tick()).phase, 'working', `повтор ${count} ещё не терминален`);
+    assert.equal((await x.cfg.state.load()).transientLeaseFailures, count);
+  }
+  const out = await x.tick();
+  assert.equal(out.phase, 'lease_lost');
+  assert.equal(out.reason, 'lease_renewal_transient_failures_exhausted');
+  assert.equal(x.effects.spawn, 1);
+  assert.equal(x.effects.verify, 0);
+  // Повторный тик не воскрешает попытку.
+  assert.equal((await x.tick()).phase, 'lease_lost');
+});
+
+test('transient failures past the lease expiry journal lease_lost instead of endless retry', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1780000000000 });
+  const x = await lab(t);
+  await x.tick();
+  breakRenewal(x, 100);
+  assert.equal((await x.tick()).phase, 'working');
+  // Аренда лаборатории — 30 секунд: после истечения повторять нечего.
+  t.mock.timers.tick(31_000);
+  const out = await x.tick();
+  assert.equal(out.phase, 'lease_lost');
+  assert.equal(out.reason, 'lease_expired_during_transient_renewal_failure');
 });

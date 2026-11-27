@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildRunPlan, runFactory } from './factory-run.mjs';
+import { buildRunPlan, ensureFilemodeGuard, runFactory } from './factory-run.mjs';
 
 async function fixture(t) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'factory-run-test-')));
@@ -129,4 +129,93 @@ test('node_modules mount targets stay strict: nested canonical targets pass, tra
     await writeMountPolicy(to);
     await assert.rejects(() => buildRunPlan(f.values(), { env: {} }), /mount_outside_allowlist/, JSON.stringify(to));
   }
+});
+
+// --- Astra #22 (P2): повторная запись core.fileMode пропускается без необходимости ---
+// Git-double ensureFilemodeGuard: журналирует вызовы и отвечает по сценарию
+// состояния конфига, без реального репозитория.
+function filemodeGitDouble(worktree, { local = null, effective = null } = {}) {
+  const calls = [];
+  const state = { local, worktreeOverride: null, effective };
+  const git = async args => {
+    calls.push(args);
+    const key = args.slice(2).join(' ');
+    if (key === 'rev-parse --show-toplevel') return worktree;
+    if (key === 'config --local --get core.fileMode') {
+      if (state.local === null) throw new Error('exit 1');
+      return state.local;
+    }
+    if (key === 'config --local core.fileMode false') {
+      state.local = 'false';
+      return '';
+    }
+    if (key === 'config --get core.fileMode') {
+      const value = state.worktreeOverride ?? state.effective ?? state.local;
+      if (value === null) throw new Error('exit 1');
+      return value;
+    }
+    if (key === 'config --worktree core.fileMode false') {
+      state.worktreeOverride = 'false';
+      return '';
+    }
+    throw new Error(`unexpected git call: ${key}`);
+  };
+  return { calls, git, state };
+}
+const configWrites = calls => calls.filter(args =>
+  args.slice(2).join(' ').startsWith('config') && args.includes('false'));
+
+test('ensureFilemodeGuard skips the write entirely when --local core.fileMode is already false', async t => {
+  const worktree = '/wt';
+  const { calls, git } = filemodeGitDouble(worktree, { local: 'false' });
+  await ensureFilemodeGuard(worktree, { git });
+  assert.deepEqual(calls.map(args => args.slice(2).join(' ')), [
+    'rev-parse --show-toplevel',
+    'config --local --get core.fileMode',
+    'config --get core.fileMode',
+  ]);
+  assert.equal(configWrites(calls).length, 0,
+    'ни одной записи в конфиг — нет повода для .git/config.lock при параллельных слотах');
+});
+
+test('ensureFilemodeGuard writes exactly once when the value is unset or not false', async t => {
+  const worktree = '/wt';
+  for (const local of [null, 'true']) {
+    const { calls, git } = filemodeGitDouble(worktree, { local });
+    await ensureFilemodeGuard(worktree, { git });
+    const writes = configWrites(calls);
+    assert.equal(writes.length, 1, `local=${local}: ровно одна запись`);
+    assert.deepEqual(writes[0].slice(2), ['config', '--local', 'core.fileMode', 'false']);
+    // Идемпотентность: повторный прогон того же слота записей уже не делает.
+    const second = await captureGuard(worktree, git, calls);
+    assert.equal(second, 0, 'повторный запуск — чистый no-op');
+  }
+});
+
+async function captureGuard(worktree, git, calls) {
+  const before = calls.length;
+  await ensureFilemodeGuard(worktree, { git });
+  return configWrites(calls.slice(before)).length;
+}
+
+test('ensureFilemodeGuard does not rewrite --local when a worktree override shadows the effective value', async t => {
+  const worktree = '/wt';
+  // --local уже false, но extensions.worktreeConfig перекрывает эффективное
+  // значение на true: guard чинит --worktree, не трогая --local повторно.
+  const { calls, git, state } = filemodeGitDouble(worktree, { local: 'false', effective: 'true' });
+  await ensureFilemodeGuard(worktree, { git });
+  const writes = configWrites(calls).map(args => args.slice(2).join(' '));
+  assert.deepEqual(writes, ['config --worktree core.fileMode false']);
+  assert.equal(state.worktreeOverride, 'false');
+});
+
+test('ensureFilemodeGuard fails closed when neither write makes the effective value false', async t => {
+  const worktree = '/wt';
+  const { git } = filemodeGitDouble(worktree, { local: null, effective: 'true' });
+  const rigged = async args => {
+    const key = args.slice(2).join(' ');
+    if (key === 'config --worktree core.fileMode false') throw new Error('config locked');
+    return git(args);
+  };
+  await assert.rejects(() => ensureFilemodeGuard(worktree, { git: rigged }), /filemode_guard_ineffective/);
 });

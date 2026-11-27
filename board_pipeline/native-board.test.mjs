@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { memoryBoardSdk } from './board-test-fixture.mjs';
-import { nativeBoardPort } from './native-board.mjs';
+import { nativeBoardPort, isDefinitiveClaimLoss, isTransientBoardError } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 
 let sdk;
@@ -372,4 +372,84 @@ test('verifyHeld preserves the held capability through transient renew failures 
   definitiveLoss = true;
   await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /claim_lost/);
   await assert.rejects(port.verifyHeld(task.id, claimed.epoch), /no native claim is held/);
+});
+
+// --- Astra #15 (P1): policyDigest — часть доверенного допуска очереди ---
+test('claimReady with a pinned policyDigest never steals a card of a foreign policy', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  const own = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  // Чужой policyDigest слота: карточка не допускается, эффектов нет.
+  assert.equal(await port.claimReady({ ...FILTER, policyDigest: 'f'.repeat(64) }), null);
+  assert.equal(seen.claim, 0, 'чужая политика — ноль claim-эффектов');
+  assert.equal((await port.lookup(own.task.id)).state, 'ready');
+  // Совпадающий дайджест допускается и захватывается.
+  const picked = await port.claimReady({ ...FILTER, policyDigest: CONTRACT.policy_digest });
+  assert.equal(picked.taskId, own.task.id);
+  assert.equal(seen.claim, 1);
+});
+
+test('claimReady re-reads policy_digest before the claim and skips a rewritten card', async t => {
+  const { handle, ported, seen } = await claimedBoard(t);
+  const { task } = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  // Выдача списка несёт совпадающий дайджест, но перечитанный перед claim
+  // снимок — уже чужой: захват недопустим даже при гонке перезаписи.
+  const original = handle.thread.bind(handle);
+  ported.thread = async (id, opts) => {
+    const snap = await original(id, opts);
+    if (id === task.id) {
+      return { message: { ...snap.message,
+        labels: { ...snap.message.labels, policy_digest: 'e'.repeat(64) } } };
+    }
+    return snap;
+  };
+  assert.equal(await port.claimReady({ ...FILTER, policyDigest: CONTRACT.policy_digest }), null);
+  assert.equal(seen.claim, 0, 'переписанная карточка не захватывается');
+  // Гонка исчезла: честный снимок вновь допускается и захватывается этим слотом.
+  ported.thread = original;
+  assert.equal((await port.claimReady({ ...FILTER, policyDigest: CONTRACT.policy_digest })).taskId, task.id);
+  assert.equal(seen.claim, 1);
+  // Без закреплённого policyDigest допускается любая валидная карточка (совместимость).
+  const plain = await claimedBoard(t);
+  const { task: legacyTask } = await contractTask(plain.handle, { ...CONTRACT, queue: 'vs1' });
+  const legacyPort = nativeBoardPort(plain.ported, { channel: 'pilot', lease: 60 });
+  assert.equal((await legacyPort.claimReady(FILTER)).taskId, legacyTask.id);
+});
+
+test('claimReady validates a configured policyDigest as a 64-char lowercase hex digest', async t => {
+  const { ported } = await claimedBoard(t);
+  const port = nativeBoardPort(ported, { channel: 'pilot', lease: 60 });
+  for (const bad of ['', 'not-hex', 'A'.repeat(64), 'b'.repeat(63), 'b'.repeat(65), 42, null]) {
+    await assert.rejects(port.claimReady({ ...FILTER, policyDigest: bad }),
+      /trusted claim filter/, JSON.stringify(bad));
+  }
+  // Валидный дайджест не отвергается фильтром (пустая очередь — честный null).
+  assert.equal(await port.claimReady({ ...FILTER, policyDigest: 'b'.repeat(64) }), null);
+});
+
+// --- Astra #16 (P1): классификаторы definitive/transient отказов Board ---
+test('isDefinitiveClaimLoss classifies 409/claim loss definitively and 5xx/network as transient', () => {
+  const withStatus = statusCode => Object.assign(new Error(`HTTP ${statusCode}`), { statusCode });
+  const coded = code => Object.assign(new Error(code), { code });
+  // Дефинитивная потеря: 409, claim_lost/epoch_mismatch коды.
+  assert.equal(isDefinitiveClaimLoss(withStatus(409)), true);
+  assert.equal(isDefinitiveClaimLoss(coded('claim_lost')), true);
+  assert.equal(isDefinitiveClaimLoss(coded('epoch_mismatch')), true);
+  assert.equal(isDefinitiveClaimLoss(Object.assign(new Error('x'), { code: 'claim_lost', statusCode: 503 })), true);
+  // Транзитные: 5xx, таймауты и сетевые обрывы не являются потерей.
+  for (const status of [500, 502, 503, 504]) {
+    assert.equal(isDefinitiveClaimLoss(withStatus(status)), false, `HTTP ${status}`);
+    assert.equal(isTransientBoardError(withStatus(status)), true, `HTTP ${status}`);
+  }
+  assert.equal(isTransientBoardError(coded('ETIMEDOUT')), true);
+  assert.equal(isTransientBoardError(coded('ECONNRESET')), true);
+  assert.equal(isTransientBoardError(coded('ECONNREFUSED')), true);
+  assert.equal(isTransientBoardError(coded('EAI_AGAIN')), true);
+  assert.equal(isTransientBoardError(new TypeError('fetch failed')), true);
+  // Ошибки вне сети/5xx не считаются транзитными обновления аренды.
+  assert.equal(isTransientBoardError(coded('claim_lost')), false);
+  assert.equal(isTransientBoardError(withStatus(409)), false);
+  assert.equal(isTransientBoardError(withStatus(404)), false);
+  assert.equal(isTransientBoardError(new Error('boom')), false);
 });

@@ -19,8 +19,26 @@ function isClaimConflict(error) {
     /(?:^|_)already_claimed(?:_|$)|claim_lost|claim_conflict/.test(String(error?.message ?? ''));
 }
 
-function isDefinitiveClaimLoss(error) {
+// Окончательная потеря захвата/эпохи: конфликт claim, чужая эпоха или отзыв
+// пилота. Не сетевой сбой и не 5xx — повторять аренду бессмысленно.
+export function isDefinitiveClaimLoss(error) {
   return error instanceof PilotDenied || isClaimConflict(error) || boardErrorCode(error) === 'epoch_mismatch';
+}
+
+// Транзитный сбой Board: сетевая ошибка без HTTP-статуса либо ответ 5xx.
+// Обратная сторона isDefinitiveClaimLoss: такие ошибки не доказывают потерю
+// аренды — контроллер сохраняет попытку и повторяет обновление.
+export function isTransientBoardError(error) {
+  if (error === null || typeof error !== 'object' || isDefinitiveClaimLoss(error)) return false;
+  const status = boardErrorStatus(error);
+  if (status !== null) return status >= 500 && status < 600;
+  const code = typeof error?.code === 'string' ? error.code : '';
+  if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'EPIPE', 'EAI_AGAIN',
+    'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'EHOSTDOWN', 'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET'].includes(code)) {
+    return true;
+  }
+  return /timeout|timed out|network|fetch failed|socket hang up/i.test(String(error?.message ?? ''));
 }
 
 // The native claim token never leaves this adapter.
@@ -139,9 +157,15 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
         (typeof filter.repoId !== 'string' || !REPO_LABEL.test(filter.repoId))) {
       throw new Error('A trusted claim filter is required');
     }
+    // Ожидаемый policyDigest слота — строго 64 hex, иначе фильтр недоверенный:
+    // ослабленная форма не должна молча отключать сверку политик.
+    if (filter.policyDigest !== undefined && !HEX64.test(filter.policyDigest)) {
+      throw new Error('A trusted claim filter is required');
+    }
     return { owner: filter.owner, label: { key, value }, finish: filter.finish,
       profileId: filter.profileId, required: [...new Set(filter.required)],
-      ...(filter.repoId !== undefined ? { repoId: filter.repoId } : {}) };
+      ...(filter.repoId !== undefined ? { repoId: filter.repoId } : {}),
+      ...(filter.policyDigest !== undefined ? { policyDigest: filter.policyDigest } : {}) };
   }
 
   // Значения контрактных меток валидируются, не только presence: дайджесты — 64 hex,
@@ -166,6 +190,12 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
     if (root.labels?.profile_id !== filter.profileId) return false;
     // Явный repoId фильтра: карточка чужого repo_id никогда не захватывается.
     if (filter.repoId !== undefined && root.labels?.repo_id !== filter.repoId) return false;
+    // Явный policyDigest фильтра: карточка, поставленная под другой политикой,
+    // никогда не захватывается этим слотом — слоты с разными политиками не
+    // крадут карточки друг друга даже при совпадающих owner/метке/профиле.
+    if (filter.policyDigest !== undefined && root.labels?.policy_digest !== filter.policyDigest) {
+      return false;
+    }
     const labels = root.labels;
     if (labels === null || typeof labels !== 'object' || !contractLabelsValid(labels)) return false;
     for (const key of filter.required) {
