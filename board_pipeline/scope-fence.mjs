@@ -51,12 +51,12 @@ export function parseAllowedPaths(raw) {
 }
 
 // Check candidate paths against an exact-file/directory-prefix allowlist.
-// Null or undefined means the legacy unrestricted mode; any malformed or
-// unmatched candidate path is a violation, never a pass.
+// An absent allowlist denies by default; legacy unrestricted mode requires opt-in.
 export function checkScopeFence(options = {}) {
   const { changedPaths, allowedPaths } = options ?? {};
   if (allowedPaths === null || allowedPaths === undefined) {
-    return { ok: true, mode: 'unrestricted', violations: [] };
+    if (options?.allowUnrestricted === true) return { ok: true, mode: 'unrestricted', violations: [] };
+    return { ok: false, mode: 'denied', reason: 'allowed_paths_required', violations: [] };
   }
   const allowed = normalizeAllowed(allowedPaths);
   if (!Array.isArray(changedPaths)) throw invalid(INVALID_INPUT);

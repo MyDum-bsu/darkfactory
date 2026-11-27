@@ -22,13 +22,19 @@ test('parseAllowedPaths rejects empty entries and unsafe path forms fail-closed'
   assert.throws(() => parseAllowedPaths(['a.mjs']), /scope_fence_input_invalid/);
 });
 
-test('checkScopeFence is unrestricted only when allowlist is null or undefined', () => {
-  assert.deepEqual(checkScopeFence({ changedPaths: ['anything'], allowedPaths: null }),
-    { ok: true, mode: 'unrestricted', violations: [] });
-  assert.deepEqual(checkScopeFence(null),
-    { ok: true, mode: 'unrestricted', violations: [] });
-  assert.deepEqual(checkScopeFence({ changedPaths: ['anything'], allowedPaths: undefined }),
-    { ok: true, mode: 'unrestricted', violations: [] });
+test('checkScopeFence preserves unrestricted mode with explicit opt-in and no allowlist', () => {
+  for (const options of [{}, { allowedPaths: null }, { allowedPaths: undefined }]) {
+    assert.deepEqual(checkScopeFence({ changedPaths: ['anything'], ...options, allowUnrestricted: true }),
+      { ok: true, mode: 'unrestricted', violations: [] });
+  }
+});
+
+test('checkScopeFence denies missing, null or undefined allowedPaths by default', () => {
+  for (const options of [undefined, null, {}, { allowedPaths: null }, { allowedPaths: undefined },
+    { allowUnrestricted: 'true' }]) {
+    assert.deepEqual(checkScopeFence(options),
+      { ok: false, mode: 'denied', reason: 'allowed_paths_required', violations: [] });
+  }
 });
 
 test('checkScopeFence matches exact files and explicit directory prefixes', () => {

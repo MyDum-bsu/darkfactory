@@ -9,6 +9,7 @@ import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { RotatingJournal, runDaemon } from './daemon.mjs';
+import { normalizeEvent } from './event-bus.mjs';
 import { createPilotSwitch } from './pilot-gate.mjs';
 import { loadSdk } from './sdk.mjs';
 
@@ -165,6 +166,31 @@ test('daemon loop: tick errors are journaled and polling continues', async t => 
   assert.equal(calls, 3);
   const log = await readFile(join(dir, 'daemon.jsonl'), 'utf8');
   assert.match(log, /tick_error.*transport lost/);
+});
+
+test('daemon loop: tick_error journal and normalized bus event carry the same error detail', async () => {
+  const errors = [
+    Object.assign(new Error('other_reason: details'), { code: 'lease_lost' }),
+    Object.assign(new Error('poll_failed: timeout'), { code: 'EIO' }),
+    new Error('No leading code'),
+  ];
+  const reports = [];
+  const events = [];
+  let index = 0;
+  await runDaemon({
+    intervalMs: 250, installSignalHandlers: false, sleep: instant,
+    journal: { append: async entry => reports.push(entry) },
+    eventBus: { emit: event => events.push(normalizeEvent(event)) },
+    tick: () => { if (index < errors.length) throw errors[index++]; },
+    onTick: () => 'stop',
+  });
+  const expected = ['lease_lost', 'poll_failed', 'tick_error'].map((code, i) => ({
+    code, message: errors[i].message, consecutiveErrors: i + 1, backoffMs: 250 * 2 ** i,
+  }));
+  assert.deepEqual(reports.filter(e => e.event === 'tick_error'),
+    expected.map(detail => ({ event: 'tick_error', ...detail })));
+  assert.deepEqual(events.filter(e => e.kind === 'daemon.tick_error'),
+    expected.map(detail => ({ kind: 'daemon.tick_error', role: 'daemon', detail })));
 });
 
 test('RotatingJournal: rotates at maxBytes and keeps bounded files', async t => {
