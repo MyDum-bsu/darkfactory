@@ -116,7 +116,7 @@ function entries(value) {
 // конфигурацией, но не доверенным API-контрактом: произвольные ключи вроде
 // api_key/billing_account никогда не копируются в snapshot.
 const PUBLIC_FINOPS_ENTRY_KEYS = new Set([
-  'id', 'label', 'provider', 'totalEur', 'remainingEur', 'monthlyEur', 'expires', 'notes',
+  'id', 'label', 'provider', 'totalEur', 'remainingEur', 'monthlyEur', 'usedMonthEur', 'expires', 'notes',
   'machineType', 'hourlyCostUsd', 'hourlyCostEur', 'pricing', 'state',
   'runningMinutesToday', 'runningMinutesMonth', 'activeMinutesToday', 'wakesMonth',
   'usageUpdatedAt', 'costTodayEur', 'costMonthEur',
@@ -276,6 +276,7 @@ function daysInMonth(at) {
 // взятых задач дольше порога — это инфраструктурный баг, сжигающий деньги
 // 24/7: алерт dead_load_detected (severity bad) поднимается немедленно.
 
+const round2 = n => Number(n.toFixed(2));
 const round4 = n => Number(n.toFixed(4));
 
 const workerishVm = entry => {
@@ -396,22 +397,44 @@ export function buildSpendDynamics({ dailyHistory = [], todayEur = 0,
   };
 }
 
+function monthlyCreditBalances(rawCredits, spentMonthCostEur) {
+  const credits = entries(rawCredits).map((entry, index) => publicEntry(entry, {
+    id: text(entry.id) ?? `credit-${index + 1}`,
+    provider: text(entry.provider) ?? null,
+    totalEur: num(entry.total_eur ?? entry.totalEur),
+    remainingEur: num(entry.remaining_eur ?? entry.remainingEur),
+    monthlyEur: num(entry.monthly_eur ?? entry.monthlyEur),
+    usedMonthEur: 0,
+    expires: iso(entry.expires ?? entry.until),
+    notes: text(entry.notes) ?? null,
+  }));
+
+  let remainingSpendToCover = spentMonthCostEur;
+  function draw(credit, allowance) {
+    if (!(remainingSpendToCover > 0)) return;
+    const baseRemaining = credit.remainingEur ?? allowance;
+    const used = Math.min(Math.max(0, baseRemaining), remainingSpendToCover);
+    credit.remainingEur = round2(Math.max(0, baseRemaining - used));
+    credit.usedMonthEur = round2(used);
+    remainingSpendToCover -= used;
+  }
+
+  // Allocate recurring credit first, without reordering the public snapshot.
+  for (const credit of credits) {
+    if (credit.monthlyEur > 0) draw(credit, credit.monthlyEur);
+  }
+  for (const credit of credits) {
+    if (credit.totalEur > 0 && !credit.monthlyEur) draw(credit, credit.totalEur);
+  }
+  return credits;
+}
+
 function normalize(raw, usage, sourcePath, at) {
   const alerts = [];
   const usdToEur = nonNegativeNum(raw.usd_to_eur ?? raw.fx?.usd_to_eur) ?? 0.92;
   const monthlyBudgetEur = num(raw.monthly_budget_eur ?? raw.budgets?.monthly_eur) ?? null;
   const utilizationThresholdPct = num(raw.underutilized_below_pct ??
     raw.budgets?.utilization_alert_below_pct) ?? 5;
-
-  const cloudCredits = entries(raw.cloud_credits).map((entry, index) => publicEntry(entry, {
-    id: text(entry.id) ?? `credit-${index + 1}`,
-    provider: text(entry.provider) ?? null,
-    totalEur: num(entry.total_eur ?? entry.totalEur),
-    remainingEur: num(entry.remaining_eur ?? entry.remainingEur),
-    monthlyEur: num(entry.monthly_eur ?? entry.monthlyEur),
-    expires: iso(entry.expires ?? entry.until),
-    notes: text(entry.notes) ?? null,
-  }));
 
   let spentMonthCostEur = 0;
   let spentTodayCostEur = 0;
@@ -503,6 +526,7 @@ function normalize(raw, usage, sourcePath, at) {
   const elapsedDays = Math.max(1, new Date(at).getUTCDate());
   const projectedMonthCostEur = spentMonthCostEur / elapsedDays * dim;
   const dailyBurnEur = projectedMonthCostEur / dim;
+  const cloudCredits = monthlyCreditBalances(raw.cloud_credits, spentMonthCostEur);
   const activeCredits = cloudCredits.filter(credit =>
     !credit.expires || Date.parse(credit.expires) >= at);
   const remainingCreditsEur = activeCredits.reduce((sum, credit) =>
@@ -566,7 +590,6 @@ function normalize(raw, usage, sourcePath, at) {
   });
 
   const workspaceLinks = flattenWorkspace(raw.workspace_links, alerts);
-  const round2 = n => Number(n.toFixed(2));
   const totals = {
     currency: text(raw.currency) ?? 'EUR',
     usdToEur,
