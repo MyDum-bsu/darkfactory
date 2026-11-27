@@ -605,7 +605,7 @@ test('guard: auth.json стёрт при загрузке и отдаётся т
     probe('sh', cp.spawnSync('sh', ['-c', 'echo hi']));
     probe('curl', cp.spawnSync('curl', ['-s', 'x'], { timeout: 3000 }));
     probe('findExec', cp.spawnSync('find', ['/tmp', '-exec', 'ls', ';']));
-    probe('findOk', cp.spawnSync('find', [], { timeout: 3000 }));
+    probe('findOk', cp.spawnSync('find', ['.', '-maxdepth', '0'], { timeout: 3000 }));
     probe('rgPiCfg', cp.spawnSync('rg', ['.', '/pi-cfg/auth.json']));
     probe('rgPre', cp.spawnSync('rg', ['--pre=sh', 'foo', '/candidate']));
     probe('findFollow', cp.spawnSync('find', ['-L', '/candidate']));

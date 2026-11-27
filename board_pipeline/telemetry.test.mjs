@@ -28,7 +28,7 @@ const verdict = { verdict: 'PASS', subject_digest, summary: 'Matches the spec',
   findings: [], checked_invariants: ['arithmetic'] };
 
 // Поток agy с заданным usage в result (валидные поля RESULT_FIELDS).
-function agyStreamWithUsage(cwd, usage, { reads = ['candidate/sum.js'] } = {}) {
+function agyStreamWithUsage(cwd, usage, { reads = ['diff.patch', 'candidate/sum.js'] } = {}) {
   const conversation_id = 'synthetic-review';
   return [
     { event: 'init', conversation_id, init: { model: NEON_CRITIC.model, cwd, permission_mode: 'request-review', tools: [] } },

@@ -289,7 +289,7 @@ test('validated PNG captures are packaged into the Neon review snapshot and inva
       const packaged = JSON.parse(await readFile(join(cwd, 'captures.json'), 'utf8'));
       assert.equal(packaged.length, 1);
       assert.equal((await readFile(join(cwd, 'captures', 'mo-tracker-ready-1440x900.png'))).equals(PNG_1X1), true);
-      return { code: 0, cwd, stdout: agyStreamFixture(verdict, { cwd, reads: ['candidate/sum.js'] }) };
+      return { code: 0, cwd, stdout: agyStreamFixture(verdict, { cwd, reads: ['diff.patch', 'candidate/sum.js'] }) };
     } });
   const receipt = await runner({ ...binding, candidate_sha, subject_digest }, profile);
   assert.equal(receipt.verdict, 'REVIEW_OK');

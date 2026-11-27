@@ -909,7 +909,7 @@ test('arbiter accept_with_notes completes the card only through a full seal', as
   assert.equal(head.result.sha, BAD2);
   const record = await x.cfg.state.load();
   assert.equal(record.arbitration.decision, 'accept_with_notes');
-  assert.deepEqual(record.arbitration.arbiter, { provider: 'openai', model: 'gpt-6.2-sol' });
+  assert.deepEqual(record.arbitration.arbiter, { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' });
 });
 
 // Пункт 1: арбитрованное принятие никогда не обходит seal — грязный worktree,
