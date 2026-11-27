@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { arbiterIntakePrompt, decisionsPromptBlock, lessonsPromptBlock, projectMemoryPromptBlock,
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { arbiterIntakePrompt, buildPromptBom, decisionsPromptBlock, lessonsPromptBlock, projectMemoryPromptBlock,
   workerIntakePrompt } from './intake-prompt.mjs';
 
 const spec = 'Accepted decisions: CSV for manual export because the operator checks the table (D-01).';
@@ -233,6 +237,72 @@ test('worker prompt embeds optional projectContext read-only before execution in
   const shaped = workerIntakePrompt({ ...worker, productQuestions: false,
     projectContext: 'Use ESM modules.', executor: { provider: 'acp-devin', model: 'swe-2-1-medium' } });
   assert.match(shaped, /Project context \(read-only conventions\/taste\):\nUse ESM modules\./);
+});
+
+test('omitted taste is byte-compatible and does not need a readable worktree', () => {
+  const expected = `${spec}\n\nWorktree path: /worktree. Write JSON atomically to /outside/submission.json and end the turn. Preserve field types: ${JSON.stringify(handoff)}\nDo not touch other threads or boards.\n`;
+  assert.equal(workerIntakePrompt(worker), expected);
+  assert.equal(workerIntakePrompt({ ...worker, tasteProfile: null }), expected);
+});
+
+test('taste opt-in loads both layers, bounds the whole block and preserves the execution contract', async t => {
+  const tree = await mkdtemp(join(tmpdir(), 'taste-intake-'));
+  t.after(() => rm(tree, { recursive: true, force: true }));
+  const args = { ...worker, tree, decisions: slice, allowedPaths: ['board_pipeline/'],
+    executor: { provider: 'acp-devin', model: 'swe-2-1-medium' } };
+  const original = workerIntakePrompt(args);
+  assert.equal(workerIntakePrompt({ ...args, tasteProfile: {} }), original);
+  const globalTastePath = join(tree, 'owner.md');
+  await writeFile(globalTastePath, 'Prefer clear names.');
+  await mkdir(join(tree, '.darkfactory'));
+  await writeFile(join(tree, '.darkfactory/project-profile.yaml'),
+    'taste: [Prefer ESM.]\ndomain_skills:\n  docs: [proofread]\n');
+  const tasteProfile = { globalTastePath, domain: 'docs' };
+  const render = () => workerIntakePrompt({ ...args, tasteProfile });
+  const start = 'Owner/project taste (read-only conventions):\n';
+  const block = start + '## Owner Taste (global)\nPrefer clear names.\n\n' +
+    '## Repo Taste (project profile)\n- Prefer ESM.\n\n## Domain Skills (docs)\n- proofread';
+  const full = render();
+  assert.ok(full.includes(block));
+  assert.equal(full.replace(block + '\n', ''), original);
+  assert.equal(render(), full);
+  assert.equal(workerIntakePrompt({ ...args, tasteProfile: { ...tasteProfile, maxChars: 1 } }), original);
+  assert.throws(() => workerIntakePrompt({ ...args, tasteProfile: 'not options' }), /prompt_input_invalid:tasteProfile/);
+  assert.throws(() => workerIntakePrompt({ ...args, tasteProfile: { maxChars: 0 } }), /taste_profile_maxchars_invalid/);
+
+  await writeFile(globalTastePath, 'long owner preference '.repeat(500));
+  for (const [maxChars, cap] of [[220, 220], [10000, 4096]]) {
+    const cut = workerIntakePrompt({ ...args, tasteProfile: { ...tasteProfile, maxChars } });
+    const at = cut.indexOf(start);
+    const end = cut.indexOf('\n\nWorktree path:', at);
+    assert.ok(at > 0 && end > at);
+    assert.ok(end - at <= cap);
+    assert.ok(cut.slice(at, end).endsWith('…[truncated]'));
+    assert.equal(cut.slice(0, at) + cut.slice(end + 1), original);
+  }
+  await writeFile(join(tree, '.darkfactory/project-profile.yaml'), 'agents_md: ../outside.md');
+  assert.throws(render, /taste_profile_path_traversal/);
+  assert.equal(workerIntakePrompt(args), original, 'no implicit load');
+});
+
+test('prompt BOM describes exactly the supplied rendered blocks in stable order without their text', () => {
+  const names = ['spec', 'decisions', 'memory', 'taste', 'skills', 'lessons', 'scope'];
+  const parts = Object.fromEntries(names.map(name => [name, ` ${name}: я🌊\n`]).reverse());
+  const bom = buildPromptBom(parts);
+  assert.deepEqual(Object.keys(bom), names);
+  for (const name of names) {
+    const text = parts[name];
+    assert.deepEqual(bom[name], { bytes: Buffer.byteLength(text, 'utf8'), chars: text.length,
+      sha256: createHash('sha256').update(text, 'utf8').digest('hex') });
+  }
+  assert.notEqual(bom.spec.bytes, bom.spec.chars);
+  assert.deepEqual(buildPromptBom({ ...parts, taste: 'changed' }).skills, bom.skills);
+  assert.notEqual(buildPromptBom({ ...parts, taste: 'changed' }).taste.sha256, bom.taste.sha256);
+  assert.deepEqual(buildPromptBom({ taste: '', decisions: null, lessons: undefined, private: 'not a block' }), {});
+  assert.deepEqual(buildPromptBom({ spec: 'abc' }), { spec: { bytes: 3, chars: 3,
+    sha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad' } });
+  assert.throws(() => buildPromptBom({ taste: { text: 'not rendered' } }), /prompt_part_invalid:taste/);
+  assert.throws(() => buildPromptBom(null), /prompt_parts_invalid/);
 });
 
 test('worker prompt omits projectContext when undefined, empty or whitespace', () => {

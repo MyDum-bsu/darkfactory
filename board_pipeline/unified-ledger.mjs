@@ -10,11 +10,12 @@
 // supersede happen in one IMMEDIATE transaction, so a crash cannot leave a
 // half-recorded approval.
 
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { DEFAULT_MAX_CHARS, ledgerTextDigest, openSqliteLedgerJournal } from './decision-ledger.mjs';
 
 export const LEDGER_SCHEMA_VERSION = 1;
-export const DEFAULT_MAX_CHARS = 4000;
+export { DEFAULT_MAX_CHARS };
 export const DEFAULT_QUERY_LIMIT = 100;
 
 const SCOPE = /^(global|project:[a-z0-9_-]{1,64}|area:[a-z0-9_-]{1,64})$/;
@@ -51,6 +52,51 @@ function validateActor(value, code) {
 // Flatten whitespace for Markdown embedding: multi-line text would break the
 // deterministic one-line-per-entry rendering used for prompt injection.
 const inline = text => text.replace(/\s+/g, ' ').trim();
+
+// The SQLite file (including :memory:) is the synchronous transport for the
+// checksummed journal. The original v1 tables are its SQL projection: in particular
+// df-decisions pending reads decision_proposals on a separate connection. No
+// sidecar file or second lock/commit is involved.
+const PROPOSALS = 'decision_proposals';
+const DECISIONS = 'decisions';
+const columns = {
+  [PROPOSALS]: ['proposal_id', 'scope', 'topic', 'decision', 'rationale', 'applicability',
+    'proposed_by', 'status', 'rejected_by', 'rejection_reason', 'created_at'],
+  [DECISIONS]: ['id', 'scope', 'topic', 'decision', 'rationale', 'applicability', 'status',
+    'superseded_by', 'approved_by', 'approved_at', 'created_at'],
+};
+
+function openRowJournal(db) {
+  const entry = (collection, row) => ({ collection, entity: row[columns[collection][0]], row });
+  const journal = openSqliteLedgerJournal(db, append => {
+    for (const collection of Object.keys(columns)) {
+      for (const row of db.prepare(`SELECT * FROM ${collection} ORDER BY rowid`).iterate()) {
+        append(entry(collection, row));
+      }
+    }
+  });
+
+  const projections = new Map(Object.entries(columns).map(([table, keys]) => [table, db.prepare(
+    `INSERT INTO ${table} (${keys}) VALUES (${keys.map(() => '?')}) ON CONFLICT(${keys[0]}) DO UPDATE SET
+     ${keys.slice(1).map(k => `${k}=excluded.${k}`)}`)]));
+  const sqlRow = row => Object.assign(Object.create(null), row);
+  return {
+    write: fn => journal.write(append => fn((collection, row) => {
+      append(entry(collection, row));
+      projections.get(collection).run(...columns[collection].map(k => row[k]));
+      return sqlRow(row);
+    })),
+    get(collection, id) {
+      const record = journal.get(collection, id);
+      return record && sqlRow(record.row);
+    },
+    rows(collection) {
+      // Stable sort preserves insertion (v1 rowid) order for equal timestamps.
+      return journal.entries(collection).map(record => sqlRow(record.row)).sort((a, b) =>
+        a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0);
+    },
+  };
+}
 
 export function openUnifiedLedger(dbPath) {
   if (typeof dbPath !== 'string' || dbPath === '') throw err('unified_ledger_path_invalid');
@@ -92,10 +138,10 @@ export function openUnifiedLedger(dbPath) {
 
   const ensureOpen = () => { if (!open) throw err('unified_ledger_closed'); };
 
-  const getProposal = proposalId => db.prepare(
-    'SELECT * FROM decision_proposals WHERE proposal_id = ?').get(proposalId);
-
-  const getDecision = id => db.prepare('SELECT * FROM decisions WHERE id = ?').get(id);
+  let journal;
+  try { journal = openRowJournal(db); } catch (error) { db.close(); throw error; }
+  const getProposal = id => journal.get(PROPOSALS, id);
+  const getDecision = id => journal.get(DECISIONS, id);
 
   // Insert a candidate decision as a pending proposal. NEVER activates: the
   // only way into `decisions` is approveProposal with explicit owner approval.
@@ -108,12 +154,11 @@ export function openUnifiedLedger(dbPath) {
     const cleanApplicability = validateText(applicability, 'applicability');
     const proposer = validateActor(proposedBy, 'unified_ledger_input_invalid');
     const proposalId = randomUUID();
-    db.prepare(`INSERT INTO decision_proposals
-      (proposal_id, scope, topic, decision, rationale, applicability, proposed_by, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
-      .run(proposalId, scope, cleanTopic, cleanDecision, cleanRationale, cleanApplicability,
-        proposer, new Date().toISOString());
-    return getProposal(proposalId);
+    return journal.write(append => append(PROPOSALS, {
+      proposal_id: proposalId, scope, topic: cleanTopic, decision: cleanDecision, rationale: cleanRationale,
+      applicability: cleanApplicability, proposed_by: proposer, status: 'pending', rejected_by: null,
+      rejection_reason: null, created_at: new Date().toISOString(),
+    }));
   }
 
   // Atomically approve a pending proposal: the proposal flips to `approved`,
@@ -126,8 +171,7 @@ export function openUnifiedLedger(dbPath) {
     ensureOpen();
     const approver = validateActor(approvedBy, 'unified_ledger_approver_required');
     if (typeof proposalId !== 'string' || proposalId === '') throw err('unified_ledger_proposal_not_found');
-    db.exec('BEGIN IMMEDIATE');
-    try {
+    return journal.write(append => {
       const proposal = getProposal(proposalId);
       if (proposal === undefined) throw err('unified_ledger_proposal_not_found');
       if (proposal.status !== 'pending') throw err('unified_ledger_proposal_not_pending');
@@ -144,52 +188,30 @@ export function openUnifiedLedger(dbPath) {
       }
       const now = new Date().toISOString();
       const id = randomUUID();
-      db.prepare(`INSERT INTO decisions
-        (id, scope, topic, decision, rationale, applicability, status, superseded_by,
-         approved_by, approved_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?)`)
-        .run(id, proposal.scope, proposal.topic, decisionText, proposal.rationale,
-          proposal.applicability, approver, now, now);
-      db.prepare('UPDATE decision_proposals SET status = ? WHERE proposal_id = ?')
-        .run('approved', proposalId);
-      if (superseded !== null) {
-        db.prepare('UPDATE decisions SET status = ?, superseded_by = ? WHERE id = ?')
-          .run('superseded', id, superseded.id);
-      }
-      db.exec('COMMIT');
-      return getDecision(id);
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
+      const active = append(DECISIONS, { id, scope: proposal.scope, topic: proposal.topic,
+        decision: decisionText, rationale: proposal.rationale, applicability: proposal.applicability,
+        status: 'active', superseded_by: null, approved_by: approver, approved_at: now, created_at: now });
+      append(PROPOSALS, { ...proposal, status: 'approved' });
+      if (superseded !== null) append(DECISIONS, { ...superseded, status: 'superseded', superseded_by: id });
+      return active;
+    });
   }
 
   // Reject a pending proposal. Rejected proposals never enter `decisions` and
   // can no longer be approved — the status transition is one-way. The update
-  // is atomic: BEGIN IMMEDIATE plus a status-guarded UPDATE verified by the
-  // changes count, so a concurrent approve+reject cannot split-brain the
-  // proposal into two terminal states.
+  // is atomic: the pending check and append share the write lock, so a
+  // concurrent approve+reject cannot give the proposal two terminal states.
   function rejectProposal(proposalId, { rejectedBy, reason } = {}) {
     ensureOpen();
     const rejector = validateActor(rejectedBy, 'unified_ledger_input_invalid');
     if (typeof proposalId !== 'string' || proposalId === '') throw err('unified_ledger_proposal_not_found');
     const cleanReason = validateText(reason, 'reason');
-    db.exec('BEGIN IMMEDIATE');
-    try {
+    return journal.write(append => {
       const proposal = getProposal(proposalId);
       if (proposal === undefined) throw err('unified_ledger_proposal_not_found');
       if (proposal.status !== 'pending') throw err('unified_ledger_proposal_not_pending');
-      const result = db.prepare(
-        `UPDATE decision_proposals SET status = ?, rejected_by = ?, rejection_reason = ?
-         WHERE proposal_id = ? AND status = 'pending'`)
-        .run('rejected', rejector, cleanReason, proposalId);
-      if (Number(result.changes) !== 1) throw err('unified_ledger_proposal_not_pending');
-      db.exec('COMMIT');
-      return getProposal(proposalId);
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
+      return append(PROPOSALS, { ...proposal, status: 'rejected', rejected_by: rejector, rejection_reason: cleanReason });
+    });
   }
 
   // Pending proposals in deterministic submission order, oldest first. This
@@ -197,9 +219,7 @@ export function openUnifiedLedger(dbPath) {
   // reappear here.
   function listPendingProposals() {
     ensureOpen();
-    return db.prepare(
-      `SELECT * FROM decision_proposals WHERE status = 'pending'
-       ORDER BY created_at ASC, rowid ASC`).all();
+    return journal.rows(PROPOSALS).filter(row => row.status === 'pending');
   }
 
   // Read-only view for leads/workers: ONLY `active` decisions whose scope is
@@ -222,10 +242,7 @@ export function openUnifiedLedger(dbPath) {
       }
       for (const area of areas) scopes.push(area.startsWith('area:') ? area : `area:${area}`);
     }
-    const placeholders = scopes.map(() => '?').join(', ');
-    const rows = db.prepare(
-      `SELECT * FROM decisions WHERE status = 'active' AND scope IN (${placeholders})
-       ORDER BY created_at ASC, rowid ASC`).all(...scopes);
+    const rows = journal.rows(DECISIONS).filter(row => row.status === 'active' && scopes.includes(row.scope));
     let filtered = rows;
     if (query !== undefined && query !== null && query !== '') {
       if (typeof query !== 'string') throw err('unified_ledger_input_invalid');
@@ -305,7 +322,7 @@ export function openUnifiedLedger(dbPath) {
       markdown = header + included.join('') + notice;
       ids = includedIds;
     }
-    const digest = createHash('sha256').update(markdown).digest('hex');
+    const digest = ledgerTextDigest(markdown);
     return { markdown, digest, truncated, total: rows.length, ids };
   }
 

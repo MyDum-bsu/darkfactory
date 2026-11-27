@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { recordDigest } from './decision-ledger.mjs';
 import { openUnifiedLedger } from './unified-ledger.mjs';
 
 function proposal(overrides = {}) {
@@ -199,6 +201,64 @@ test('ledger persists across close and reopen on a file-backed database', async 
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('v1 SQL rows seed the checksummed journal exactly once without changing IDs or pending order', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'ledger-v1-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'v1.sqlite');
+  const db = new DatabaseSync(path);
+  t.after(() => db.close());
+  db.exec(`CREATE TABLE decision_proposals (proposal_id TEXT PRIMARY KEY, scope TEXT, topic TEXT,
+    decision TEXT, rationale TEXT, applicability TEXT, proposed_by TEXT, status TEXT, rejected_by TEXT,
+    rejection_reason TEXT, created_at TEXT);
+    INSERT INTO decision_proposals VALUES ('b','global','first','B','','','p','pending',NULL,NULL,'2020-01-01'),
+    ('a','global','second','A','','','p','pending',NULL,NULL,'2020-01-01');
+    CREATE TABLE decisions (id TEXT PRIMARY KEY, scope TEXT, topic TEXT, decision TEXT, rationale TEXT,
+    applicability TEXT, status TEXT, superseded_by TEXT, approved_by TEXT, approved_at TEXT, created_at TEXT);
+    INSERT INTO decisions VALUES ('old','global','prior','original','','','active',NULL,'owner','2019','2019');`);
+  const pending = db.prepare('SELECT * FROM decision_proposals ORDER BY rowid').all();
+  const active = db.prepare('SELECT * FROM decisions').all();
+  const ledger = openUnifiedLedger(path);
+  t.after(() => ledger.close());
+  assert.deepEqual(ledger.listPendingProposals(), pending);
+  assert.deepEqual(ledger.queryRelevantDecisions(), active);
+  const newer = ledger.approveProposal('b', { approvedBy: 'owner', supersedesId: 'old' });
+  ledger.close();
+  const reopened = openUnifiedLedger(path);
+  t.after(() => reopened.close());
+  assert.deepEqual(reopened.listPendingProposals(), pending.slice(1));
+  assert.deepEqual(reopened.queryRelevantDecisions(), [newer]);
+  assert.deepEqual(db.prepare('SELECT * FROM decisions WHERE id=?').get(newer.id), newer);
+  const lines = db.prepare('SELECT line FROM ledger_records ORDER BY rowid').all();
+  assert.equal(lines.length, 6, 'three baseline rows plus three atomic approval changes');
+  for (const { line } of lines) {
+    assert.ok(line.endsWith('\n'));
+    const row = JSON.parse(line);
+    assert.equal(row.sha256, recordDigest(row));
+  }
+});
+
+test('a failed SQL projection rolls back the journal; a modified journal record fails closed', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'ledger-integrity-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'ledger.sqlite');
+  const ledger = openUnifiedLedger(path);
+  t.after(() => ledger.close());
+  const db = new DatabaseSync(path);
+  t.after(() => db.close());
+  const prop = ledger.proposeDecision(proposal());
+  db.exec(`CREATE TRIGGER refuse_approval BEFORE UPDATE ON decision_proposals
+    BEGIN SELECT RAISE(ABORT, 'projection refused'); END`);
+  assert.throws(() => ledger.approveProposal(prop.proposal_id, { approvedBy: 'owner' }), /projection refused/);
+  assert.deepEqual(ledger.listPendingProposals(), [prop]);
+  assert.deepEqual(ledger.queryRelevantDecisions(), []);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM ledger_records').get().n, 1);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM decisions').get().n, 0);
+  db.exec('DROP TRIGGER refuse_approval');
+  db.exec(`UPDATE ledger_records SET line=json_set(line, '$.row.decision', 'altered') || char(10)`);
+  assert.throws(() => ledger.listPendingProposals(), /decision_ledger_tampered/);
+  assert.throws(() => ledger.approveProposal(prop.proposal_id, { approvedBy: 'owner' }), /decision_ledger_tampered/);
 });
 
 test('invalid input is rejected fail-closed and closed ledger refuses operations', () => {
