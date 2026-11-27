@@ -10,9 +10,15 @@ import {
   detectStalledReview,
   evaluateAutoApprove,
   findingSignatureSha,
+  isNeonArbiter,
+  isOpusArbiter,
+  isSolArbiter,
   loadApprovalPolicy,
+  NEON_PI_ARBITER,
   normalizeSeverity,
+  OPUS_ARBITER,
   partitionFindingsBySeverity,
+  SOL_ARBITER,
 } from './review-policy.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -196,4 +202,55 @@ test('severity gating: P2/nit-only ESCALATE нейтрализуется так 
     { journal, taskId: '13', candidateSha: SHA, round: 1 });
   assert.equal(blocking.status, 'ESCALATE');
   assert.equal(blocking.verdict, 'REVIEW_ESCALATE');
+});
+
+// Board #11994: утверждённый арбитр Neon-reviewed маршрутов — Sol (openai)
+// или Opus (agy/claude-opus-5.5, anthropic) с reasoningLevel medium|high.
+// Допуск первого Anthropic-арбитра освобождает OpenAI-воркеров от конфликта
+// семейств: triad openai/google/anthropic остаётся строго независимой.
+test('Neon arbiter admission: Sol или Opus medium|high, прочее отклоняется', () => {
+  assert.deepEqual(OPUS_ARBITER, { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'medium' });
+  assert.equal(Object.isFrozen(OPUS_ARBITER), true);
+  for (const reasoningLevel of ['medium', 'high']) {
+    const sol = { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel };
+    const opus = { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel };
+    // Прежний допуск Sol-арбитра — без изменений.
+    assert.equal(isSolArbiter(sol), true);
+    assert.equal(isNeonArbiter(sol), true);
+    assert.equal(isOpusArbiter(sol), false);
+    // Новый допуск Opus-арбитра.
+    assert.equal(isOpusArbiter(opus), true);
+    assert.equal(isNeonArbiter(opus), true);
+    assert.equal(isSolArbiter(opus), false);
+  }
+  assert.equal(isNeonArbiter(SOL_ARBITER), true);
+  assert.equal(isNeonArbiter(OPUS_ARBITER), true);
+  // Неправильный/отсутствующий reasoningLevel, чужая модель или провайдер,
+  // pi-обёртки, строки и пустые формы — не утверждены.
+  for (const bad of [
+    { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'low' },
+    { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'xhigh' },
+    { provider: 'agy', model: 'claude-opus-5.5' },
+    { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'MEDIUM' },
+    { provider: 'agy', model: 'claude-opus-5.5x', reasoningLevel: 'medium' },
+    { provider: 'agy', model: 'gpt-6.2-sol', reasoningLevel: 'medium' },
+    { provider: 'AGY', model: 'claude-opus-5.5', reasoningLevel: 'medium' },
+    { provider: 'pi', model: 'agy/claude-opus-5.5', reasoningLevel: 'medium' },
+    { provider: 'anthropic', model: 'claude-opus-5.5', reasoningLevel: 'medium' },
+    { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'low' },
+    { provider: 'openai', model: 'gpt-6.2-sol' },
+    { provider: 'openai', model: 'gpt-6.2-astra', reasoningLevel: 'medium' },
+    { provider: 'pi', model: 'openai/gpt-6.2-sol', reasoningLevel: 'medium' },
+    NEON_PI_ARBITER,
+    { provider: 'google', model: 'gemini-4-neon', reasoningLevel: 'high' },
+    { provider: 'acp-devin', model: 'swe-2-high', reasoningLevel: 'medium' },
+    'agy/claude-opus-5.5',
+    {},
+    null,
+    undefined,
+  ]) {
+    assert.equal(isOpusArbiter(bad), false, JSON.stringify(bad));
+    assert.equal(isSolArbiter(bad), false, JSON.stringify(bad));
+    assert.equal(isNeonArbiter(bad), false, JSON.stringify(bad));
+  }
 });

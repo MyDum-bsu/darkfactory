@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { hostAgyTransport } from './agy-transport.mjs';
-import { defaultReviewRoles, NEON_CRITIC, NEON_PI_ARBITER, PI_SOL_CRITIC,
+import { defaultReviewRoles, NEON_CRITIC, NEON_PI_ARBITER, OPUS_ARBITER, PI_SOL_CRITIC,
   SOL_ARBITER } from './review-policy.mjs';
 import { operatorReviewSetup } from './review-setup.mjs';
 
@@ -202,4 +202,81 @@ test('headless DF_AGY_OAUTH_TOKEN_FILE enrolls Neon, enforces 0600, and revokes 
     }),
     err => err?.reason === 'agy_oauth_token_not_enrolled',
   );
+});
+
+// Board #11994: first-class OpenAI-воркер (pi + openai/gpt-6.2-astra) на
+// Neon-reviewed маршруте. Sol-арбитр (openai) конфликтует с исполнителем по
+// семейству, поэтому утверждён Opus-арбитр (agy/claude-opus-5.5, anthropic) —
+// триада openai/google/anthropic остаётся строго независимой.
+const PI_ASTRA = { provider: 'pi', model: 'openai/gpt-6.2-astra' };
+
+test('OpenAI-воркер + Neon-критик + Opus-арбитр допускается (строгая триада)', async t => {
+  const skillPath = await skillFiles(t);
+  const env = { DF_AGY_KEYRING_ITEM: KEYRING };
+  for (const reasoningLevel of ['medium', 'high']) {
+    const arbiter = { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel };
+    const policy = policyOf(NEON, { bb: PI_ASTRA, arbiter, reviewSkillFiles: { logika: skillPath } });
+    const setup = await operatorReviewSetup(policy, { env });
+    assert.equal(setup.neon, true);
+    assert.deepEqual(setup.arbiter, arbiter);
+    assert.deepEqual(setup.critic, NEON);
+    assert.deepEqual(setup.skillPaths, [skillPath]);
+  }
+  // Экспортируемая константа OPUS_ARBITER (medium) — тот же допуск.
+  const setup = await operatorReviewSetup(
+    policyOf(NEON, { bb: PI_ASTRA, arbiter: OPUS_ARBITER, reviewSkillFiles: { logika: skillPath } }), { env });
+  assert.deepEqual(setup.arbiter, OPUS_ARBITER);
+  // Opus-арбитр не привязан к openai-исполнителю: cognition-воркер под Neon
+  // с Opus — тоже строгая триада (cognition/google/anthropic).
+  const cognition = await operatorReviewSetup(
+    policyOf(NEON, { arbiter: OPUS_ARBITER, reviewSkillFiles: { logika: skillPath } }), { env });
+  assert.equal(cognition.neon, true);
+  assert.deepEqual(cognition.arbiter, OPUS_ARBITER);
+  // Прежнее поведение сохраняется: cognition-воркер + Neon + Sol проходит.
+  const legacy = await operatorReviewSetup(
+    policyOf(NEON, { arbiter: SOL_ARBITER, reviewSkillFiles: { logika: skillPath } }), { env });
+  assert.deepEqual(legacy.arbiter, SOL_ARBITER);
+});
+
+test('OpenAI-воркер + Neon-критик + Sol-арбитр отклоняется: arbiter_family_not_independent', async t => {
+  const skillPath = await skillFiles(t);
+  const env = { DF_AGY_KEYRING_ITEM: KEYRING };
+  // Явно закреплённый Sol-арбитр — тот же отказ, что и до допуска Opus:
+  // семейство openai совпадает с семейством исполнителя.
+  for (const arbiter of [SOL_ARBITER, { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'high' }]) {
+    const policy = policyOf(NEON, { bb: PI_ASTRA, arbiter, reviewSkillFiles: { logika: skillPath } });
+    await assert.rejects(operatorReviewSetup(policy, { env }),
+      e => e.reason === 'arbiter_family_not_independent');
+  }
+  // Дефолтный (незакреплённый) арбитр Neon-маршрута — Sol: для OpenAI-воркера
+  // он отклоняется той же независимостью триады, молчаливого ослабления нет.
+  const unpinned = policyOf(NEON, { bb: PI_ASTRA, reviewSkillFiles: { logika: skillPath } });
+  await assert.rejects(operatorReviewSetup(unpinned, { env }),
+    e => e.reason === 'arbiter_family_not_independent');
+});
+
+test('Neon-маршрут: неутверждённый арбитр отклоняется прежней ошибкой допуска', async t => {
+  const skillPath = await skillFiles(t);
+  const env = { DF_AGY_KEYRING_ITEM: KEYRING };
+  const unapproved = [
+    // Формально независимое семейство, но не Sol и не Opus — допуска нет.
+    { provider: 'acp-devin', model: 'swe-2-high', reasoningLevel: 'medium' },
+    { provider: 'deepseek', model: 'deepseek-v4', reasoningLevel: 'medium' },
+    // Opus-модель вне agy-провайдера или с неподходящим reasoningLevel.
+    { provider: 'pi', model: 'agy/claude-opus-5.5', reasoningLevel: 'medium' },
+    { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'low' },
+    { provider: 'agy', model: 'claude-opus-5.5' },
+    // Прочие формы: Astra, сам Neon, произвольный и пустой спеки.
+    { provider: 'openai', model: 'gpt-6.2-astra', reasoningLevel: 'medium' },
+    NEON_PI_ARBITER,
+    { provider: 'unknown', model: 'mystery', reasoningLevel: 'medium' },
+    {},
+  ];
+  for (const arbiter of unapproved) {
+    for (const bb of [BB, PI_ASTRA]) {
+      const policy = policyOf(NEON, { bb, arbiter, reviewSkillFiles: { logika: skillPath } });
+      await assert.rejects(operatorReviewSetup(policy, { env }),
+        /Neon requires a subject-bound queue route, fingerprinted policy and Sol arbiter/);
+    }
+  }
 });
