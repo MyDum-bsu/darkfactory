@@ -71,6 +71,9 @@ function permissionArguments(spec, permissionMode) {
   if (spec.command === 'agy') {
     return mode === 'full' ? ['--dangerously-skip-permissions'] : ['--mode', 'accept-edits'];
   }
+  if (spec.command === 'pi') {
+    return ['--approve'];
+  }
   return [];
 }
 

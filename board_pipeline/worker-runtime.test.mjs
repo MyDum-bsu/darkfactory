@@ -53,6 +53,19 @@ test('executor command builders map devin, pi and agy to safe argv arrays', () =
     { prompt, permissionMode: 'full' });
   assert.deepEqual(agyFull.argv, ['--model', 'gemini-4-neon', '--dangerously-skip-permissions',
     '--prompt-interactive', '--', prompt]);
+  // pi 1.6+ спрашивает "Trust project folder?" в интерактиве; --approve снимает
+  // блокирующий промпт для автономного воркера, как --respect-workspace-trust false у devin.
+  const piFull = buildExecutorCommand({ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
+    { prompt, permissionMode: 'full' });
+  assert.deepEqual(piFull.argv, ['--model', 'opencode-go/deepseek-v4.1-flash', '--approve',
+    '--', prompt]);
+  const piEdits = buildExecutorCommand({ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
+    { prompt, permissionMode: 'accept-edits', interactive: false });
+  assert.deepEqual(piEdits.argv, ['--model', 'opencode-go/deepseek-v4.1-flash', '--approve',
+    '--print', '--', prompt]);
+  assert.equal(pi.argv.includes('--approve'), false);
+  assert.throws(() => buildExecutorCommand({ provider: 'pi', model: 'x' },
+    { prompt, permissionMode: 'smart' }), /permission_mode_invalid/);
   assert.throws(() => buildExecutorCommand({ provider: 'acp-devin', model: 'swe-2-1-medium' },
     { prompt, permissionMode: 'smart' }), /permission_mode_invalid/);
   for (const built of [devin, pi, agy]) {
@@ -76,6 +89,10 @@ test('resume command builders preserve executor flags and session continuation c
   const pi = buildResumeCommand({ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash', effort: 'medium' },
     { prompt: 'continue WIP', interactive: false });
   assert.deepEqual(pi.argv, ['--model', 'opencode-go/deepseek-v4.1-flash', '--thinking', 'medium',
+    '--continue', '--print', '--', 'continue WIP']);
+  const piApproved = buildResumeCommand({ provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' },
+    { prompt: 'continue WIP', permissionMode: 'full', interactive: false });
+  assert.deepEqual(piApproved.argv, ['--model', 'opencode-go/deepseek-v4.1-flash', '--approve',
     '--continue', '--print', '--', 'continue WIP']);
   const agy = buildResumeCommand({ provider: 'acp-antigravity-acp', model: 'gemini-4-neon', effort: 'high' },
     { sessionId: 'conv-1', prompt: 'continue WIP', permissionMode: 'full', interactive: false });
