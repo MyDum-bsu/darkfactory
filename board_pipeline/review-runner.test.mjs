@@ -1578,3 +1578,94 @@ process.exit(0);
     await rm(scratch, { recursive: true, force: true });
   }
 });
+
+test('fingerprint: live git status/diff use hardened args and isolated git configuration', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'fp-hardened-'));
+  const envKeys = ['PATH', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'REAL_GIT', 'GIT_SHIM_LOG'];
+  const oldEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+  t.after(() => {
+    for (const key of envKeys) {
+      if (oldEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = oldEnv[key];
+    }
+  });
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const repo = join(root, 'repo');
+  const attack = join(root, 'attack');
+  const bin = join(root, 'bin');
+  await mkdir(bin, { recursive: true });
+  await mkdir(attack, { recursive: true });
+  await mkdir(repo, { recursive: true });
+  const realGit = (await exec('sh', ['-c', 'command -v git'], { timeout: 15_000 })).stdout.trim();
+  const git = async (...args) =>
+    (await exec('git', ['-C', repo, ...args], { timeout: 15_000 })).stdout.trim();
+  await git('init', '-q', '-b', 'pilot');
+  await git('config', 'user.email', 't@l');
+  await git('config', 'user.name', 't');
+  await writeFile(join(repo, 'a.txt'), 'one\n');
+  await git('add', 'a.txt');
+  await git('commit', '-qm', 'init');
+  await writeFile(join(repo, 'a.txt'), 'two\n');
+
+  const markerFs = join(attack, 'fsmonitor-ran');
+  const markerDiff = join(attack, 'external-diff-ran');
+  const evilFsmonitor = join(attack, 'evil-fsmonitor.sh');
+  const evilDiff = join(attack, 'evil-diff.sh');
+  await writeFile(evilFsmonitor, `#!/bin/sh\necho x >> "${markerFs}"\nexit 1\n`, { mode: 0o755 });
+  await writeFile(evilDiff, `#!/bin/sh\necho x >> "${markerDiff}"\nexit 0\n`, { mode: 0o755 });
+  await git('config', 'core.fsmonitor', evilFsmonitor);
+  await git('config', 'diff.external', evilDiff);
+  await exec('git', ['-C', repo, 'status', '--porcelain'], { timeout: 15_000 });
+  await exec('git', ['-C', repo, 'diff', 'HEAD'], { timeout: 15_000 }).catch(() => {});
+  assert.ok(await lstat(markerFs).catch(() => null) !== null,
+    'control: unhardened status did not execute core.fsmonitor');
+  assert.ok(await lstat(markerDiff).catch(() => null) !== null,
+    'control: unhardened diff did not execute diff.external');
+  await rm(markerFs, { force: true });
+  await rm(markerDiff, { force: true });
+
+  const log = join(attack, 'git-calls.ndjson');
+  const shim = join(bin, 'git');
+  await writeFile(shim, `#!/usr/bin/env node
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+fs.appendFileSync(process.env.GIT_SHIM_LOG, JSON.stringify({
+  args: process.argv.slice(2),
+  env: {
+    GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+    GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM,
+  },
+}) + '\\n');
+const result = spawnSync(process.env.REAL_GIT, process.argv.slice(2), {
+  stdio: 'inherit', env: process.env,
+});
+process.exit(result.status ?? 1);
+`, { mode: 0o755 });
+  process.env.PATH = `${bin}:${oldEnv.PATH ?? ''}`;
+  process.env.REAL_GIT = realGit;
+  process.env.GIT_SHIM_LOG = log;
+  process.env.GIT_CONFIG_GLOBAL = join(attack, 'attacker-global.gitconfig');
+  process.env.GIT_CONFIG_NOSYSTEM = '0';
+
+  const fingerprint = await worktreeFingerprint(repo);
+  assert.match(fingerprint.head, /^[a-f0-9]{40}$/);
+  assert.equal(await lstat(markerFs).catch(() => null), null,
+    'hardened live status executed core.fsmonitor');
+  assert.equal(await lstat(markerDiff).catch(() => null), null,
+    'hardened live diff executed diff.external');
+
+  const entries = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.ok(entries.length > 0, 'git shim saw no calls');
+  const hardening = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    '-c', 'diff.external='];
+  for (const entry of entries) {
+    assert.deepEqual(entry.args.slice(0, hardening.length), hardening);
+    assert.equal(entry.env.GIT_CONFIG_GLOBAL, '/dev/null');
+    assert.equal(entry.env.GIT_CONFIG_NOSYSTEM, '1');
+  }
+  assert.ok(entries.some(entry => entry.args.includes('status')),
+    'worktree fingerprint did not inspect live status');
+  assert.ok(entries.some(entry => entry.args.includes('diff')),
+    'worktree fingerprint did not inspect the live diff');
+});

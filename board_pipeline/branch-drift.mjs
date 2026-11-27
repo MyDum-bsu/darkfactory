@@ -12,8 +12,16 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
+const GIT_HARDENING = Object.freeze([
+  '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'diff.external=',
+]);
+const hardenedGitArgs = args =>
+  GIT_HARDENING.every((value, index) => args[index] === value) ? args : [...GIT_HARDENING, ...args];
+
 const defaultExecGit = async (args, cwd) =>
-  (await execFileAsync('git', args, { cwd, timeout: 20_000 })).stdout;
+  (await execFileAsync('git', hardenedGitArgs(args), { cwd, timeout: 20_000,
+    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+  })).stdout;
 
 const BB_THREAD_BRANCH = /^bb\/thr_[a-z0-9]+/;
 const HC_WORKER_BRANCH = /^(?:feat\/)?df-[^/]+/;
@@ -95,7 +103,7 @@ export async function inspectWorktreesAndBranches({
   const bbThreadWorktrees = [];
   const workerWorktrees = [];
   for (const wt of worktrees) {
-    const statusText = await execGit(['status', '--porcelain'], wt.path)
+    const statusText = await execGit(hardenedGitArgs(['status', '--porcelain']), wt.path)
       .catch(() => null);
     // Worktree недоступен/удалён из-под git — считаем грязным (fail-closed).
     const dirtyFiles = statusText === null ? ['<status_unavailable>']
@@ -128,8 +136,8 @@ export async function inspectWorktreesAndBranches({
     // -z: NUL-разделённые сырые пути без quoting — переименованные файлы и
     // имена с переводами строк/кавычками не могут уйти от детекции дрейфа;
     // --no-renames: rename не схлопывается в 'old => new', оба пути видимы.
-    const diffText = await execGit(['diff', '--no-renames', '--name-only', '-z',
-      `${baseRef}...${branch}`, '--'], repoDir).catch(() => null);
+    const diffText = await execGit(hardenedGitArgs(['diff', '--no-renames', '--name-only', '-z',
+      `${baseRef}...${branch}`, '--']), repoDir).catch(() => null);
     const files = diffText === null ? ['<diff_unavailable>'] : diffText.split('\0').filter(Boolean);
     // diff недоступен → считаем пересечением (fail-closed), не тихий ok:true.
     const intersects = diffText === null || touchPaths.length === 0 ||
