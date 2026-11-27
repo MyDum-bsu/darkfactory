@@ -331,7 +331,6 @@ test('subproc feedback starts a structured continuation turn and stop signals an
   children[1].kill = signal => {
     children[1].killed = signal;
     setTimeout(() => children[1].emit('exit', null, 'SIGTERM'), 2);
-    return true;
   };
   assert.deepEqual(await runtime.stop({ runtimeId: spawned.runtimeId }),
     { stopped: true, state: 'exited', signal: 'SIGTERM' });
@@ -361,7 +360,6 @@ test('subproc stop falls back to SIGKILL when SIGTERM is ignored', async () => {
   child.kill = signal => {
     signals.push(signal);
     if (signal === 'SIGKILL') setTimeout(() => child.emit('exit', null, 'SIGKILL'), 2);
-    return true;
   };
   const outcome = await runtime.stop({ runtimeId: spawned.runtimeId });
   assert.deepEqual(signals, ['SIGTERM', 'SIGKILL'], 'SIGKILL только после игнорированного SIGTERM');
@@ -380,7 +378,7 @@ test('subproc stop reports stopped false when the child never exits', async t =>
   const spawned = await runtime.spawn({ ...SPAWN,
     executor: { provider: 'pi', model: 'opencode-go/deepseek-v4.1-flash' } });
   const signals = [];
-  children[0].kill = signal => { signals.push(signal); return true; };
+  children[0].kill = signal => { signals.push(signal); };
   const outcome = await runtime.stop({ runtimeId: spawned.runtimeId });
   assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
   assert.equal(outcome.stopped, false, 'неподтверждённый выход — stopped: false, а не отправка сигнала');

@@ -2009,8 +2009,7 @@ test('checking phase persists validated submission notes and dispute in the dura
   await x.tick();
   const envelopes = [];
   x.cfg.submissions = { async read(attempt, after) {
-    if (after >= 1) return;
-    return { turnSeq: 1, submission: {
+    if (after < 1) return { turnSeq: 1, submission: {
       task_id: attempt.task_id, epoch: attempt.epoch, attempt_id: attempt.attempt_id,
       worker_thread_id: attempt.bb_thread_id, candidate_sha: 'c'.repeat(40),
       notes: ['postоронняя\u0007 находка   с\tпробелами'],
@@ -2051,7 +2050,6 @@ test('a checking round without notes or dispute clears the pinned values of the 
     if (round === 2 && after === 1) {
       return { turnSeq: 2, submission: envelope(attempt, 'c'.repeat(40)) };
     }
-    return undefined;
   } };
   const snapshots = [];
   const save0 = x.cfg.state.save;
