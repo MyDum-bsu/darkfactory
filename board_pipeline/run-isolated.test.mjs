@@ -16,6 +16,29 @@ import { deterministicRuntimeId } from './worker-runtime.mjs';
 import { DEFAULT_ARBITER, DEFAULT_CRITIC, PRIMARY_WORKER, resolveTriad } from './worker-selector.mjs';
 import { arbiterIntakePrompt, workerIntakePrompt } from './intake-prompt.mjs';
 
+test('run-isolated preserves the public bindings of the split modules', async () => {
+  const root = await import('./run-isolated.mjs');
+  const transport = await import('./run-transport.mjs');
+  const adaptive = await import('./run-adaptive.mjs');
+  for (const [module, names] of [
+    [transport, ['buildWorkerTransport', 'readSubmissionEnvelope', 'allowedPathsFromLabels',
+      'allowedPathsFromAttempt', 'scopeFenceReworkResult', 'queueModeSpecInputs',
+      'resolveWorkerRuntimeKind', 'assertSubprocLiveAllowed']],
+    [adaptive, ['planAdaptiveChecks', 'filterAdaptiveTelemetry', 'adaptiveLocalPlanCore',
+      'hardenedGitEnv', 'ancestorOrNull', 'shouldStopWorkerOnShutdown', 'candidatePinRef',
+      'resetQueueWorktree', 'recordPostReviewMemory', 'isApprovedWorker', 'baseWorkerFromPolicy']],
+  ]) {
+    for (const name of names) {
+      assert.equal(typeof module[name], 'function', name);
+      assert.equal(root[name], module[name], name);
+    }
+  }
+  for (const name of ['HARDENED_GIT_CONFIG', 'QUEUE_CHECKOUT_QUARANTINE']) {
+    assert.ok(Object.hasOwn(adaptive, name), name);
+    assert.equal(root[name], adaptive[name], name);
+  }
+});
+
 test('isApprovedWorker accepts SWE-2.1 implementation workers and legacy SWE-2 High', () => {
   for (const model of ['swe-2-1-medium', 'swe-2-1-high', 'swe-2-1-xhigh', 'swe-2-1-max']) {
     assert.equal(isApprovedWorker({ provider: 'acp-devin', model }), true);
