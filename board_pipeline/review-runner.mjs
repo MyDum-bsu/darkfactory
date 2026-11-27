@@ -1255,6 +1255,7 @@ const PROVIDER_EGRESS = new Map([
   ['glm', ['open.bigmodel.cn:443']],
   ['cognition', ['api.cognition.ai:443']],
   ['opencode-go', ['opencode.ai:443']],
+  ['agy', ['daily-cloudcode-pa.googleapis.com:443']],
 ]);
 
 // Спек критика/арбитра в форме, реально исполняемой L2-раннером, либо

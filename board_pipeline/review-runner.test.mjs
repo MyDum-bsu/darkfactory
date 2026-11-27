@@ -11,6 +11,7 @@ import {
   executorFamily, assertCrossFamily, parseReviewTranscript, parseReviewVerdict,
   hasValidFinding, isolatedArbiterRunner, isolatedPiReviewRunner, runInReadOnlySandbox, snapshotDigest,
   worktreeFingerprint, assertToolsAllowed, ReviewDenied, REVIEW_IMAGE, l2CriticSpec,
+  runnerReviewSpec,
 } from './review-runner.mjs';
 import { isNeonReview } from './review-policy.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
@@ -1304,6 +1305,40 @@ test('l2CriticSpec: google-критик без reasoningLevel наследует
 
   // Неисполняемый спек — null.
   assert.equal(l2CriticSpec({ provider: 'acp-devin', model: 'swe-2-high' }), null);
+});
+
+test('runnerReviewSpec: agy-арбитр исполняем, неизвестные провайдеры отклоняются', () => {
+  // agy (Anthropic Claude Opus 5.5) — escalation-слот Routing Policy v2 на
+  // Neon-роутах OpenAI/Astra: у провайдера есть egress-endpoint, спек
+  // нормализуется к исполняемой форме вместо null
+  // (route_base_arbiter_not_runnable при запуске pi + openai/gpt-6.2-astra).
+  const spec = { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'high' };
+  const runnable = runnerReviewSpec(spec);
+  assert.notEqual(runnable, null);
+  assert.equal(runnable.provider, 'agy');
+  assert.equal(runnable.model, 'claude-opus-5.5');
+  assert.equal(runnable.reasoningLevel, 'high');
+  // Входной объект не мутируется, повторный вызов детерминирован.
+  assert.deepEqual(spec, { provider: 'agy', model: 'claude-opus-5.5', reasoningLevel: 'high' });
+  assert.deepEqual(runnerReviewSpec(spec), runnable);
+
+  // Неизвестные провайдеры и сырой anthropic по-прежнему неисполняемы.
+  for (const bad of [
+    { provider: 'vendor', model: 'claude-opus-5.5', reasoningLevel: 'high' },
+    { provider: 'anthropic', model: 'claude-opus-5.5', reasoningLevel: 'high' },
+    { provider: 'acp-devin', model: 'swe-2-high' },
+    { provider: 'AGY', model: 'claude-opus-5.5' },
+  ]) {
+    assert.equal(runnerReviewSpec(bad), null, JSON.stringify(bad));
+  }
+  // Пустой и вырожденный вход — null, без исключений.
+  for (const degenerate of [null, undefined, {}, [], 'agy', 42,
+    { model: 'claude-opus-5.5' }, { provider: null, model: 'm' }]) {
+    assert.equal(runnerReviewSpec(degenerate), null, JSON.stringify(degenerate));
+  }
+  // Спек без модели не отклоняется нормализацией — пустая модель ловится
+  // раннером (arbiter/review_profile_not_approved) на nonEmpty-проверке.
+  assert.deepEqual(runnerReviewSpec({ provider: 'agy' }), { provider: 'agy', model: undefined });
 });
 
 // --- P1: hardened diff generation, symlink unpack rejection, mount injection ---
