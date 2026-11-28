@@ -103,6 +103,132 @@ test('resume command builders preserve executor flags and session continuation c
     '--', 'continue WIP']);
 });
 
+test('zcode builds headless prompts and interactive turns for both provider aliases', () => {
+  const prompt = 'review this; $(stay literal)\nsecond line';
+  for (const [provider, model] of [
+    ['zcode', 'account:zai-individual-coding-plan/GLM-5.3-Flash'],
+    ['acp-zcode-start', 'account:zai-start-plan/GLM-5.3-Flash'],
+  ]) {
+    const spec = { provider, model: 'glm-5.3-flash', effort: 'high' };
+    const built = buildExecutorCommand(spec, { prompt, interactive: false, permissionMode: 'full' });
+    assert.equal(built.command, 'zcode');
+    assert.deepEqual(built.argv, ['--model', model, '--effort', 'high', '--mode', 'yolo', '-p', prompt]);
+    const tui = buildExecutorCommand(spec, { prompt, permissionMode: 'accept-edits' });
+    assert.deepEqual(tui.argv, ['--model', model, '--effort', 'high', '--mode', 'edit']);
+    assert.equal(tui.initialInput, prompt);
+    assert.deepEqual(buildExecutorCommand(spec, { prompt, interactive: false }).argv,
+      ['--model', model, '--effort', 'high', '--mode', 'guarded', '-p', prompt]);
+    assert.deepEqual(buildExecutorCommand(spec, { prompt: '--help', interactive: false, followUp: true,
+      permissionMode: 'accept-edits' }).argv.slice(-2), ['-c', '-p--help']);
+  }
+});
+
+test('zcode bare models use provider-specific default account prefixes', () => {
+  const prompt = 'route the model';
+  assert.deepEqual(buildExecutorCommand({ provider: 'acp-zcode-start', model: 'glm-5.3-flash' },
+    { prompt, interactive: false }).argv.slice(0, 2), ['--model', 'account:zai-start-plan/GLM-5.3-Flash']);
+  assert.deepEqual(buildExecutorCommand({ provider: 'zcode', model: 'glm-5.3-flash' },
+    { prompt, interactive: false }).argv.slice(0, 2), ['--model', 'account:zai-individual-coding-plan/GLM-5.3-Flash']);
+});
+
+test('zcode explicit account-qualified models are validated and canonicalized', () => {
+  const prompt = 'route the explicit model';
+  assert.deepEqual(buildExecutorCommand({ provider: 'acp-zcode-start', model: 'account:zai-start-plan/GLM-5.3-Flash' },
+    { prompt, interactive: false }).argv.slice(0, 2), ['--model', 'account:zai-start-plan/GLM-5.3-Flash']);
+  assert.deepEqual(buildExecutorCommand({ provider: 'zcode', model: 'account:zai-individual-coding-plan/glm-5.3' },
+    { prompt, interactive: false }).argv.slice(0, 2), ['--model', 'account:zai-individual-coding-plan/GLM-5.3']);
+  assert.throws(() => buildExecutorCommand({ provider: 'acp-zcode-start', model: 'account:untrusted/GLM-5.3-Flash' },
+    { prompt, interactive: false }), /executor_model_invalid/);
+  assert.throws(() => buildExecutorCommand({ provider: 'zcode', model: 'account:zai-start-plan/glm-unknown' },
+    { prompt, interactive: false }), /executor_model_invalid/);
+});
+
+test('zcode resumes the named session or continues the latest in the worktree', () => {
+  const spec = { provider: 'zcode', model: 'GLM-5.3' };
+  const base = ['--model', 'account:zai-individual-coding-plan/GLM-5.3', '--mode', 'edit'];
+  const prompt = 'continue WIP';
+  assert.deepEqual(buildResumeCommand(spec, { sessionId: 'sess_123', prompt, permissionMode: 'accept-edits', interactive: false }).argv,
+    [...base, '--resume', 'sess_123', '-p', prompt]);
+  const resumed = buildResumeCommand(spec, { prompt, permissionMode: 'accept-edits' });
+  assert.deepEqual(resumed.argv, [...base, '-c']);
+  assert.equal(resumed.initialInput, prompt);
+  assert.throws(() => buildResumeCommand(spec, { prompt, sessionId: 'bad session' }), /session_id_invalid/);
+});
+
+test('hc delivers the zcode TUI prompt on spawn and resume to the launched address', async () => {
+  const prompt = 'implement the card\nwithout interpreting $HOME';
+  for (const method of ['spawn', 'resume']) {
+    const { calls, exec } = hcMock(async (_, argv) => ({ stdout: JSON.stringify(argv[0] === 'run' ? { address: 't7' } :
+      argv[0] === 'get' ? { state: 'live', argv: ['zcode'],
+        labels: { 'darkfactory.attempt': SPAWN.attemptId, 'darkfactory.executor': 'zcode' } } : { started: true }) }));
+    const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => prompt });
+    const launched = await runtime[method]({ ...SPAWN, executor: { provider: 'zcode', model: 'GLM-5.3-Flash' }, permissionMode: 'accept-edits' });
+    assert.equal(launched.terminalId, 't7');
+    assert.equal(calls[0].argv.includes(prompt), false);
+    assert.ok(calls[0].argv.includes('darkfactory.executor=zcode'));
+    assert.deepEqual(calls[1].argv, ['get', '--json', '--', 't7']);
+    assert.deepEqual(calls[2].argv, ['send', '--json', '--', 't7', prompt]);
+  }
+});
+
+test('hc refuses to deliver the zcode prompt to a terminal that is not the launched worker', async () => {
+  const prompt = 'implement the card';
+  for (const method of ['spawn', 'resume']) {
+    const { calls, exec } = hcMock(async (_, argv) => ({ stdout: JSON.stringify(argv[0] === 'run' ? { address: 't7' } :
+      argv[0] === 'get' ? { state: 'live', argv: ['/bin/bash'],
+        labels: { 'darkfactory.attempt': SPAWN.attemptId, 'darkfactory.executor': 'zcode' } } : { started: true }) }));
+    const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => prompt });
+    await assert.rejects(() => runtime[method]({ ...SPAWN, executor: { provider: 'zcode', model: 'GLM-5.3-Flash' },
+      permissionMode: 'accept-edits' }), /hc_prompt_target_mismatch/);
+    assert.equal(calls[0].argv[0], 'run');
+    assert.deepEqual(calls.slice(1).map(c => c.argv), ['get', 'kill', 'rm'].map(op => [op, '--json', '--', 't7']));
+  }
+});
+
+for (const stage of ['get', 'send']) {
+  test(`zcode launch cleanup preserves a ${stage} error even when kill and rm fail`, async () => {
+    const original = new Error(`${stage} failed`);
+    const { calls, exec } = hcMock(async (_, [op]) => {
+      if (op === stage) throw original;
+      if (op === 'run') return { stdout: JSON.stringify({ address: 't7' }) };
+      if (op === 'get') return { stdout: JSON.stringify({ state: 'live', argv: ['zcode'],
+        labels: { 'darkfactory.attempt': SPAWN.attemptId, 'darkfactory.executor': 'zcode' } }) };
+      throw new Error(`${op} failed during cleanup`);
+    });
+    const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => 'prompt' });
+    await assert.rejects(runtime.spawn({ ...SPAWN, executor: { provider: 'zcode', model: 'GLM-5.3' } }),
+      error => error === original);
+    assert.deepEqual(calls.map(c => c.argv[0]), ['run', 'get', ...(stage === 'send' ? ['send'] : []), 'kill', 'rm']);
+    assert.deepEqual(calls.slice(-2).map(c => c.argv), [['kill', '--json', '--', 't7'], ['rm', '--json', '--', 't7']]);
+  });
+}
+
+test('hc retires only a confirmed live shell replacement for a labeled worker', async () => {
+  const worker = (name, argv, foreground) => ({ state: 'live', address: 't9', labels: { 'darkfactory.executor': name }, argv, foreground });
+  for (const [terminal, respawned] of [
+    [worker('devin', ['/bin/bash'], { name: 'bash' }), true],
+    [worker('pi', ['sh']), true], [worker('agy', ['/bin/zsh'], { name: 'zsh' }), true],
+    [worker('zcode', ['bash'], null), true],
+    [worker('devin', ['devin', '--model', 'x'], { name: 'bash' }), false],
+    [worker('pi', ['/bin/bash'], { name: 'pi' }), false],
+    [worker('zcode', ['zcode'], { name: 'git' }), false],
+    [worker('agy', ['sh', '-c', 'agy'], { name: 'sh' }), false],
+    [worker('devin', ['bash'], { name: 'node' }), false],
+    [worker('pi', ['/tmp/bash'], null), false], [worker('bash', ['bash'], null), false],
+    [worker(undefined, ['bash'], null), false], [worker('devin', undefined, null), false],
+    [{ ...worker('pi', ['sh'], null), exit_code: 2 }, false],
+  ]) {
+    const { calls, exec } = hcMock(async (_, argv) => {
+      if (argv[0] === 'kill' && terminal.labels['darkfactory.executor'] === 'pi') throw new Error('already gone');
+      return { stdout: JSON.stringify(argv[0] === 'get' ? terminal : {}) };
+    });
+    const observed = await createWorkerRuntime({ kind: 'hc', exec }).observe({ runtimeId: 'worker-name' });
+    assert.deepEqual(observed, respawned ? { state: 'exited', exitCode: 137, missing: true, respawnedShell: true } :
+      terminal.exit_code ? { state: 'exited', exitCode: 2 } : { state: 'working' }, JSON.stringify(terminal));
+    assert.deepEqual(calls.filter(c => c.argv[0] === 'kill').map(c => c.argv), respawned ? [['kill', '--json', '--', 't9']] : []);
+  }
+});
+
 test('hc spawn uses run --bg --keep, labels, and a shell-free argv tail', async () => {
   const prompt = 'worker prompt with spaces; $(not_shell) `literal`';
   const { calls, exec } = hcMock(async () => ({ stdout: JSON.stringify({ address: 't7', pid: 123 }) }));
@@ -163,6 +289,23 @@ test('hc observe treats a finished terminal as exited even when its exit code is
   const runtime = createWorkerRuntime({ kind: 'hc', exec });
   assert.deepEqual(await runtime.observe({ runtimeId: 't9' }),
     { state: 'exited', exitCode: 2, tail: 'failure tail' });
+});
+
+test('hc observe reports a vanished terminal only for an explicit negative get response', async () => {
+  const runtimeId = 'df-gone';
+  for (const stderr of ['{"error":{"kind":"not_found"}}', 'not_found', 'hc: no terminal "df-gone"']) {
+    const { calls, exec } = hcMock(() => { throw Object.assign(new Error('hc get exited 3'), { code: 3, stderr }); });
+    const observed = await createWorkerRuntime({ kind: 'hc', exec }).observe({ runtimeId });
+    assert.deepEqual(observed, { state: 'exited', exitCode: 137, missing: true });
+    assert.ok(Object.isFrozen(observed));
+    assert.deepEqual(calls.map(c => c.argv), [['get', '--json', '--', runtimeId]]);
+  }
+  for (const error of [new Error('connection refused'), new Error('no terminal response from daemon'),
+    Object.assign(new Error('get timed out'), { killed: true, signal: 'SIGTERM', stderr: 'no terminal' }),
+    Object.assign(new Error('unknown hc failure'), { stderr: '{"error":{"kind":"transport","detail":"not_found"}}' })]) {
+    const { exec } = hcMock(() => { throw error; });
+    await assert.rejects(createWorkerRuntime({ kind: 'hc', exec }).observe({ runtimeId }), e => e === error);
+  }
 });
 
 test('hc observe keeps a valid hc get result when hc read fails transiently', async () => {
@@ -516,6 +659,20 @@ test('hc resume under an existing runtimeId removes the dead terminal before re-
   const separator = calls[3].argv.indexOf('--');
   assert.deepEqual(calls[3].argv.slice(separator + 1), ['devin', '--model', 'swe-2-1-medium',
     '-r', 'ses-7', '--prompt-file', '/tmp/prompt.md']);
+});
+
+test('hc resume stops and removes a live replacement shell before reusing the worker name', async () => {
+  const runtimeId = 'df-3840-d0d63638ee';
+  const { calls, exec } = hcMock(async (_, [op]) => ({ stdout: JSON.stringify(op === 'get' ?
+    { state: 'live', address: 't-old', argv: ['/bin/bash'], foreground: { name: 'bash' },
+      labels: { 'darkfactory.executor': 'devin' } } : op === 'run' ? { address: 't-new' } : {}) }));
+  const runtime = createWorkerRuntime({ kind: 'hc', exec, readFile: async () => 'prompt' });
+  const resumed = await runtime.resume({ ...SPAWN, runtimeId });
+  assert.equal(resumed.terminalId, 't-new');
+  assert.deepEqual(calls.slice(0, 3).map(c => c.argv), [['get', '--json', '--', runtimeId],
+    ['kill', '--json', '--', 't-old'], ['rm', '--json', '--', 't-old']]);
+  assert.deepEqual(calls.map(c => c.argv[0]), ['get', 'kill', 'rm', 'run']);
+  assert.deepEqual(calls[3].argv.slice(7, 9), ['--name', runtimeId]);
 });
 
 test('hc resume never clobbers a live terminal under the same name', async () => {

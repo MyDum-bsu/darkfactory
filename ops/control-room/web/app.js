@@ -133,6 +133,8 @@ function opsMetric(label, value, sub, cls) {
   return node;
 }
 
+const creditSources = finops => [...new Set((finops?.cloudCredits ?? []).map(c => c.source ?? 'unknown'))].join(' / ') || 'unknown';
+
 function renderOpsSummary(snap) {
   const box = $('ops-summary');
   box.replaceChildren();
@@ -151,7 +153,7 @@ function renderOpsSummary(snap) {
     opsMetric('Раунды', String(rounds), `rework ${trees.reduce((sum, tree) => sum + (tree.reworkRounds ?? 0), 0)}`),
     opsMetric('Ревью в работе', String(reviews), 'L2 critic + arbiter', reviews ? 'warn' : null),
     opsMetric('Burn rate', burn ? `$${burn.toFixed(2)}/h` : '—', 'оценка активных воркеров', burn ? 'warn' : null),
-    opsMetric('GCP credits', credits == null ? '—' : eur(credits), 'остаток по FinOps', credits ? 'ok' : null),
+    opsMetric('GCP credits', credits == null ? '—' : eur(credits), creditSources(snap.finops), credits ? 'ok' : null),
     opsMetric('Изоляция repo slots', `${slotCount}/repo ≤ 1`, warnings ? `${warnings} конфликт(а)` : 'по одному писателю', warnings ? 'bad' : 'ok'),
   );
 }
@@ -227,10 +229,21 @@ function treeCard(tree) {
     kpis.append(kpi);
   }
   node.append(kpis);
-  node.append(workerNode(tree.worker ?? {}));
+  const worker = workerNode(tree.worker ?? {});
+  if (tree.worker?.teamlead) {
+    const lead = el('section', 'teamlead');
+    lead.append(el('h4', null, `Teamlead · ${tree.worker.teamlead}`), worker);
+    node.append(lead);
+  } else node.append(worker);
   const stages = el('ol', 'stage-list');
   for (const stage of tree.stages ?? []) stages.append(stageNode(stage));
-  node.append(stages);
+  if (tree.slot) {
+    const slot = el('section', 'slot');
+    slot.append(el('h4', null, `Slot ${tree.slot.slotId} · ${tree.slot.phase}`),
+      el('div', 'meta', `Herdr ${tree.slot.herdrSpaceId ?? '—'} · scope-lock owner ${tree.slot.scopeLockOwner ?? '—'}`),
+      stages, el('div', 'meta', `Merge Queue · depth ${tree.slot.mergeQueueDepth ?? '—'}`));
+    worker.append(slot);
+  } else node.append(stages);
   node.addEventListener('click', () => openInspect(tree.taskId));
   return node;
 }
@@ -239,7 +252,17 @@ function renderAgentTrees(snap) {
   const box = $('agent-trees');
   box.replaceChildren();
   const trees = Array.isArray(snap.activeTrees) ? snap.activeTrees : [];
-  for (const tree of trees) box.append(treeCard(tree));
+  const projects = new Map();
+  for (const tree of trees) {
+    const name = tree.repoId ?? tree.channel ?? 'unassigned';
+    if (!projects.has(name)) {
+      const project = el('section', 'project-tree');
+      project.append(el('h3', null, `Project · ${name}`));
+      projects.set(name, project);
+      box.append(project);
+    }
+    projects.get(name).append(treeCard(tree));
+  }
   if (!trees.length) box.append(el('div', 'empty', 'Нет активных деревьев исполнения'));
 }
 
@@ -864,6 +887,14 @@ function spendDynamicsMetric(spendDynamics) {
   trendLine.append(el('span', null, 'trend '), pill(trend,
     trend === 'rising' ? 'warn' : trend === 'falling' ? 'ok' : null));
   node.append(trendLine);
+  const series = (spendDynamics.series ?? []).slice(-30).filter(p => Number.isFinite(p?.eur));
+  if (series.length) {
+    const peak = Math.max(...series.map(p => p.eur));
+    const bars = series.map(p => '▁▂▃▄▅▆▇█'[peak ? Math.round(7 * p.eur / peak) : 0]).join('');
+    const chart = el('div', 'metric-label', `Daily EUR ${bars}`);
+    chart.title = series.map(p => `${p.date}: ${eur(p.eur)}`).join('\n');
+    node.append(chart, el('div', 'metric-label', `7-day baseline ${eur(spendDynamics.baseline7dEur)} · burn ${spendDynamics.burnRatio ?? '—'}×`));
+  }
   if (overTarget) node.append(el('div', 'metric-label', 'over target'));
   return node;
 }
@@ -902,14 +933,14 @@ function renderFinops(snap) {
   summary.append(metric('Today', eur(totals.spentTodayCostEur)));
   summary.append(metric('Monthly budget', eur(totals.monthlyBudgetEur)));
   if (finops.spendDynamics) summary.append(spendDynamicsMetric(finops.spendDynamics));
-  summary.append(metric('GCP credits', eur(totals.remainingCreditsEur), 'ok'));
+  summary.append(metric(`GCP credits · ${creditSources(finops)}`, eur(totals.remainingCreditsEur), 'ok'));
   summary.append(metric('Credit runway', finops.creditRunway?.days == null
     ? '—' : `${finops.creditRunway.days} days`));
   summary.append(metric('Worker hours', `${totals.runningHoursMonth ?? 0} h/mo`));
 
   simpleCards($('finops-credits'), (finops.cloudCredits ?? []).map(credit => {
     const node = el('div', 'resource-card');
-    node.append(el('div', 'resource-title', credit.label ?? credit.id ?? 'credit'));
+    node.append(el('div', 'resource-title', credit.label ?? credit.id ?? 'credit'), pill(credit.source ?? 'unknown'));
     node.append(el('div', 'meta',
       `total ${eur(credit.totalEur)} · remaining ${eur(credit.remainingEur)}${credit.monthlyEur != null ? ` · monthly ${eur(credit.monthlyEur)}` : ''}`));
     if (credit.expires) node.append(el('div', 'meta', `expires ${credit.expires}`));
@@ -921,12 +952,14 @@ function renderFinops(snap) {
     const node = el('div', 'resource-card');
     const top = el('div', 'resource-top');
     top.append(el('span', 'resource-title', vm.id ?? 'vm'));
-    top.append(el('span', 'badge', vm.state ?? 'unknown'));
+    top.append(el('span', 'badge', vm.state ?? 'unknown'), pill(vm.source ?? 'unknown'));
+    const stopped = ['stopped', 'terminated', 'suspended', 'stopping'].includes(String(vm.state ?? '').trim().toLowerCase());
+    const pricing = stopped && /(?:\/\s*h|per hour)/i.test(vm.pricing ?? '') ? null : vm.pricing;
     node.append(top);
     node.append(el('div', 'meta',
       `${vm.machineType ?? '—'} · today ${eur(vm.costTodayEur)} · month ${eur(vm.costMonthEur)}`));
     node.append(el('div', 'meta',
-      `hours ${(((vm.runningMinutesMonth ?? 0) / 60)).toFixed(1)} · wakes ${vm.wakesMonth ?? 0}${vm.pricing ? ` · ${vm.pricing}` : ''}`));
+      `hours ${(((vm.runningMinutesMonth ?? 0) / 60)).toFixed(1)} · wakes ${vm.wakesMonth ?? 0}${pricing ? ` · ${pricing}` : ''}`));
     if (vm.notes) node.append(el('div', 'last', vm.notes));
     return node;
   }), 'Нет compute VM');
@@ -950,9 +983,12 @@ function renderFinops(snap) {
     deadLoad?.deadLoadDetected === true ||
     (Array.isArray(deadLoad?.vms) && deadLoad.vms.some(vm => vm?.deadLoad === true));
   const alertCards = [];
-  if (deadLoadActive) alertCards.push(deadLoadBanner(deadLoad));
+  const deadLoads = finops.deadLoads ?? [];
+  for (const alert of deadLoads) alertCards.push(el('div', 'alert bad', `DEAD LOAD · ${alert.message}`));
+  if (!deadLoads.length && deadLoadActive) alertCards.push(deadLoadBanner(deadLoad));
   alertCards.push(...(finops.alerts ?? [])
-    .filter(alert => !(deadLoadActive && alert.code === 'dead_load_detected'))
+    .filter(alert => !(deadLoadActive && alert.code === 'dead_load_detected') &&
+      !deadLoads.some(item => item.code === alert.code && item.resourceId === alert.resourceId))
     .map(alert => el('div', `alert ${alert.severity === 'bad' ? 'bad' : 'warn'}`,
       `${alert.code}: ${alert.message}`)));
   simpleCards($('finops-alerts'), alertCards, 'Алертов нет');
@@ -1010,6 +1046,7 @@ function renderWorkspace(snap) {
   const commands = $('workspace-commands');
   box.replaceChildren();
   commands.replaceChildren();
+  commands.append(el('p', 'last', 'hc actions · отдельный пульт оператора: запустите node ops/control-room/server.mjs и откройте напечатанный loopback URL.'));
   const finops = snap.finops;
   if (!finops?.ok) {
     box.append(el('div', 'empty', finops?.error ?? 'workspace map недоступна'));
@@ -1121,42 +1158,87 @@ function connectSse() {
   es.onerror = () => { es.close(); setTimeout(connectSse, 3000); };
 }
 
-$('toggle-done').addEventListener('click', () => {
-  state.showAllDone = !state.showAllDone;
-  if (state.snapshot) renderBoard(state.snapshot);
-});
-$('chip-drift').addEventListener('click', () => {
-  state.driftOpen = !state.driftOpen;
-  if (state.snapshot) renderDriftPanel(state.snapshot);
-});
-$('inspect-close').addEventListener('click', () => $('inspect').classList.add('hidden'));
-$('board-task-close').addEventListener('click', () => $('board-task-drawer').classList.add('hidden'));
-$('board-channel-filter').addEventListener('change', ev => {
-  state.boardChannel = ev.target.value;
-  if (state.snapshot) renderBoardExplorer(state.snapshot);
-});
-$('board-search').addEventListener('input', ev => {
-  state.boardSearch = ev.target.value;
-  if (state.snapshot) renderBoardExplorer(state.snapshot);
-});
-for (const button of document.querySelectorAll('#board-state-filter .state-pill')) {
-  button.addEventListener('click', () => {
-    state.boardState = button.dataset.state;
-    if (state.snapshot) renderBoardExplorer(state.snapshot);
+// The opt-in action listener has a separate origin from the read-only Board.
+// No bearer or nonce in URLs, cookies, browser storage, or snapshot data.
+function connectActionGate() {
+  const controls = $('hc-controls'), status = $('hc-status');
+  let auth = null;
+  async function post(path, headers, body) {
+    const response = await fetch(path, { method: 'POST', credentials: 'omit', mode: 'same-origin', redirect: 'error',
+      headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
+    const result = await response.json();
+    if (!response.ok) {
+      if (response.status === 403) { auth = null; controls.disabled = true; }
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    return result;
+  }
+  $('hc-login').addEventListener('click', async () => {
+    const input = $('hc-token'), token = input.value;
+    input.value = ''; controls.disabled = true; auth = null;
+    $('hc-login').disabled = true;
+    try {
+      const session = await post('/api/action-session', { Authorization: `Bearer ${token}` }, {});
+      auth = { Authorization: `Bearer ${session.sessionId}`, 'X-CSRF-Nonce': session.nonce };
+      controls.disabled = false; status.textContent = 'Unlocked';
+    } catch (error) { status.textContent = error.message; }
+    finally { $('hc-login').disabled = false; }
+  });
+  $('hc-submit').addEventListener('click', async () => {
+    if (!auth || controls.disabled) return;
+    const click = { action: $('hc-action').value, session: $('hc-session').value, task: $('hc-task').value };
+    if ($('hc-attempt').value) click.attempt = $('hc-attempt').value;
+    if (!window.confirm(`${click.action} on ${click.session} (task ${click.task}${click.attempt ? `, attempt ${click.attempt}` : ''})?`)) return;
+    controls.disabled = true; $('hc-login').disabled = true; status.textContent = 'Waiting for receipt…';
+    try {
+      await post('/api/action', auth, click);
+      status.textContent = `Accepted: ${click.action} on ${click.session} (task ${click.task})`;
+    } catch (error) { status.textContent = `Not confirmed: ${error.message}`; }
+    finally { controls.disabled = !auth; $('hc-login').disabled = false; }
   });
 }
-$('toggle-clean').addEventListener('change', ev => { state.cleanOnly = ev.target.checked; });
-for (const button of document.querySelectorAll('#tabs .tab')) {
-  button.addEventListener('click', () => setTab(button.dataset.tab));
-}
 
-document.addEventListener('keydown', ev => {
-  if (ev.key === 'Escape') {
-    $('inspect').classList.add('hidden');
-    $('board-task-drawer').classList.add('hidden');
+if (document.body.dataset.view === 'action-gate') connectActionGate();
+else startDashboard();
+
+function startDashboard() {
+  $('toggle-done').addEventListener('click', () => {
+    state.showAllDone = !state.showAllDone;
+    if (state.snapshot) renderBoard(state.snapshot);
+  });
+  $('chip-drift').addEventListener('click', () => {
+    state.driftOpen = !state.driftOpen;
+    if (state.snapshot) renderDriftPanel(state.snapshot);
+  });
+  $('inspect-close').addEventListener('click', () => $('inspect').classList.add('hidden'));
+  $('board-task-close').addEventListener('click', () => $('board-task-drawer').classList.add('hidden'));
+  $('board-channel-filter').addEventListener('change', ev => {
+    state.boardChannel = ev.target.value;
+    if (state.snapshot) renderBoardExplorer(state.snapshot);
+  });
+  $('board-search').addEventListener('input', ev => {
+    state.boardSearch = ev.target.value;
+    if (state.snapshot) renderBoardExplorer(state.snapshot);
+  });
+  for (const button of document.querySelectorAll('#board-state-filter .state-pill')) {
+    button.addEventListener('click', () => {
+      state.boardState = button.dataset.state;
+      if (state.snapshot) renderBoardExplorer(state.snapshot);
+    });
   }
-});
+  $('toggle-clean').addEventListener('change', ev => { state.cleanOnly = ev.target.checked; });
+  for (const button of document.querySelectorAll('#tabs .tab')) {
+    button.addEventListener('click', () => setTab(button.dataset.tab));
+  }
 
-refresh();
-connectSse();
-setInterval(refresh, 5000);
+  document.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape') {
+      $('inspect').classList.add('hidden');
+      $('board-task-drawer').classList.add('hidden');
+    }
+  });
+
+  refresh();
+  connectSse();
+  setInterval(refresh, 5000);
+}

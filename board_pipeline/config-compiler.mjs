@@ -1,15 +1,16 @@
 // Declarative config is compiled without filesystem access. The async contract
 // check is deliberately separate: only the operator can validate host paths.
+import { createHash } from 'node:crypto';
 import { lstat, readdir, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, normalize, resolve } from 'node:path';
 import { inside } from './fs-safe.mjs';
 import { effectiveL1ProfileId, resolveL1Profile } from './l1-profiles.mjs';
 import { assertPolicyModelMatrix } from './model-registry.mjs';
 import { boardActivation, createPilotSwitch } from './pilot-gate.mjs';
-import { isReviewSkillList } from './review-policy.mjs';
+import { isReviewSkillList, reviewPanelPolicy } from './review-policy.mjs';
 import { isAllowedCandidateNodeModulesTarget } from './runtime.mjs';
 import { assertTriadIndependent } from './worker-selector.mjs';
-import { resolveWorkerRuntimeKind } from './run-isolated.mjs';
+import { resolveWorkerRuntimeKind } from './run-transport.mjs';
 
 function fail(code) { throw new Error(code); }
 const record = v => v !== null && typeof v === 'object' &&
@@ -17,6 +18,49 @@ const record = v => v !== null && typeof v === 'object' &&
 const nonempty = v => typeof v === 'string' && v.trim() !== '';
 const overlaps = (a, b) => inside(a, b) || inside(b, a);
 const systemMounts = new Set(['/usr', '/etc/fonts', '/etc/texmf', '/var/lib/texmf', '/opt/google/chrome']);
+
+// Preserve the established input/model tuple order; sort all other JSON keys.
+// Arrays (notably the sequence of checks and selected skills) stay ordered.
+const digestKeyOrder = new Map(['brief', 'reviewPrompt', 'reviewGate', 'route', 'profiles', 'provider', 'model', 'reasoningLevel']
+  .map((key, rank) => [key, rank]));
+function canonicalJson(value) {
+  return JSON.stringify(value, (_, v) => !record(v) ? v : Object.fromEntries(Object.keys(v).sort((a, b) => {
+    return (digestKeyOrder.get(a) ?? digestKeyOrder.size) - (digestKeyOrder.get(b) ?? digestKeyOrder.size) ||
+      (a < b ? -1 : a > b ? 1 : 0);
+  }).map(key => [key, v[key]])));
+}
+const digestBytes = bytes => createHash('sha256').update(bytes).digest('hex');
+const ruleFields = entry => {
+  if (!record(entry)) return entry;
+  const { base, worktree, ...rules } = entry;
+  return rules;
+};
+
+/** Card identity, not the controller's byte-exact WAL/input integrity pin. */
+export function canonicalPolicyDigest({ policy, brief, reviewPrompt, reviewGate, routes, skills = [], reviewSetup }) {
+  if (!record(policy) || (!record(routes) && !Array.isArray(routes))) fail('policy_inputs_invalid');
+  const normalizeEntries = entries => Array.isArray(entries) ? entries.map(ruleFields)
+    : record(entries) ? Object.fromEntries(Object.entries(entries).map(([k, v]) => [k, ruleFields(v)])) : entries;
+  const reviewRoutes = Array.isArray(routes) ? normalizeEntries(routes)
+    : { ...routes, routes: normalizeEntries(routes.routes) };
+  const inputs = [canonicalJson({ ...policy, route: ruleFields(policy.route) }), brief, reviewPrompt,
+    reviewGate, canonicalJson(reviewRoutes), ...skills];
+  // The critic (including skill order) can be partly selected by host
+  // enrollment. Bind its resolved setup when it isn't already explicit in
+  // the policy. The default arbiter is determined by that critic.
+  const declared = policy.profiles?.[policy.route?.checkProfile]?.review ?? {};
+  if (reviewSetup && Object.keys(reviewSetup.critic).some(k => !Object.hasOwn(declared, k))) {
+    inputs.push(canonicalJson({ critic: reviewSetup.critic, arbiter: reviewSetup.arbiter }));
+  }
+  return digestBytes(JSON.stringify(inputs.map(digestBytes)));
+}
+
+// Selected skill order is significant to reviewText. Also pin bytes of the
+// remaining operator bindings so changing an alternate profile's skill is drift.
+export function policySkillPaths(policy, setup) {
+  const files = policy.reviewSkillFiles ?? {};
+  return [...setup.skillPaths, ...Object.keys(files).filter(k => !setup.skills.includes(k)).sort().map(k => files[k])];
+}
 
 export async function canonicalPolicyPath(path, kind, missing = 'path_missing') {
   if (typeof path !== 'string' || !isAbsolute(path)) fail('path_not_absolute');
@@ -340,7 +384,7 @@ export function compileDarkfactoryConfig({ yamlText, configObject, baseDir } = {
   const project = fields(cfg.project, 'project', ['id', 'repoId', 'branch']);
   if (!/^proj_[a-z0-9]+$/.test(string(project.id, 'project.id'))) invalid('project.id');
   const topology = fields(cfg.topology, 'topology', ['worktree', 'base', 'handoffDir']);
-  if (typeof topology.base !== 'string' || !/^[0-9a-f]{40}$/.test(topology.base)) invalid('topology.base');
+  if (topology.base !== 'HEAD' && (typeof topology.base !== 'string' || !/^[0-9a-f]{40}$/.test(topology.base))) invalid('topology.base');
   const board = fields(cfg.board, 'board', ['url', 'owner', 'label']);
   fields(board.label, 'board.label', ['key', 'value']);
   const runtime = !Object.hasOwn(cfg, 'runtime') ? {} : fields(cfg.runtime, 'runtime', [], ['kind', 'waitMs']);
@@ -360,7 +404,7 @@ export function compileDarkfactoryConfig({ yamlText, configObject, baseDir } = {
   }
   function role(name) { return models.get(roles[name]) ?? invalid(`roles.${name}`); }
   const gates = fields(cfg.gates, 'gates', ['profile', 'checks', 'brief', 'reviewPrompt', 'reviewGate'],
-    ['l1Profile', 'visual', 'reviewSkillFiles']);
+    ['l1Profile', 'visual', 'reviewSkillFiles', 'reviewPanel']);
   if (!identifier(gates.profile) || !Array.isArray(gates.checks) || !gates.checks.length) invalid('gates.profile');
   resolveL1Profile({ l1Profile: gates.l1Profile });
   const compiledPolicy = {
@@ -377,6 +421,11 @@ export function compileDarkfactoryConfig({ yamlText, configObject, baseDir } = {
       ...(gates.visual === undefined ? {} : { visual: recipe(gates.visual, gates.l1Profile) }),
       ...(gates.l1Profile === undefined ? {} : { l1Profile: gates.l1Profile }) } },
   };
+  if (Object.hasOwn(gates, 'reviewPanel')) {
+    const panel = fields(gates.reviewPanel, 'gates.reviewPanel', [], ['mode', 'size']);
+    try { compiledPolicy.profiles[gates.profile].reviewPanel = reviewPanelPolicy(panel); }
+    catch { invalid('gates.reviewPanel'); }
+  }
   if (Object.hasOwn(gates, 'reviewSkillFiles')) {
     if (!record(gates.reviewSkillFiles) || !isReviewSkillList(Object.keys(gates.reviewSkillFiles))) invalid('gates.reviewSkillFiles');
     compiledPolicy.reviewSkillFiles = Object.fromEntries(Object.keys(gates.reviewSkillFiles).sort()

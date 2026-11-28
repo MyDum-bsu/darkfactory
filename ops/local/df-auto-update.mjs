@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { execFile } from 'node:child_process';
-import { access, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
-import { homedir as osHomedir } from 'node:os';
+import { execFile, spawn } from 'node:child_process';
+import { access, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { homedir as osHomedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
@@ -22,7 +22,8 @@ const BUSY_PATTERNS = Object.freeze([
   // hc — CLI herdr-core: активная оркестрация воркеров --runtime hc. Токен
   // сопоставляется целиком (границы start/слеш/пробел + пробел/конец), иначе
   // подстроки в 'which'/'dhcpcd' ложно блокировали бы обновление.
-  /(^|[/\s])hc(?:\s|$)/,
+  /(^|[/\s])(?:hc|herdr-core|herdr-app|vb)(?:\s|$)/,
+  /(?:^|\/)@vercel\/board\/dist\/cli(?:-embedded)?\.mjs(?:\s|$)/,
 ]);
 const CONTROLLER_DAEMON_PATTERN = /(?:run-isolated|factory-run)\.mjs(?:\s|$)/;
 const DAEMON_FLAG_PATTERN = /(?:^|\s)--daemon(?:\s|$)/;
@@ -46,17 +47,18 @@ async function defaultPathExists(path) {
   }
 }
 
-async function defaultRunner(command, args = [], options = {}) {
+export async function defaultRunner(command, args = [], options = {}) {
   try {
     const result = await execFileAsync(command, args, {
       timeout: options.timeoutMs ?? 120_000,
       maxBuffer: options.maxBuffer ?? 8 * 1024 * 1024,
       encoding: 'utf8',
       env: options.env,
+      cwd: options.cwd,
     });
     return { code: 0, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
   } catch (error) {
-    const code = Number.isInteger(error.code) ? error.code : 1;
+    const code = error.code === 'ENOENT' ? 127 : Number.isInteger(error.code) ? error.code : 1;
     return { code, stdout: error.stdout ?? '', stderr: error.stderr ?? error.message };
   }
 }
@@ -106,7 +108,7 @@ const SEMVER = new RegExp(
   '(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$');
 const NUMERIC_IDENTIFIER = /^\d+$/;
 
-function parseSemver(value) {
+export function parseSemver(value) {
   if (typeof value !== 'string') return null;
   const match = SEMVER.exec(value.trim());
   if (!match) return null;
@@ -213,14 +215,23 @@ async function toolVersion(ctx, command) {
   return result.code === 0 ? outputVersion(result.stdout) ?? outputVersion(result.stderr) : null;
 }
 
-async function simpleToolComponent(ctx, name, command) {
+async function strictlyBusy(ctx) {
+  if (ctx.activeBusy) return true; // --force never overrides the managed-runtime fence
+  try { return (await ctx.checkManagedBusy()) !== false; } catch { return true; }
+}
+
+async function simpleToolComponent(ctx, name, command, guarded = false) {
   const result = baseComponent(name);
   if (!await ctx.commandExists(command)) return result;
+  if (guarded && ctx.activeBusy) return finished(result, 'deferred_busy', null, null);
   const before = await toolVersion(ctx, command);
+  if (guarded && !before) throw new Error(`${command} --version failed before update`);
   const planned = [commandLine(command, ['update'])];
+  if (guarded && await strictlyBusy(ctx)) return finished(result, 'deferred_busy', before, before);
   if (ctx.dryRun) return finished(result, 'dry_run', before, before, { planned });
   await mustRun(ctx, command, ['update'], { timeoutMs: 10 * 60_000 });
   const after = await toolVersion(ctx, command);
+  if (guarded && !after) return finished(result, 'failed', before, null, { error: `${command} --version failed after update` });
   return finished(result, before && after && before !== after ? 'updated' : 'already_current', before, after);
 }
 
@@ -244,6 +255,95 @@ async function bbComponent(ctx) {
     return finished(result, 'failed', before, after, { error: errors.join('; ') });
   }
   return finished(result, before && after && before !== after ? 'updated' : 'already_current', before, after);
+}
+
+export async function managedNpmInstall(home, name, command, exists = defaultPathExists) {
+  const prefixes = [[join(home, NPM_PREFIX), true]];
+  if (name === '@vercel/board') prefixes.unshift([join(home, '.local/share/vercel-board'), false]);
+  for (const [prefix, global] of prefixes) {
+    const modules = join(prefix, global ? 'lib/node_modules' : 'node_modules');
+    const file = join(modules, name, 'package.json');
+    const bin = global ? join(prefix, 'bin', command) : join(modules, '.bin', command);
+    if (await exists(file)) return { prefix, global, file, bin };
+  }
+  return null;
+}
+
+// Conformance posts messages and changes grants. Never inherit the operator's
+// Board URL, credentials, working directory or home, even for local checks.
+async function withScratchBoard(vb, check, spawnBoard) {
+  const dir = await mkdtemp(join(tmpdir(), 'df-vb-smoke-'));
+  const env = { PATH: process.env.PATH, HOME: dir };
+  let child, closed, timer;
+  try {
+    child = spawnBoard(vb, ['serve', '--port', '0', '--dir', dir, '--no-open', '--no-inspect'],
+      { env, cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] });
+    closed = new Promise(resolve => child.once('close', resolve));
+    const url = await new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('scratch Board startup timed out')), 20_000);
+      child.once('error', reject);
+      child.once('exit', () => reject(new Error('scratch Board exited before startup')));
+      let banner = '';
+      child.stdout.on('data', chunk => {
+        banner = (banner + chunk).slice(-8192);
+        const match = /serving a local board at (http:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/api\/board)/.exec(banner);
+        if (match && Number(match[2]) <= 65535 && match[2] !== '44100') resolve(match[1]);
+      });
+    });
+    await check(url, { env, cwd: dir });
+  } finally {
+    clearTimeout(timer);
+    child?.kill('SIGKILL');
+    await closed;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function managedPackageComponent(ctx, name, command) {
+  const result = baseComponent(name);
+  const layout = await managedNpmInstall(ctx.home, name, command, ctx.pathExists);
+  if (!layout) return name === 'herdr-app' ? simpleToolComponent(ctx, name, command, true) : result;
+  const { file, prefix, global, bin } = layout;
+  const before = await readPackageVersion(ctx, file);
+  if (await strictlyBusy(ctx)) return finished(result, 'deferred_busy', before, before);
+  const view = await mustRun(ctx, 'npm', ['view', name, 'version'], { timeoutMs: 60_000 });
+  const latest = view.stdout.trim(), from = parseSemver(before), to = parseSemver(latest);
+  if (!from || !to) throw new Error(`invalid installed or registry ${name} version`);
+  if (!compareVersions(latest, before)) return finished(result, 'already_current', before, before, { latest });
+  // A 0.x minor can break the protocol just as a stable major can.
+  if (from.core[0] !== to.core[0] || (from.core[0] === '0' && from.core[1] !== to.core[1]) || to.prerelease) {
+    return finished(result, 'review_required', before, before, { latest });
+  }
+  const args = ['install', ...(global ? ['-g'] : ['--save-exact']), `${name}@${latest}`, '--prefix', prefix];
+  if (ctx.dryRun) return finished(result, 'dry_run', before, before,
+    { latest, planned: [commandLine('npm', args), `${bin} --version`, ...(command === 'vb' ? [`${bin} conformance --url <scratch>`] : [])] });
+  if (await strictlyBusy(ctx)) return finished(result, 'deferred_busy', before, before, { latest });
+  await mustRun(ctx, 'npm', args, { timeoutMs: 10 * 60_000 });
+  const after = await readPackageVersion(ctx, file);
+  try {
+    if (after !== latest) throw new Error(`${name} install did not produce the pinned version`);
+    const version = await mustRun(ctx, bin, ['--version'], { timeoutMs: 20_000 });
+    if (!version.stdout.trim().split(/\s+/).includes(latest)) throw new Error(`${command} --version did not report ${latest}`);
+    if (command === 'vb') await withScratchBoard(bin, (url, isolation) => mustRun(ctx, bin, ['conformance', '--url', url],
+      { ...isolation, timeoutMs: 120_000 }), ctx.spawnBoard);
+  } catch (error) {
+    return finished(result, 'failed', before, after, { latest, error: error.message });
+  }
+  return finished(result, 'updated', before, after, { latest });
+}
+
+export async function probeHex(runner) {
+  const args = ['models', 'list'];
+  const run = await runner('hex', args, { timeoutMs: 15_000 });
+  if (run.code !== 0) throw failure('hex', args, run);
+  return { model: 'gigaam_v4', available: /(?:^|[^\w.-])gigaam_v4(?=$|[^\w.-])/.test(run.stdout) };
+}
+
+async function hexComponent(ctx) {
+  const result = baseComponent('hex');
+  if (ctx.role !== 'laptop') return finished(result, 'skipped_role', null, null);
+  if (!await ctx.commandExists('hex')) return result;
+  return finished(result, 'checked', null, null, await probeHex(ctx.runner));
 }
 
 async function readPackageVersion(ctx, file) {
@@ -383,6 +483,10 @@ function componentSpecs(ctx) {
     ['pi', () => npmPackageComponent(ctx, {
       name: 'pi', packageName: ['@mariozechner/pi-coding-agent', '@earendil-works/pi-coding-agent'], roles: ['laptop', 'brain', 'hub', 'worker'],
     })],
+    ['@vercel/board', () => managedPackageComponent(ctx, '@vercel/board', 'vb')],
+    ['herdr-core', () => simpleToolComponent(ctx, 'herdr-core', 'hc', true)],
+    ['herdr-app', () => managedPackageComponent(ctx, 'herdr-app', 'herdr-app')],
+    ['hex', () => hexComponent(ctx)],
     ['darkfactory', () => gitRepoComponent(ctx)],
     ['gitmark', () => gitmarkComponent(ctx)],
   ];
@@ -401,6 +505,10 @@ async function plannedBusyComponents(ctx) {
     await ctx.pathExists(join(prefix, 'lib', 'node_modules', 'bb-app', 'package.json')));
   add('pi', await ctx.pathExists(join(prefix, 'lib', 'node_modules', '@mariozechner', 'pi-coding-agent', 'package.json')) ||
     await ctx.pathExists(join(prefix, 'lib', 'node_modules', '@earendil-works', 'pi-coding-agent', 'package.json')));
+  add('@vercel/board', await managedNpmInstall(ctx.home, '@vercel/board', 'vb', ctx.pathExists));
+  add('herdr-core', await ctx.commandExists('hc'));
+  add('herdr-app', await ctx.commandExists('herdr-app') || await managedNpmInstall(ctx.home, 'herdr-app', 'herdr-app', ctx.pathExists));
+  add('hex', ctx.role === 'laptop' && await ctx.commandExists('hex'));
   add('darkfactory', ctx.repo && await ctx.pathExists(ctx.repo));
   add('gitmark', ctx.repo && await ctx.pathExists(join(ctx.repo, 'ops/memory-index/gitmark.py')));
   return components;
@@ -441,7 +549,7 @@ async function writeStateAtomic(file, report) {
   await rename(tmp, file);
 }
 
-async function scanBusyProcesses(ctx, deps) {
+async function scanBusyProcesses(ctx, deps, strict = false) {
   let processText = '';
   let processScanFailed = false;
   if (deps.processList !== undefined) {
@@ -452,7 +560,7 @@ async function scanBusyProcesses(ctx, deps) {
     }
   } else {
     try {
-      const processes = await ctx.runner('ps', ['-eo', 'args='], { timeoutMs: 10_000 });
+      const processes = await ctx.runner('ps', ['-eww', '-o', 'args='], { timeoutMs: 10_000 });
       processScanFailed = processes.code !== 0;
       processText = processes.stdout ?? '';
     } catch {
@@ -460,8 +568,9 @@ async function scanBusyProcesses(ctx, deps) {
     }
   }
   const busyProcesses = [];
+  if (typeof processText !== 'string' || (deps.processList === undefined && !processText.trim())) processScanFailed = true;
   for (const line of findBusyProcesses(processText)) {
-    if (isControllerDaemonLine(line)) {
+    if (!strict && isControllerDaemonLine(line)) {
       if (await controllerDaemonBusy(line, deps)) busyProcesses.push(line);
     } else {
       busyProcesses.push(line);
@@ -478,10 +587,12 @@ export async function runAutoUpdate(options = {}, deps = {}) {
     ...normalized,
     home,
     runner: deps.runner ?? defaultRunner,
+    spawnBoard: deps.spawnBoard ?? spawn,
     pathExists: deps.pathExists ?? defaultPathExists,
     commandExists: deps.commandExists ?? (command => defaultCommandExists(command, deps.env ?? process.env)),
     nowMs: deps.nowMs ?? (() => Date.now()),
   };
+  ctx.checkManagedBusy = deps.checkActiveBusy ?? (async () => (await scanBusyProcesses(ctx, deps, true)).length > 0);
   ctx.checkActiveBusy = deps.checkActiveBusy ?? (async () => (await scanBusyProcesses(ctx, deps)).length > 0);
   const busyProcesses = await scanBusyProcesses(ctx, deps);
   ctx.activeBusy = busyProcesses.length > 0;
@@ -556,8 +667,10 @@ function printHuman(report) {
   console.log(`darkfactory auto-update: ${report.status} role=${report.role} busy=${report.busy}`);
   for (const component of report.components) {
     const versions = component.before || component.after ? ` ${component.before ?? '-'} -> ${component.after ?? '-'}` : '';
+    const detail = component.model ? ` ${component.model}=${component.available ? 'available' : 'absent'}` :
+      component.status === 'review_required' ? ` candidate=${component.latest}` : '';
     const error = component.error ? ` error=${component.error}` : '';
-    console.log(`${component.name}: ${component.status}${versions}${error}`);
+    console.log(`${component.name}: ${component.status}${versions}${detail}${error}`);
   }
   console.log(`state: report written atomically`);
 }

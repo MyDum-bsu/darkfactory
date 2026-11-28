@@ -12,6 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { canonicalDigest } from './subject.mjs';
 import { DEFAULT_MAX_CHARS, ledgerTextDigest, openSqliteLedgerJournal } from './decision-ledger.mjs';
 
 export const LEDGER_SCHEMA_VERSION = 1;
@@ -98,6 +99,56 @@ function openRowJournal(db) {
   };
 }
 
+// Read the checksummed heads, not the mutable projection. Never create or
+// migrate a database while resolving inputs for an attempt or v1 snapshot.
+export function readActiveUnifiedRows(dbPath) {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    return openSqliteLedgerJournal(db).entries(DECISIONS)
+      .map(record => record.row).filter(row => row.status === 'active');
+  } finally { db.close(); }
+}
+
+const ruleText = row => row.topic === row.decision ? row.topic : `${row.topic}: ${row.decision}`;
+
+export function legacyRuleSummary(row) {
+  const text = ruleText(row);
+  // v1 counts UTF-16 code units. Never split a surrogate pair at the boundary.
+  return text.length <= 1000 ? text : `${text.slice(0, 999).replace(/[\uD800-\uDBFF]$/, '')}…`;
+}
+
+// Planning intake is not the operator's portfolio search. A global/area
+// decision has no repo provenance (legacy imports include whole portfolios).
+function repoDecisionFilter(repoId, projectId, runtime) {
+  if (typeof repoId !== 'string' || !/^[a-z0-9_-]{1,64}$/.test(repoId) ||
+      (projectId !== undefined && projectId !== repoId)) throw err('unified_ledger_input_invalid');
+  const scope = `project:${repoId}`;
+  return row => row.scope === scope && (runtime === 'bb' ||
+    ![row.topic, row.decision, row.rationale, row.applicability].some(text => /\bbb\s+thread\s+create\b/i.test(text)));
+}
+
+export function readUnifiedDecisionSlice({ dbPath, projectId, repo_id = projectId, runtime = 'hc', maxChars = DEFAULT_MAX_CHARS }) {
+  if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw err('decision_ledger_maxchars_invalid');
+  const relevant = repoDecisionFilter(repo_id, projectId, runtime);
+  const rows = readActiveUnifiedRows(dbPath).filter(relevant);
+  const items = [], lines = [];
+  let length = 0;
+  for (const row of rows) {
+    const { id, scope } = row;
+    const lineFor = rule => `- [${scope}] ${rule} (${id})`;
+    let rule = ruleText(row).trim();
+    // A single oversized decision shouldn't crowd *all* decisions out of intake.
+    if (lineFor(rule).length > maxChars) rule = legacyRuleSummary(row).trim();
+    const line = lineFor(rule);
+    length += line.length + (lines.length ? 1 : 0);
+    if (length > maxChars) break;
+    lines.push(line);
+    items.push({ id, scope, rule });
+  }
+  return { text: lines.join('\n'), ids: items.map(item => item.id), digest: canonicalDigest(items),
+    truncated: items.length < rows.length, total: rows.length, items };
+}
+
 export function openUnifiedLedger(dbPath) {
   if (typeof dbPath !== 'string' || dbPath === '') throw err('unified_ledger_path_invalid');
   const db = new DatabaseSync(dbPath);
@@ -148,8 +199,11 @@ export function openUnifiedLedger(dbPath) {
   function proposeDecision({ scope, topic, decision, rationale, applicability, proposedBy } = {}) {
     ensureOpen();
     validateScope(scope);
-    const cleanTopic = validateText(topic, 'topic', { required: true, maxChars: MAX_TOPIC_CHARS });
-    const cleanDecision = validateText(decision, 'decision', { required: true });
+    // A title-only portfolio entry uses the rule itself as its topic. Keep
+    // its full identity for repeat imports; ordinary topic labels stay short.
+    const cleanTopic = validateText(topic, 'topic', { required: true,
+      maxChars: topic === decision ? Infinity : MAX_TOPIC_CHARS });
+    const cleanDecision = validateText(decision, 'decision', { required: true, maxChars: Infinity });
     const cleanRationale = validateText(rationale, 'rationale');
     const cleanApplicability = validateText(applicability, 'applicability');
     const proposer = validateActor(proposedBy, 'unified_ledger_input_invalid');
@@ -177,7 +231,7 @@ export function openUnifiedLedger(dbPath) {
       if (proposal.status !== 'pending') throw err('unified_ledger_proposal_not_pending');
       const decisionText = overrideDecision === undefined
         ? proposal.decision
-        : validateText(overrideDecision, 'decision', { required: true });
+        : validateText(overrideDecision, 'decision', { required: true, maxChars: Infinity });
       let superseded = null;
       if (supersedesId !== undefined && supersedesId !== null) {
         superseded = getDecision(supersedesId);
@@ -222,14 +276,15 @@ export function openUnifiedLedger(dbPath) {
     return journal.rows(PROPOSALS).filter(row => row.status === 'pending');
   }
 
-  // Read-only view for leads/workers: ONLY `active` decisions whose scope is
+  // Operator search (no repo_id): ONLY `active` decisions whose scope is
   // `global`, `project:<projectId>` or one of the requested `area:<name>`
   // scopes. Proposals — pending, approved or rejected — are never visible
   // here. Optional `query` is a case-insensitive substring matched against
   // topic/decision/rationale. Rows are ordered deterministically by
   // creation time and insertion order, then bounded by `limit`.
-  function queryRelevantDecisions({ projectId, areas, query, limit = DEFAULT_QUERY_LIMIT } = {}) {
+  function queryRelevantDecisions(options = {}) {
     ensureOpen();
+    const { repo_id, projectId, runtime, areas, query, limit = DEFAULT_QUERY_LIMIT } = options;
     if (!Number.isSafeInteger(limit) || limit < 1) throw err('unified_ledger_input_invalid');
     const scopes = ['global'];
     if (projectId !== undefined && projectId !== null) {
@@ -242,7 +297,12 @@ export function openUnifiedLedger(dbPath) {
       }
       for (const area of areas) scopes.push(area.startsWith('area:') ? area : `area:${area}`);
     }
-    const rows = journal.rows(DECISIONS).filter(row => row.status === 'active' && scopes.includes(row.scope));
+    // An explicit repo_id (e.g. Owner Twin intake) cannot be widened by
+    // portfolio search options such as areas, query or limit.
+    const relevant = Object.hasOwn(options, 'repo_id') || runtime !== undefined
+      ? repoDecisionFilter(Object.hasOwn(options, 'repo_id') ? repo_id : projectId, projectId, runtime)
+      : row => scopes.includes(row.scope);
+    const rows = journal.rows(DECISIONS).filter(row => row.status === 'active' && relevant(row));
     let filtered = rows;
     if (query !== undefined && query !== null && query !== '') {
       if (typeof query !== 'string') throw err('unified_ledger_input_invalid');
@@ -264,14 +324,15 @@ export function openUnifiedLedger(dbPath) {
   // how many of the total entries are shown. A entry is never sliced
   // mid-sentence; when nothing fits, only the header and the marker remain.
   // `ids` lists exactly the decision ids present in the emitted markdown.
-  function exportMarkdown({ project, projectId, areas, maxChars = DEFAULT_MAX_CHARS } = {}) {
+  function exportMarkdown(options = {}) {
     ensureOpen();
+    const { project, projectId, maxChars = DEFAULT_MAX_CHARS } = options;
     if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw err('unified_ledger_input_invalid');
     if (project !== undefined && projectId !== undefined && project !== projectId) {
       throw err('unified_ledger_input_invalid');
     }
     const effectiveProject = project !== undefined ? project : projectId;
-    const rows = queryRelevantDecisions({ projectId: effectiveProject, areas, limit: Number.MAX_SAFE_INTEGER });
+    const rows = queryRelevantDecisions({ ...options, projectId: effectiveProject, limit: Number.MAX_SAFE_INTEGER, query: undefined });
     const header = '# Owner Decision Ledger\n';
     const byScope = new Map();
     for (const row of rows) {

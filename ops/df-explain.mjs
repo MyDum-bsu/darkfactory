@@ -65,7 +65,7 @@ function selectAttempt(wal, summaries, events, taskId, attemptId) {
   const epoch = dimension(matches(wal) ? count(wal.epoch) : null, row => count(row.epoch));
   const belongs = row => attemptOf(row) === id && taskOf(row) === task && count(row.epoch) === epoch;
   return { taskId: task, attemptId: id, epoch, wal: belongs(wal) ? wal : null,
-    summary: summaries.filter(belongs).at(-1), events: events.filter(belongs) };
+    summaries: summaries.filter(belongs), events: events.filter(belongs) };
 }
 
 function promptInventory(records) {
@@ -140,7 +140,36 @@ function executorFamily(spec) {
     providers.includes(id.slice(0, slash)) && models.includes(id.slice(slash + 1)))?.[0] ?? null;
 }
 
-function buildReport({ taskId, attemptId, epoch, wal, summary, events }) {
+const FIELD_KEYS = { field_mode: 'fieldMode', task_plan: 'taskPlan', fast_track: 'fastTrack',
+  baseline_status: 'baselineStatus', blast_radius: 'blastRadius' };
+
+// Newer events replace older observations; the terminal snapshot and WAL take
+// precedence. Positive fast-track evidence cannot be erased by a later default.
+function fieldEvidence(records) {
+  const fields = {};
+  const marker = 'greenfield-fast-track';
+  for (const row of records) {
+    if (!row) continue;
+    for (const source of [row.labels, row.metadata, row.detail?.fieldPolicy, row.detail,
+      row.receipt?.evidence, row.releaseVerification?.evidence, row.fieldPolicy, row]) {
+      if (!source) continue;
+      for (const [key, alias] of Object.entries(FIELD_KEYS)) {
+        const value = source[key] ?? source[alias];
+        if (key === 'fast_track') {
+          if (typeof value === 'boolean') fields[key] ||= value;
+        } else if (value != null) fields[key] = value;
+      }
+      if ([source.actual?.model, source.review?.actual?.model, source.review?.model,
+        source.models?.critic?.model].includes(marker)) {
+        fields.fast_track = true;
+      }
+    }
+  }
+  return fields;
+}
+
+function buildReport({ taskId, attemptId, epoch, wal, summaries, events }) {
+  const summary = summaries.at(-1);
   const phaseEvent = events.findLast(e => ['phase', 'completed', 'hold', 'lease_lost', 'uncertain',
     'blocked', 'question_blocked', 'rework'].includes(e.kind) && string(e.phase));
   const outcome = string(wal?.phase) ?? string(wal?.outcome) ??
@@ -154,20 +183,27 @@ function buildReport({ taskId, attemptId, epoch, wal, summary, events }) {
     (summary?.outcome === outcome ? string(summary.reason) : null);
   // An open telemetry snapshot from a prior run of this same attempt is not
   // evidence for the now-completed candidate.
-  const snapshot = (summary?.outcome && summary.outcome !== outcome) || (summary?.sha && summary.sha !== sha) ||
-    (outcome === 'done' && summary?.open === true) ? null : summary;
+  const currentSnapshot = row => (!row.outcome || row.outcome === outcome) && (!row.sha || row.sha === sha) &&
+    !(outcome === 'done' && row.open === true);
+  const snapshot = summary && currentSnapshot(summary) ? summary : null;
   const gates = summarizeGates(wal, snapshot, events, sha, reason);
   const worker = modelSpec(wal?.executor ?? snapshot?.models?.worker ?? wal?.triad?.worker);
   const critic = modelSpec(snapshot?.models?.critic ?? wal?.triad?.critic);
   const arbiter = modelSpec(snapshot?.models?.arbiter ?? wal?.triad?.arbiter);
   const workerFamily = executorFamily(worker), criticFamily = executorFamily(critic);
   const ok = name => gates.phases.find(p => p.name === name).status === 'ok';
-  const crossFamilyVerified = ok('l2_critic') && workerFamily !== null && criticFamily !== null && workerFamily !== criticFamily;
+  const currentEvents = events.filter(e => {
+    const eventSha = e.detail?.sha ?? e.sha;
+    return !sha || !eventSha || eventSha === sha;
+  });
+  const fields = fieldEvidence([...currentEvents, ...summaries.filter(currentSnapshot), wal]);
+  const crossFamilyVerified = !fields.fast_track && ok('l2_critic') && workerFamily !== null &&
+    criticFamily !== null && workerFamily !== criticFamily;
   let grade = 'IN_PROGRESS';
   if (outcome === 'done') grade = crossFamilyVerified && ok('l1_local') && ok('tamper') ? 'VERIFIED' : 'CHECKED';
   else if (['blocked', 'awaiting_answer'].includes(outcome)) grade = 'BLOCKED';
   else if (['hold', 'held', 'lease_lost', 'uncertain'].includes(outcome)) grade = 'HELD';
-  return { identity: { taskId, attemptId, epoch, sha, outcome, reason }, grade,
+  return { identity: { taskId, attemptId, epoch, sha, outcome, reason }, grade, ...fields,
     models: { worker, critic, arbiter, workerFamily, criticFamily, crossFamilyVerified }, gates,
     promptBom: promptInventory([wal, snapshot, ...events]), blockingInvariants: [...INVARIANTS] };
 }
@@ -187,13 +223,16 @@ export async function explainAttempt({ stateDir, taskId, attemptId } = {}) {
   return buildReport(selectAttempt(wal, summaries, events, taskId, attemptId));
 }
 
-export function formatExplanation({ identity: id, grade, models, gates, promptBom, blockingInvariants }) {
+export function formatExplanation(report) {
+  const { identity: id, grade, models, gates, promptBom, blockingInvariants } = report;
   const show = value => String(value ?? 'not recorded').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
   const model = spec => show(typeof spec === 'object' && spec ? `${spec.provider}/${spec.model}` : spec);
   return [
     `${grade} | ${show(id.outcome)} | SHA ${show(id.sha)}`,
     `Task ${show(id.taskId)} / attempt ${show(id.attemptId)} / epoch ${show(id.epoch)}`,
     ...(id.reason ? [`Reason: ${show(id.reason)}`] : []), '',
+    ...Object.keys(FIELD_KEYS).filter(key => Object.hasOwn(report, key)).map(key =>
+      `${key}: ${show(typeof report[key] === 'object' ? canonicalJson(report[key]) : report[key])}`),
     `Worker: ${model(models.worker)} (${show(models.workerFamily)})`,
     `Critic: ${model(models.critic)} (${show(models.criticFamily)})`, `Arbiter: ${model(models.arbiter)}`,
     `Cross-family L2 verified: ${models.crossFamilyVerified ? 'yes' : 'no'}`, '',

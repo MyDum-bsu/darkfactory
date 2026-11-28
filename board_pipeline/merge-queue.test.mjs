@@ -5,7 +5,149 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PROTECTED_BRANCH_PATTERNS, canonicalizeBranchName, isProtectedBranch,
   computeOwnerApprovalToken, validateMergeCandidate, processMergeCandidate,
-  drainMergeQueue } from './merge-queue.mjs';
+  drainMergeQueue, localIntegrationQueue, verifiedCompletionBoard } from './merge-queue.mjs';
+
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { bindClaimBase, isClaimCheckout } from './run-isolated.mjs';
+import { advanceWithProjection } from './controller.mjs';
+import { nativeBoardPort } from './native-board.mjs';
+import { runDaemon, scopeLockedBoard } from './daemon.mjs';
+import { memoryBoard } from './board-test-fixture.mjs';
+import { resetQueueWorktree } from './run-adaptive.mjs';
+
+async function gitFixture(t) {
+  const root = await mkdtemp(join(tmpdir(), 'df-needs-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: 'pipe' }).trim();
+  git('init', '-qb', 'slot'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.org');
+  git('commit', '-qm', 'base', '--allow-empty');
+  const integration = localIntegrationQueue({ git, branch: 'df/integration', slotBranch: 'slot' });
+  return { git, root, integration };
+}
+
+test('daemon ticks integrate A -> B -> C before native complete unlocks each successor', async t => {
+  const { git, root, integration } = await gitFixture(t);
+  const registry = await mkdtemp(join(tmpdir(), 'df-needs-lock-'));
+  t.after(() => rm(registry, { recursive: true, force: true }));
+  const handle = memoryBoard(), locked = scopeLockedBoard(handle, { registry, slot: 'one' });
+  const board = nativeBoardPort(locked.handle, { channel: 'q' });
+  const labels = { queue: 'q', repo_id: 'repo', profile_id: 'p', finish: 'verified',
+    spec_digest: SHA_A.padEnd(64,'a'), policy_digest: SHA_B.padEnd(64,'b') };
+  const ids = [];
+  for (const text of ['A','B','C']) ids.push((await handle.tasks.create('q', { text, labels, needs: ids.slice(-1) })).task.id);
+  let last = git('rev-parse', 'HEAD'), wal = null, completed = 0, failure, ticks = 0;
+  const state = { load: async () => wal, save: async v => { wal = v; } };
+  const route = { base: 'HEAD', worktree: root, policyVersion: 'test', checkProfile: 'p', finish: 'verified',
+    allowlist: { owner: 'board:client', label: { key: 'queue', value: 'q' }, repoId: 'repo' } };
+  await runDaemon({ intervalMs: 250, sleep: async () => {}, installSignalHandlers: false,
+    tick: async () => {
+      // Surface failures instead of asking the production daemon to retry a broken test forever.
+      try {
+        assert.ok(++ticks <= 6, 'one claim tick and one verification tick per card');
+        const bound = await bindClaimBase({ route, state, git, prepareBase: integration.prepare });
+        const result = await advanceWithProjection({ ...bound, board,
+          authorize: () => isClaimCheckout({ git, route: bound.route, branch: 'slot' }),
+          bb: { spawn: async a => {
+            assert.equal(a.task_id, ids[completed]); assert.equal(a.base_sha, last);
+            assert.equal(git('rev-parse', 'HEAD'), last);
+            await writeFile(join(root, a.specText), a.specText);
+            git('add', a.specText); git('commit', '-qm', a.specText);
+            return { threadId: 'thr_demo' };
+          } },
+          submissions: { read: async a => ({ turnSeq: 1, submission: { task_id: a.task_id, attempt_id: a.attempt_id,
+            epoch: a.epoch, worker_thread_id: a.bb_thread_id, candidate_sha: git('rev-parse', 'HEAD') } }) },
+          verify: async (attempt, { candidate_sha: candidate }) => {
+            const terminal = verifiedCompletionBoard(board, { queue: integration, attempt, candidate, runL1: assert.fail,
+              guard: () => board.verifyHeld(attempt.task_id, attempt.epoch), record: async receipt => {
+                assert.equal(await integration.head(), receipt.sha);
+                assert.equal((await board.lookup(attempt.task_id)).state, 'claimed');
+              } });
+            await terminal.complete(attempt.task_id, attempt.epoch, { sha: candidate });
+            return { outcome: 'verified', receipt: { settle: 'completed' } };
+          },
+        });
+        const expectedPhase = ticks % 2 === 1 ? 'working' : 'done';
+        assert.equal(result.phase, expectedPhase, result.reason);
+        assert.equal(wal.taskId, ids[completed]);
+        if (expectedPhase === 'working') {
+          assert.equal((await board.lookup(wal.taskId)).state, 'claimed');
+          assert.equal(await integration.head(), last);
+        } else {
+          last = wal.sha;
+          await resetQueueWorktree({ git, base: wal.base_sha, phase: result.phase, branch: 'slot',
+            workerStopped: true, record: wal });
+          await locked.release({ taskId: wal.taskId, repoId: 'repo' });
+          await state.save(null);
+          completed++;
+        }
+      } catch (e) { failure = e; }
+    }, onTick: () => failure || completed === 3 ? 'stop' : undefined });
+  if (failure) throw failure;
+  assert.equal(git('ls-tree','--name-only','df/integration'), 'A\nB\nC');
+  for (const id of ids) assert.equal((await board.lookup(id)).state, 'completed');
+});
+
+test('drift rebases in a disposable worktree and requires L1 on the exact new SHA', async t => {
+  const { root, git, integration } = await gitFixture(t);
+  const base = await integration.prepare();
+  await writeFile(join(root, 'first'), 'first'); git('add', 'first'); git('commit', '-qm', 'first');
+  const first = git('rev-parse', 'HEAD');
+  await integration.mergeVerified({ taskId: '1', base, sha: first, runL1: assert.fail });
+  git('switch', '-qc', 'second-slot', base); // second disjoint card was claimed on the same base
+  await writeFile(join(root, 'second'), 'second'); git('add', 'second'); git('commit', '-qm', 'second');
+  const sha = git('rev-parse', 'HEAD'), before = git('worktree', 'list', '--porcelain');
+  const subject = { taskId: '2', base, sha };
+  for (const bad of [s => ({ ok: false, sha: s }), () => ({ ok: true, sha })]) {
+    await assert.rejects(integration.mergeVerified({ ...subject, runL1: bad }), /integration_smoke_failed/);
+    assert.equal(await integration.head(), first);
+    assert.equal(git('worktree', 'list', '--porcelain'), before);
+  }
+  const merged = await integration.mergeVerified({ ...subject, runL1: async s => {
+    assert.notEqual(s, sha); assert.equal(git('rev-parse', `${s}^`), first);
+    assert.equal(git('ls-tree', '--name-only', s), 'first\nsecond');
+    return { ok: true, sha: s };
+  } });
+  assert.equal(merged.retested, true); assert.equal(await integration.head(), merged.sha);
+  assert.equal(git('worktree', 'list', '--porcelain'), before);
+  assert.equal(git('rev-parse', 'HEAD'), sha, 'never rebases the worker checkout');
+});
+
+test('competing ref CAS is retried from the new head, without reusing stale verification', async t => {
+  const { root, git, integration } = await gitFixture(t);
+  const base = await integration.prepare();
+  await writeFile(join(root, 'a'), 'a'); git('add', 'a'); git('commit', '-qm', 'a');
+  const sha = git('rev-parse', 'HEAD');
+  // A second disjoint writer won the CAS after the first head read.
+  const winner = git('commit-tree', `${base}^{tree}`, '-p', base, '-m', 'other');
+  let updates = 0, tested;
+  const merged = await integration.mergeVerified({ taskId: 'one', base, sha,
+    beforeUpdate: () => { if (++updates === 1) git('update-ref', 'refs/heads/df/integration', winner, base); },
+    runL1: s => { tested = s; return { ok: true, sha: s }; } });
+  assert.equal(updates, 2); assert.equal(merged.sha, tested);
+  assert.equal(git('rev-parse', `${tested}^`), winner);
+  assert.equal(await integration.head(), tested);
+});
+
+test('conflict leaves the dependency blocked and removes only the disposable rebase worktree', async t => {
+  const { root, git, integration } = await gitFixture(t);
+  const base = await integration.prepare();
+  await writeFile(join(root, 'same'), 'one'); git('add', 'same'); git('commit', '-qm', 'one');
+  const first = git('rev-parse', 'HEAD');
+  await integration.mergeVerified({ taskId: 'one', sha: first, base, runL1: assert.fail });
+  git('switch', '-qc', 'another', base);
+  await writeFile(join(root, 'same'), 'two'); git('add', 'same'); git('commit', '-qm', 'two');
+  const candidate = git('rev-parse', 'HEAD'), worktrees = git('worktree', 'list', '--porcelain');
+  let completed = false, tested = false, recorded = false;
+  const terminal = verifiedCompletionBoard({ complete: () => { completed = true; } }, {
+    queue: integration, candidate, attempt: { task_id: 'two', epoch: 1, base_sha: base }, guard: async () => {},
+    runL1: () => { tested = true; }, record: () => { recorded = true; } });
+  await assert.rejects(terminal.complete('two', 1, { sha: candidate }), /integration_/);
+  assert.deepEqual([completed, tested, recorded], [false, false, false]);
+  assert.equal(await integration.head(), first); assert.equal(git('worktree', 'list', '--porcelain'), worktrees);
+});
 
 const SHA_A = 'a'.repeat(40);
 const SHA_B = 'b'.repeat(40);

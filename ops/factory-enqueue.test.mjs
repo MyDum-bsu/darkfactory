@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,6 +31,97 @@ const baseValues = () => ({
   'board-url': 'https://board.example', channel: 'ops', title: 'T',
   'repo-id': 'repo', profile: 'prof', finish: 'verified',
   'spec-digest': HEX, 'policy-digest': HEX2 });
+
+test('enqueue hashes validated rule inputs rather than slot locations', async t => {
+  const dir = await tempdir();
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const at = file => join(dir, file);
+  for (const name of ['slot1', 'slot2', 'handoff']) await mkdir(at(name));
+  for (const name of ['brief', 'prompt', 'gate', 'skill']) await writeFile(at(name), name);
+  const p = { brief: at('brief'), reviewPrompt: at('prompt'), reviewGate: at('gate'), reviewSkillFiles: { logika: at('skill') },
+    handoffDir: at('handoff'), profiles: { prof: { review: { provider: 'openai', model: 'gpt-6.2-sol', reasoningLevel: 'medium' } } },
+    route: { checkProfile: 'prof', worktree: at('slot1'), base: 'a'.repeat(40) } };
+  const routes = { routes: [{ ...p.route, gate: 'enforce' }] };
+  const getDigest = async () => {
+    await writeFile(at('policy.json'), JSON.stringify(p));
+    await writeFile(at('routes.json'), JSON.stringify(routes));
+    return (await buildEnqueuePlan({ ...baseValues(), policy: at('policy.json'), 'policy-digest': undefined })).labels.policy_digest;
+  };
+  const original = await getDigest();
+  p.route.base = 'HEAD'; assert.equal(await getDigest(), original);
+  p.route.worktree = at('slot2'); assert.equal(await getDigest(), original);
+  Object.assign(routes.routes[0], p.route); assert.equal(await getDigest(), original);
+  routes.routes[0].gate = 'changed'; assert.notEqual(await getDigest(), original);
+  routes.routes[0].gate = 'enforce';
+  await writeFile(at('skill'), 'new skill bytes'); assert.notEqual(await getDigest(), original);
+  p.route.worktree = dir; await assert.rejects(getDigest(), /path_inside_worktree/);
+});
+
+const fieldArgs = ['--board-url', 'https://board.example', '--channel', 'ops', '--title', 'T',
+  '--repo-id', 'repo', '--profile', 'prof', '--finish', 'verified', '--spec-digest', HEX,
+  '--policy-digest', HEX2, '--dry-run'];
+
+test('enqueue emits normalized field labels only for explicit choices', async () => {
+  const defaults = await runEnqueue(fieldArgs);
+  assert.ok(!Object.hasOwn(defaults.plan.labels, 'field_mode'));
+  assert.ok(!Object.hasOwn(defaults.plan.labels, 'task_plan'));
+  for (const flags of [['--field-mode', ' GreenField ', '--task-plan', ' MVP '],
+    ['--label', 'field_mode= GreenField ', '--label', 'task_plan=MVP']]) {
+    const { plan } = await runEnqueue([...fieldArgs, ...flags]);
+    assert.deepEqual(plan.argv.filter(s => /^(field_mode|task_plan)=/.test(s)), ['field_mode=greenfield', 'task_plan=mvp']);
+  }
+});
+
+test('enqueue rejects invalid or duplicate field/plan inputs with exit 2', async () => {
+  for (const [flags, message] of [
+    [['--field-mode', 'experimental'], 'field_mode_invalid'], [['--task-plan', ''], 'task_plan_invalid'],
+    [['--label', 'field_mode=invalid'], 'field_mode_invalid'], [['--label', 'task_plan=invalid'], 'task_plan_invalid'],
+    [['--field-mode', 'brownfield', '--label', 'field_mode=greenfield'], 'field_mode_duplicate'],
+    [['--label', 'task_plan=mvp', '--label', 'task_plan=mvp'], 'task_plan_duplicate'],
+    [['--field-mode', 'invalid', '--field-mode', 'greyfield'], 'field-mode_duplicate'],
+  ]) {
+    await assert.rejects(execFileAsync(process.execPath, [ENQUEUE_CLI, ...fieldArgs, ...flags]),
+      err => err.code === 2 && err.stdout === '' && err.stderr.includes(message));
+  }
+});
+
+test('ticket preflight reads every page, rejects duplicates, and fails closed on unreadable listings', async () => {
+  const args = [...fieldArgs.slice(0, -1), '--ticket', 'V12-1'];
+  const prefix = ['--url', 'https://board.example', 'tasks', 'ops', '--json'];
+  for (const state of ['ready', 'claimed', 'waiting', 'blocked']) {
+    const calls = [];
+    await assert.rejects(runEnqueue(args, { exec: async (cmd, argv) => {
+      assert.equal(cmd, 'vb'); calls.push(argv);
+      return JSON.stringify(calls.length === 1 ? { tasks: [{ id: '1', state: 'done', labels: { ticket: 'V12-1' } }], cursor: '1' }
+        : { tasks: [{ message: { id: '2', task: { state }, labels: { ticket: 'V12-1' } } }] });
+    } }), /duplicate_open_ticket:V12-1/);
+    assert.deepEqual(calls, [prefix, [...prefix, '--after', '1']]);
+  }
+  for (const listing of ['bad json', '{}', '{"tasks":[{}]}']) {
+    let calls = 0;
+    await assert.rejects(runEnqueue(args, { exec: async () => { calls++; return listing; } }));
+    assert.equal(calls, 1);
+  }
+  const calls = [];
+  await runEnqueue(args, { exec: async (_, argv) => { calls.push(argv); return '[]'; } });
+  assert.equal(calls.length, 2); assert.equal(calls[1][3], 'create');
+  await runEnqueue([...args, '--allow-duplicate-ticket'], { exec: async (_, argv) => assert.equal(argv[3], 'create') });
+});
+
+test('supersedes cancels before create; invalid IDs, failed cancel and dry-run never create', async () => {
+  const args = [...fieldArgs.slice(0, -1), '--ticket', 'V12-1', '--supersedes'];
+  const calls = [];
+  const deps = { exec: async (_, argv) => { calls.push(argv); return '{}'; } };
+  await assert.rejects(runEnqueue([...args, '2x'], deps), /supersedes_invalid/);
+  const { plan } = await runEnqueue([...args, '27', '--dry-run'], deps);
+  assert.equal(plan.labels.supersedes, '27'); assert.deepEqual(calls, []);
+  await runEnqueue([...args, '27'], deps);
+  assert.deepEqual(calls, [['--url', 'https://board.example', 'tasks', 'cancel', '27', 'superseded_by_requeue'], plan.argv]);
+  assert.ok(plan.argv.includes('supersedes=27'));
+  await assert.rejects(runEnqueue([...args, '27'], { exec: async (_, argv) => {
+    assert.equal(argv[3], 'cancel'); throw new Error('cancel refused');
+  } }), /cancel refused/);
+});
 
 const cliArgs = brief => [
   '--board-url', 'https://board.example', '--channel', 'ops',

@@ -1,7 +1,8 @@
-import { createReadStream } from 'node:fs';
-import { lstat, open, readFile, readdir } from 'node:fs/promises';
+import { constants, createReadStream } from 'node:fs';
+import { lstat, open, readFile, readdir, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
+import { DEFAULT_DOCS_PATH, resolveHerdrSpace } from '../../board_pipeline/herdr-spaces.mjs';
 import { loadModelRegistry, registrySnapshot } from '../../board_pipeline/model-registry.mjs';
 import { collectTelemetry } from '../../board_pipeline/telemetry-collector.mjs';
 import { normalizeCost, normalizeUsage, parseTelemetryLines } from '../../board_pipeline/telemetry.mjs';
@@ -246,8 +247,8 @@ function boundedCacheSet(map, key, value, maxEntries) {
   while (map.size > maxEntries) map.delete(map.keys().next().value);
 }
 
-// Safe read-only telemetry provider. It reads only regular telemetry*.jsonl
-// files, caps both file count and per-file tail bytes, ignores corrupt JSONL
+// Safe read-only telemetry provider. It reads only regular telemetry*.jsonl and
+// worker-*.jsonl files, caps both file count and per-file tail bytes, ignores corrupt JSONL
 // rows, and returns null when no valid run record exists. Missing directories
 // and filesystem races are observation gaps, never server failures.
 // Parsed file tails are cached by path+mtime+size; unchanged rotated journals
@@ -286,7 +287,8 @@ export function createTelemetryProvider({
       for (const dir of directories) {
         const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
         for (const entry of entries) {
-          if (entry.isFile() && entry.name.startsWith('telemetry') && entry.name.endsWith('.jsonl')) {
+          if (entry.isFile() && entry.name.endsWith('.jsonl') &&
+              (entry.name.startsWith('telemetry') || entry.name.startsWith('worker-'))) {
             files.push({ dir, name: entry.name });
           }
         }
@@ -628,7 +630,10 @@ export async function readEventsTail(stateDirs, limit) {
       if (collected.length >= cap) break;
       const fileEvents = [];
       for (const line of await readNdjsonTailLines(path, cap - collected.length)) {
-        try { fileEvents.push(JSON.parse(line)); } catch { /* пропуск битой строки */ }
+        try {
+          const event = JSON.parse(line);
+          if (event && typeof event === 'object' && !Array.isArray(event)) fileEvents.push(event);
+        } catch { /* пропуск битой строки */ }
       }
       // Файлы обходятся newest→oldest только ради раннего stop; в журнале
       // события остаются в хронологическом порядке даже без ts.
@@ -968,14 +973,147 @@ export function buildActiveTrees({ events = [], tasks = [], telemetryAttempts = 
   return trees.slice(0, limit);
 }
 
+// reserveWorktree persists <tree hash>.json = {state,device,inode}; scopeLockedBoard
+// persists scope-<repo hash>.json = [{slot: state,repoId,taskId,...}]. Neither a
+// durable reservation nor a lock file alone proves a controller is working.
+async function readSlotJson(path) {
+  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(() => null);
+  if (!fd) return null;
+  try {
+    const st = await fd.stat();
+    if (!st.isFile() || st.size > TELEMETRY_MAX_BYTES) return null;
+    const buf = Buffer.alloc(st.size);
+    const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
+    return JSON.parse(buf.toString('utf8', 0, bytesRead));
+  } catch { return null; } finally { await fd.close(); }
+}
+
+const slotTaskId = value => Number.isSafeInteger(value) ? String(value) : textValue(value);
+
+async function discoverSlotDirectories(registry, stateDirs, projects) {
+  const dirs = new Map(stateDirs.filter(d => typeof d === 'string' && d).map(d => [resolve(d), null]));
+  for (const project of projects) {
+    if (typeof project?.state !== 'string' || !isAbsolute(project.state)) continue;
+    dirs.set(project.state, project);
+  }
+  const locks = new Map();
+  const privateRegistry = registry && await lstat(registry).catch(() => null);
+  if (privateRegistry?.isDirectory() && !(privateRegistry.mode & 0o077) && privateRegistry.uid === process.getuid() &&
+      await realpath(registry).catch(() => null) === registry) {
+    const files = await readdir(registry, { withFileTypes: true }).catch(() => []);
+    for (const file of files) {
+      if (!file.isFile() || !/^(scope-)?[0-9a-f]{64}\.json$/.test(file.name)) continue;
+      const data = await readSlotJson(join(registry, file.name));
+      if (file.name.startsWith('scope-')) {
+        for (const row of Array.isArray(data) ? data : []) {
+          if (typeof row?.slot === 'string' && slotTaskId(row.taskId)) locks.set(row.slot, row);
+        }
+      } else if (typeof data?.state === 'string' && isAbsolute(data.state) && !dirs.has(data.state)) {
+        const st = await lstat(data.state).catch(() => null);
+        if (st?.isDirectory() && st.dev === data.device && st.ino === data.inode) dirs.set(data.state, null);
+      }
+    }
+  }
+  return { dirs, locks };
+}
+
+// Native verified-completion queues execute inline: this slot can contribute
+// at most one candidate, between acceptHeld's complete intent and its receipt.
+// Do not count every checking slot (it may still be running L1 or L2).
+async function nativeQueueDepth(dir, wal, project) {
+  if (wal.phase !== 'checking') return ['claiming', 'launching', 'working', 'blocking', 'returning', 'awaiting_answer'].includes(wal.phase) ? 0 : null;
+  if (!project?.policy || !/^[\w-]+$/.test(wal.attemptId ?? '') || !Number.isSafeInteger(wal.epoch) ||
+      !/^[0-9a-f]{40}$/.test(wal.sha ?? '')) return null;
+  const policy = await readSlotJson(project.policy);
+  if (!policy?.route || policy.route.repoId !== project.repo_id) return null;
+  if (policy.route.finish !== 'verified' || policy.route.taskId != null) return 0;
+  if (policy.dynamicBase === false && policy.route.base !== 'HEAD' && !policy.integrationBranch && !policy.route.integrationBranch) return 0;
+  const receipt = await readSlotJson(join(dir, `integration-${wal.attemptId}-${wal.epoch}.json`));
+  if (receipt?.candidate === wal.sha && receipt.status === 'merged') return 0;
+  const prefix = `run-${wal.taskId}.${wal.attemptId}.${wal.epoch}-${wal.sha}-v`;
+  const names = (await readdir(dir, { withFileTypes: true }).catch(() => []))
+    .filter(f => {
+      if (!f.isFile() || !f.name.startsWith(prefix)) return false;
+      const tail = /(?:-r(\d+))?-h[a-f0-9]{16}\.jsonl$/.exec(f.name);
+      return tail && Number(tail[1] ?? 0) === (wal.recoverySeq ?? 0);
+    });
+  if (names.length !== 1) return null; // absent, compacted or ambiguous journal
+  const lines = await readNdjsonTailLines(join(dir, names[0].name), 1);
+  try {
+    const last = JSON.parse(lines[0]);
+    return last.kind === 'intent' && last.phase === 'complete' ? 1 : 0;
+  } catch { return null; }
+}
+
+export async function readControllerSlots({ registry, stateDirs, projects, tasks, events, threads, telemetryAttempts, now,
+  herdrDocsPath = DEFAULT_DOCS_PATH }) {
+  const { dirs, locks } = await discoverSlotDirectories(registry, stateDirs, projects);
+  const projectByRepo = new Map(projects.map(p => [p.repo_id, p]));
+  let docs;
+  async function spaceFor(repo, project) {
+    if (project) return resolveHerdrSpace(project, { docsPath: herdrDocsPath }).catch(() => null);
+    if (!repo) return null;
+    docs ??= readSlotJson(herdrDocsPath);
+    const spaces = (await docs)?.['herdr-app']?.value?.spaces;
+    if (!Array.isArray(spaces)) return null;
+    const matches = spaces.filter(s => (s?.repo_id ?? (typeof s?.folder === 'string' ? basename(s.folder) : null)) === repo);
+    return matches.length === 1 ? textValue(matches[0].id) : null;
+  }
+  const slots = [], trees = [];
+  for (const [dir, registered] of [...dirs].sort(([a], [b]) => a.localeCompare(b))) {
+    if (await realpath(dir).catch(() => null) !== dir) continue;
+    const wal = await readSlotJson(join(dir, 'attempt.json'));
+    const phase = textValue(wal?.phase);
+    if (!phase || ['idle', 'done', 'hold', 'uncertain', 'lease_lost', 'completed'].includes(phase)) continue;
+    const lock = locks.get(dir);
+    const taskId = slotTaskId(wal.taskId);
+    const repo = firstText(registered?.repo_id, wal.contract?.repo_id, wal.repo_id, lock?.repoId);
+    const boardTask = tasks.find(t => String(t.task_id ?? t.id) === taskId && (!repo || !taskRepoId(t) || taskRepoId(t) === repo));
+    const repoId = repo ?? taskRepoId(boardTask);
+    const project = registered ?? projectByRepo.get(repoId);
+    const space = firstText(project?.herdrSpaceId, wal.herdrSpaceId) ?? await spaceFor(repoId, project) ??
+      firstText(boardTask?.herdrSpaceId, boardTask?.labels?.herdrSpaceId);
+    // Queue implementations without a depth observation report unknown, never an invented zero.
+    const queue = await readSlotJson(join(dir, 'merge-queue.json'));
+    const depth = Array.isArray(queue) ? queue.length : queue?.depth ?? wal.mergeQueueDepth ?? await nativeQueueDepth(dir, wal, project);
+    const slot = { slotId: textValue(basename(dir)), repo_id: repoId, herdrSpaceId: space, taskId,
+      attemptId: textValue(wal.attemptId), phase, scopeLockOwner: lock ? slotTaskId(lock.taskId) : null,
+      mergeQueueDepth: Number.isSafeInteger(depth) && depth >= 0 ? depth : null };
+    const matches = e => slot.attemptId && e?.attempt_id === slot.attemptId &&
+      (!taskId || String(e.task_id) === taskId) && (wal.epoch == null || wal.epoch === e.epoch);
+    const local = (await readEventsTail([dir], 128)).filter(matches);
+    const pushed = events.filter(matches);
+    const journal = [...new Map([...local, ...pushed].map(e => [JSON.stringify([e.seq, e.ts, e.kind]), e])).values()]
+      .sort((a, b) => eventTime(a) - eventTime(b));
+    const telemetry = telemetryAttempts.find(a => slot.attemptId && (a.attemptId ?? a.attempt_id) === slot.attemptId);
+    const tree = buildTreeForTask(taskId ?? '—', { boardTask: { ...boardTask, thread_id: textValue(wal.threadId) ?? boardTask?.thread_id },
+      events: journal, telemetry: compactTelemetryAttempt(telemetry), threads,
+      nowMs: nowMilliseconds(now) });
+    tree.repoId = repoId;
+    tree.status = phase === 'awaiting_answer' ? 'hold' : phase === 'returning' ? 'rework' : 'running';
+    tree.worker.phase = phase;
+    tree.worker.threadId = firstText(wal.threadId, tree.worker.threadId);
+    tree.worker.model = firstText(wal.executor?.model, tree.worker.model);
+    tree.worker.provider = firstText(wal.executor?.provider, tree.worker.provider);
+    const thread = threads.find(t => tree.worker.threadId && t?.id === tree.worker.threadId);
+    tree.worker.teamlead = firstText(thread?.lead_session_id, thread?.leadSessionId, thread?.parentThreadId);
+    tree.channel = firstText(project?.channel, tree.channel);
+    tree.slot = slot;
+    slots.push(slot);
+    trees.push(tree);
+  }
+  return { slots, trees };
+}
+
 export function buildRepoSlots(trees = []) {
-  const activeByRepo = {};
+  const counts = new Map();
   for (const tree of Array.isArray(trees) ? trees : []) {
     if (!['running', 'rework'].includes(tree?.status)) continue;
     const repoId = textValue(tree.repoId);
     if (!repoId) continue;
-    activeByRepo[repoId] = (activeByRepo[repoId] ?? 0) + 1;
+    counts.set(repoId, (counts.get(repoId) ?? 0) + 1);
   }
+  const activeByRepo = Object.fromEntries(counts);
   const multiWriterWarnings = Object.entries(activeByRepo)
     .filter(([, count]) => count > 1)
     .map(([repoId, count]) =>

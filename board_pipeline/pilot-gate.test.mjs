@@ -3,7 +3,7 @@ import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { boardActivation, createPilotSwitch, guardedEffect } from './pilot-gate.mjs';
+import { boardActivation, createPilotSwitch, guardedEffect, PilotDenied } from './pilot-gate.mjs';
 
 const pilotChannel = 'fixture-pilot';
 const base = { scope: 'pilot', boardUrl: 'http://127.0.0.1:44100/api/board', channel: pilotChannel,
@@ -28,6 +28,21 @@ test('live pilot requires a separately pinned channel, owner, repo, profile, fin
   });
   assert.equal(boardActivation({ scope: 'isolated', boardUrl: 'http://127.0.0.1:44101/api/board', channel: 'pilot' }), null);
   assert.throws(() => boardActivation({ ...base, scope: 'isolated', channel: 'pilot' }), { code: 'pilot_route_not_allowed' });
+});
+
+const activate = channel => boardActivation({ ...base, channel, pilot: { enabled: true, killSwitch: '/operator/switch' } },
+  { pilotChannel: channel, allowLive: true });
+
+test('pilot activation preserves valid Board channels up to the pilot length limit', () => {
+  for (const channel of ['darkfactory', 'optimization/tracker', 'a_1/b-2/c3', 'a/'.padEnd(128, 'b')]) {
+    assert.equal(activate(channel).scope.channel, channel);
+  }
+});
+
+test('pilot activation rejects invalid channels even when policy and pin agree', () => {
+  for (const channel of ['Upper/Case', 'Upper', 'a:b', 'a.b', 'a b', '', '/bad', 'a//b', 'a/', 'a/'.padEnd(129, 'b'), null, 42]) {
+    assert.throws(() => activate(channel), err => err instanceof PilotDenied && err.code === 'pilot_route_not_allowed', String(channel));
+  }
 });
 
 test('read the private switch at the last effect boundary, fail closed on absence, stop and unsafe files', async t => {

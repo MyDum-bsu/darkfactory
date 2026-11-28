@@ -188,6 +188,7 @@ export class ReviewRunnerTimeout extends ReviewDenied {
 const PROVIDER_FAMILY = new Map([
   ['acp-devin', 'cognition'],
   ['acp-zcode-start', 'glm'],
+  ['zcode', 'glm'],
   ['opencode-go', 'deepseek'],
   ['openai', 'openai'],
   ['google', 'google'],
@@ -212,6 +213,11 @@ const MODEL_FAMILY = new Map([
   ['swe-2-1-xhigh', 'cognition'],
   ['swe-2-1-max', 'cognition'],
   ['glm-5.3-flash', 'glm'],
+  ['glm-5.3', 'glm'],
+  ['account:zai-start-plan/glm-5.3-flash', 'glm'],
+  ['account:zai-start-plan/glm-5.3', 'glm'],
+  ['account:zai-individual-coding-plan/glm-5.3-flash', 'glm'],
+  ['account:zai-individual-coding-plan/glm-5.3', 'glm'],
   ['builtin:zai-start-plan\\glm-5.3-flash', 'glm'],
   ['deepseek-v4.1-flash', 'deepseek'],
   ['deepseek-v4', 'deepseek'],
@@ -226,11 +232,28 @@ const MODEL_FAMILY = new Map([
   ['claude-opus-5.5', 'anthropic'],
 ]);
 
+// Only these Devin Local combinations have a known lead AND sidekick. A
+// recognizable vendor prefix alone is not evidence of an enrolled model.
+const FUSION_MODELS = new Map();
+for (const [leadFamily, leads] of [
+  ['openai', ['gpt-6-2-astra-high', 'gpt-6-2-astra-medium', 'gpt-6-2-sol-high', 'gpt-6-2-sol-medium']],
+  ['anthropic', ['claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-sonnet-5-5-high']],
+]) {
+  const meta = Object.freeze({ isFusion: true, leadFamily, sidekickFamily: 'cognition' });
+  for (const lead of leads) for (const sidekick of ['swe-2-medium', 'swe-2-1-medium']) {
+    FUSION_MODELS.set(`fusion-${lead}-sidekick-${sidekick}`, meta);
+  }
+}
+
+export function fusionModelMeta(modelId) {
+  return FUSION_MODELS.get(modelId) ?? null;
+}
+
 // Семейство по идентификатору исполнителя/критика. Строка вида 'acp-devin'
 // или 'openai/gpt-6.2-sol', либо объект { provider, model }. Пара
 // provider+model обязана состоять в одном семействе; противоречивая пара
 // и неизвестный id дают null → отказ review_unknown_family.
-export function executorFamily(spec) {
+function executorMeta(spec) {
   if (spec === null || spec === undefined) return null;
   let provider;
   let model;
@@ -248,6 +271,11 @@ export function executorFamily(spec) {
   } else {
     return null;
   }
+  const fusion = fusionModelMeta(model);
+  if (fusion) {
+    const harness = provider === undefined ? spec.harness : provider;
+    return harness === 'acp-devin' || harness === 'devin' ? fusion : null;
+  }
   const pf = typeof provider === 'string' && provider !== ''
     ? PROVIDER_FAMILY.get(provider.toLowerCase()) : undefined;
   const mf = typeof model === 'string' && model !== ''
@@ -257,19 +285,26 @@ export function executorFamily(spec) {
   if (pf === undefined && typeof provider === 'string' &&
       HARNESS_PROVIDERS.has(provider.toLowerCase()) &&
       typeof model === 'string' && model.includes('/')) {
-    return executorFamily(model);
+    const inner = executorMeta(model);
+    return inner?.isFusion ? null : inner;
   }
   // Оба поля обязательны и обязаны указывать на одно семейство.
-  return pf !== undefined && pf === mf ? pf : null;
+  return pf !== undefined && pf === mf ? { leadFamily: pf } : null;
+}
+
+export function executorFamily(spec) {
+  return executorMeta(spec)?.leadFamily ?? null;
 }
 
 // Жёсткий инвариант до любого эффекта: оба семейства известны и различны.
 export function assertCrossFamily(executor, critic) {
-  const ef = executorFamily(executor);
-  const cf = executorFamily(critic);
-  if (ef === null || cf === null) throw new ReviewDenied('review_unknown_family');
-  if (ef === cf) throw new ReviewDenied('review_same_family');
-  return { executor: ef, critic: cf };
+  const e = executorMeta(executor);
+  const c = executorMeta(critic);
+  if (!e || !c) throw new ReviewDenied('review_unknown_family');
+  if ([e.leadFamily, e.sidekickFamily].some(f => f && (f === c.leadFamily || f === c.sidekickFamily))) {
+    throw new ReviewDenied('review_same_family');
+  }
+  return { executor: e.leadFamily, critic: c.leadFamily };
 }
 
 const nonEmpty = (v) => typeof v === 'string' && v.trim().length > 0;
@@ -531,10 +566,27 @@ async function git(worktree, ...args) {
     { timeout: 20_000, env: hardenedGitEnv() })).stdout.trimEnd();
 }
 
-async function hardenedGitDiff(worktree, range) {
+async function hardenedGitDiff(worktree, range, flags = ['--text']) {
   return exec('git', [...GIT_HARDENING, '-C', worktree, 'diff',
-    '--text', '--no-textconv', '--no-ext-diff', range],
+    ...flags, '--no-textconv', '--no-ext-diff', range, '--'],
     { timeout: 30_000, maxBuffer: 16 * 1024 * 1024, env: hardenedGitEnv() });
+}
+
+// -z and --no-renames preserve both changed paths, including tabs/newlines.
+export async function reviewDiffStats({ worktree, base_sha, candidate_sha }) {
+  if (!SHA.test(base_sha ?? '') || !SHA.test(candidate_sha ?? '')) throw new ReviewDenied('review_requires_full_sha');
+  const { stdout } = await hardenedGitDiff(worktree, `${base_sha}..${candidate_sha}`,
+    ['--numstat', '-z', '--no-renames', '--ignore-submodules=none']);
+  let changedLines = 0, binary = false;
+  const changedPaths = [];
+  for (const row of stdout.split('\0').filter(Boolean)) {
+    const match = /^(\d+|-)\t(\d+|-)\t(.+)$/s.exec(row);
+    if (!match) throw new ReviewDenied('review_diff_invalid');
+    changedPaths.push(match[3]);
+    if (match[1] === '-' || match[2] === '-') binary = true;
+    else changedLines += Number(match[1]) + Number(match[2]);
+  }
+  return { changedPaths, changedLines, binary };
 }
 
 // Симлинки распакованного снимка обязаны резолвиться строго внутрь него:
@@ -900,8 +952,23 @@ export function l2LaunchBoundary({ retryGuard, verifySubject, assertOpen,
 export function l2CriticRunners({ makeRunner, options, beforeEffect, retryBeforeEffect }) {
   const lazy = hook => {
     let runner;
-    return (binding, profile) =>
-      (runner ??= makeRunner({ ...options, beforeEffect: hook }))(binding, profile);
+    return async (binding, profile) => {
+      // The legacy unbound port retains its single pinned reader. Queue routes
+      // have a manifest and an independent arbiter: apply the panel policy.
+      if (profile?.reviewPanel !== undefined || (binding.subject_digest != null && profile?.arbiter)) {
+        const { isolatedReviewPanelRunner } = await import('./review-panel.mjs');
+        const receipt = await isolatedReviewPanelRunner({ ...options, beforeEffect: hook, makePrimary: makeRunner })(binding, profile);
+        // A fast P0 can cancel the pinned primary before it attests. The
+        // single-receipt acceptance boundary cannot process another model as
+        // that primary. Hard-stop with the real evidence, never relabel it.
+        const pinned = receipt.panel.seats[0];
+        if (receipt.actual.model !== pinned.model || receipt.actual.provider !== pinned.provider) {
+          throw new ReviewDenied(`review_panel_p0:${receipt.sha}:${receipt.transcript_file}`);
+        }
+        return receipt;
+      }
+      return (runner ??= makeRunner({ ...options, beforeEffect: hook }))(binding, profile);
+    };
   };
   return { review: lazy(beforeEffect), retry: lazy(retryBeforeEffect) };
 }
@@ -1307,6 +1374,18 @@ export function l2CriticSpec(spec, { defaultReasoningLevel = 'medium' } = {}) {
   return critic;
 }
 
+// A split carries planning suggestions only, never Board commands, targets or labels.
+export function splitVerdict(value) {
+  if (value?.verdict !== 'SPLIT') return null;
+  const { reason, subtasks, subject_digest } = value;
+  const text = (v, limit) => typeof v === 'string' && v.trim().length > 0 && v.length <= limit;
+  if (Object.keys(value).some(k => !['verdict', 'reason', 'subtasks', 'subject_digest', 'usage'].includes(k)) ||
+      !SHA256.test(subject_digest ?? '') || !text(reason, 512) || !Array.isArray(subtasks) ||
+      subtasks.length < 2 || subtasks.length > 12 || subtasks.some(s => !text(s, 512)) ||
+      new Set(subtasks.map(s => s.trim())).size !== subtasks.length) throw new ReviewDenied('arbiter_response_invalid');
+  return { verdict: 'SPLIT', reason, subtasks, subject_digest };
+}
+
 function parseArbiterDecision(text) {
   const body = String(text ?? '').trim();
   const json = /^```(?:json)?\s+([\s\S]*?)```$/i.exec(body)?.[1] ?? body;
@@ -1324,7 +1403,7 @@ function parseArbiterDecision(text) {
 // арбитр судит по сериализованному спору (trigger + evidence + спека), а не
 // по дереву — дерево и worktree в контейнер не монтируются вообще.
 export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi', 'agent'),
-  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect }) {
+  prompt = '', image = REVIEW_IMAGE, timeoutMs = 480_000, sandbox = piSandbox, beforeEffect, signal }) {
   if (!isAbsolute(piRoot ?? '')) {
     throw new ReviewDenied('arbiter_runner_misconfigured');
   }
@@ -1363,8 +1442,16 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
       const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1',
         PI_ALLOW_CONNECT: allow.join(',') };
 
+      // A panel receives the primary reader's brief (including its verdict
+      // format). Present that as context, not as the arbiter's output contract.
+      const panelDispute = req.trigger?.kind === 'panel_p1_conflict';
+      const evidence = JSON.stringify(req.evidence ?? null);
+      // A panel ruling may resolve a proven objection: never turn truncated
+      // findings into an acceptance. Oversized disputes require a hold.
+      if (panelDispute && Buffer.byteLength(evidence) > 64 * 1024) throw new ReviewDenied('arbiter_evidence_too_large');
       const instruction = [
-        `Independent arbitration for Board #${req.task_id} attempt ${req.attempt_id}.`,
+        ...(panelDispute ? ['Reviewer brief (context for the dispute):', prompt, 'End reviewer brief.', ''] : []),
+        `Independent arbitration for Board #${req.task_id}${req.attempt_id ? ` attempt ${req.attempt_id}` : ''}.`,
         'You are the arbiter of the third independent family. Judge the dispute below',
         'against the spec. You have read-only tools only; do not attempt to write.',
         `The required subject_digest is "${req.subject_digest ?? ''}". Repeat it verbatim`,
@@ -1374,13 +1461,14 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
         '"subject_digest":"<the required digest>",',
         '"directive":"..."} or {"decision":"accept_with_notes","subject_digest":"...",',
         '"notes":"..."} or {"decision":"escalate_owner","subject_digest":"...",',
-        '"question":"..."}.',
+        '"question":"..."}. For an over-scoped card, including repeated REWORK on mixed concerns,',
+        'route to Project Teamlead instead: {"verdict":"SPLIT","subject_digest":"...",',
+        '"reason":"why separate these concerns","subtasks":["first bounded outcome","second bounded outcome"]}.',
         'You may never waive deterministic gates, DoD, or accept harm 10 findings.',
         '',
         `Trigger: ${JSON.stringify(req.trigger ?? null)}`,
-        `Evidence: ${JSON.stringify(req.evidence ?? null).slice(0, 8000)}`,
-        '',
-        prompt,
+        `Evidence: ${panelDispute ? evidence : evidence.slice(0, 8000)}`,
+        ...(panelDispute ? [] : ['', prompt]),
       ].join('\n');
 
       const piArgv = ['/bin/sh', '-c',
@@ -1402,13 +1490,13 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
       const snapshot = join(scratch, 'empty');
       await mkdir(snapshot);
       const run = await sandbox({ snapshot, argv: piArgv, image, env, mounts, allow, timeoutMs,
-        input: authInput, beforeEffect });
+        input: authInput, beforeEffect, signal });
       if (run.code !== 0) {
         throw new ReviewDenied(`arbiter_runner_exit:${run.code ?? 'timeout'}`);
       }
       const transcript = run.stdout;
       if (typeof journal === 'string' && isAbsolute(journal)) {
-        const name = `arbiter-${req.task_id}-${req.attempt_id}-${randomUUID()}.ndjson`;
+        const name = `arbiter-${req.task_id}-${req.attempt_id ?? 'panel'}-${randomUUID()}.ndjson`;
         await writeFile(join(journal, name), transcript, { flag: 'wx', mode: 0o600 });
       }
       const parsed = parseReviewTranscript(transcript);
@@ -1424,7 +1512,7 @@ export function isolatedArbiterRunner({ journal, piRoot = join(homedir(), '.pi',
         throw new ReviewDenied('arbiter_subject_mismatch');
       }
       // VS-3: решение арбитра с суммарным usage его ходов (null при отсутствии).
-      return { ...decision, usage: parsed.usage ?? null };
+      return { ...(splitVerdict(decision) ?? decision), usage: parsed.usage ?? null };
     } finally {
       await rm(scratch, { recursive: true, force: true });
     }

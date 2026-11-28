@@ -26,6 +26,7 @@ import {
   resolveTriad,
   toPipelineAllowlist,
 } from './model-registry.mjs';
+import { assertCrossFamily, executorFamily } from './review-runner.mjs';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -114,7 +115,7 @@ test('a pinned registry restricts exact pairs and effective status; a catalog ca
 test('example registry загружается: 9 моделей, строгая схема, balanced mode', async () => {
   await tmp(async dir => {
     const registry = await loadFixture(dir);
-    assert.equal(registry.catalog.models.length, 9);
+    assert.equal(registry.catalog.models.length, 10);
     assert.equal(registry.policy.mode, 'balanced');
     const gpt = registry.modelById.get('gpt-6.2-sol');
     assert.equal(gpt.family, 'openai');
@@ -125,13 +126,32 @@ test('example registry загружается: 9 моделей, строгая 
   });
 });
 
+test('the standby zcode catalog worker is independent of the five other model families', async () => {
+  await tmp(async dir => {
+    const registry = await loadFixture(dir);
+    const entry = registry.modelById.get('glm-5.3-flash');
+    assert.ok(entry, 'example catalog must enroll glm-5.3-flash');
+    assert.deepEqual([entry.provider, entry.model, entry.family, entry.status, entry.cost_tier],
+      ['zcode', 'GLM-5.3-Flash', 'glm', 'standby', 'subscription']);
+    assert.deepEqual(entry.capabilities, ['code', 'reasoning', 'fast', 'review']);
+    for (const [critic, family] of [['openai/gpt-6.2-sol', 'openai'], ['acp-devin/swe-2-high', 'cognition'],
+      ['google/gemini-4-neon', 'google'], ['agy/claude-opus-5.5', 'anthropic'], ['deepseek/deepseek-v4', 'deepseek']]) {
+      assert.deepEqual(assertCrossFamily(entry, critic), { executor: 'glm', critic: family });
+    }
+    for (const provider of ['zcode', 'acp-zcode-start']) for (const model of ['GLM-5.3', 'glm-5.3-flash']) {
+      assert.equal(executorFamily({ provider, model }), 'glm');
+      assert.throws(() => assertCrossFamily(entry, { provider, model }), /review_same_family/);
+    }
+  });
+});
+
 test('config discovery: user pair имеет приоритет, половинчатая пара fail-closed', async () => {
   await tmp(async dir => {
     const paths = await fixture(dir);
     const registry = await loadModelRegistry({ configDir: dir, now: NOW });
     assert.equal(registry.catalogPath, paths.catalogPath);
     assert.equal(registry.policyPath, paths.policyPath);
-    assert.equal(registry.catalog.models.length, 9);
+    assert.equal(registry.catalog.models.length, 10);
 
     await rm(paths.policyPath);
     await assert.rejects(loadModelRegistry({ configDir: dir, now: NOW }),
@@ -143,6 +163,44 @@ test('config discovery: user pair имеет приоритет, половин�
     const registry = await loadModelRegistry({ configDir: empty, now: NOW });
     assert.equal(registry.catalogPath, EXAMPLE_CATALOG_PATH);
     assert.equal(registry.policyPath, EXAMPLE_POLICY_PATH);
+  });
+});
+
+test('Devin Fusion: catalog attests the lead, triad excludes both families from reviewer and arbiter', async () => {
+  await tmp(async dir => {
+    for (const [lead, family, cost_tier, same] of [
+      ['gpt-6-2-astra-high', 'openai', 'subscription', 'gpt-6.2-sol'],
+      ['claude-opus-5-5-high', 'anthropic', 'paid_api', 'claude-opus-5.5'],
+    ]) {
+      const entry = { id: 'fusion-worker', provider: 'acp-devin', model: `fusion-${lead}-sidekick-swe-2-1-medium`,
+        family, cost_tier, status: 'active', capabilities: ['code', 'reasoning'], quota_source: 'manual', notes: '' };
+      const registry = await loadFixture(dir, catalog => {
+        catalog.models.push(entry, { ...structuredClone(catalog.models[0]), id: 'swe-reader', provider: 'cognition' });
+        for (const m of catalog.models) {
+          m.status = 'active'; m.capabilities.push(...['review', 'reasoning'].filter(c => !m.capabilities.includes(c)));
+        }
+      }, policy => {
+        const mode = policy.modes.balanced;
+        mode.cost_tiers = ['free', 'subscription', 'paid_api'];
+        Object.assign(mode.candidates, { coder_default: [entry.id], reviewer: ['swe-reader', same, 'gemini-4-neon'],
+          arbiter: [same, 'swe-reader', 'deepseek-v4.1-flash'] });
+      });
+      assert.ok(isApprovedModel(entry, registry));
+      const allowlist = toPipelineAllowlist(registry, { now: NOW });
+      assert.deepEqual(allowlist.worker, [{ provider: entry.provider, model: entry.model }]);
+      assert.doesNotThrow(() => assertPolicyModelMatrix({ registry, policy: { routing: { allowlist } } }));
+      for (const role of ['critic', 'arbiter']) {
+        assert.ok(!allowlist[role].some(spec => spec.provider === 'cognition'));
+        const unsafe = { ...allowlist, [role]: [registry.modelById.get('swe-reader')] };
+        assert.throws(() => assertPolicyModelMatrix({ registry, policy: { routing: { allowlist: unsafe } } }), /sidekick_family_collision/);
+      }
+      const { coder, reviewer, arbiter } = resolveTriad(registry, { now: NOW });
+      assert.deepEqual([coder?.family, reviewer?.family, arbiter?.family], [family, 'google', 'deepseek']);
+      for (const patch of [{ family: 'cognition' }, { cost_tier: 'free' }, { provider: 'openai' },
+        { model: entry.model + '-unknown' }, { model: 'openai/' + entry.model, provider: 'pi' }]) {
+        await assert.rejects(loadFixture(dir, c => c.models.push({ ...entry, ...patch })), /model_catalog_invalid/);
+      }
+    }
   });
 });
 
@@ -325,7 +383,7 @@ test('registrySnapshot: компактный срез моделей, contextual
     const registry = await loadFixture(dir);
     const snapshot = registrySnapshot(registry, { now: NOW });
     assert.equal(snapshot.mode, 'balanced');
-    assert.equal(snapshot.models.length, 9);
+    assert.equal(snapshot.models.length, 10);
     assert.equal(snapshot.models.find(m => m.id === 'gpt-6.2-sol').effectiveStatus, 'quota_paused');
     assert.ok(Array.isArray(snapshot.roles.coder_default));
     assert.equal(snapshot.triad.coder.family, 'cognition');
@@ -351,7 +409,7 @@ test('CLI list/effective --json работают без инициализаци
     const configDir = join(dir, 'config');
     const list = await runCli(['list', '--json', '--config-dir', configDir]);
     assert.equal(list.code, 0, list.stderr);
-    assert.equal(JSON.parse(list.stdout).models.length, 9);
+    assert.equal(JSON.parse(list.stdout).models.length, 10);
 
     const effective = await runCli(['effective', '--mode', 'economy', '--json', '--config-dir', configDir]);
     assert.equal(effective.code, 0, effective.stderr);
@@ -543,7 +601,7 @@ test('P2: symlink родительского config dir допустим, symlin
     const linked = join(dir, 'linked-config');
     await symlink(real, linked, 'dir');
     const registry = await loadModelRegistry({ configDir: linked, now: NOW });
-    assert.equal(registry.catalog.models.length, 9);
+    assert.equal(registry.catalog.models.length, 10);
 
     const target = join(dir, 'catalog-target.yaml');
     await writeFile(target, await readFile(paths.catalogPath, 'utf8'));

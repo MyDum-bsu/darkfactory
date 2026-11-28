@@ -1,6 +1,65 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createDispatcher } from './dispatcher.mjs';
 import { normalizeScopePaths, pathsOverlap, planSlotAssignments } from './scope-lock-scheduler.mjs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { scopeLockedBoard } from './daemon.mjs';
+import { nativeBoardPort } from './native-board.mjs';
+import { memoryBoard } from './board-test-fixture.mjs';
+
+// Separate controllers share only Board and the private lock directory. A new
+// controller process must still see a stopped controller's in-flight writer.
+test('native claim skips overlaps, admits disjoint scopes and retains locks across restart', async t => {
+  const registry = await mkdtemp(join(tmpdir(), 'df-scope-'));
+  t.after(() => rm(registry, { recursive: true, force: true }));
+  const handle = memoryBoard();
+  const labels = { repo_id: 'repo', queue: 'q', profile_id: 'p', finish: 'verified',
+    spec_digest: 'a'.repeat(64), policy_digest: 'b'.repeat(64) };
+  const filter = { owner: 'board:client', label: { key: 'queue', value: 'q' }, profileId: 'p',
+    finish: 'verified', required: ['repo_id', 'profile_id', 'policy_digest', 'spec_digest'] };
+  const cards = [];
+  for (const scope of ['src/', 'src/file', 'tests/', undefined]) {
+    cards.push((await handle.tasks.create('q', { labels: { ...labels,
+      ...(scope && { allowed_paths: scope }) } })).task.id);
+  }
+  const slot = id => {
+    const locked = scopeLockedBoard(handle, { registry, slot: id });
+    return { board: nativeBoardPort(locked.handle, { channel: 'q' }), retire: locked.release };
+  };
+  const a = slot('a'), b = slot('b'), c = slot('c');
+  // Pause A between planning and SDK claim: B cannot slip through the
+  // same-repo check/write gap before A's durable reservation is published.
+  const claim = handle.tasks.claim.bind(handle.tasks);
+  const entered = Promise.withResolvers(), resume = Promise.withResolvers();
+  handle.tasks.claim = async (...args) => { entered.resolve(); await resume.promise; return claim(...args); };
+  const acquiring = a.board.claimReady(filter);
+  await entered.promise;
+  try { assert.equal(await b.board.claimReady(filter), null); } finally { resume.resolve(); }
+  assert.equal((await acquiring).taskId, cards[0]);
+  assert.equal((await b.board.claimReady(filter)).taskId, cards[2]);
+  assert.equal(await c.board.claimReady(filter), null);
+  assert.equal((await c.board.lookup(cards[1])).state, 'ready');
+  await slot('b').retire({ repoId: 'repo', taskId: cards[0] }); // cannot release another slot
+  assert.equal(await c.board.claimReady(filter), null);
+  await slot('a').retire({ repoId: 'repo', taskId: cards[0] });
+  assert.equal((await c.board.claimReady(filter)).taskId, cards[1]);
+  assert.equal(await slot('d').board.claimReady(filter), null, 'unscoped needs the entire repo');
+});
+
+test('dispatcher reserves a whole repo for a boolean hint; scoped admissions last until controller exit', async () => {
+  const projects = ['a', 'b', 'c'].map((worktree, i) => ({ repo_id: i === 1 ? 'REPO' : 'repo', worktree }));
+  const held = new Map(), starts = [];
+  const hints = new Map(projects.map(p => [p, true]));
+  const dispatcher = createDispatcher({ projects, resources: () => ({ cpuCount: 4, availableMemoryBytes: 12 * 2 ** 30 }),
+    poll: p => hints.get(p), launch: p => { starts.push(p.worktree); return new Promise(r => held.set(p, r)); } });
+  await dispatcher.tick(); await dispatcher.tick(); assert.deepEqual(starts, ['a']);
+  hints.set(projects[0], false); held.get(projects[0])(); await dispatcher.drain();
+  for (const [i, scope] of ['src/one', 'docs/', 'src/'].entries()) hints.set(projects[i], { taskId: String(i), allowed_paths: scope });
+  await dispatcher.tick(); await dispatcher.tick(); assert.deepEqual(starts, ['a','b','c']);
+  held.get(projects[1])(); held.get(projects[2])(); await dispatcher.drain();
+});
 
 test('normalizeScopePaths parses comma-separated strings and arrays verbatim', () => {
   assert.deepEqual(normalizeScopePaths('a/b.mjs, c/d.mjs'), ['a/b.mjs', 'c/d.mjs']);

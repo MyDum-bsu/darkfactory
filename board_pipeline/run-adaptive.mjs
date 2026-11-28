@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { TERMINAL_PHASES } from './daemon.mjs';
 import { extractPostReviewMemoryUpdates, writeTrustedReviewReceipt } from './project-memory.mjs';
 import { parseTelemetryLines, readTelemetryLines } from './telemetry.mjs';
@@ -10,6 +10,7 @@ import * as workerSelector from './worker-selector.mjs';
 import { assertTriadStageCompatible } from './playbook-router.mjs';
 import { loadRoleRegistry } from './role-registry.mjs';
 import { pinAttemptTriad } from './review-setup.mjs';
+import { fusionModelMeta } from './review-runner.mjs';
 
 // V2-9b Adaptive 2-Tier Verification Gates: чистый планировщик разбиения
 // проверок доверенного профиля на синхронные (L1 Docker) и отложенные
@@ -301,16 +302,20 @@ export async function recordPostReviewMemory({
   }
 }
 
-export function createAttemptLearning({ ab, root, tree, state, route }) {
-  // VS-4.2 Self-Learning Review Loop (#1263): уроки REWORK живут в
-  // приватном каталоге состояния, вне дерева воркера. При инъекции
-  // хранилище проходит повторный fail-closed гейт — ослабляющий урок
-  // в промпт не попадает никогда.
-  const lessonsPath = join(root, 'lessons.jsonl');
+export function createAttemptLearning({ ab, root, tree, state, route, lessonsPath: override }) {
+  const configuredPath = override ?? (process.env.DF_LESSONS_PATH || null);
+  if (configuredPath !== null) {
+    if (!isAbsolute(configuredPath)) throw new Error('lessons_store_path_not_absolute');
+    if (typeof tree !== 'string' || !isAbsolute(tree)) throw new Error('lessons_store_worktree_required');
+  }
+  const lessonsPath = configuredPath ?? join(root, 'lessons.jsonl');
+  // run-isolated supplies the canonical worktree. Pin the store's parent so
+  // the distiller checks it for symlinks even before the first file exists.
+  const storeBounds = { allowedDir: configuredPath === null ? root : dirname(lessonsPath),
+    outside: [tree] };
   const currentLessons = async () => {
     if (ab) return [];
-    // Границы хранилища: файл в приватном root, не симлинк, вне worktree.
-    const existing = await loadLessons(lessonsPath, { allowedDir: root, outside: [tree] });
+    const existing = await loadLessons(lessonsPath, storeBounds);
     if (!existing.length) return [];
     const { accepted } = validateDistilledLessons(existing);
     return accepted;
@@ -337,11 +342,10 @@ export function createAttemptLearning({ ab, root, tree, state, route }) {
       const candidates = distillReworkLessons(rounds,
         { cardId: String(record.taskId ?? route.taskId ?? 'unknown') });
       if (!candidates.length) return;
-      const existing = await loadLessons(lessonsPath, { allowedDir: root, outside: [tree] });
+      const existing = await loadLessons(lessonsPath, storeBounds);
       const { accepted, pending, rejected } = validateDistilledLessons(candidates, { existing });
       if (accepted.length) {
-        await appendLessons(lessonsPath, accepted,
-          { existing, allowedDir: root, outside: [tree] });
+        await appendLessons(lessonsPath, accepted, storeBounds);
       }
       if (pending.length || rejected.length) {
         console.log(JSON.stringify({ kind: 'lessons_gate',
@@ -369,8 +373,16 @@ const approved = [
   { provider: 'pi', model: 'openai/gpt-6.2-astra' },
   { provider: 'pi', model: 'openai/gpt-6.2-sol' },
 ];
+const approvedZcodeModels = new Set(['glm-5.3-flash', 'glm-5.3']);
+for (const account of ['account:zai-start-plan', 'account:zai-individual-coding-plan']) {
+  for (const model of ['glm-5.3-flash', 'glm-5.3']) approvedZcodeModels.add(`${account}/${model}`);
+}
 export const isApprovedWorker = bb =>
   approved.some(e => e.provider === bb?.provider && e.model === bb?.model) ||
+  (['acp-zcode-start', 'zcode'].includes(bb?.provider) && typeof bb.model === 'string' &&
+    approvedZcodeModels.has(bb.model.toLowerCase())) ||
+  (bb?.provider === 'acp-devin' && typeof bb.model === 'string' &&
+    fusionModelMeta(bb.model) !== null) ||
   (bb?.provider === 'pi' && typeof bb.model === 'string' &&
     /^opencode-go\//i.test(bb.model) &&
     workerSelector.workerFamily(bb) === 'deepseek');

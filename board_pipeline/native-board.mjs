@@ -1,3 +1,5 @@
+import { setTimeout as delay } from 'node:timers/promises';
+import { checkChannel, cliRunner, createRolePass, requireRole } from './board-stigmergy.mjs';
 import { PilotDenied } from './pilot-gate.mjs';
 import { pilotProjection, pilotScopeMatches } from './pilot-projection.mjs';
 
@@ -41,12 +43,129 @@ export function isTransientBoardError(error) {
   return /timeout|timed out|network|fetch failed|socket hang up/i.test(String(error?.message ?? ''));
 }
 
-// The native claim token never leaves this adapter.
-export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestionOwner = false, pilot }) {
+const cursorOf = page => {
+  if (typeof page?.cursor !== 'string' || !page.cursor.length || page.cursor.length > 4096) throw new Error('invalid_board_cursor');
+  return page.cursor;
+};
+
+// HTTP equivalent of Board's tail/wait: /events long-polls from an opaque
+// event cursor. /tasks pagination cursors and message timestamps are NOT event cursors.
+export function httpBoardFeed({ base, headers, fetchImpl = fetch }) {
+  return { async poll(query, signal) {
+    const url = `${base.replace(/\/$/, '')}/events?${new URLSearchParams(query)}`;
+    const res = await fetchImpl(url, { method: 'GET', redirect: 'error', headers, signal });
+    if (!res.ok) {
+      const body = res.status === 400 ? await res.json().catch(() => null) : null;
+      throw Object.assign(new Error(`board_events_http_${res.status}`), { code: body?.error?.code });
+    }
+    const page = await res.json();
+    if (!Array.isArray(page.events)) throw new Error('invalid_board_event_page');
+    cursorOf(page);
+    return page;
+  } };
+}
+
+// Change notifications only invalidate an authoritative snapshot; they never
+// authorize work. One bounded wait in flight. No timer or reconnect loop left
+// behind when a consumer stops. Even a silent/missing feed can't hide lease
+// expiry, WAL recovery or permission changes past the reconciliation deadline.
+export function eventSnapshots(feed, channel, { now = Date.now, maxAgeMs = 25_000, onChange } = {}) {
+  checkChannel(channel);
+  if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1 || maxAgeMs > 60_000) throw new Error('invalid_event_deadline');
+  let cursor, cache, until = 0, retryAt = 0, pending, generation = 0, primed = false;
+  function reset() {
+    ++generation;
+    pending?.abort(); pending = undefined; cache = undefined; until = 0;
+  }
+  function arm() {
+    if (pending) return;
+    const ac = pending = new AbortController();
+    const signal = AbortSignal.any([ac.signal, AbortSignal.timeout(30_000)]);
+    Promise.resolve().then(() => feed.poll({ channel, after: cursor, wait: 25 }, signal)).then(page => {
+      if (pending !== ac) return;
+      if (!Array.isArray(page.events)) throw new Error('invalid_board_event_page');
+      const next = cursorOf(page);
+      if (page.events.length && next === cursor) throw new Error('board_cursor_stalled');
+      cursor = next;
+      if (page.events.length) { until = 0; onChange?.(); }
+    }).catch(error => {
+      if (pending !== ac) return;
+      if (boardErrorCode(error) === 'invalid_cursor') cursor = undefined;
+      until = 0; retryAt = now() + 1000; // disconnect: next caller takes a bounded snapshot
+    }).finally(() => { if (pending === ac) pending = undefined; });
+  }
+  return { reset, async read(load, cacheable = () => true) {
+    if (!feed?.poll) return load();
+    if (now() < retryAt) {
+      if (now() < until) return cache;
+      const version = generation;
+      const result = await load();
+      if (version === generation && cacheable(result)) { cache = result; until = retryAt; }
+      return result;
+    }
+    // A one-shot observer never opens a stream. On reuse, anchor BEFORE
+    // taking the first cacheable snapshot, so the snapshot/subscribe gap replays.
+    if (!primed) { primed = true; return load(); }
+    if (now() < until) { arm(); return cache; }
+    reset();
+    const version = generation;
+    let anchor;
+    try {
+      anchor = cursor ?? cursorOf(await feed.poll({ channel, last: 1 }, AbortSignal.timeout(3000)));
+    } catch { retryAt = now() + 1000; return load(); }
+    const result = await load();
+    if (version === generation && cacheable(result)) {
+      cursor = anchor; cache = result; until = now() + maxAgeMs; arm();
+    }
+    return result;
+  } };
+}
+
+// SDK equivalents of `tail` and `wait --after`. One fallback notification
+// asks the consumer for a snapshot. Never invent a cursor on disconnect.
+export function boardChanges(handle, channel) {
+  checkChannel(channel);
+  async function* follow(after, { signal, timeoutMs = 25_000, fallbackMs = 1000 } = {}, once) {
+    if (after != null) cursorOf({ cursor: after });
+    if (![timeoutMs, fallbackMs].every(n => Number.isSafeInteger(n) && n > 0 && n <= 60_000)) throw new Error('invalid_event_deadline');
+    const timer = AbortSignal.timeout(timeoutMs);
+    const bounded = signal ? AbortSignal.any([signal, timer]) : timer;
+    const query = { channel, ...(after == null ? {} : { after }) };
+    try {
+      if (!once && handle.events) {
+        for await (const event of handle.events(query, { signal: bounded })) {
+          const next = cursorOf(event);
+          if (next === after) continue;
+          after = next; yield { cursor: next, event };
+        }
+      } else if (handle.wait) {
+        const event = await handle.wait(query, { timeout: timeoutMs, signal: bounded });
+        if (event && cursorOf(event) !== after) { yield { cursor: event.cursor, event }; return; }
+      }
+    } catch { signal?.throwIfAborted(); }
+    signal?.throwIfAborted();
+    await delay(fallbackMs, undefined, { signal });
+    yield { cursor: after ?? null, event: null, fallback: true };
+  }
+  return { tailChanges: (after, options) => follow(after, options, false),
+    async waitForChange(after, options) { for await (const item of follow(after, options, true)) return item; } };
+}
+
+// The native claim token never leaves this adapter. Trace writes are opt-in
+// for an enrolled channel; do not silently mutate an existing pilot Board.
+export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestionOwner = false, pilot,
+  role = process.env.DF_STIGMERGY_CHANNEL === channel ? process.env.BOARD_PROFILE ?? 'arbiter' : 'arbiter',
+  traceRun = process.env.DF_STIGMERGY_CHANNEL === channel ? cliRunner({ url: process.env.BOARD_URL }) : null }) {
   if (pilot && (pilot.scope.channel !== channel || typeof pilot.assertOpen !== 'function')) {
     throw new PilotDenied('pilot_route_not_allowed');
   }
   const held = new Map();
+  let idleView, filterKey;
+  function pass(taskId, epoch) {
+    if (!traceRun) throw new Error('stigmergy_not_enrolled');
+    return createRolePass({ role, taskId, epoch, channel, run: traceRun,
+      guard: pilot ? (id, epoch, action) => allowEffect(id, action === 'assign' ? 'ready' : 'claimed', epoch) : undefined });
+  }
 
   async function rootOf(taskId) {
     const { message } = await handle.thread(taskId, { limit: 1 });
@@ -68,6 +187,7 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
   }
 
   async function project(taskId, epoch, phase, sha) {
+    requireRole(role, 'complete');
     const root = await rootOf(taskId);
     const change = pilotProjection({ phase, epoch, sha }, root, pilot.scope);
     if (!change) return;
@@ -205,6 +325,7 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
   }
 
   async function acquire(taskId, token, seen) {
+    requireRole(role, 'complete'); // a claim token also authorizes completion
     await allowEffect(taskId, 'ready', undefined, seen);
     const claim = await handle.tasks.claim(taskId, token === undefined ? { lease } : { lease, token });
     held.set(taskId, claim);
@@ -235,8 +356,12 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
 
   return {
     ...(pilot ? { project, blockText, guardTask: (taskId, epoch) => allowEffect(taskId, 'claimed', epoch) } : {}),
+    ...boardChanges(handle, channel),
+    postTrace: (taskId, schema, data, evidence) => pass(taskId, data?.epoch).post(schema, data, evidence),
+    assign: (taskId, epoch, assignee) => pass(taskId, epoch).assign(epoch, assignee),
     questionState,
     async unblockQuestion(question, blockText) {
+      requireRole(role, 'complete');
       if (await questionState(question, blockText) !== 'blocked') throw new Error('Question hold changed');
       // Board 0.54.0 has no CAS on unblock. This capability is only enabled on
       // the isolated owner-exclusive queue, never on the public pilot route.
@@ -256,49 +381,26 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
         (!pilot || pilotScopeMatches(root, pilot.scope));
     },
     async claim(taskId, { token } = {}) {
+      requireRole(role, 'complete');
       return claimById(taskId, { token });
     },
     // Захват старейшей готовой карточки этого канала по allowlist. waiting-карточки с
     // незакрытыми needs и неавторизованные карточки не трогаются: эффектов нет, возврат null.
     async claimReady(filter, { token } = {}) {
       const trusted = checkFilter(filter);
-      const query = { channel, state: 'ready', limit: 200, owner: trusted.owner };
-      const serverLabels = [`${trusted.label.key}=${trusted.label.value}`, `finish=${trusted.finish}`];
-      for (const key of trusted.required) serverLabels.push(key);
-      query.label = serverLabels;
-      let after;
-      for (;;) {
-        const page = await handle.tasks.list({ ...query, ...(after ? { after } : {}) });
-        for (const entry of page.tasks ?? []) {
-          const listed = entry?.message;
-          if (listed?.channel !== channel || !admits(trusted, listed)) continue;
-          // Единственный перечитанный снимок непосредственно перед SDK claim: владелец,
-          // метка, профиль и контракт проверяются на нём же, его метки и возвращаются.
-          const fresh = await rootOf(listed.id);
-          if (fresh.task.state !== 'ready' || !admits(trusted, fresh)) continue;
-          try {
-            const claim = await acquire(listed.id, token, fresh);
-            return { taskId: listed.id, ...claim, labels: fresh.labels,
-              ...(typeof fresh.text === 'string' ? { text: fresh.text } : {}) };
-          } catch (error) {
-            if (isClaimConflict(error)) continue;
-            throw error;
-          }
-        }
-        // Сервер сообщает курсор следующей страницы; без сдвига или без карточек очередь кончилась.
-        if (!page.cursor || page.cursor === after || !page.tasks?.length) return null;
-        after = page.cursor;
+      requireRole(role, 'complete');
+      const key = JSON.stringify(trusted);
+      if (key !== filterKey) {
+        idleView?.reset(); filterKey = key; idleView = eventSnapshots(handle, channel);
       }
+      return idleView.read(() => scanReady(trusted, token), result => result === null);
     },
     async adopt(taskId, { epoch, token }) {
+      requireRole(role, 'complete');
       if (!Number.isSafeInteger(epoch) || !/^[a-zA-Z0-9_-]{43}$/.test(token ?? '')) {
         throw new Error('A trusted held capability is required');
       }
       const root = await lookup(taskId);
-      // Ошибка потери владения маркируется кодом окончательной потери: без кода
-      // isDefinitiveClaimLoss не распознал бы её, а контроллер fail-closed
-      // классифицирует любой не-транзитный сбой как терминал — но точный код
-      // делает потерю claim/эпохи явной для всех потребителей адаптера.
       if (root.state !== 'claimed' || root.epoch !== epoch) {
         const error = new Error('Held epoch no longer owns the card');
         error.code = root.epoch !== epoch ? 'epoch_mismatch' : 'claim_lost';
@@ -308,7 +410,14 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
       held.set(taskId, { epoch, until: null, renew: () => capability.renew(lease),
         complete: result => capability.complete(result), block: (reason, opts) => capability.block(reason, opts) });
     },
+    async block(taskId, epoch, reason) {
+      const claim = claimFor(taskId, epoch);
+      await allowEffect(taskId, 'claimed', epoch);
+      await claim.block(blockText(epoch, reason), { kind: 'needs_input' });
+      held.delete(taskId);
+    },
     async complete(taskId, epoch, evidence) {
+      requireRole(role, 'complete');
       const claim = claimFor(taskId, epoch);
       let publicEvidence = evidence;
       if (pilot && evidence?.arbitration && Object.hasOwn(evidence.arbitration, 'notes')) {
@@ -321,14 +430,48 @@ export function nativeBoardPort(handle, { channel, lease = 1800, isolatedQuestio
         throw new Error('Board result requires compact typed evidence (up to 1000 characters)');
       }
       await allowEffect(taskId, 'claimed', epoch);
+      if (traceRun) {
+        // Project from the same frozen bytes as complete, never model notes or paths.
+        const { sha, review, checks, finish, target, smoke, verdict } = JSON.parse(text);
+        const trace = pass(taskId, epoch);
+        if (finish === 'deployed') {
+          await trace.post('df.deploy_receipt@1', { epoch, sha, target, smoke });
+        } else {
+          const data = { epoch, sha, verdict: review?.verdict ?? verdict };
+          await trace.post('df.l2_verdict@1', data, { 'verdict.json': JSON.stringify(data),
+            ...(checks ? { 'l1-tail.txt': JSON.stringify(checks) } : {}) });
+        }
+        await allowEffect(taskId, 'claimed', epoch);
+      }
       await claim.complete(text);
       held.delete(taskId);
     },
-    async block(taskId, epoch, reason) {
-      const claim = claimFor(taskId, epoch);
-      await allowEffect(taskId, 'claimed', epoch);
-      await claim.block(blockText(epoch, reason), { kind: 'needs_input' });
-      held.delete(taskId);
-    },
   };
+
+  async function scanReady(trusted, token) {
+    const query = { channel, state: 'ready', limit: 200, owner: trusted.owner,
+      label: [`${trusted.label.key}=${trusted.label.value}`, `finish=${trusted.finish}`, ...trusted.required] };
+    let after;
+    for (let pages = 0; pages < 100; pages++) {
+      const page = await handle.tasks.list({ ...query, ...(after ? { after } : {}) });
+      for (const entry of page.tasks ?? []) {
+        const listed = entry?.message;
+        if (listed?.channel !== channel || !admits(trusted, listed)) continue;
+        // Never claim from a cached hint: check the exact root passed to acquire.
+        const fresh = await rootOf(listed.id);
+        if (!admits(trusted, fresh)) continue;
+        try {
+          const claim = await acquire(listed.id, token, fresh);
+          return { taskId: listed.id, ...claim, labels: fresh.labels,
+            ...(typeof fresh.text === 'string' ? { text: fresh.text } : {}) };
+        } catch (error) {
+          if (isClaimConflict(error)) continue;
+          throw error;
+        }
+      }
+      if (!page.cursor || page.cursor === after || !page.tasks?.length) return null;
+      after = page.cursor;
+    }
+    throw new Error('board_pagination_exceeded');
+  }
 }

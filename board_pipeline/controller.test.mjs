@@ -301,6 +301,37 @@ test('queue mode claims only the admitted card, unlocks the dependent and stops 
   assert.equal(x.seen.claim, 2);
 });
 
+test('matching expected_base_sha pins the claim and allows a worker to start', async t => {
+  const expected = 'a'.repeat(40);
+  const x = await queueLab(t, { labels: { ...CONTRACT, expected_base_sha: expected } });
+  assert.equal((await x.tick()).phase, 'working');
+  assert.equal(x.effects.spawn, 1);
+  assert.equal((await x.cfg.state.load()).contract.expected_base_sha, expected);
+});
+
+for (const [kind, expected] of [
+  ['stale', 'b'.repeat(40)], ['abbreviated', 'a'.repeat(39)], ['uppercase', 'A'.repeat(40)],
+  ['empty', ''], ['null', null], ['non-string', ['a'.repeat(40)]],
+]) {
+  test(`${kind} expected_base_sha blocks the claimed card without spawning`, async t => {
+    const labels = typeof expected === 'string' ? { ...CONTRACT, expected_base_sha: expected } : CONTRACT;
+    const x = await queueLab(t, { labels });
+    if (typeof expected !== 'string') {
+      // The SDK only writes string labels; exercise malformed input at the controller's claim boundary.
+      const claimReady = x.cfg.board.claimReady;
+      t.mock.method(x.cfg.board, 'claimReady', async (...args) => {
+        const claim = await claimReady(...args);
+        return { ...claim, labels: { ...claim.labels, expected_base_sha: expected } };
+      });
+    }
+    const result = await x.tick();
+    assert.equal(result.reason, 'expected_base_sha_mismatch');
+    assert.equal(result.phase, 'hold');
+    assert.equal(x.effects.spawn, 0);
+    assert.equal((await x.card(0)).state, 'blocked');
+  });
+}
+
 test('queue mode pins the card contract into the attempt for the subject manifest', async t => {
   const x = await queueLab(t);
   await x.tick();

@@ -30,6 +30,7 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parseArgs } from 'node:util';
+import { parse as parseYaml } from 'yaml';
 import { normalizeEvent } from '../../board_pipeline/event-bus.mjs';
 import { isAllowedHost, isAllowedOrigin, isAllowedFetchSite, sanitizeTerminalText,
   SECURITY_HEADERS } from './origin-guard.mjs';
@@ -39,7 +40,7 @@ import { buildAdaptiveGatesSummary } from '../../board_pipeline/adaptive-gates.m
 import { BOARD_API_PATH, buildBoardColumns, buildBoardExplorer, createBoardObserver,
   createBranchDriftProvider, readBoardTasks } from './board-observer.mjs';
 import { buildActiveTrees, buildFleetTelemetry, buildRepoSlots, createFleetHostsProvider,
-  createModelsProvider, createTelemetryProvider, readEventsTail } from './telemetry-fleet.mjs';
+  createModelsProvider, createTelemetryProvider, readControllerSlots, readEventsTail } from './telemetry-fleet.mjs';
 
 export { BOARD_API_PATH, buildBoardExplorer, createBoardObserver, createBranchDriftProvider,
   loadBoardTasksFromApi, normalizeBoardBaseUrl } from './board-observer.mjs';
@@ -187,6 +188,9 @@ export function createControlRoomAggregator({
   socketPath = null,
   stateDir = null,
   stateDirs = [],
+  projects = [],
+  herdrDocsPath,
+  slotRegistryDir = join(process.env.XDG_STATE_HOME ?? join(homedir(), '.local', 'state'), 'darkfactory-lab', 'slots'),
   fleetDir,
   ringLimit = RING_LIMIT,
   boardTasksProvider = async () => [],
@@ -205,6 +209,7 @@ export function createControlRoomAggregator({
   killSwitchPath = null,
   snapshotCacheTtlMs = 0,
 } = {}) {
+  stateDirs = [...new Set([stateDir, ...stateDirs, ...projects.map(p => p.state)].filter(Boolean))];
   const readTelemetry = telemetryProvider ?? createTelemetryProvider({ telemetryDir, stateDirs, now });
   const effectiveStateDir = stateDir ?? stateDirs[0] ?? null;
   const effectiveFleetDir = fleetDir !== undefined ? fleetDir
@@ -318,11 +323,14 @@ export function createControlRoomAggregator({
       : null;
     const sessions = sessionHygiene(threads, tasks, attempts);
     const shiva = shivaCounter(threads, tasks);
-    const activeTrees = buildActiveTrees({ events: ring, tasks,
-      telemetryAttempts: telemetry?.attempts ?? [], threads, now });
+    const inputs = { events: ring, tasks, telemetryAttempts: telemetry?.attempts ?? [], threads, now };
+    const { slots, trees } = await readControllerSlots({ ...inputs, registry: slotRegistryDir, stateDirs, projects, herdrDocsPath });
+    // Prefer the current WAL to stale historical attempts or a lagging Board poll.
+    const activeTrees = [...trees, ...buildActiveTrees(inputs).filter(tree => !slots.some(slot =>
+      slot.taskId === tree.taskId && (!tree.repoId || !slot.repo_id || tree.repoId === slot.repo_id)))];
     const fleetTelemetry = buildFleetTelemetry({ hosts: fleetHosts, telemetry, activeTrees });
     const boardExplorer = buildBoardExplorer(tasks);
-    const repoSlots = buildRepoSlots(activeTrees);
+    const repoSlots = buildRepoSlots(slots.length ? trees : activeTrees);
     const adaptiveGates = buildAdaptiveGatesSummary({ attempts: telemetry?.attempts ?? [] });
     const reconciled = reconcileNeeded;
     reconcileNeeded = false;
@@ -337,6 +345,7 @@ export function createControlRoomAggregator({
       sessions: { active: sessions.active, archivedCount: sessions.archived.length },
       shiva,
       activeTrees,
+      slots,
       boardExplorer,
       repoSlots,
       adaptiveGates,
@@ -700,6 +709,9 @@ export function parseControlRoomArgs(argv, env = process.env) {
     'worker-usage': { type: 'string' },
     'telemetry-dir': { type: 'string' },
     'fleet-dir': { type: 'string' },
+    'fleet-config': { type: 'string' }, // same operator registration file as factory-dispatch --config
+    'slot-registry-dir': { type: 'string' },
+    'finops-history': { type: 'string' },
     'kill-switch': { type: 'string' },
     'owner-write-token': { type: 'string' } } });
   const workerStatePath = values['worker-state-file'] ?? values['cloud-state'] ??
@@ -723,8 +735,11 @@ async function cli(argv) {
     cloudStatePath: workerStatePath });
   const boardUrl = values['board-url'] ?? process.env.BOARD_URL ??
     `http://127.0.0.1:44100${BOARD_API_PATH}`;
-  const channels = (values['board-channels'] ?? 'darkfactory')
-    .split(',').map(c => c.trim()).filter(Boolean);
+  const fleetConfig = values['fleet-config'] ?? process.env.DF_FLEET_CONFIG;
+  const projects = fleetConfig ? parseYaml(await readFile(fleetConfig, 'utf8'), { maxAliasCount: 0 })?.projects : [];
+  if (!Array.isArray(projects)) throw new Error('fleet config requires projects');
+  const channels = [...new Set([...(values['board-channels'] ?? 'darkfactory').split(','),
+    ...projects.map(p => p.channel)].filter(c => typeof c === 'string').map(c => c.trim()).filter(Boolean))];
   const boardToken = await loadBoardToken(values['board-token']);
   const observeBoard = createBoardObserver({ boardUrl, token: boardToken, channels });
   const driftRepos = await resolveDriftRepos(values['drift-repo']);
@@ -734,7 +749,8 @@ async function cli(argv) {
     : null;
   const stateDirs = values['state-dir'] ?? [];
   const aggregator = createControlRoomAggregator({
-    port, socketPath, stateDir: stateDirs[0] ?? null, stateDirs,
+    port, socketPath, stateDir: stateDirs[0] ?? null, stateDirs, projects,
+    slotRegistryDir: values['slot-registry-dir'],
     netHealth,
     boardTasksProvider: observeBoard.fetchTasks,
     bbThreadsProvider: () => loadBbThreadsFromCli(),
@@ -746,7 +762,7 @@ async function cli(argv) {
     fleetDir: values['fleet-dir'],
     finopsProvider: createFinopsProvider({
       budgetPath: values['resources-budget'],
-      workerUsagePath: values['worker-usage'],
+      workerUsagePath: values['worker-usage'], historyPath: values['finops-history'],
       workerStatePath }),
     // Owner Write-API: токен доступен из CLI/env, но ownerActions port — это
     // программный мост (Herdr Desktop/Mobile, Telegram/Iva); без живого порта

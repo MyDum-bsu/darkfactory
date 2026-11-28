@@ -356,8 +356,8 @@ export function createStageSandboxTransport({
       const env = { NODE_OPTIONS: '--require /tmp/pi-guard.cjs', PI_OFFLINE: '1',
         PI_ALLOW_CONNECT: allow.join(',') };
       const instruction = [
-        'Изолированный этап измерения. Read-only: никаких записей, сети, команд и инструментов изменения.',
-        'Дерево кандидата смонтировано read-only в /candidate — читай файлы напрямую.',
+        'Isolated measurement stage. Read-only: no writes, network, shell commands, or editing tools.',
+        'The candidate tree is mounted read-only at /candidate - read files directly.',
         prompt,
         '',
         `Challenge: ${challenge}`,
@@ -474,7 +474,7 @@ export function createStageSandboxTransport({
       };
       const instruction = [
         prompt,
-        'Файлы кандидата доступны read-only в candidate/ — прочитай их инструментами чтения (read_file, grep_search, find_by_name, list_dir).',
+        'Candidate files are available read-only under candidate/ - inspect them with read-only tools (read_file, grep_search, find_by_name, list_dir).',
         `Challenge: ${challenge}`,
         STAGE_VERDICT_INSTRUCTION,
         `Exact PASS format: ${challenge} PASS`,

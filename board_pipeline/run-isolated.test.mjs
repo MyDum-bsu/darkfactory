@@ -2,16 +2,21 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { adaptiveLocalPlanCore, allowedPathsFromAttempt, allowedPathsFromLabels, ancestorOrNull,
   assertSubprocLiveAllowed, baseWorkerFromPolicy, buildWorkerTransport, candidatePinRef,
-  filterAdaptiveTelemetry, HARDENED_GIT_CONFIG, hardenedGitEnv, isApprovedWorker, planAdaptiveChecks,
+  fieldScopeFence, filterAdaptiveTelemetry, HARDENED_GIT_CONFIG, hardenedGitEnv, isApprovedWorker, planAdaptiveChecks,
   queueModeSpecInputs, readSubmissionEnvelope, resetQueueWorktree, resolveWorkerRuntimeKind,
   scopeFenceReworkResult, shouldStopWorkerOnShutdown } from './run-isolated.mjs';
+import { advance } from './controller.mjs';
+import { saveState } from './slot.mjs';
+import { attemptWorkerPrompt, bindClaimBase, createWorkerLearning, isClaimCheckout } from './run-isolated.mjs';
+import { resolveFieldPolicy } from './field-mode.mjs';
+import { createAttemptLearning } from './run-adaptive.mjs';
 import { deterministicRuntimeId } from './worker-runtime.mjs';
 import { DEFAULT_ARBITER, DEFAULT_CRITIC, PRIMARY_WORKER, resolveTriad } from './worker-selector.mjs';
 import { arbiterIntakePrompt, workerIntakePrompt } from './intake-prompt.mjs';
@@ -37,6 +42,150 @@ test('run-isolated preserves the public bindings of the split modules', async ()
     assert.ok(Object.hasOwn(adaptive, name), name);
     assert.equal(root[name], adaptive[name], name);
   }
+});
+
+test('scope fence warns on greenfield only; the same diff requires rework in strict fields', () => {
+  for (const repoFieldMode of ['greenfield', 'brownfield', 'bluefield', 'greyfield']) {
+    const warnings = [];
+    const result = fieldScopeFence({ fieldPolicy: resolveFieldPolicy({ repoFieldMode }),
+      allowedPaths: ['allowed/'], changedPaths: ['other.mjs'], warn: note => warnings.push(note) });
+    if (repoFieldMode === 'greenfield') {
+      assert.equal(result, null);
+      assert.deepEqual(warnings.map(w => w.violations), [['other.mjs']]);
+    } else {
+      assert.equal(result.outcome, 'rework');
+      assert.equal(result.reason, 'scope_fence_violation');
+      assert.deepEqual(warnings, []);
+    }
+  }
+});
+
+test('dynamic claim persists the clean HEAD in the WAL and never rebinds a resumed attempt to the candidate', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'df-claim-base-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const record = join(dir, 'attempt.json');
+  const state = { load: async () => { try { return JSON.parse(readFileSync(record)); } catch (e) { if (e.code !== 'ENOENT') throw e; } },
+    save: value => saveState(record, value) };
+  const first = 'a'.repeat(40), next = 'b'.repeat(40);
+  let head = first, dirty = true;
+  const git = async (...args) => ({ 'rev-parse HEAD': head, 'rev-parse --show-toplevel': dir,
+    'branch --show-current': 'pilot', 'status --porcelain=v1 --untracked-files=all': dirty ? '?? new' : '' })[args.join(' ')];
+  for (const [base, dynamicBase] of [['HEAD', false], [next, true]]) {
+    head = first; dirty = true;
+    const route = { base, taskId: '1', worktree: dir, policyVersion: 1, checkProfile: 'p', finish: 'verified' };
+    const bind = () => bindClaimBase({ route, dynamicBase, state, git });
+    let claims = 0, verified = false;
+    const tick = async () => {
+      const bound = await bind();
+      return advance({ ...bound, authorize: () => isClaimCheckout({ git, route: bound.route, branch: 'pilot' }),
+        board: { adopt: async () => {}, lookup: async () => verified
+          ? { state: 'completed', result: { sha: next } } : { state: 'ready' }, claim: async () => {
+          assert.equal((await state.load()).base_sha, first); claims++; return { epoch: 1 };
+        }, verifyHeld: async () => ({ epoch: 1 }) },
+        bb: { spawn: async a => { assert.equal(a.base_sha, first); return { threadId: 'thr_demo' }; } },
+        submissions: { read: async a => ({ turnSeq: 1, submission: { task_id: a.task_id, attempt_id: a.attempt_id,
+          epoch: a.epoch, worker_thread_id: a.bb_thread_id, candidate_sha: head } }) },
+        verify: async (a, submission) => {
+          assert.equal(a.base_sha, first); assert.equal(bound.route.base, first); assert.equal(submission.candidate_sha, next);
+          verified = true; return { outcome: 'verified', receipt: { settle: 'completed' } };
+        } });
+    };
+    assert.equal((await tick()).reason, 'route_not_authorized'); assert.equal(claims, 0);
+    dirty = false;
+    assert.equal((await tick()).phase, 'working'); assert.equal(claims, 1);
+    head = next;
+    assert.equal((await tick()).phase, 'done'); assert.ok(verified);
+    assert.equal((await state.load()).base_sha, first);
+    await state.save({ phase: 'working' });
+    await assert.rejects(bind(), /claim_base_sha_invalid/);
+    await state.save(null);
+    assert.equal((await bind()).route.base, next);
+    assert.equal((await bindClaimBase({ route: { ...route, base: first }, state, git })).route.base, first);
+  }
+});
+
+async function learningFixture(t) {
+  const dir = await mkdtemp(join(tmpdir(), 'df-learning-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const prior = process.env.DF_LESSONS_PATH;
+  t.after(() => {
+    if (prior === undefined) delete process.env.DF_LESSONS_PATH;
+    else process.env.DF_LESSONS_PATH = prior;
+  });
+  const root = join(dir, 'slot');
+  const tree = join(dir, 'worktree');
+  await mkdir(root);
+  await mkdir(tree);
+  const state = { load: async () => ({ taskId: '42', roundsHistory: [
+    { excerpt: 'assert disappears under -O' }, { excerpt: 'assert removed by optimization' },
+  ] }) };
+  return { dir, root, tree, state, learning: overrides => createAttemptLearning({ root, tree, state, ...overrides }) };
+}
+
+test('attempt learning shares distilled lessons across slot roots via DF_LESSONS_PATH', async t => {
+  const { dir, root, learning } = await learningFixture(t);
+  const otherSlot = join(dir, 'other-slot');
+  await mkdir(otherSlot);
+  const shared = join(dir, 'shared.jsonl');
+  process.env.DF_LESSONS_PATH = shared;
+  await learning().distillClosedAttempt();
+  const lessons = await learning({ root: otherSlot }).currentLessons();
+  assert.deepEqual(lessons.map(l => l.category), ['assert_under_optimize']);
+  assert.deepEqual(lessons[0].evidence_cards, ['42']);
+  assert.deepEqual(await readdir(root), []);
+
+  process.env.DF_LESSONS_PATH = '';
+  const local = learning();
+  assert.deepEqual(await local.currentLessons(), []);
+  await local.distillClosedAttempt();
+  assert.deepEqual(await readdir(root), ['lessons.jsonl']);
+  process.env.DF_LESSONS_PATH = 'invalid-relative-path';
+  assert.deepEqual(await learning({ lessonsPath: shared }).currentLessons(), lessons);
+  assert.throws(() => learning(), /lessons_store_path_not_absolute/);
+});
+
+test('hc spawn uses verified task spec and only lessons distilled for the claimed repo_id', async t => {
+  const { dir, root, tree, state, learning } = await learningFixture(t);
+  process.env.DF_LESSONS_PATH = join(dir, 'all-slots.jsonl');
+  await learning().distillClosedAttempt(); // unscoped legacy store, even in the same slot
+  const record = { ...await state.load(), contract: { repo_id: 'alpha' } };
+  const store = createWorkerLearning({ root, tree, route: {}, state: { load: async () => record } }, 'hc');
+  assert.deepEqual(await store.currentLessons('alpha'), []);
+  await store.distillClosedAttempt();
+  const specText = 'Fix the bounds check.';
+  const spec_digest = createHash('sha256').update(specText).digest('hex');
+  const render = repo_id => attemptWorkerPrompt({ runtime: 'hc', tree, route: {},
+    attempt: { task_id: '42', repo_id, epoch: 1, attempt_id: 'id', specText, spec_digest },
+    currentLessons: store.currentLessons, activeProjectMemory: () => assert.fail('hc must not read memory'),
+    handoffPath: '/private/submission.json', handoff: { task_id: '42', epoch: 1, attempt_id: 'id',
+      worker_thread_id: 'thread-id', candidate_sha: '<full Git SHA>' }, allowedPaths: ['a.mjs'],
+    operatorBrief: 'Портфель: bb thread create --provider obsolete', reviewSpec: 'Private reviewer context',
+    projectContext: 'Prefer pure functions.', skillBlock: 'Exercise boundary cases.',
+    executor: { provider: 'pi', model: 'openai/gpt-6.2-sol' } });
+  const own = await render('alpha');
+  assert.equal(own, await render('alpha'));
+  for (const text of [specText, spec_digest, 'a.mjs', 'Prefer pure functions.', 'Exercise boundary cases.',
+    '<full Git SHA>', 'Do not use assert for checks required in release']) assert.ok(own.includes(text), text);
+  assert.doesNotMatch(own, /\p{Script=Cyrillic}|bb thread create|Accepted owner decisions|Private reviewer/u);
+  for (const repo of ['alpha2', undefined]) assert.doesNotMatch(await render(repo), /Lessons from prior REWORK/);
+});
+
+test('attempt learning refuses worktree and symlinked lessons stores, even before first write', async t => {
+  const { dir, tree, learning } = await learningFixture(t);
+  process.env.DF_LESSONS_PATH = join(tree, 'lessons.jsonl');
+  assert.throws(() => learning({ tree: undefined }), /lessons_store_worktree_required/);
+  const unsafe = learning();
+  await assert.rejects(unsafe.currentLessons(), /lessons_store_in_worktree/);
+  await unsafe.distillClosedAttempt();
+  assert.deepEqual(await readdir(tree), []);
+
+  const link = join(dir, 'linked-store');
+  await symlink(process.env.DF_LESSONS_PATH, link);
+  await assert.rejects(learning({ lessonsPath: link }).currentLessons(), /lessons_store_not_a_file/);
+  const parent = join(dir, 'linked-dir');
+  await symlink(tree, parent);
+  await assert.rejects(learning({ lessonsPath: join(parent, 'new.jsonl') }).currentLessons(),
+    /lessons_store_dir_mismatch/);
 });
 
 test('isApprovedWorker accepts SWE-2.1 implementation workers and legacy SWE-2 High', () => {
@@ -72,6 +221,35 @@ test('isApprovedWorker accepts attested pi openai workers and rejects unattested
   }
 });
 
+
+test('isApprovedWorker admits only the enrolled zcode model and provider pairs', () => {
+  for (const provider of ['zcode', 'acp-zcode-start']) {
+    for (const model of ['GLM-5.3-Flash', 'glm-5.3-flash', 'GLM-5.3']) assert.equal(isApprovedWorker({ provider, model }), true);
+    for (const model of ['glm-5.3-flash-extra', 'gpt-6.2-sol', 'glm-5.3 ', undefined, 53]) assert.equal(isApprovedWorker({ provider, model }), false);
+  }
+  for (const provider of ['pi', 'acp-devin', 'glm', 'ZCODE', undefined]) assert.equal(isApprovedWorker({ provider, model: 'GLM-5.3-Flash' }), false);
+});
+
+test('isApprovedWorker admits attested Devin Fusion workers only on the acp-devin harness', () => {
+  for (const model of ['fusion-gpt-6-2-astra-high-sidekick-swe-2-1-medium',
+    'fusion-claude-opus-5-5-high-sidekick-swe-2-1-medium']) {
+    assert.equal(isApprovedWorker({ provider: 'acp-devin', model }), true);
+  }
+});
+
+test('isApprovedWorker rejects unknown fusion strings, wrong providers and disallowed fusion leads', () => {
+  for (const spec of [
+    { provider: 'acp-devin', model: 'fusion-gpt-6-1-terra-high-sidekick-swe-2-1-medium' },
+    { provider: 'acp-devin', model: 'fusion-gpt-6-2-astra-high' },
+    { provider: 'acp-devin', model: 'fusion-unknown-lead-sidekick-swe-2-1-medium' },
+    { provider: 'acp-devin', model: 'fusion-gpt-6-2-astra-high-sidekick-swe-2-1-medium-extra' },
+    { provider: 'pi', model: 'fusion-gpt-6-2-astra-high-sidekick-swe-2-1-medium' },
+    { provider: 'openai', model: 'fusion-claude-opus-5-5-high-sidekick-swe-2-1-medium' },
+    { provider: 'acp-devin', model: 'gpt-6.1-terra' },
+  ]) {
+    assert.equal(isApprovedWorker(spec), false);
+  }
+});
 
 const sha256 = text => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
 
@@ -249,6 +427,7 @@ test('portable worker transport probes, spawns, sends feedback and reconciles wi
     assert.equal(spawnInput.spaceLabel, 'repo-1');
     assert.equal(spawnInput.tabLabel, 'DF #4051');
     assert.equal(preparedPrompts.length, 1);
+    assert.match(preparedPrompts[0], /"candidate_sha":"<full Git SHA>"/);
     assert.match(preparedPrompts[0], new RegExp(`"worker_thread_id":"${runtimeId}"`));
 
     const packet = { attempt: { ...attempt, bb_thread_id: runtimeId }, feedbackId: 'fb-1' };
@@ -286,6 +465,34 @@ test('portable observeTurn uses the runtime turn watermark and fails closed whil
   assert.equal(await transport.observeTurn({ runtimeId, after: 1 }), undefined);
   assert.deepEqual(await transport.observeTurn({ runtimeId, after: 1 }),
     { turnSeq: 2, completed: true, state: 'done' });
+});
+
+test('working-phase restart on a rework watermark resumes the missing hc writer in its original slot', async () => {
+  const route = { taskId: '4051', base: 'a'.repeat(40), worktree: '/slot/original',
+    policyVersion: 1, checkProfile: 'test', finish: 'verified' };
+  const attemptId = 'rework', threadId = deterministicRuntimeId('hc', route.taskId, attemptId);
+  let record = { binding: createHash('sha256').update(JSON.stringify(route)).digest('hex'),
+    phase: 'working', taskId: route.taskId, epoch: 1, attemptId, threadId, turnSeq: 2, seenShas: [route.base] };
+  const resumes = [];
+  const bb = buildWorkerTransport({ kind: 'hc', worktree: route.worktree,
+    runtime: { spawn: assert.fail, feedback: assert.fail, probeAvailability: assert.fail,
+      observe: async () => ({ state: 'exited', exitCode: 137, missing: true }),
+      resume: async input => { resumes.push(input); return { runtimeId: input.runtimeId }; } },
+    prepareSpawn: async () => '/slot-private/prompt', prepareFeedback: assert.fail });
+  assert.deepEqual(await bb.reconcileSpawn({ task_id: route.taskId, attempt_id: attemptId }), { status: 'empty' });
+  const result = await advance({ route, bb, authorize: async () => true,
+    board: { adopt: async () => {}, verifyHeld: async () => ({ epoch: 1 }) },
+    state: { load: async () => record, save: async value => { record = value; } },
+    submissions: { read: async (attempt, after) => {
+      assert.equal(after, 2);
+      const obs = await bb.observeTurn({ runtimeId: attempt.bb_thread_id, after });
+      assert.deepEqual(obs, { turnSeq: 3, completed: false, state: 'exited', exitCode: 137, missing: true });
+      return obs;
+    } }, verify: assert.fail });
+  assert.equal(result.phase, 'working');
+  assert.deepEqual(resumes.map(r => [r.runtimeId, r.worktree]), [[threadId, route.worktree]]);
+  assert.equal(record.crashResumes, 1);
+  assert.equal(record.turnSeq, 0);
 });
 
 test('portable reconcileSpawn is empty for missing or exited subproc sessions', async () => {
@@ -753,7 +960,10 @@ test('portable worker transport forwards permissionMode and exposes stop, resume
   assert.deepEqual(calls[2], ['stop', { runtimeId }]);
 
   observed = { state: 'working', turn: 2, tail: 'Замечание фабрики fb-7. Исправь найденное.' };
-  assert.deepEqual(await transport.reconcileFeedback({ attempt, feedbackId: 'fb-7', afterSeq: 1 }),
+  assert.deepEqual(await transport.reconcileFeedback({ attempt, feedbackId: 'fb-7', afterSeq: 2 }),
+    { status: 'delivered', threadId: runtimeId, turn: 2 });
+  observed = { state: 'working', turn: 2, tail: 'Factory feedback fb-7. SHA deadbeef.' };
+  assert.deepEqual(await transport.reconcileFeedback({ attempt, feedbackId: 'fb-7', afterSeq: 2 }),
     { status: 'delivered', threadId: runtimeId, turn: 2 });
   observed = { state: 'working', turn: 2, tail: 'no factory marker here' };
   assert.deepEqual(await transport.reconcileFeedback({ attempt, feedbackId: 'fb-7', afterSeq: 2 }),
@@ -803,6 +1013,28 @@ test('portable observeTurn does not reuse stale idle after feedback without a ne
   assert.deepEqual(await restarted.observeTurn({ runtimeId: restartId, after: 1 }),
     { turnSeq: 2, completed: true, state: 'idle' });
 });
+
+for (const kind of ['candidate', 'question']) {
+  test(`missing PTY recovers only an unseen candidate: ${kind} handoff`, async t => {
+    const dir = await mkdtemp(join(tmpdir(), 'df-spot-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const attemptId = 'attempt-spot';
+    await mkdir(join(dir, attemptId));
+    const source = join(dir, attemptId, 'submission.json');
+    const sha = 'c'.repeat(40), other = 'b'.repeat(40);
+    const submission = { task_id: '42', epoch: 1, attempt_id: attemptId,
+      worker_thread_id: deterministicRuntimeId('hc', '42', attemptId),
+      ...(kind === 'candidate' ? { candidate_sha: sha } : { question: { prompt: 'Which mode?', evidence: 'Two modes' } }) };
+    await writeFile(source, JSON.stringify(submission));
+    const observed = { turnSeq: 3, completed: false, state: 'exited', exitCode: 137, missing: true };
+    for (const [seenShas, fresh] of [[[], true], [[other], true], [[sha], false], [[other, sha], false]]) {
+      assert.deepEqual(await readSubmissionEnvelope({ observed, source, seenShas }), kind === 'candidate' && fresh
+        ? { turnSeq: 3, completed: true, state: 'done', submission } : observed);
+    }
+    const idle = { turnSeq: 3, completed: true, state: 'idle' };
+    assert.deepEqual(await readSubmissionEnvelope({ observed: idle, source, seenShas: [sha] }), { ...idle, submission });
+  });
+}
 
 test('readSubmissionEnvelope returns typed invalid handoffs for malformed, oversized and symlink files', async () => {
   const observed = { turnSeq: 4, completed: true, state: 'idle' };

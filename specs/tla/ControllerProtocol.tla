@@ -39,13 +39,27 @@ VARIABLES
     acceptedTurnSeq,     \* ход, засчитанный ответом на feedback (0 — ещё нет)
     commitEpoch,         \* эпоха, под которой карточка закрыта
     reworkRounds,        \* число раундов доработки: 0..3
-    progressMade         \* был ли зарегистрирован реальный прогресс
+    progressMade,        \* был ли зарегистрирован реальный прогресс
+    production           \* bounded hc/queue/scheduler projection (see ProductionNext)
 
-vars == <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent, walReceipt,
+walVars == <<boardState, boardEpoch, leaseAlive, ctrlPhase, walIntent, walReceipt,
           worktreeReserved, liveWriters, spawnOnWire, feedbackWire, spawnCount,
           candidateDigest, verifiedDigest, activePolicyDigest, pinnedPolicyDigest,
           lastTurnSeq, feedbackWatermark, acceptedTurnSeq, commitEpoch,
           reworkRounds, progressMade>>
+
+vars == <<walVars, production>>
+
+\* A second finite projection of the same route. Scheduler locks are sets of
+\* canonical (repo,path) atoms: a prefix/unknown scope covers its descendants.
+\* Tasks 1 and 2 overlap, 3 can run concurrently, 4 is repo-exclusive.
+Footprint(t) == CASE t = 1 -> {"src/a", "src/b"} [] t = 2 -> {"src/a"}
+                  [] t = 3 -> {"docs"} [] OTHER -> {"src/a", "src/b", "docs"}
+ProductionFault == "none"  \* overridden one guard at a time by TLC config
+ProdInit == [held |-> {}, stage |-> "idle", attested |-> FALSE,
+             reviewed |-> FALSE, protected |-> FALSE, approved |-> FALSE,
+             head |-> "base", expected |-> "base", previous |-> "none",
+             rebased |-> FALSE, smokeSha |-> "none"]
 
 ResetAttempt ==
     /\ walIntent' = "none" /\ walReceipt' = "none"
@@ -55,6 +69,7 @@ ResetAttempt ==
     /\ reworkRounds' = 0 /\ progressMade' = FALSE
 
 Init ==
+    /\ production = ProdInit
     /\ boardState = "ready" /\ boardEpoch = 0 /\ leaseAlive = FALSE
     /\ ctrlPhase = "idle" /\ walIntent = "none" /\ walReceipt = "none"
     /\ worktreeReserved = FALSE /\ liveWriters = {}
@@ -403,7 +418,7 @@ WriterDies(e) ==
                    pinnedPolicyDigest, lastTurnSeq, feedbackWatermark,
                    acceptedTurnSeq, commitEpoch, reworkRounds, progressMade>>
 
-Next ==
+WalNext ==
     \/ Claim \/ Takeover \/ LeaseExpires
     \/ SpawnIntent \/ SpawnSend \/ SpawnEffect \/ SpawnReceipt
     \/ Crash \/ ReconcileSpawn \/ ReconcileFeedbackDelivered \/ ReconcileFeedbackEmpty \/ ReconcileBlock
@@ -412,7 +427,62 @@ Next ==
     \/ AcceptTurn \/ CheckDone \/ Verify \/ ChangePolicy \/ Complete
     \/ \E e \in 1..MaxEpoch : WriterDies(e)
 
+\* Task 1 represents the hc writer. Its launch receipt is usable only after
+\* runHc observes a terminal address. The reservation survives missing acks.
+Reserve(t) ==
+    /\ t \notin production.held
+    /\ ProductionFault = "scope" \/
+       (\A s \in production.held : Footprint(t) \cap Footprint(s) = {})
+    /\ production' = [production EXCEPT !.held = @ \cup {t}]
+
+HcLaunch ==
+    /\ production.stage = "idle" /\ 1 \in production.held
+    /\ \E ack \in BOOLEAN : production' = [production EXCEPT
+            !.stage = "launching", !.attested = ack]
+HcReceipt ==
+    /\ production.stage = "launching"
+    /\ production.attested \/ ProductionFault = "hc"
+    /\ production' = [production EXCEPT !.stage = "working"]
+
+\* The queue snapshots the integration ref; a competing slot can move it
+\* before update-ref. A rebase creates a DIFFERENT subject needing fresh L1.
+Enqueue ==
+    /\ production.stage = "working"
+    /\ \E reviewed, prot, approved, rebase \in BOOLEAN :
+        production' = [production EXCEPT !.stage = "queued", !.expected = production.head,
+            !.reviewed = reviewed, !.protected = prot, !.approved = approved,
+            !.rebased = rebase, !.smokeSha = "candidate"]
+MergeUpdate ==
+    /\ production.stage = "queued"
+    /\ production.reviewed \/ ProductionFault = "review"
+    /\ ~production.protected \/ production.approved \/ ProductionFault = "owner"
+    /\ production.expected = production.head \/ ProductionFault = "cas"
+    /\ ~production.rebased \/ production.smokeSha = "rebased" \/ ProductionFault = "smoke"
+    /\ production' = [production EXCEPT !.stage = "merged", !.previous = production.head,
+            !.head = IF production.rebased THEN "rebased" ELSE "candidate"]
+
+ProductionNext ==
+    \/ \E t \in 1..4 : Reserve(t)
+    \/ \E t \in production.held \ {1} : production' = [production EXCEPT !.held = @ \ {t}]
+    \/ HcLaunch \/ HcReceipt \/ Enqueue \/ MergeUpdate
+    \/ /\ production.stage = "queued" /\ production.head = "base"
+       /\ production' = [production EXCEPT !.head = "competing"]
+    \/ /\ production.stage = "queued" /\ production.rebased /\ production.smokeSha # "rebased"
+       /\ production' = [production EXCEPT !.smokeSha = "rebased"]
+
+\* Explore the two projections as a union, not their Cartesian product.
+Next == \/ /\ production = ProdInit /\ WalNext /\ UNCHANGED production
+        \/ /\ ctrlPhase = "idle" /\ ProductionNext /\ UNCHANGED walVars
+        \/ UNCHANGED vars  \* Safety only: waiting/quarantine is an intentional idle tick.
 Spec == Init /\ [][Next]_vars
+
+ScopeLocksDisjoint == \A t, s \in production.held :
+    t # s => Footprint(t) \cap Footprint(s) = {}
+HcReceiptAttested == production.stage \in {"working", "queued", "merged"} => production.attested
+MergeReviewed == production.stage = "merged" => production.reviewed
+MergeAuthorized == production.stage = "merged" /\ production.protected => production.approved
+MergeHeadCurrent == production.stage = "merged" => production.previous = production.expected
+RebaseSmokePassed == production.stage = "merged" /\ production.rebased => production.smokeSha = production.head
 
 \* --- Safety-инварианты --------------------------------------------------------
 

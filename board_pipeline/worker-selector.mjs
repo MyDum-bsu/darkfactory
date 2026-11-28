@@ -8,7 +8,7 @@
 // чистый worktree и HEAD === base_sha. Неизвестный исход — uncertain без
 // второго писателя.
 
-import { executorFamily, l2RunnableSpec, ReviewDenied } from './review-runner.mjs';
+import { executorFamily, fusionModelMeta, l2RunnableSpec, ReviewDenied } from './review-runner.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
 import { NEON_CRITIC, SOL_ARBITER, detectStalledReview, isNeonArbiter } from './review-policy.mjs';
 import {
@@ -100,22 +100,28 @@ export function selectWorker() {
 // Триада: family(critic) !== family(executor) и арбитр из третьего
 // независимого семейства — как для первичного воркера, так и после
 // любого переключения на резерв.
-export function assertTriadIndependent({ executor, critic = DEFAULT_CRITIC, arbiter = DEFAULT_ARBITER }) {
+export function assertTriadIndependent({ executor, critic = DEFAULT_CRITIC, arbiter = DEFAULT_ARBITER },
+  { reportSidekick = typeof executor !== 'string' } = {}) {
   const ef = executor !== undefined ? workerFamily(executor) : null;
+  const model = typeof executor === 'string' ? executor.slice(executor.indexOf('/') + 1) : executor?.model;
+  const sidekickFamily = fusionModelMeta(model)?.sidekickFamily;
+  const executorFamilies = new Set([ef]);
+  if (sidekickFamily) executorFamilies.add(sidekickFamily);
   const cf = executorFamily(critic);
   const af = arbiter !== undefined && arbiter !== null ? workerFamily(arbiter) : null;
   if (cf === null) throw new ReviewDenied('review_unknown_family');
   if (executor !== undefined) {
     if (ef === null) throw new ReviewDenied('review_unknown_family');
-    if (ef === cf) throw new ReviewDenied('review_same_family');
+    if (executorFamilies.has(cf)) throw new ReviewDenied('review_same_family');
   }
   if (arbiter !== undefined && arbiter !== null) {
     if (af === null) throw new ReviewDenied('arbiter_unknown_family');
-    if (af === cf || (ef !== null && af === ef)) {
+    if (af === cf || executorFamilies.has(af)) {
       throw new ReviewDenied('arbiter_family_not_independent');
     }
   }
-  return { executor: ef, critic: cf, arbiter: af };
+  // Keep legacy string reports at three fields unless the caller needs every occupied family.
+  return { executor: ef, critic: cf, arbiter: af, ...(reportSidekick && sidekickFamily ? { sidekick: sidekickFamily } : {}) };
 }
 
 // Нормализация ответа probeAvailability: 'available', 'confirmed_refusal'

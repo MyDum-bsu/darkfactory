@@ -1,6 +1,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, appendFile, rm, readFile, readdir } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdir, mkdtemp, writeFile, appendFile, rm, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -396,6 +397,106 @@ function heldPorts(over = {}) {
   };
   return { ports, calls };
 }
+
+// Real Git objects for field-policy tests; only Board and gate execution are fake.
+async function fieldFixture({ base = {}, candidate = {} } = {}) {
+  const worktree = await tmpJournal();
+  const git = (...args) => execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=test@example.invalid',
+    '-c', 'commit.gpgSign=false', '-c', 'core.hooksPath=/dev/null', ...args], { cwd: worktree, encoding: 'utf8' }).trim();
+  const commit = async files => {
+    for (const [name, bytes] of Object.entries(files)) {
+      const file = path.join(worktree, name);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, bytes);
+    }
+    git('add', '.');
+    git('commit', '-qm', 'snapshot', '--allow-empty');
+    return git('rev-parse', 'HEAD');
+  };
+  git('init', '-q');
+  const base_sha = await commit(base), candidate_sha = await commit(candidate);
+  return async ({ attempt = {}, overrides = {}, profile = {} } = {}) => {
+    const journal = await tmpJournal();
+    const policy = heldPolicy();
+    Object.assign(policy.profiles.pilot, { base: base_sha, worktree }, profile);
+    const { ports, calls } = heldPorts(overrides);
+    const result = await acceptHeld({ attempt: heldAttempt({ base_sha, worktree, ...attempt }),
+      submission: heldSubmission({ candidate_sha }), policy, ports, journal });
+    return { result, calls, journal };
+  };
+}
+
+const FIELD_PROFILE = '.darkfactory/project-profile.yaml';
+test('neither candidate profile edits nor a card override can downgrade the brownfield base policy', async () => {
+  for (const base of [{}, { [FIELD_PROFILE]: 'field_mode: brownfield' }]) {
+    const verify = await fieldFixture({ base, candidate: { [FIELD_PROFILE]: 'field_mode: greenfield' } });
+    const strict = await verify();
+    assert.equal(strict.result.outcome, 'verified');
+    assert.equal(strict.calls.review, 1);
+    const denied = await verify({ attempt: { field_mode: 'greenfield' } });
+    assert.equal(denied.result.outcome, 'hold');
+    assert.equal(denied.result.reason, 'field_mode_downgrade_denied');
+    assert.equal(denied.calls.local, 0);
+  }
+});
+
+test('invalid base profile holds even if the candidate repairs it', async () => {
+  const verify = await fieldFixture({ base: { [FIELD_PROFILE]: 'field_mode: [' },
+    candidate: { [FIELD_PROFILE]: 'field_mode: greenfield' } });
+  const { result, calls } = await verify();
+  assert.equal(result.reason, 'project_profile_invalid');
+  assert.equal(result.outcome, 'hold');
+  assert.equal(calls.local, 0);
+});
+
+test('base greenfield uses mandatory secrets-only tamper, preserves L3 and records its capped policy verdict', async () => {
+  const bytes = 'field_mode: greenfield\ndefault_plan: api-change\n';
+  const verify = await fieldFixture({ base: { [FIELD_PROFILE]: bytes } });
+  let scans = 0;
+  const overrides = { tamper: async (_binding, profile) => {
+    assert.equal(profile.secretsOnly, true);
+    scans++;
+    return { ok: true };
+  } };
+  const { result, calls } = await verify({ overrides, profile: { tamper: false } });
+  assert.equal(result.outcome, 'verified');
+  assert.equal(scans, 1);
+  assert.equal(calls.review, 0);
+  assert.deepEqual(result.receipt.review, { status: 'PASS', verdict: 'REVIEW_OK', summary: 'greenfield-fast-track',
+    checked_invariants: ['greenfield_fast_track', 'secrets_only_tamper'], findings: [], fast_track: true,
+    checkpoint: createHash('sha256').update(bytes).digest('hex'), task_plan: 'api-change', field_mode: 'greenfield',
+    grade_cap: 'CHECKED', actual: { provider: 'policy', model: 'greenfield-fast-track', reasoningLevel: null } });
+  assert.equal((await verify({ overrides: { tamper: async () => ({ ok: false }) } })).result.reason, 'tamper_gate_failed');
+  assert.equal((await verify({ attempt: { has_ui: true }, overrides })).result.reason, 'visual_port_missing');
+  assert.equal((await verify({ attempt: { task_plan: 'refactor' } })).result.receipt.review.task_plan, 'refactor');
+});
+
+test('high blast radius vetoes otherwise eligible auto-approval', async () => {
+  const approval = { enabled: true, allowedCategories: ['docs'], maxChangedFiles: 2, maxChangedLines: 5,
+    requireGreenL1: true, requireCleanTamper: true, allowPathPatterns: ['**'], denyPathPatterns: [] };
+  const verify = await fieldFixture({ base: { '.darkfactory/approval-policy.yaml': JSON.stringify({ version: 1, autoApprove: approval }) },
+    candidate: { 'board_pipeline/controller.mjs': '// changed\n' } });
+  const { result, calls, journal } = await verify({ attempt: { category: 'docs' } });
+  assert.equal(result.outcome, 'verified');
+  assert.equal(calls.review, 1);
+  assert.ok((await readRunFile(journal)).some(e => e.detail?.auto_approve?.reason === 'auto_approve_high_blast_radius'));
+});
+
+test('ratchet records known failures and rejects new or unidentified red tests before L2', async () => {
+  const verify = await fieldFixture();
+  for (const [output, preexisting] of [['not ok 1 - old', true], ['not ok 1 - old\nnot ok 2 - new', false], ['', false]]) {
+    const { result, calls } = await verify({ overrides: {
+      local: async b => ({ sha: b.candidate_sha, ok: false, output, evidence: 'checks.log' }),
+      baseline: async () => ({ ok: false, failedTests: ['old'] }),
+    } });
+    assert.equal(result.outcome, preexisting ? 'verified' : 'rework');
+    assert.equal(calls.review, preexisting ? 1 : 0);
+    if (preexisting) {
+      assert.equal(result.receipt.baseline_status, 'preexisting_red');
+      assert.deepEqual(result.receipt.preexisting_failures, ['old']);
+    } else assert.equal(result.reason, 'local_checks_failed');
+  }
+});
 
 async function runFiles(journal) {
   return readdir(journal);

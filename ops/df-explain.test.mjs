@@ -74,6 +74,64 @@ test('done does not imply verified: single or unknown family, absent or failed g
   }
 });
 
+test('fast-track evidence caps an otherwise VERIFIED attempt in JSON and text', async t => {
+  const radius = { files: ['src/app.mjs'], sensitive: false };
+  const stateDir = await fixture(t, {
+    'attempt.json': JSON.stringify({ ...wal, fieldPolicy: { fieldMode: 'greenfield', taskPlan: 'mvp' } }),
+    'telemetry.jsonl': ndjson({ ...summary, baseline_status: 'skipped' }),
+    'events.ndjson': ndjson({ ...id, kind: 'phase', detail: { fast_track: true, blast_radius: radius } }),
+  });
+  const json = run('--state', stateDir, '--json');
+  assert.equal(json.status, 0, json.stderr);
+  const report = JSON.parse(json.stdout);
+  assert.equal(report.grade, 'CHECKED');
+  assert.equal(report.models.crossFamilyVerified, false);
+  const fields = { field_mode: 'greenfield', task_plan: 'mvp', fast_track: true,
+    baseline_status: 'skipped', blast_radius: radius };
+  const text = run('--state', stateDir);
+  assert.equal(text.status, 0, text.stderr);
+  for (const [key, value] of Object.entries(fields)) {
+    assert.deepEqual(report[key], value);
+    assert.ok(text.stdout.includes(`${key}: ${key === 'blast_radius' ? canonicalJson(value) : value}`));
+  }
+});
+
+test('incomplete fast-track attempts keep their outcome grade', async t => {
+  const stateDir = await fixture(t);
+  const fieldPolicy = { fieldMode: 'greenfield', taskPlan: 'mvp', fastTrack: true };
+  for (const [phase, grade] of Object.entries({ hold: 'HELD', held: 'HELD', lease_lost: 'HELD',
+    uncertain: 'HELD', blocked: 'BLOCKED', awaiting_answer: 'BLOCKED', working: 'IN_PROGRESS', checking: 'IN_PROGRESS' })) {
+    await writeFile(join(stateDir, 'attempt.json'), JSON.stringify({ ...wal, phase, fieldPolicy }));
+    const report = await explainAttempt({ stateDir });
+    assert.equal(report.fast_track, true);
+    assert.equal(report.grade, grade, phase);
+  }
+});
+
+test('keeps earlier matching telemetry fields, not evidence for another SHA', async t => {
+  const stateDir = await fixture(t, { 'attempt.json': JSON.stringify(wal),
+    'telemetry.jsonl': ndjson({ ...summary, sha, fast_track: false, field_mode: 'greyfield' }, summary),
+    'events.ndjson': ndjson({ ...id, detail: { sha: 'b'.repeat(40), fast_track: true } }),
+  });
+  const report = await explainAttempt({ stateDir });
+  assert.equal(report.fast_track, false);
+  assert.equal(report.field_mode, 'greyfield');
+  assert.equal(report.grade, 'VERIFIED');
+});
+
+test('actual model independently caps the grade; absent or unrelated evidence does not', async t => {
+  const stateDir = await fixture(t, { 'attempt.json': JSON.stringify(wal), 'telemetry.jsonl': ndjson(summary),
+    'events.ndjson': ndjson({ ...id, epoch: 6, detail: { fast_track: true } }) });
+  const ordinary = await explainAttempt({ stateDir });
+  assert.equal(ordinary.grade, 'VERIFIED');
+  assert.ok(!Object.hasOwn(ordinary, 'fast_track'));
+  const event = { ...id, detail: { actual: { model: 'greenfield-fast-track' } } };
+  await writeFile(join(stateDir, 'events.ndjson'), ndjson(event, { ...id, fast_track: false }));
+  const fast = await explainAttempt({ stateDir });
+  assert.equal(fast.fast_track, true);
+  assert.equal(fast.grade, 'CHECKED');
+});
+
 test('held after rework: separates final reason from rejection history and avoids double counting', async t => {
   const stateDir = await fixture(t, {
     'attempt.json': JSON.stringify({ ...wal, phase: 'hold', reason: 'no_progress_deterministic_gate',

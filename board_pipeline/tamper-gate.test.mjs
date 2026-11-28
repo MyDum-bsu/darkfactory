@@ -119,6 +119,30 @@ test('явный допуск allowTestDeletion пропускает удале�
   assert.deepEqual(res.violations, []);
 });
 
+test('only secretsOnly: true permits test rewrites, file deletions and runner changes', async () => {
+  const { repo, base, candidate } = await fixture({
+    base: { 'tests/empty.js': '', 'app.test.js': 'test("old", () => check());\n',
+      'package.json': '{"scripts":{"test":"node --test"}}\n' },
+    candidate: { 'tests/empty.js': null, 'app.test.js': 'test.' + 'skip("new", () => check());\n',
+      'package.json': '{}\n' },
+  });
+  const binding = { worktree: repo, base_sha: base, candidate_sha: candidate };
+  const full = await tamperGate(binding);
+  assert.deepEqual(full.violations.map(v => v.kind).sort(),
+    ['gate_bypass', 'test_deleted', 'test_file_deleted', 'test_skipped']);
+  for (const secretsOnly of [false, 'true']) {
+    assert.deepEqual(await tamperGate(binding, { secretsOnly }), full);
+  }
+  const fast = await tamperGate(binding, { secretsOnly: true });
+  assert.equal(fast.ok, true);
+  assert.deepEqual(fast.violations, []);
+
+  await writeFile(path.join(repo, 'app.test.js'), 'test.' + 'skip("new", () => check());\n// ghp_' + 'a'.repeat(20) + '\n');
+  const leaky = await tamperGate({ ...binding, candidate_sha: commit(repo, 'Add synthetic token') }, { secretsOnly: true });
+  assert.equal(leaky.ok, false);
+  assert.deepEqual(leaky.violations, [{ kind: 'secret_leak', file: 'app.test.js', line: 2, detail: 'github_token' }]);
+});
+
 test('добавленные skip/only/xfail маркеры отклоняются', async () => {
   const res = await gate({
     base: { 'tests/app.test.js': 'test("a", () => {});\n' },

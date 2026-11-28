@@ -1,13 +1,25 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import {
+  configuredArchiveEmbedder,
+  DEFAULT_EMBED_MODEL,
+  extractTranscriptMeta,
+  importDevinSqlite,
+  importOpencodeSqlite,
+  indexTerminalAttempt,
+  inferSessionProject,
   normalizeTimestamp,
   openSessionArchive,
   parseAgyTranscript,
+  parseClaudeTranscript,
+  parseCodexTranscript,
+  parseDevinTranscript,
+  parseOmpTranscript,
   parsePiTranscript,
   sanitizeFtsQuery,
 } from './session-archive.mjs';
@@ -34,6 +46,72 @@ function mockEmbedder(texts) {
     return vector;
   }));
 }
+
+test('project inference uses canonical path components before title and fallback', () => {
+  for (const id of ['darkfactory', 'music-restoration', 'optimization', 'autoresearcher', 'moml-course', 'bsu-cabinet-skill']) {
+    assert.equal(inferSessionProject({ cwd: `/src/${id}/lib`, title: 'CTO', fallback: 'general' }), id);
+  }
+  for (const [cwd, title, expected] of [
+    ['/src/df-v12-4-wt', '', 'darkfactory'], ['/work/mr-a/tests', '', 'music-restoration'],
+    ['/src/darkfactory-hub', '', 'cto'], ['/tmp', 'Fleet-wide CTO review', 'cto'],
+    ['/src/not-optimization', 'doctor', 'general'], ['/src/darkfactory/../tmp', '', 'general'],
+    [undefined, undefined, 'general'],
+  ]) assert.equal(inferSessionProject({ cwd, title }), expected);
+  assert.equal(inferSessionProject({ fallback: 'optimization' }), 'optimization');
+  assert.equal(inferSessionProject({ cwd: '/tmp', fallback: 'darkfactory' }), 'general');
+});
+
+test('terminal replay indexes only this attempt, with Vertex document/query vectors fused with FTS', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'terminal-index-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'archive.db');
+  const env = { DF_VERTEX_PROJECT: 'offline', DF_VERTEX_LOCATION: 'global', DF_VERTEX_ACCESS_TOKEN: 'mock' };
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.match(url, /aiplatform\.googleapis\.com\/v1\/projects\/offline\/.+:predict$/);
+    const { instances } = JSON.parse(options.body);
+    assert.equal(instances.length, 1);
+    const { content, task_type } = instances[0];
+    calls.push(task_type);
+    const [values] = await mockEmbedder([content]);
+    return Response.json({ predictions: [{ embeddings: { values } }] });
+  });
+  const embedder = configuredArchiveEmbedder(DEFAULT_EMBED_MODEL, 'RETRIEVAL_DOCUMENT', env);
+  const query = configuredArchiveEmbedder(DEFAULT_EMBED_MODEL, 'RETRIEVAL_QUERY', env);
+  const archive = openSessionArchive(dbPath, { embedder: query });
+  t.after(() => archive.close());
+  archive.ingestSession(sessionFixture()); // pending unrelated messages must not leave this host
+  for (const phase of ['working', 'lease_lost', 'hold', 'done']) {
+    const result = { phase, attemptId: phase }, record = { ...result, taskId: '7', contract: { specText: 'database index' } };
+    const input = { dbPath, record, result, cwd: '/repos/mr-work', host: 'test', harness: 'pi', tail: 'postgres tuning', embedder };
+    const index = () => indexTerminalAttempt(input);
+    if (!['done', 'hold'].includes(phase)) { assert.equal(await index(), null); continue; }
+    assert.equal((await index()).insertedMessages, 3);
+    assert.equal((await index()).insertedMessages, 0);
+  }
+  assert.equal(archive.stats().embeddings, 6);
+  assert.deepEqual(calls, Array(6).fill('RETRIEVAL_DOCUMENT'));
+  const hits = await archive.search({ query: 'index', mode: 'hybrid', project: 'music-restoration', queryModel: DEFAULT_EMBED_MODEL });
+  assert.equal(hits[0].matchSource, 'both');
+  assert.ok(hits.some(hit => hit.seq === 1 && hit.matchSource === 'vector'));
+  assert.equal(calls.at(-1), 'RETRIEVAL_QUERY');
+});
+
+test('CLI automatically tags a Pi transcript from its session cwd, not the scanner cwd', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'archive-cli-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'archive.db'), file = join(dir, 'session.jsonl');
+  await writeFile(file, [JSON.stringify({ type: 'session', cwd: '/work/mr-mix/lib' }),
+    JSON.stringify({ message: { role: 'user', content: 'archive test' } })].join('\n'));
+  for (const count of [1, 0]) {
+    const result = execFileSync(process.execPath, [join(import.meta.dirname, '../ops/df-archive.mjs'),
+      'ingest', '--db', dbPath, '--file', file, '--host', 'test', '--harness', 'pi', '--json']);
+    assert.equal(JSON.parse(result).insertedMessages, count);
+  }
+  const archive = openSessionArchive(dbPath);
+  try { assert.equal((await archive.search({ query: 'archive' }))[0].project, 'music-restoration'); }
+  finally { archive.close(); }
+});
 
 function sessionFixture(overrides = {}) {
   return {
@@ -239,6 +317,143 @@ test('parsePiTranscript: normalized records, fail-open on corrupt lines', () => 
   assert.equal(rows[2].content, 'streaming chunk');
   assert.throws(() => parsePiTranscript(null), /session_archive_transcript_invalid/);
 });
+
+const jsonl = (...rows) => rows.map(row => JSON.stringify(row)).join('\n');
+const stamp = '2025-03-01T00:00:00.000Z';
+
+test('Codex rollout ignores non-messages, merges mirrored events, and opts in to developer text', () => {
+  const response = (role, content) => ({ type: 'response_item', timestamp: stamp, payload: { type: 'message', role, content } });
+  const event = (type, message) => ({ type: 'event_msg', payload: { type, message } });
+  const text = 'broken\n' + jsonl(response('developer', 'policy'), response('user', [{ type: 'input_text', text: 'query' }]),
+    event('user_message', 'query'), response('assistant', [{ type: 'output_text', text: 'one' }, { text: 'two' }]),
+    event('agent_message', 'event only'), event('user_message', 'query'), { type: 'response_item', payload: { type: 'tool_call' } });
+  const parsed = parseCodexTranscript(text);
+  assert.deepEqual(parsed, [
+    { seq: 2, role: 'user', content: 'query', createdAt: stamp },
+    { seq: 4, role: 'assistant', content: 'one\ntwo', createdAt: stamp },
+    { seq: 5, role: 'assistant', content: 'event only', createdAt: null },
+    { seq: 6, role: 'user', content: 'query', createdAt: null },
+  ]);
+  assert.deepEqual(parseCodexTranscript(text, { includeSystem: true }), [
+    { seq: 1, role: 'system', content: 'policy', createdAt: stamp }, ...parsed]);
+});
+
+test('OMP and Claude use their native message wrapper, timestamps and physical line numbers', () => {
+  const message = { role: 'assistant', content: [{ type: 'text', text: 'answer' }], timestamp: Date.parse(stamp) };
+  const fixture = type => jsonl({ type: 'session', message }, null, { type, message, timestamp: stamp }, { type, message: {} });
+  const expected = [{ seq: 2, role: 'assistant', content: 'answer', createdAt: stamp }];
+  assert.deepEqual(parseOmpTranscript(fixture('message')), expected);
+  assert.deepEqual(parseClaudeTranscript(fixture('assistant')), expected);
+  assert.deepEqual(parseClaudeTranscript(jsonl({ type: 'user', message: { role: 'user', content: 'hello' } })),
+    [{ seq: 0, role: 'user', content: 'hello', createdAt: null }]);
+});
+
+test('Devin steps and JSONL fallback retain positions despite system, empty and malformed rows', () => {
+  const steps = [null, { step_id: 'a', source: 'system', message: 'policy' },
+    { source: 'human', message: 'question', timestamp: stamp }, { source: 'devin', message: [{ text: 'reply' }] },
+    { source: 'unknown', message: 'skip' }, { source: 'tool', message: ' ' }];
+  const expected = [{ seq: 2, role: 'user', content: 'question', createdAt: stamp },
+    { seq: 3, role: 'assistant', content: 'reply', createdAt: null }];
+  for (const text of [JSON.stringify({ schema_version: 1, session_id: 'd', steps }, null, 2), jsonl(...steps) + '\nbad']) {
+    assert.deepEqual(parseDevinTranscript(text), expected);
+    assert.deepEqual(parseDevinTranscript(text, { includeSystem: true }), [
+      { seq: 1, role: 'system', content: 'policy', createdAt: null }, ...expected]);
+  }
+});
+
+test('transcript metadata uses native headers and omits absent fields and message IDs', () => {
+  const header = { type: 'session', id: 'h', cwd: '/work', title: 't' };
+  const expected = { sessionId: 'h', cwd: '/work', title: 't' };
+  for (const harness of ['agy', 'pi']) {
+    assert.deepEqual(extractTranscriptMeta(harness, jsonl(header, { id: 'wrong' })), expected);
+    assert.deepEqual(extractTranscriptMeta(harness, jsonl({ id: 'turn', message: {} })), {});
+  }
+  assert.deepEqual(extractTranscriptMeta('codex', jsonl({ type: 'session_meta', payload: header })), expected);
+  assert.deepEqual(extractTranscriptMeta('omp', 'broken\n' + jsonl({ ...header, title: undefined }, { type: 'title', title: 't' })), expected);
+  assert.deepEqual(extractTranscriptMeta('claude', jsonl({ id: 'turn' }, { cwd: '/work', sessionId: 'c' })), { cwd: '/work', sessionId: 'c' });
+  assert.deepEqual(extractTranscriptMeta('devin', JSON.stringify({ session_id: 'd', steps: [] }, null, 2)), { sessionId: 'd' });
+  for (const input of [undefined, null, 'bad\n[]\nnull', '']) {
+    assert.deepEqual(extractTranscriptMeta('omp', input), {});
+    for (const parse of [parseCodexTranscript, parseOmpTranscript, parseClaudeTranscript, parseDevinTranscript]) {
+      assert.deepEqual(parse(input), []);
+    }
+  }
+});
+
+async function sourceFixture(t, name, ddl) {
+  const dir = await mkdtemp(join(tmpdir(), 'archive-import-'));
+  const sourceDbPath = join(dir, name);
+  const source = new DatabaseSync(sourceDbPath);
+  try { source.exec(ddl); } finally { source.close(); }
+  const original = await readFile(sourceDbPath);
+  const archive = openSessionArchive(':memory:');
+  t.after(() => archive.close());
+  t.after(async () => {
+    try { assert.deepEqual(await readFile(sourceDbPath), original); }
+    finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  return { archive, sourceDbPath, host: 'offline', fallbackProject: 'fallback' };
+}
+
+test('Devin SQLite: latest activity cutoff, ordered nodes, system opt-in, empty sessions, replay', async t => {
+  const opts = await sourceFixture(t, 'sessions.db', `
+    CREATE TABLE sessions(id, working_directory, created_at, last_activity_at, title);
+    CREATE TABLE message_nodes(row_id INTEGER PRIMARY KEY, session_id, chat_message, created_at);
+    INSERT INTO sessions VALUES ('old',NULL,0,'2025-02-28T23:59:59Z',NULL),
+      ('empty',NULL,0,'2025-03-02',NULL), ('s','/work/df-session',0,'2025-03-01','s');
+    INSERT INTO message_nodes VALUES (7,'s','{"role":"assistant","content":[{"text":"answer"}]}','2025-03-01'),
+      (1,'s','{"role":"system","content":"policy"}',0), (3,'s','{"role":"user","content":"question"}',0),
+      (5,'s','broken',0), (8,'empty','{}',0), (10,'old','{"role":"user","content":"old"}',0);`);
+  const run = extra => importDevinSqlite({ ...opts, since: stamp, ...extra });
+  assert.deepEqual(run({ limit: 1 }), { harness: 'devin', sourceDbPath: opts.sourceDbPath, scannedSessions: 1,
+    ingestedSessions: 0, skippedEmpty: 1, insertedMessages: 0, totalMessages: 0 });
+  assert.deepEqual(run(), { harness: 'devin', sourceDbPath: opts.sourceDbPath, scannedSessions: 2,
+    ingestedSessions: 1, skippedEmpty: 1, insertedMessages: 2, totalMessages: 2 });
+  assert.equal((await opts.archive.search({ query: 'policy' })).length, 0);
+  const included = run({ includeSystem: true });
+  assert.equal(included.insertedMessages, 1);
+  assert.equal(included.totalMessages, 3);
+  assert.equal(run({ includeSystem: true }).insertedMessages, 0);
+  const hits = await opts.archive.search({ query: 'policy question answer' });
+  assert.deepEqual([...hits].sort((a, b) => a.seq - b.seq).map(hit => hit.role), ['system', 'user', 'assistant']);
+  assert.ok(hits.every(hit => hit.sessionId === 'devin:s' && hit.project === 'darkfactory'));
+  for (const args of [{ host: ' ' }, { since: 'bad' }, { limit: 0 }, { harness: 'zcode' }]) {
+    assert.throws(() => run(args), /session_archive_import_/);
+  }
+});
+
+for (const harness of ['opencode', 'zcode']) {
+  test(`${harness} SQLite: optional schema, ordering, text-only parts, filters and replay`, async t => {
+    const full = harness === 'zcode';
+    const opts = await sourceFixture(t, full ? 'db.sqlite' : 'opencode.db', `
+      CREATE TABLE session(id, ${full ? 'path' : 'directory'}, title, time_created, time_updated ${full ? ', time_deleted' : ''});
+      CREATE TABLE message(id, session_id, data, time_created ${full ? ', sequence' : ''});
+      CREATE TABLE part(id, message_id, data, time_created ${full ? ', sequence' : ''});
+      INSERT INTO session VALUES ('s','/repos/mr-mix','main',0,${Date.parse(stamp)} ${full ? ',NULL' : ''}),
+        ('old',NULL,NULL,0,0 ${full ? ',NULL' : ''});
+      ${full ? "INSERT INTO session VALUES ('deleted',NULL,NULL,0,1999999999999,0);" : ''}
+      INSERT INTO message VALUES ('m1','s','{"role":"assistant"}',1 ${full ? ',2' : ''}),
+        ('m2','s','{"role":"user"}',2 ${full ? ',1' : ''}), ('m3','s','bad',3 ${full ? ',3' : ''});
+      INSERT INTO part VALUES ('p2','m1','{"type":"text","text":"second"}',2 ${full ? ',1' : ''}),
+        ('p1','m1','{"type":"text","text":"first"}',1 ${full ? ',2' : ''}),
+        ('p3','m1','{"type":"tool","text":"secret"}',3 ${full ? ',3' : ''}),
+        ('p4','m1','{"type":"text","text":" "}',4 ${full ? ',4' : ''}),
+        ('p5','m2','{"type":"text","text":"question"}',1 ${full ? ',1' : ''}),
+        ('p6','m3','broken',1 ${full ? ',1' : ''});`);
+    const run = extra => importOpencodeSqlite({ ...opts, harness, ...extra });
+    assert.deepEqual(run({ since: stamp }), { harness, sourceDbPath: opts.sourceDbPath, scannedSessions: 1,
+      ingestedSessions: 1, skippedEmpty: 0, insertedMessages: 2, totalMessages: 2 });
+    assert.equal(run({ limit: 1 }).insertedMessages, 0);
+    assert.equal(run().skippedEmpty, 1);
+    assert.equal((await opts.archive.search({ query: 'secret' })).length, 0);
+    const [answer] = await opts.archive.search({ query: 'first' });
+    assert.equal(answer.seq, full ? 1 : 0);
+    assert.equal(answer.snippet, full ? 'second\n«first»' : '«first»\nsecond');
+    assert.equal(answer.sessionId, `${harness}:s`);
+    assert.equal(answer.project, 'music-restoration');
+    assert.throws(() => run({ harness: 'devin' }), /harness_invalid/);
+  });
+}
 
 test('embedPending + hybrid RRF: semantic match with zero overlapping words', async () => {
   const archive = openSessionArchive(':memory:', { embedder: mockEmbedder });

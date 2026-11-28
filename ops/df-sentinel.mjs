@@ -201,7 +201,34 @@ async function atomicWrite(path, content) {
   } finally { await optional(() => unlink(temp)); }
 }
 
-export async function scanStateDirs({ stateDirs, cursorPath, outPath }) {
+// Accept a vb task-list snapshot (thread summaries) or flattened task rows.
+// Prefer the time of blocking/last update; creation is the fallback when the
+// Board has no state-change clock. Missing or invalid dates are not evidence.
+export function detectStaleBoardTasks(tasks, { nowMs, blockedMaxAgeHours = 72, activePolicyDigests = null }) {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(blockedMaxAgeHours) || blockedMaxAgeHours < 0) {
+    throw new Error('Invalid stale-task clock or age limit');
+  }
+  const active = activePolicyDigests === null ? null : new Set(activePolicyDigests);
+  const findings = [];
+  for (const row of tasks) {
+    const root = row.message ?? row;
+    const task = root.task ?? root;
+    const task_id = root.id ?? task.task_id;
+    if (task.state === 'blocked') {
+      const at = task.blocked?.at ?? task.blocked_at ?? task.blockedAt ?? root.updated_at ?? root.updatedAt ??
+        row.last?.createdAt ?? root.editedAt ?? root.createdAt ?? root.created_at;
+      const since = typeof at === 'number' ? at : Date.parse(at);
+      if (nowMs - since > blockedMaxAgeHours * 3_600_000) findings.push({ task_id, code: 'stale_blocked' });
+    } else if (task.state === 'ready' && active !== null) {
+      const digest = root.labels?.policy_digest;
+      if (!digest || !active.has(digest)) findings.push({ task_id, code: 'policy_digest_drift_ready' });
+    }
+  }
+  return findings;
+}
+
+export async function scanStateDirs({ stateDirs, cursorPath, outPath, boardTasks, nowMs = Date.now(),
+  blockedMaxAgeHours, activePolicyDigests }) {
   if (!stateDirs?.length) throw new Error('At least one state directory is required');
   const cursor = await destination(cursorPath);
   const out = await destination(outPath);
@@ -215,6 +242,14 @@ export async function scanStateDirs({ stateDirs, cursorPath, outPath }) {
   }
   const incidents = Object.values(state.groups).map(({ attempts, ...item }) => ({ ...item, distinctAttempts: attempts.length }))
     .sort((a, b) => compare(a.fp, b.fp));
+  // Queue alerts describe the current snapshot, not cumulative log events.
+  if (boardTasks !== undefined) {
+    for (const { task_id, code } of detectStaleBoardTasks(boardTasks, { nowMs, blockedMaxAgeHours, activePolicyDigests })) {
+      const obs = { source: 'board', module: 'queue', message: `#${task_id}`, code };
+      incidents.push({ ...obs, fp: fingerprintObservation(obs), class: 'queue_hygiene', occurrences: 1,
+        distinctAttempts: 0, firstSeen: null, lastSeen: null, evidence: [{ task_id }] });
+    }
+  }
   // Publish a snapshot, not deltas. If interrupted between renames, replay
   // from the old checkpoint replaces the snapshot rather than appending twice.
   if (out) await atomicWrite(out, incidents.map(i => JSON.stringify(i) + '\n').join(''));
@@ -255,9 +290,20 @@ export function formatHealthDigest(d) {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     const { values: v } = parseArgs({ options: { observe: { type: 'boolean' }, 'state-dir': { type: 'string', multiple: true },
-      cursor: { type: 'string' }, out: { type: 'string' }, digest: { type: 'boolean' }, json: { type: 'boolean' } } });
-    if (!v.observe || !v['state-dir']?.length) throw new Error('Usage: --observe --state-dir <dir> [--cursor <file>] [--out <file>] [--digest] [--json]');
-    const result = await scanStateDirs({ stateDirs: v['state-dir'], cursorPath: v.cursor, outPath: v.out });
+      'board-tasks': { type: 'string' }, 'active-policy-digest': { type: 'string', multiple: true },
+      'blocked-max-age-hours': { type: 'string' }, cursor: { type: 'string' }, out: { type: 'string' }, digest: { type: 'boolean' }, json: { type: 'boolean' } } });
+    if (!v.observe || !v['state-dir']?.length) throw new Error('Usage: --observe --state-dir <dir> [--cursor <file>] [--out <file>] [--board-tasks <vb-json-file> [--active-policy-digest HEX ...] [--blocked-max-age-hours N]] [--digest] [--json]');
+    let boardTasks;
+    if (v['board-tasks'] !== undefined) {
+      const path = await realpath(v['board-tasks']);
+      if ([await destination(v.cursor), await destination(v.out)].includes(path)) throw new Error('Board snapshot must be read-only');
+      const page = JSON.parse(await readFile(path, 'utf8'));
+      boardTasks = Array.isArray(page) ? page : page?.tasks;
+      if (!Array.isArray(boardTasks)) throw new Error('Invalid Board task snapshot');
+    }
+    const result = await scanStateDirs({ stateDirs: v['state-dir'], cursorPath: v.cursor, outPath: v.out, boardTasks,
+      blockedMaxAgeHours: v['blocked-max-age-hours'] === undefined ? undefined : Number(v['blocked-max-age-hours']),
+      activePolicyDigests: v['active-policy-digest'] });
     if (v.digest) {
       const digest = buildHealthDigest(result);
       console.log(v.json ? JSON.stringify(digest) : formatHealthDigest(digest));

@@ -12,13 +12,14 @@ import { closeSync, fstatSync, lstatSync, openSync, readFileSync, readSync,
   realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parseDocument } from 'yaml';
+import { normalizeFieldMode, normalizeTaskPlan, resolveIntakeMode } from './field-mode.mjs';
 
 export const DEFAULT_PROFILE_RELPATH = '.darkfactory/project-profile.yaml';
 export const DEFAULT_MAX_CHARS = 4096;
 export const AGENTS_EXCERPT_CHARS = 1500;
-export const DOMAINS = Object.freeze(['backend', 'ui', 'security', 'docs', 'research', 'ml']);
+export const DOMAINS = Object.freeze(['backend', 'ui', 'security', 'docs', 'research', 'ml', 'dsp', 'math', 'ops']);
 export const PROFILE_KEYS = Object.freeze([
-  'repo_id', 'stack', 'l1_profile', 'agents_md', 'taste', 'domain_skills',
+  'repo_id', 'stack', 'l1_profile', 'agents_md', 'taste', 'domain_skills', 'field_mode', 'default_plan', 'intake_mode', 'repo_skills',
 ]);
 const PROFILE_LIMIT_BYTES = 256 * 1024;
 const AGENTS_READ_BYTES = 256 * 1024;
@@ -102,7 +103,72 @@ export function loadProjectProfile(repoRoot, { profileRelPath = DEFAULT_PROFILE_
   if (!info.isFile() || info.size === 0 || info.size > PROFILE_LIMIT_BYTES) {
     throw fail('taste_profile_file_invalid', profileRelPath);
   }
-  const text = readFileSync(canonical, 'utf8');
+  return parseProjectProfileBytes(readFileSync(canonical), { profileRelPath: canonical });
+}
+
+// Omission is allowed; an explicit null or invalid enum is a schema error.
+function profileEnum(raw, key, normalize) {
+  if (!Object.hasOwn(raw, key)) return null;
+  if (!validString(raw[key])) throw fail('taste_profile_invalid', key);
+  try {
+    return normalize(raw[key]);
+  } catch {
+    throw fail('taste_profile_invalid', key);
+  }
+}
+
+// A declaration names exactly one skills/<id>/SKILL.md, never a host path.
+function repoSkillIds(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw fail('taste_profile_invalid', 'repo_skills');
+  return value.map(entry => {
+    const name = typeof entry === 'string' ? entry.trim() : '';
+    const id = /^skills\/([^/]+)\/SKILL\.md$/.exec(name)?.[1] ?? name;
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(id)) throw fail('taste_profile_invalid', 'repo_skills');
+    return id;
+  });
+}
+
+// ATX sections end at the next peer/ancestor heading. Fenced examples are
+// literal content: a heading inside one must not promote preferences to rules.
+export function parseOwnerTaste(markdown = '') {
+  const parts = { hard: [], soft: [] };
+  let active, depth, fence, found = false;
+  for (const line of markdown.split(/\r?\n/)) {
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence || marker) {
+      if (!fence) fence = marker[1];
+      else if (marker?.[1].startsWith(fence) && !marker[2].trim()) fence = null;
+    } else {
+      const heading = /^ {0,3}(#{1,6})\s+(.+?)\s*$/.exec(line);
+      if (heading) {
+        const title = heading[2].replace(/\s+#+$/, '');
+        const tier = /^(?:Tier 1\s*[:—–-]\s*)?Hard Taste Rules(?:\s*\(Tier 1\))?$/i.test(title) ? 'hard'
+          : /^(?:Tier 2\s*[:—–-]\s*)?Soft Taste Preferences(?:\s*\(Tier 2\))?$/i.test(title) ? 'soft' : null;
+        if (tier) {
+          active = tier; depth = heading[1].length; found = true;
+          parts[tier].push('');
+          continue;
+        }
+        if (heading[1].length <= depth) active = null;
+      }
+    }
+    if (active) parts[active].push(line);
+  }
+  return Object.freeze({ hard: parts.hard.join('\n').trim(),
+    soft: found ? parts.soft.join('\n').trim() : markdown.trim() });
+}
+
+export function parseProjectProfileBytes(bytes, { profileRelPath = DEFAULT_PROFILE_RELPATH } = {}) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > PROFILE_LIMIT_BYTES) {
+    throw fail('taste_profile_file_invalid', profileRelPath);
+  }
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw fail('taste_profile_yaml_invalid', `${profileRelPath}: invalid UTF-8`);
+  }
   const raw = parseYamlStrict(text, profileRelPath);
   if (!isRecord(raw)) throw fail('taste_profile_invalid', 'top-level mapping required');
   for (const key of Object.keys(raw)) {
@@ -138,9 +204,13 @@ export function loadProjectProfile(repoRoot, { profileRelPath = DEFAULT_PROFILE_
     stack: Object.freeze(toStringList(raw.stack, 'stack')),
     l1Profile: raw.l1_profile === undefined ? null : raw.l1_profile.trim(),
     agentsMd,
+    intakeMode: profileEnum(raw, 'intake_mode', intake_mode => resolveIntakeMode({ intake_mode })),
+    repoSkills: Object.freeze(repoSkillIds(raw.repo_skills)),
     taste: Object.freeze(toStringList(raw.taste, 'taste')),
     domainSkills: Object.freeze(domainSkills),
-    path: canonical,
+    fieldMode: profileEnum(raw, 'field_mode', normalizeFieldMode),
+    defaultPlan: profileEnum(raw, 'default_plan', normalizeTaskPlan),
+    path: profileRelPath,
   });
 }
 
@@ -278,6 +348,16 @@ function assembleSections(sections, maxChars) {
   return { text: parts.join('\n\n') + marker, truncated: true };
 }
 
+export function projectTasteBlock(profile, maxChars = Infinity) {
+  if (!profile) return '';
+  const lines = [];
+  if (profile.repoId !== null) lines.push(`repo: ${profile.repoId}`);
+  if (profile.stack.length) lines.push(`stack: ${profile.stack.join(', ')}`);
+  if (profile.l1Profile !== null) lines.push(`l1_profile: ${profile.l1Profile}`);
+  for (const bullet of profile.taste) lines.push(`- ${bullet}`);
+  return lines.length ? assembleSections([`## Repo Taste (project profile)\n${lines.join('\n')}`], maxChars).text : '';
+}
+
 // Сборка компактного projectContext: фиксированный порядок секций делает
 // текст и digest детерминированными при неизменных входах. Бюджет maxChars
 // гарантируется per-section кепами с явным маркером усечения вместо среза
@@ -317,14 +397,8 @@ export function buildProjectContext({ globalTastePath = null, repoRoot, domain =
   if (globalTaste !== null) {
     sections.push(`## Owner Taste (global)\n${globalTaste}`);
   }
-  if (profile !== null) {
-    const lines = [];
-    if (profile.repoId !== null) lines.push(`repo: ${profile.repoId}`);
-    if (profile.stack.length) lines.push(`stack: ${profile.stack.join(', ')}`);
-    if (profile.l1Profile !== null) lines.push(`l1_profile: ${profile.l1Profile}`);
-    for (const bullet of profile.taste) lines.push(`- ${bullet}`);
-    if (lines.length) sections.push(`## Repo Taste (project profile)\n${lines.join('\n')}`);
-  }
+  const repoTaste = projectTasteBlock(profile);
+  if (repoTaste) sections.push(repoTaste);
   if (agentsExcerpt !== null) {
     sections.push(`## AGENTS.md (excerpt)\n${agentsExcerpt}`);
   }

@@ -1,5 +1,6 @@
 import { isRoleRegistry } from './role-registry.mjs';
 import { canonicalDigest } from './subject.mjs';
+import { parseAllowedPaths } from './scope-fence.mjs';
 
 // Детерминированный on-demand подбор скиллов стадии: станция получает свои
 // закреплённые скиллы и правила skillPicker по меткам тикета — без чтения ФС
@@ -12,6 +13,62 @@ function record(value) {
 
 export function computeSkillsDigest(skills) {
   return canonicalDigest((skills ?? []).map(({ id, digest }) => ({ id, digest })));
+}
+
+export const WORKER_SKILL_BYTES = 16 * 1024;
+const domainPatterns = {
+  ui: /\b(?:ui|frontend|components|css|html|tsx|jsx|vue|svelte)\b/,
+  security: /\b(?:auth|security|crypto|permissions)\b/,
+  docs: /\b(?:docs|readme|md|rst)\b/,
+  research: /\b(?:research|papers|experiments)\b/,
+  ml: /\b(?:ml|models|training|ipynb)\b/,
+  dsp: /\b(?:dsp|audio|signal|fft|wav)\b/,
+  math: /\b(?:math|lean|proofs|theorems)\b/,
+  ops: /\b(?:ops|infra|deploy|dockerfile|workflows|terraform)\b/,
+  backend: /\b(?:backend|api|server|board-pipeline)\b/,
+};
+const sharedDefaults = { backend: ['test-first'], ui: ['three-pass-review'], security: ['three-pass-review'],
+  docs: ['session-handoff'], research: ['prod-recon'], ml: ['property-testing'], dsp: ['property-testing'],
+  math: ['property-testing'], ops: ['prod-recon'] };
+
+function detectedDomains(paths) {
+  const domains = new Set();
+  for (const path of paths ?? []) {
+    const tokens = path.toLowerCase().replaceAll('_', '-');
+    const matched = Object.keys(domainPatterns).filter(domain => domainPatterns[domain].test(tokens));
+    if (!matched.length && /\.(?:m?[jt]s|py|go|rs|java)$/.test(tokens)) matched.push('backend');
+    for (const domain of matched) domains.add(domain);
+  }
+  return [...domains].sort();
+}
+
+// Project declarations may only select shared registry entries and enrolled
+// repo/owner IDs. They never specify host paths. First layer wins on ID clash.
+export async function resolveWorkerSkills({ registry, allowedPaths, profile = null, ownerSkills = {}, readRepoSkill }) {
+  const domains = detectedDomains(typeof allowedPaths === 'string' ? parseAllowedPaths(allowedPaths) : allowedPaths);
+  const repoIds = profile?.repoSkills ?? [];
+  const seen = new Set(), blocks = [];
+  let bytes = 0;
+  function add(layer, id, text) {
+    if (seen.has(id)) return;
+    if (typeof text !== 'string' || !text.trim()) throw new Error(`worker_skill_empty:${id}`);
+    const block = `Read-only ${layer} skill (${id}):\n${text}`;
+    bytes += Buffer.byteLength(block) + (blocks.length ? 2 : 0);
+    if (bytes > WORKER_SKILL_BYTES) throw new Error('worker_skill_budget_exceeded');
+    blocks.push(block);
+    seen.add(id);
+  }
+  for (const domain of domains.length ? domains : [null]) {
+    for (const skill of pickSkills({ registry, labels: { domain } }).skills) add('shared', skill.id, skill.text);
+    const selected = profile?.domainSkills?.[domain] ?? sharedDefaults[domain] ?? [];
+    for (const id of selected) {
+      if (Object.hasOwn(registry.sharedSkills, id)) add('shared', id, registry.sharedSkills[id].text);
+      else if (!repoIds.includes(id) && !Object.hasOwn(ownerSkills, id)) throw new Error(`skill_picker_unknown_skill:${id}`);
+    }
+  }
+  for (const id of repoIds) if (!seen.has(id)) add('repo', id, await readRepoSkill(id));
+  for (const id of Object.keys(ownerSkills).sort()) add('owner', id, ownerSkills[id]);
+  return blocks.join('\n\n');
 }
 
 function ruleMatches(match, labels) {

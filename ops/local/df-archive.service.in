@@ -1,0 +1,8 @@
+[Unit]
+Description=Ingest recent Darkfactory session transcripts into the local FTS archive
+
+[Service]
+Type=oneshot
+NoNewPrivileges=true
+Environment="DF_REPO=@REPO@"
+ExecStart="@REPO@/ops/local/df-archive-ingest.sh"

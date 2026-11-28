@@ -1,11 +1,85 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { recordDigest } from './decision-ledger.mjs';
-import { openUnifiedLedger } from './unified-ledger.mjs';
+import { recordDigest, resolveActiveDecisions } from './decision-ledger.mjs';
+import { legacyRuleSummary, openUnifiedLedger, readUnifiedDecisionSlice } from './unified-ledger.mjs';
+import { teamleadIntakePrompt } from './intake-prompt.mjs';
+
+test('portfolio import keeps full long decisions and publishes a bounded checksummed v1 view', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'long-owner-rule-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const db = join(dir, 'unified-ledger.db'), out = join(dir, 'view.jsonl'), from = join(dir, 'portfolio.md');
+  const topic = 'Release';
+  const prefix = `${topic}: `;
+  const rule = 'a'.repeat(998 - prefix.length) + '🙂'.repeat(2000) + ' keep this suffix';
+  const titleOnly = 'portfolio '.repeat(110).trim();
+  await writeFile(from, `1. **${topic}**: ${rule}\n2. **${titleOnly}**\n`);
+  const args = [join(import.meta.dirname, '../ops/local/import-owner-decisions.mjs'), '--from', from,
+    '--db', db, '--approved-by', 'owner', '--export-jsonl', out];
+  for (const imported of [2, 0]) {
+    assert.equal(JSON.parse(execFileSync(process.execPath, args)).imported, imported);
+  }
+  const legacy = await resolveActiveDecisions({ ledgerPath: out });
+  assert.equal(legacy.items.length, 2);
+  const summary = legacy.items[0].rule;
+  assert.ok(summary.length <= 1000 && summary.endsWith('…') && summary.isWellFormed());
+  const ledger = openUnifiedLedger(db);
+  try {
+    const [decision, second] = ledger.queryRelevantDecisions();
+    assert.equal(second.decision, titleOnly);
+    assert.equal(decision.id, legacy.ids[0]);
+    assert.equal(decision.decision, rule);
+  } finally { ledger.close(); }
+});
+
+test('v1 summaries leave the inclusive 1000-unit boundary intact', () => {
+  for (const length of [999, 1000, 1001]) {
+    const decision = 'x'.repeat(length);
+    assert.equal(legacyRuleSummary({ topic: decision, decision }), length <= 1000 ? decision : `${'x'.repeat(999)}…`);
+  }
+});
+
+test('Teamlead and Owner Twin intake see only their repo, before budgeting or hashing the hc slice', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'controller-decisions-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'unified-ledger.db');
+  const ledger = openUnifiedLedger(dbPath);
+  const decision = 'sqlite-only '.repeat(110).trim();
+  try {
+    for (const [scope, rule] of [['global', 'Portfolio project: unrelated'], ['project:proj_xy', 'Чужое'],
+      ['area:other', 'Not repo-specific'], ['project:proj_x', 'Always run bb thread create --provider old --model obsolete'],
+      ['project:proj_x', decision]]) {
+      const prop = ledger.proposeDecision(proposal({ scope, decision: rule }));
+      ledger.approveProposal(prop.proposal_id, { approvedBy: 'owner' });
+    }
+    ledger.proposeDecision(proposal({ scope: 'project:proj_x', decision: 'not approved' }));
+    const twin = { repo_id: 'proj_x', runtime: 'hc', areas: ['other'] };
+    const rows = ledger.queryRelevantDecisions(twin);
+    assert.deepEqual(rows.map(row => row.decision), [decision]);
+    assert.deepEqual(ledger.exportMarkdown(twin).ids, rows.map(row => row.id));
+    for (const options of [{ ...twin, projectId: 'proj_xy' }, { repo_id: undefined }, { runtime: 'hc' }]) {
+      assert.throws(() => ledger.queryRelevantDecisions(options), /unified_ledger_input_invalid/);
+      assert.throws(() => ledger.exportMarkdown(options), /unified_ledger_input_invalid/);
+    }
+  } finally { ledger.close(); }
+  const slice = readUnifiedDecisionSlice({ dbPath, projectId: 'proj_x' }); // Teamlead's enrolled repo_id
+  assert.deepEqual(slice, readUnifiedDecisionSlice({ dbPath, repo_id: 'proj_x', runtime: 'hc' }));
+  assert.equal(slice.total, 1);
+  assert.ok(slice.items[0].rule.endsWith(decision));
+  const prompt = teamleadIntakePrompt({ requestBlock: 'Plan it.', decisions: slice,
+    memory: { text: '', ids: [], digest: 'a'.repeat(64) } });
+  assert.ok(prompt.includes(slice.text));
+  assert.doesNotMatch(prompt, /Portfolio|Чужое|bb thread create|Not repo-specific/);
+  assert.equal(readUnifiedDecisionSlice({ dbPath, repo_id: 'proj_x', runtime: 'bb' }).total, 2);
+  assert.equal(readUnifiedDecisionSlice({ dbPath, repo_id: 'unused' }).total, 0);
+  for (const options of [{}, { repo_id: '' }, { repo_id: null }, { repo_id: 'proj_x', projectId: 'proj_xy' }]) {
+    assert.throws(() => readUnifiedDecisionSlice({ dbPath, ...options }), /unified_ledger_input_invalid/);
+  }
+});
 
 function proposal(overrides = {}) {
   return {

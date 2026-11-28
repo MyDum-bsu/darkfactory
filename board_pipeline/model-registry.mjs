@@ -9,6 +9,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument } from 'yaml';
 import { opencodeGoPolicyViolation, retiredProviderViolation, workerFamily } from './worker-selector.mjs';
+import { fusionModelMeta } from './review-runner.mjs';
 import { isApprovedWorker } from './run-isolated.mjs';
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -82,6 +83,15 @@ export function isApprovedModel(spec, registry) {
     ELIGIBLE_STATUSES.includes(effectiveStatus(entry, registry.loadedAt)));
 }
 
+function fusionMetaOf(spec) {
+  const model = typeof spec === 'string' ? spec.slice(spec.indexOf('/') + 1) : spec?.model;
+  return fusionModelMeta(model);
+}
+
+function sidekickSafeReader(spec) {
+  return !fusionMetaOf(spec) && workerFamily(spec) !== 'cognition';
+}
+
 export function assertPolicyModelMatrix({ cli, policy, registry }) {
   function check(where, spec) {
     if (spec === undefined) return;
@@ -107,6 +117,14 @@ export function assertPolicyModelMatrix({ cli, policy, registry }) {
       throw new Error(`model_allowlist_invalid:${role}`);
     }
     for (const entry of entries) check(`routing.allowlist.${role}`, entry ?? null);
+  }
+  // Runtime allowlists are independent pools. Its scalar family check already
+  // excludes the lead, but cannot express a conditional sidekick exclusion.
+  const workers = [cli, policy?.bb, ...(allowlist?.worker ?? [])];
+  if (workers.some(fusionMetaOf)) {
+    const readers = [policy?.arbiter, policy?.route?.critic, policy?.route?.arbiter,
+      ...Object.values(policy?.profiles ?? {}).map(p => p?.review), ...(allowlist?.critic ?? []), ...(allowlist?.arbiter ?? [])];
+    if (readers.some(spec => !sidekickSafeReader(spec))) throw new Error('fusion_sidekick_family_collision');
   }
 }
 
@@ -206,6 +224,13 @@ function validateCatalog(raw) {
         !nonEmptyString(entry.quota_source) || typeof entry.notes !== 'string' ||
         !validateUntil(entry.until)) {
       throw invalid('model_catalog_invalid', where);
+    }
+    if (/(?:^|[/\\])\s*fusion-/i.test(entry.model)) {
+      const meta = fusionModelMeta(entry.model);
+      if (!meta || !['acp-devin', 'devin'].includes(entry.provider) || entry.family !== meta.leadFamily ||
+          !['subscription', 'paid_api'].includes(entry.cost_tier)) {
+        throw invalid('model_catalog_invalid', `${where}: invalid Devin Fusion model, family or cost tier`);
+      }
     }
     seen.add(entry.id);
     return Object.freeze({ ...entry, capabilities: Object.freeze([...entry.capabilities]) });
@@ -431,6 +456,13 @@ const isNeonEntry = entry => entry?.family === 'google' &&
 const isSolEntry = entry => entry?.family === 'openai' &&
   finalModelSegment(entry?.model) === 'gpt-6.2-sol';
 
+// Ordinary catalog models carry one family; Fusion occupies two seats for
+// independence purposes even though its public family is always the lead.
+function entryFamilies(entry) {
+  const meta = fusionModelMeta(entry.model);
+  return meta ? [meta.leadFamily, meta.sidekickFamily] : [entry.family];
+}
+
 export function resolveRoleChain(registry, role, {
   mode,
   excludeFamilies = [],
@@ -461,7 +493,7 @@ export function resolveRoleChain(registry, role, {
     const status = effectiveStatus(entry, now, quota);
     if (status === 'disabled' || status === 'quota_paused') return;
     if (!allowedCost.has(entry.cost_tier)) return;
-    if (excluded.has(entry.family)) return;
+    if (entryFamilies(entry).some(family => excluded.has(family))) return;
     if ([...required].some(capability => !entry.capabilities.includes(capability))) return;
     eligible.push({ entry, status, index, quota });
   });
@@ -503,10 +535,10 @@ export function resolveTriad(registry, { mode, now = new Date(), quotas, strictL
   let chosen = null;
   let partial = null;
   for (const coder of coderChain) {
-    const reviewerChain = chainFor('reviewer', [coder.family]);
+    const reviewerChain = chainFor('reviewer', entryFamilies(coder));
     if (reviewerChain.length && !partial) partial = { coder, reviewerChain };
     for (const reviewer of reviewerChain) {
-      const arbiterChain = chainFor('arbiter', [coder.family, reviewer.family]);
+      const arbiterChain = chainFor('arbiter', [...entryFamilies(coder), ...entryFamilies(reviewer)]);
       if (arbiterChain.length) {
         chosen = { coder, reviewer, reviewerChain, arbiterChain };
         break;
@@ -519,16 +551,16 @@ export function resolveTriad(registry, { mode, now = new Date(), quotas, strictL
     if (partial) {
       const reviewer = partial.reviewerChain[0];
       chosen = { coder: partial.coder, reviewer, reviewerChain: partial.reviewerChain,
-        arbiterChain: chainFor('arbiter', [partial.coder.family, reviewer.family]) };
+        arbiterChain: [] }; // Backtracking already exhausted every arbiter.
     } else if (coderChain.length) {
       const coder = coderChain[0];
       chosen = { coder, reviewer: null, reviewerChain: [],
-        arbiterChain: chainFor('arbiter', [coder.family]) };
+        arbiterChain: chainFor('arbiter', entryFamilies(coder)) };
     } else {
       const reviewerChain = chainFor('reviewer');
       const reviewer = reviewerChain[0] ?? null;
       chosen = { coder: null, reviewer, reviewerChain,
-        arbiterChain: chainFor('arbiter', reviewer ? [reviewer.family] : []) };
+        arbiterChain: chainFor('arbiter', reviewer ? entryFamilies(reviewer) : []) };
     }
   }
 
@@ -573,10 +605,13 @@ export function toPipelineAllowlist(registry, { mode, now = new Date(), quotas }
   const activeMode = mode ?? registry.policy.mode;
   const chain = role => resolveRoleChain(registry, role, { mode: activeMode, now, quotas });
   const spec = entry => Object.freeze({ provider: entry.provider, model: entry.model });
+  const workers = chain('coder_default');
+  const withSidekick = workers.some(fusionMetaOf);
+  const runnableReader = entry => isL2RunnableEntry(entry) && (!withSidekick || sidekickSafeReader(entry));
   return Object.freeze({
-    worker: Object.freeze(chain('coder_default').map(spec)),
-    critic: Object.freeze(chain('reviewer').filter(isL2RunnableEntry).map(spec)),
-    arbiter: Object.freeze(chain('arbiter').filter(isL2RunnableEntry).map(spec)),
+    worker: Object.freeze(workers.map(spec)),
+    critic: Object.freeze(chain('reviewer').filter(runnableReader).map(spec)),
+    arbiter: Object.freeze(chain('arbiter').filter(runnableReader).map(spec)),
   });
 }
 

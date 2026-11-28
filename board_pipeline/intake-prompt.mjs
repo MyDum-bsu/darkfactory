@@ -3,8 +3,10 @@ import { buildProjectContext, DEFAULT_MAX_CHARS as TASTE_MAX_CHARS } from './tas
 import { SAFE_CATALOG } from './rework-distiller.mjs';
 import { formatArbiterPrompt, formatWorkerPrompt, resolveModelFamily } from './model-prompt-profiles.mjs';
 import { scopeFencePromptBlock } from './scope-fence.mjs';
+import { taskPlanPromptBlock } from './field-mode.mjs';
+import { formatBlastRadiusSummary } from './blast-radius.mjs';
+import { WORKER_SKILL_BYTES } from './skill-picker.mjs';
 
-const EMPTY_DECISIONS_TEXT = '(no active decisions)';
 const EMPTY_MEMORY_TEXT = '(project memory is empty)';
 
 // A slice explicitly represents an empty store when it carries no entries and
@@ -26,8 +28,7 @@ const OWNER_PRECHECK = [
 ].join('\n');
 
 // Read-only block for the active Owner Decision Ledger slice (Board #1261):
-// digest-pinned owner decisions. The worker receives the excerpt but cannot
-// modify the ledger — the journal itself lives outside its worktree.
+// digest-pinned owner decisions for planning intake, not code writers.
 export function decisionsPromptBlock(slice) {
   if (!slice || typeof slice.digest !== 'string' || !/^[a-f0-9]{64}$/.test(slice.digest) ||
       !Array.isArray(slice.ids)) {
@@ -89,7 +90,7 @@ export function projectMemoryPromptBlock(slice) {
 export function buildPromptBom(parts) {
   if (!parts || typeof parts !== 'object' || Array.isArray(parts)) throw new Error('prompt_parts_invalid');
   const bom = {};
-  for (const name of ['spec', 'decisions', 'memory', 'taste', 'skills', 'lessons', 'scope']) {
+  for (const name of ['spec', 'decisions', 'memory', 'taste', 'skills', 'lessons', 'scope', 'taskPlan', 'blastRadius']) {
     if (!Object.hasOwn(parts, name)) continue;
     const text = parts[name];
     if (text == null || text === '') continue;
@@ -114,9 +115,26 @@ function tastePromptBlock(tree, tasteProfile) {
   return budget > 0 && text ? header + text : '';
 }
 
-export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, decisions,
-  projectMemory, lessons, executor, allowedPaths, projectContext, tasteProfile }) {
+// Only paired, whole-line evidence markers in the brief exempt the enclosed text.
+// Never let an unclosed quote consume the following instructions or project profile.
+function briefProse(brief) {
+  const parts = String(brief ?? '').split(/^(Verbatim Owner Request|End Verbatim Owner Request)\r?$/m);
+  return parts.filter((_, i) => !(parts[i - 1] === 'Verbatim Owner Request' &&
+    parts[i + 1] === 'End Verbatim Owner Request')).join('');
+}
+
+function hasNonLatinProse(text) {
+  // Single Greek variables and unit prefixes are notation; Greek words are prose.
+  const prose = text.replace(/(?<!\p{Script=Greek})[\p{Script=Greek}µ](?!\p{Script=Greek})/gu, '');
+  return /(?=\p{Letter})(?!\p{Math})\P{Script=Latin}/u.test(prose);
+}
+
+export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQuestions, runtime,
+  projectMemory, lessons, executor, allowedPaths, projectContext, tasteProfile, skillBlock, fieldMode, taskPlan, blastRadius }) {
+  const hc = runtime === 'hc';
   const instructions = [brief];
+  if (taskPlan != null) instructions.push(taskPlanPromptBlock(taskPlan, fieldMode));
+  if (blastRadius != null) instructions.push(formatBlastRadiusSummary(blastRadius));
   // Read-only project conventions/taste (AGENTS.md or project guide excerpt),
   // embedded before the execution instructions; omitted when undefined/empty.
   if (projectContext !== undefined && projectContext !== null) {
@@ -125,18 +143,25 @@ export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQ
       instructions.push(`Project context (read-only conventions/taste):\n${projectContext}`);
     }
   }
-  if (tasteProfile != null) {
+  // hc uses only the pinned owner taste and project profile in projectContext;
+  // the legacy opt-in loader also reads a mutable AGENTS.md excerpt.
+  if (!hc && tasteProfile != null) {
     const block = tastePromptBlock(tree, tasteProfile);
     if (block) instructions.push(block);
   }
-  instructions.push(`\nWorktree path: ${tree}. Write JSON atomically to ${handoffPath} and end the turn. Preserve field types: ${JSON.stringify(handoff)}`);
-  if (decisions) {
-    // Validation runs first and stays fail-closed; only the redundant
-    // empty-store rendering is skipped, never an invalid or truncated slice.
-    const block = decisionsPromptBlock(decisions);
-    if (!isEmptyStoreSlice(decisions, EMPTY_DECISIONS_TEXT)) instructions.push(block);
+  if (skillBlock != null) {
+    if (typeof skillBlock !== 'string') throw new Error('prompt_input_invalid:skillBlock');
+    if (Buffer.byteLength(skillBlock) > WORKER_SKILL_BYTES) throw new Error('worker_skill_budget_exceeded');
+    if (skillBlock) instructions.push(skillBlock);
   }
-  if (projectMemory) {
+  // A task may legitimately discuss bb itself. Conventions/skills, however,
+  // must not prescribe a BB launch matrix for a Herdr worker.
+  if (hc && ([projectContext, skillBlock].some(text => /\bbb\s+thread\s+create\b/i.test(text ?? '')) ||
+      /\bbb\s+thread\s+create\b[^\n]*(?:--provider|--model)\b/i.test(brief))) {
+    throw new Error('worker_prompt_bb_rule');
+  }
+  instructions.push(`\nWorktree path: ${tree}. Write JSON atomically to ${handoffPath} and end the turn. Preserve field types: ${JSON.stringify(handoff)}`);
+  if (!hc && projectMemory) {
     const block = projectMemoryPromptBlock(projectMemory);
     if (!isEmptyStoreSlice(projectMemory, EMPTY_MEMORY_TEXT)) instructions.push(block);
   }
@@ -152,35 +177,47 @@ export function workerIntakePrompt({ brief, tree, handoffPath, handoff, productQ
   const fence = allowedPaths === undefined || allowedPaths === null
     ? null
     : scopeFencePromptBlock(allowedPaths);
-  if (executor === undefined || executor === null) {
-    return fence === null ? basePrompt : `${basePrompt}\n${fence}\n`;
+  const prompt = executor == null ? (fence === null ? basePrompt : `${basePrompt}\n${fence}\n`)
+    : formatWorkerPrompt({ family: resolveModelFamily(executor), basePrompt, scopeFenceBlock: fence ?? undefined });
+  // Never silently rewrite a digest-pinned spec, scope fence or selected skill.
+  // Non-Latin prose requires an English input from intake before dispatch.
+  // Mathematical notation is allowed in prose, not in the SHA placeholder.
+  if (hc && ((typeof handoff?.candidate_sha === 'string' && /(?=\p{Letter})\P{Script=Latin}/u.test(handoff.candidate_sha)) ||
+      [briefProse(brief), ...instructions.slice(1), fence ?? ''].some(hasNonLatinProse))) {
+    throw new Error('worker_prompt_english_required');
   }
-  return formatWorkerPrompt({
-    family: resolveModelFamily(executor),
-    basePrompt,
-    scopeFenceBlock: fence ?? undefined,
-  });
+  if (hc && /^Accepted owner decisions \(read-only, slice digest /m.test(prompt)) {
+    throw new Error('worker_prompt_contains_ledger');
+  }
+  return prompt;
 }
 
-export function arbiterIntakePrompt(spec, extra, decisions, projectMemory, arbiter) {
+export function teamleadIntakePrompt({ requestBlock, splitContext, fence, memory, decisions }) {
+  return [requestBlock, splitContext && `Arbiter SPLIT context:\n${splitContext}`, fence && `Allowed paths: ${fence}`,
+    projectMemoryPromptBlock(memory), decisionsPromptBlock(decisions),
+    'Based on the specification and context provided above, act as the read-only Project Teamlead. ' +
+    'Decompose only the requested work. Write each task spec in English, with a verifiable outcome and scope. ' +
+    'Apply relevant decisions to the requirements; do not paste ledger entries into cards. ' +
+    'Return only JSON {"cards":[{"key":"step1","text":"...","allowed_paths":"src/a,test/a","needs":[]}]}. ' +
+    'Give each card a minimal comma-separated scope of relative files or directory prefixes ending in /. ' +
+    'Use unique keys in dependency order; needs may name only earlier keys.'].filter(Boolean).join('\n\n');
+}
+
+export function arbiterIntakePrompt(spec, extra, _legacyDecisions, projectMemory, arbiter) {
   const guidance = 'Use the following specification; output only an arbitration decision, not a critic verdict.';
   const escalator = 'Choose escalate_owner only for a remaining product fork.';
   // Validation runs first and stays fail-closed; only redundant empty-store
   // boilerplate is skipped, never an invalid or truncated slice.
-  const decisionsBlock = decisions ? decisionsPromptBlock(decisions) : null;
   const memoryBlock = projectMemory ? projectMemoryPromptBlock(projectMemory) : null;
-  const includeDecisions = decisionsBlock !== null && !isEmptyStoreSlice(decisions, EMPTY_DECISIONS_TEXT);
   const includeMemory = memoryBlock !== null && !isEmptyStoreSlice(projectMemory, EMPTY_MEMORY_TEXT);
   if (arbiter === undefined || arbiter === null) {
-    return [guidance, spec, extra, includeDecisions ? decisionsBlock : null,
-      includeMemory ? memoryBlock : null, OWNER_PRECHECK,
+    return [guidance, spec, extra, includeMemory ? memoryBlock : null, OWNER_PRECHECK,
       escalator].filter(Boolean).join('\n\n');
   }
   return formatArbiterPrompt({
     family: resolveModelFamily(arbiter),
     guidance,
-    spec: [spec, extra, includeDecisions ? decisionsBlock : null,
-      includeMemory ? memoryBlock : null].filter(Boolean).join('\n\n'),
+    spec: [spec, extra, includeMemory ? memoryBlock : null].filter(Boolean).join('\n\n'),
     rules: [OWNER_PRECHECK, escalator].join('\n\n'),
   });
 }

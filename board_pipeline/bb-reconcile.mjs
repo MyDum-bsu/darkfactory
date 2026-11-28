@@ -62,10 +62,14 @@ export async function reconcileSpawnFromBb({ execBb, project, tree, attemptId, h
   return { status: matched.length === 0 ? 'empty' : 'ambiguous' };
 }
 
-// Ровно одно сообщение `Замечание фабрики ${feedbackId}.` в журнале треда —
-// delivered; 0 → empty, >1 → ambiguous. `bb thread log --limit N` читает
-// ПЕРВЫЕ N событий — журнал после известного хода читается через --after-seq,
-// иначе целиком через --all.
+// Legacy compatibility: historical threads retain the original header.
+const LEGACY_FEEDBACK_PREFIX = 'Замечание фабрики';
+export function hasFeedbackHeader(text, feedbackId) {
+  return text.includes(`Factory feedback ${feedbackId}.`) || text.includes(`${LEGACY_FEEDBACK_PREFIX} ${feedbackId}.`);
+}
+
+// One matching tell is delivered; zero is empty and duplicates are ambiguous.
+// --limit reads the oldest events. Use --all, optionally after the known turn.
 export async function reconcileFeedbackFromBb({ execBb, threadId, feedbackId, afterSeq }) {
   if (!THREAD_ID.test(threadId ?? '') || typeof feedbackId !== 'string' || !feedbackId) {
     return { status: 'ambiguous' };
@@ -76,10 +80,9 @@ export async function reconcileFeedbackFromBb({ execBb, threadId, feedbackId, af
   if (Number.isSafeInteger(afterSeq) && afterSeq > 0) args.push('--after-seq', String(afterSeq));
   args.push('--all', '--json');
   const log = await execBb(args, { timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
-  const header = `Замечание фабрики ${feedbackId}.`;
   const hits = events(log.stdout).filter(event =>
     (event?.data?.source === undefined || event?.data?.source === 'tell') &&
-    turnTexts(event).some(text => text.includes(header)));
+    turnTexts(event).some(text => hasFeedbackHeader(text, feedbackId)));
   if (hits.length === 1) return { status: 'delivered' };
   return { status: hits.length === 0 ? 'empty' : 'ambiguous' };
 }

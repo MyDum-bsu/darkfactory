@@ -5,7 +5,8 @@
 
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { chmod, mkdtemp, mkdir, rm, writeFile, readFile, readdir, utimes } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { chmod, lstat, mkdtemp, mkdir, rm, writeFile, readFile, readdir, utimes } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { get, request } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
@@ -19,7 +20,7 @@ import { createNetHealthMonitor } from './net-health.mjs';
 import * as aggregator from './aggregator.mjs';
 import * as board from './board-observer.mjs';
 import * as fleet from './telemetry-fleet.mjs';
-import { createControlRoomAggregator, createBoardObserver,
+import { createBoardObserver,
   createBranchDriftProvider, createModelsProvider, createTelemetryProvider,
   buildActiveTrees, buildFleetTelemetry, normalizeFleetHost, readKillSwitchState,
   readRequestBody, OWNER_WRITE_BODY_TIMEOUT_MS, RING_LIMIT } from './aggregator.mjs';
@@ -28,6 +29,9 @@ import vm from 'node:vm';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+
+// A test may opt into its own registry; never discover slots from the host.
+const createControlRoomAggregator = options => aggregator.createControlRoomAggregator({ slotRegistryDir: null, ...options });
 
 const httpGet = url => new Promise((resolve, reject) => {
   const req = get(url, res => {
@@ -499,7 +503,7 @@ test('activeTrees: telemetry is matched to live events by attempt and epoch', ()
 });
 
 test('aggregator V2-8: additive snapshot preserves existing keys', async () => {
-  const server = createControlRoomAggregator({ port: 0 });
+  const server = createControlRoomAggregator({ port: 0, telemetryProvider: async () => null });
   const snap = await server.snapshot();
   for (const key of ['ts', 'reconcile', 'running', 'queued', 'needsOwner', 'recentlyCompleted',
     'boardStatus', 'health', 'sessions', 'shiva', 'branchDrift', 'netHealth', 'telemetry',
@@ -1239,7 +1243,8 @@ test('aggregator: snapshot включает read-only models snapshot из яв�
       assert.equal(res.status, 200);
       const snap = JSON.parse(res.body);
       assert.equal(snap.models.ok, true);
-      assert.equal(snap.models.models.length, 9);
+      assert.equal(snap.models.models.length, 10);
+      assert.equal(snap.models.models.some(model => model.id === 'glm-5.3-flash'), true);
       assert.equal(snap.models.mode, 'balanced');
       assert.equal(snap.models.triad.coder.family, 'cognition');
       assert.equal(snap.models.triad.reviewer.family, 'google');
@@ -1716,6 +1721,74 @@ function loadWebApp(source, hookNames = ['renderProjects', 'renderStatus']) {
   vm.runInContext(`${source}\n;__capture({ ${capture} });`, sandbox);
   return { hooks, ids, sandbox };
 }
+
+test('V12-5: refresh all registered WAL slots, not just the configured state directory', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'control-room-slots-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const registry = join(root, 'registry');
+  await mkdir(registry, { mode: 0o700 });
+  const hash = value => createHash('sha256').update(value).digest('hex');
+  const put = (file, value) => writeFile(file, JSON.stringify(value));
+  const locks = new Map();
+  const repos = ['one', 'one', 'two', 'three'];
+  const herdrDocsPath = join(root, 'spaces.json'), policy = join(root, 'policy.json');
+  await put(herdrDocsPath, { 'herdr-app': { value: { spaces: [...new Set(repos)].map(repo => ({
+    id: `space-${repo}`, repo_id: repo, folder: join(root, repo), name: repo })) } } });
+  await mkdir(join(root, 'two'));
+  await put(policy, { route: { repoId: 'two', finish: 'verified', base: 'HEAD' } });
+  const sha = 'a'.repeat(40);
+  for (const [i, repo] of repos.entries()) {
+    const dir = join(root, `slot-${i}`);
+    await mkdir(dir);
+    const { dev, ino } = await lstat(dir);
+    await put(join(registry, `${hash(dir)}.json`), { state: dir, device: dev, inode: ino });
+    const taskId = String(i + 1);
+    const rows = locks.get(repo) ?? [];
+    rows.push({ slot: dir, repoId: repo, taskId, allowedPaths: `src/${i}` });
+    locks.set(repo, rows);
+    await put(join(dir, 'attempt.json'), { taskId, attemptId: `at-${i}`, epoch: 1,
+      phase: i === 2 ? 'checking' : 'working', threadId: `worker-${i}`,
+      sha, contract: { repo_id: repo, specText: 'must-not-leak' } });
+    if (i === 2) {
+      await writeFile(join(dir, `run-${taskId}.at-2.1-${sha}-v1-h0123456789abcdef.jsonl`),
+        JSON.stringify({ seq: 5, kind: 'intent', phase: 'complete' }) + '\n');
+    } else await put(join(dir, 'merge-queue.json'), { depth: i });
+  }
+  for (const [repo, rows] of locks) await put(join(registry, `scope-${hash(repo)}.json`), rows);
+  const control = createControlRoomAggregator({ stateDir: join(root, 'slot-0'), slotRegistryDir: registry, herdrDocsPath,
+    projects: [{ repo_id: 'two', repo_dir: join(root, 'two'), herdr_space_name: 'two', policy, state: join(root, 'slot-2') }],
+    bbThreadsProvider: async () => [{ id: 'worker-0', lead_session_id: 'lead-A' }],
+    boardTasksProvider: async () => repos.map((repo, i) => ({ task_id: String(i + 1), state: 'claimed', labels: { repo_id: repo } })),
+    telemetryProvider: async () => null, finopsProvider: null, modelsProvider: null });
+  const snap = await control.snapshot();
+  assert.deepEqual(snap.slots.map(s => [s.repo_id, s.herdrSpaceId, s.phase, s.mergeQueueDepth, s.scopeLockOwner]),
+    repos.map((r, i) => [r, `space-${r}`, i === 2 ? 'checking' : 'working', i === 2 ? 1 : i, String(i + 1)]));
+  assert.deepEqual(snap.repoSlots.activeByRepo, { one: 2, two: 1, three: 1 });
+  assert.ok(!JSON.stringify(snap.slots).includes('must-not-leak'));
+  const { hooks, ids } = loadWebApp(await readFile(join(MODULE_DIR, 'web/app.js'), 'utf8'), ['renderAgentTrees']);
+  hooks.renderAgentTrees(snap);
+  const tree = ids.get('agent-trees');
+  assert.equal(tree.children.length, 3);
+  for (const label of ['Project', 'Teamlead · lead-A', 'Worker', 'slot-3', 'L1', 'L2', 'Merge Queue', 'scope-lock']) assert.ok(deepText(tree).includes(label), label);
+  await put(join(root, 'slot-1', 'attempt.json'), null);
+  await put(join(root, 'slot-2', 'integration-at-2-1.json'), { candidate: sha, status: 'merged' });
+  const refreshed = await control.snapshot();
+  assert.equal(refreshed.slots.length, 3);
+  assert.equal(refreshed.slots.find(s => s.taskId === '3').mergeQueueDepth, 0);
+  assert.deepEqual(refreshed.repoSlots.activeByRepo, { one: 1, two: 1, three: 1 });
+});
+
+test('V12-5: FinOps chart, source and stopped VM are visible without a stopped rate', async () => {
+  const { hooks, ids } = loadWebApp(await readFile(join(MODULE_DIR, 'web/app.js'), 'utf8'), ['renderFinops']);
+  hooks.renderFinops({ finops: { ok: true, computeVms: [{ id: 'vm', state: 'STOPPED', pricing: '0 EUR/h', source: 'metered' }],
+    cloudCredits: [{ id: 'credit', source: 'static' }], deadLoads: [{ code: 'spend_spike', message: 'high spend' }],
+    spendDynamics: { series: [{ date: '2026-11-21', eur: 1 }, { date: '2026-11-22', eur: 3 }], baseline7dEur: 1, burnRatio: 3 } } });
+  assert.doesNotMatch(deepText(ids.get('finops-vms')), /EUR\/h/);
+  assert.match(deepText(ids.get('finops-vms')), /metered/);
+  assert.match(deepText(ids.get('finops-credits')), /static/);
+  assert.match(deepText(ids.get('finops-alerts')), /high spend/);
+  assert.match(deepText(ids.get('finops-summary')), /[▁▂▃▄▅▆▇█]/);
+});
 
 function projectCounts(projNode) {
   const out = {};
@@ -2250,6 +2323,17 @@ function controlRoomTelemetryRecord(taskId, attemptId = `att-${taskId}`) {
     labels: { domain: 'backend', size: 'S' },
   };
 }
+
+test('aggregator telemetry: aggregates worker and telemetry journals but ignores notes', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-names-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const name of ['worker-daemon', 'telemetry-worker-all', 'notes']) {
+    await writeFile(join(dir, `${name}.jsonl`), `${JSON.stringify(controlRoomTelemetryRecord(name))}\n`);
+  }
+  const telemetry = await createTelemetryProvider({ telemetryDir: dir })();
+  assert.equal(telemetry.runs, 2);
+  assert.deepEqual(telemetry.attempts.map(a => a.taskId).sort(), ['telemetry-worker-all', 'worker-daemon']);
+});
 
 test('aggregator telemetry: newest files win maxFiles and unchanged parsed result is cached', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'cr-telemetry-cache-'));

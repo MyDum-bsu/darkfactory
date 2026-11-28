@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdir, mkdtemp, symlink, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +9,35 @@ import { loadRoleRegistry } from './role-registry.mjs';
 import { computeSkillsDigest, pickSkills } from './skill-picker.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
+
+test('live intake resolves scoped shared, declared repo and enrolled owner text in that order', async () => {
+  const { resolveWorkerSkills } = await import('./skill-picker.mjs');
+  const { workerIntakePrompt } = await import('./intake-prompt.mjs');
+  const registry = await loadRoleRegistry(root);
+  const args = { registry, allowedPaths: ['audio/filter.py', 'ops/', 'audio/fft.py'],
+    profile: { domainSkills: { dsp: ['property-testing'], ops: ['prod-recon'], ui: ['feature-blueprint'] },
+      repoSkills: ['listen'] }, ownerSkills: { notation: 'Use owner notation.' },
+    readRepoSkill: async id => { assert.equal(id, 'listen'); return 'Use repo reference audio.'; } };
+  const text = await resolveWorkerSkills(args);
+  assert.ok(text.includes(registry.sharedSkills['property-testing'].text));
+  assert.ok(text.includes(registry.sharedSkills['prod-recon'].text));
+  assert.ok(!text.includes(registry.sharedSkills['feature-blueprint'].text));
+  assert.equal(text.split(registry.sharedSkills['property-testing'].text).length, 2);
+  assert.ok(text.indexOf('Use repo reference audio.') > text.indexOf(registry.sharedSkills['prod-recon'].text));
+  assert.ok(text.indexOf('Use owner notation.') > text.indexOf('Use repo reference audio.'));
+  assert.equal(await resolveWorkerSkills(args), text);
+  assert.ok(workerIntakePrompt({ brief: 'task', tree: root, skillBlock: text }).includes(text));
+});
+
+test('worker skill budget counts UTF-8, headings and separators; equality is allowed', async () => {
+  const { resolveWorkerSkills } = await import('./skill-picker.mjs');
+  const registry = await loadRoleRegistry(root);
+  const render = text => resolveWorkerSkills({ registry, ownerSkills: { boundary: text } });
+  const spare = 16 * 1024 - Buffer.byteLength(await render('a'));
+  const body = 'a' + 'я'.repeat(Math.floor(spare / 2)) + 'a'.repeat(spare % 2);
+  assert.equal(Buffer.byteLength(await render(body)), 16 * 1024);
+  await assert.rejects(render(body + 'x'), /worker_skill_budget_exceeded/);
+});
 
 test('pickSkills: station skills + defaults, deterministic digest, no foreign stations', async () => {
   const registry = await loadRoleRegistry(root);
@@ -28,6 +58,37 @@ test('pickSkills: station skills + defaults, deterministic digest, no foreign st
   // Детерминизм: повторный вызов даёт тот же digest.
   assert.equal(pickSkills({ registry, labels: { domain: 'ui', has_ui: true }, stationId: 'ui-builder' }).skills_digest,
     ui.skills_digest);
+});
+
+test('controller reads project taste and selected skill bodies only from regular blobs at claim base', async t => {
+  const { workerProjectInputs } = await import('./run-isolated.mjs');
+  const tree = await mkdtemp(join(tmpdir(), 'df-worker-skills-'));
+  t.after(() => rm(tree, { recursive: true, force: true }));
+  const git = (...args) => execFileSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.org',
+    '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args], { cwd: tree, encoding: 'utf8' }).trim();
+  git('init', '-q');
+  const profile = join(tree, '.darkfactory', 'project-profile.yaml');
+  const skill = join(tree, 'skills', 'lemma', 'SKILL.md');
+  await mkdir(join(tree, '.darkfactory'));
+  await mkdir(join(tree, 'skills', 'lemma'), { recursive: true });
+  await writeFile(profile, 'repo_id: theorem\ntaste: explain each proof\nrepo_skills: [lemma]\n');
+  await writeFile(skill, 'Use the base lemma.');
+  git('add', '.'); git('commit', '-qm', 'base');
+  const base = git('rev-parse', 'HEAD');
+  const registry = await loadRoleRegistry(root);
+  const resolve = base => workerProjectInputs({ tree, base, registry, allowedPaths: ['proof.lean'] });
+  await writeFile(profile, 'repo_skills: [absent]');
+  await writeFile(skill, 'Candidate instructions');
+  git('add', '.'); git('commit', '-qm', 'candidate');
+  const inputs = await resolve(base);
+  assert.match(inputs.projectContext, /explain each proof/);
+  assert.match(inputs.skillBlock, /Use the base lemma/);
+  assert.doesNotMatch(inputs.skillBlock, /Candidate instructions/);
+  await assert.rejects(resolve(git('rev-parse', 'HEAD')), /repo_skill_missing/);
+  await writeFile(profile, 'repo_skills: [lemma]');
+  await rm(skill); await symlink(profile, skill);
+  git('add', '.'); git('commit', '-qm', 'symlink');
+  await assert.rejects(resolve(git('rev-parse', 'HEAD')), /prompt_blob_invalid/);
 });
 
 test('pickSkills: label rules by contract marks', async () => {

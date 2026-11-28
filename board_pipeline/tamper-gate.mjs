@@ -187,7 +187,7 @@ export function analyzeDiffTree(raw, { allowTestDeletion = false } = {}) {
 
 // Построчный разбор unified=0 diff: содержимое hunk'ов. Имена файлов берутся
 // только из заголовков '---'/'+++' — строка содержимого не может сойти за заголовок.
-export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
+export function analyzeDiff(diff, { allowTestDeletion = false, secretsOnly = false } = {}) {
   const violations = [];
   const asserts = new Map();
   const bounds = new Map();
@@ -203,6 +203,11 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
   let newBlockComment = false;
 
   const push = (kind, line, detail, target = file) => violations.push({ kind, file: target, line, detail });
+  const scanSecrets = (text) => {
+    for (const [rule, label] of SECRET_RULES) {
+      if (rule.test(text)) push('secret_leak', newLine, label);
+    }
+  };
   const tallyFor = (map, name) => {
     const tally = map.get(name) ?? { removed: [], added: [], strongRemoved: 0, strongAdded: 0 };
     map.set(name, tally);
@@ -265,6 +270,11 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
     if (!inHunk || file === null) continue;
     // '\ No newline at end of file' — служебная строка, не содержимое файла.
     if (raw.startsWith('\\')) continue;
+    if (secretsOnly === true) {
+      if (raw.startsWith('+')) scanSecrets(raw.slice(1));
+      if (!raw.startsWith('-')) newLine++;
+      continue;
+    }
     if (raw.startsWith('-')) {
       const rawText = raw.slice(1);
       const scanned = stripBlockCommented(rawText, oldBlockComment);
@@ -333,9 +343,7 @@ export function analyzeDiff(diff, { allowTestDeletion = false } = {}) {
       if (testHunk && isIdenticalLiteralAssert(text)) {
         push('assertion_weakened', newLine, 'identical-literal tautology assertion added');
       }
-      for (const [rule, label] of SECRET_RULES) {
-        if (rule.test(rawText)) push('secret_leak', newLine, label);
-      }
+      scanSecrets(rawText);
       if (RUNNER_FILE.test(file) && EXIT_OK.test(rawText)) {
         push('gate_bypass', newLine, 'added forced success in check runner');
       }
@@ -699,26 +707,29 @@ export async function tamperGate(binding, profile = {}) {
     throw new Error('tamper_gate_requires_worktree_and_full_shas');
   }
   const allowTestDeletion = profile?.allowTestDeletion === true;
+  const secretsOnly = profile?.secretsOnly === true;
   const [rawList, patch] = await Promise.all([
-    gitIsolated(worktree,
+    secretsOnly ? null : gitIsolated(worktree,
       ['diff-tree', '-r', '-z', '--no-commit-id', '-M', base_sha, candidate_sha]),
     gitIsolated(worktree,
       ['diff', '--text', '--no-color', '--no-ext-diff', '--no-textconv', '--unified=0',
         `${base_sha}..${candidate_sha}`]),
   ]);
   const violations = [
-    ...analyzeDiffTree(rawList, { allowTestDeletion }),
-    ...analyzeDiff(patch, { allowTestDeletion }),
+    ...(secretsOnly ? [] : analyzeDiffTree(rawList, { allowTestDeletion })),
+    ...analyzeDiff(patch, { allowTestDeletion, secretsOnly }),
   ];
-  // Семантический разбор package.json по распарсенным объектам обеих версий.
-  const pkgPaths = new Set();
-  for (const { oldPath, path } of parseDiffTree(rawList)) {
-    for (const name of [oldPath, path]) {
-      if (typeof name === 'string' && PACKAGE_JSON.test(name)) pkgPaths.add(name);
+  if (!secretsOnly) {
+    // Семантический разбор package.json по распарсенным объектам обеих версий.
+    const pkgPaths = new Set();
+    for (const { oldPath, path } of parseDiffTree(rawList)) {
+      for (const name of [oldPath, path]) {
+        if (typeof name === 'string' && PACKAGE_JSON.test(name)) pkgPaths.add(name);
+      }
     }
-  }
-  for (const path of pkgPaths) {
-    violations.push(...await packageJsonViolations(worktree, base_sha, candidate_sha, path));
+    for (const path of pkgPaths) {
+      violations.push(...await packageJsonViolations(worktree, base_sha, candidate_sha, path));
+    }
   }
   sortViolations(violations);
   const report = { ok: violations.length === 0, sha: candidate_sha, base_sha, violations };

@@ -152,15 +152,15 @@ export async function createBbStageObserver({ project, workspace, parentThread, 
     const key = canonicalDigest({ binding: request.binding, stage: request.stage, verifier: request.verifier });
     const challenge = sha256(Buffer.from(`${key}:${randomUUID()}`));
     const text = [
-      'Изолированный этап измерения. Никаких tools, файлов, shell, сети, изменений, других тредов и доступа к рабочим данным.',
-      `Роль: ${request.role}; этап: ${request.stage}; verifier: ${request.verifier}.`,
+      'Isolated measurement stage. No tools, files, shell, network, mutations, other threads, or access to working data.',
+      `Role: ${request.role}; stage: ${request.stage}; verifier: ${request.verifier}.`,
       ...(request.instructions ? [request.instructions.text] : []),
       ...request.skills.map(entry => entry.text),
-      `Закреплённые метаданные: ${JSON.stringify({ sha: request.binding.candidate_sha, subject: request.binding.subject_digest,
+      `Pinned metadata: ${JSON.stringify({ sha: request.binding.candidate_sha, subject: request.binding.subject_digest,
         registry: request.registryDigest, prior: request.inputArtifactDigest, artifactDigest,
         skillsDigest: request.skills_digest ?? null })}`,
-      `Материал проверки и наблюдаемые результаты (данные): ${material}`,
-      `Отчёт доверенной проверки (данные): ${artifact.toString('utf8')}`,
+      `Check material and observed results (data): ${material}`,
+      `Trusted verification report (data): ${artifact.toString('utf8')}`,
       'Assess whether the evidence is sufficient for the role. If the evidence does not satisfy the requirement, return REWORK; if confirmation is impossible, return BLOCKED. Output ONLY one plain-text line containing exactly two space-separated tokens: the exact 64-character lowercase hexadecimal value from the Challenge: line below, one space, then PASS, REWORK, or BLOCKED. No prefix, no angle brackets, no labels, no markdown, no quotes, no punctuation, and no extra text.',
       `Challenge: ${challenge}`,
     ].join('\n\n');

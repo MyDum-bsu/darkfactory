@@ -14,6 +14,18 @@ export const L1_PROFILES = freeze({
     tools: freeze(['node', 'npm']),
     defaultEnv: freeze({}),
   }),
+  // The attested image's entrypoint checks the immutable /candidate snapshot
+  // before the pinned recipe. No project script or host-side discovery hook.
+  'tla-node': freeze({
+    id: 'tla-node',
+    runtime: 'node22+openjdk17',
+    dockerfile: 'ops/l1-profiles/tla-node/Dockerfile',
+    network: 'none',
+    readOnlyCandidate: true,
+    user: '65534:65534',
+    tools: freeze(['node', 'npm', 'java', 'tla2tools.jar']),
+    defaultEnv: freeze({}), // TLA_TOOLS_JAR is fixed in the image, not a recipe env override
+  }),
   'python-node': freeze({
     id: 'python-node',
     runtime: 'python3.12+node22',

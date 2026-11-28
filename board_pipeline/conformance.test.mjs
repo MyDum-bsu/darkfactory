@@ -225,7 +225,9 @@ async function lab(t, { finish = 'verified', lease = 900, mutants, questions = f
     if (hit) return typeof hit === 'function' ? hit(attempt, submission) : hit;
     const policy = policyFor(attempt);
     const journal = await mkdtemp(join(root, 'journal-'));
-    return acceptHeld({ attempt, submission, policy, journal, ports: {
+    // Match run-isolated: specText is for the worker prompt, not the acceptance envelope.
+    const { specText, ...acceptanceAttempt } = attempt;
+    return acceptHeld({ attempt: acceptanceAttempt, submission, policy, journal, ports: {
       board: port,
       inspect: worktreeInspector(policy),
       local: async binding => { await port.guardTask?.(attempt.task_id, attempt.epoch); effects.localCalls++;
@@ -490,7 +492,7 @@ test('V2-1: Foreman RO stage transport → L2 → native complete на одно�
         stageTransportKind(req.model);
         assert.equal(req.binding.candidate_sha, x.candidate);
         assert.equal(req.binding.worktree, x.tree);
-        assert.match(req.prompt, /Изолированный этап измерения/);
+        assert.match(req.prompt, /Isolated measurement stage/);
         const transcript = `stage-transcript:${req.challenge}`;
         return { verdict: 'PASS', transcript_file: null, witness: {
           mode: 'read-only', transport: 'docker-ro-v1', snapshotDigest: 'c'.repeat(64),

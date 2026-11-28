@@ -331,6 +331,24 @@ test('assertTriadIndependent требует три разных семейств
   }), e => e.reason === 'arbiter_unknown_family');
 });
 
+for (const role of ['critic', 'arbiter']) {
+  test(`Fusion triad excludes the sidekick family from the ${role} seat`, () => {
+    const model = 'fusion-gpt-6-2-astra-high-sidekick-swe-2-1-medium';
+    for (const executor of [{ provider: 'acp-devin', model }, `acp-devin/${model}`]) {
+      const triad = { executor, critic: DEFAULT_CRITIC, arbiter: ESCALATION_REVIEWER_OPUS };
+      const reason = role === 'critic' ? 'review_same_family' : 'arbiter_family_not_independent';
+      assert.throws(() => assertTriadIndependent({ ...triad, [role]: PRIMARY_WORKER }),
+        e => e instanceof ReviewDenied && e.reason === reason);
+    }
+  });
+}
+
+test('Fusion triad reports both executor families for independent seats', () => {
+  const executor = { provider: 'acp-devin', model: 'fusion-gpt-6-2-astra-high-sidekick-swe-2-1-medium' };
+  assert.deepEqual(assertTriadIndependent({ executor, critic: DEFAULT_CRITIC, arbiter: ESCALATION_REVIEWER_OPUS }),
+    { executor: 'openai', sidekick: 'cognition', critic: 'google', arbiter: 'anthropic' });
+});
+
 const l2Round = (over = {}) => ({
   sha: 'c'.repeat(40), tree_sha: null, gate: 'l2',
   signature: 'review_verdict:REVIEW_BLOCKED|src/a.js||expect X|got Y', blocking: 1,

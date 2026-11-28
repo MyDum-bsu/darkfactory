@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { evaluateGoNoGo, loadBenchmarkCorpus, renderBenchmarkReport,
-  runDryRun, runLive, runSecurityMutantSuite } from './factory-benchmark.mjs';
+  pairedPlan, scorePairs, renderFusionComparison, runCli, runDryRun, runLive, runSecurityMutantSuite } from './factory-benchmark.mjs';
 
 const cli = new URL('./factory-benchmark.mjs', import.meta.url).pathname;
 const corpusRoot = new URL('./benchmarks/corpus', import.meta.url).pathname;
@@ -42,6 +42,48 @@ test('corpus validation fail-closes on a missing or mutated case spec', async ()
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('Devin Fusion: score identical tasks with pinned arms, complete accounting and an inclusive 15% gate', () => {
+  const runners = { sha: 'a'.repeat(40), path: '/benchmark/runner' };
+  const plan = { schema: 1, preset: 'devin-fusion-ab', runners: { baseline: runners, fusion: runners },
+    tasks: Array.from({ length: 8 }, (_, i) => ({ id: `t-${i}`, domain: ['Code', 'UI', 'Math/Lean', 'DSP/Docs'][i % 4],
+      baseSha: 'b'.repeat(40), maxTokens: 1000, maxCostUsd: 5 })) };
+  const workers = { baseline: { provider: 'pi', model: 'openai/gpt-6.2-astra' },
+    fusion: { provider: 'acp-devin', model: 'fusion-gpt-6-2-astra-high-sidekick-swe-2-1-medium' } };
+  const schedule = pairedPlan(plan);
+  assert.deepEqual(schedule.slice(0, 4).map(r => r.arm), ['baseline', 'fusion', 'fusion', 'baseline']);
+  const rows = schedule.map(({ id, arm, baseSha }) => ({ id, arm, baseSha, runnerSha: runners.sha, worker: workers[arm],
+    inputsDigest: 'e'.repeat(64), attemptId: `${id}-${arm}`, nativeClosed: true, firstRoundPass: id !== 't-0',
+    reworkRounds: id === 't-0' ? 2 : 0, wallClockMs: 30, tokens: arm === 'baseline' ? 100 : 85,
+    costUsd: arm === 'baseline' ? 2 : 1 }));
+  const score = scorePairs(plan, rows);
+  assert.equal(score.benchmarkVerdict, 'GO');
+  assert.deepEqual(score.savingsPct, { tokens: 15, usd: 50 });
+  assert.equal(score.comparison.baseline.reworkRate, 1 / 8);
+  assert.equal(score.comparison.fusion.firstRoundPassRate, 7 / 8);
+  assert.equal(score.comparison.fusion.wallClockMs, 240);
+  assert.equal(score.comparison.fusion.tokens, 680);
+  assert.match(renderFusionComparison(score), /Total tokens \| 800 \| 680/);
+  assert.match(renderFusionComparison(score), /15% \/ 50%/);
+  assert.throws(() => pairedPlan({ ...plan, runners: { ...plan.runners, fusion: { ...runners, sha: 'c'.repeat(40) } } }), /identical runner revisions/);
+  const patch = (id, arm, fields) => rows.map(r => r.id === id && r.arm === arm ? { ...r, ...fields } : r);
+  for (const fields of [{ tokens: 86 }, { firstRoundPass: false, reworkRounds: 1 }, { tokens: null }]) {
+    assert.equal(scorePairs(plan, patch('t-1', 'fusion', fields)).benchmarkVerdict, 'NO-GO');
+  }
+  assert.equal(scorePairs(plan, rows.map(r => ({ ...r, tokens: 0 }))).benchmarkVerdict, 'NO-GO');
+  assert.throws(() => scorePairs(plan, patch('t-1', 'fusion', { worker: workers.baseline })), /worker/);
+  assert.throws(() => scorePairs(plan, patch('t-1', 'fusion', { inputsDigest: 'f'.repeat(64) })), /mismatched evidence/);
+  assert.throws(() => scorePairs(plan, rows.slice(1)), /incomplete matrix/);
+});
+
+test('Devin Fusion CLI preset selects only its matching enrolled paired plan', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'df-fusion-profile-'));
+  try {
+    await writeFile(join(dir, 'plan.json'), JSON.stringify({ schema: 1 }));
+    await assert.rejects(runCli(['--preset', 'devin-fusion-ab', '--root', dir]), /plan preset mismatch/);
+    await assert.rejects(runCli(['--preset', 'unknown']), /unknown preset/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 const mutantSuitePromise = runSecurityMutantSuite();

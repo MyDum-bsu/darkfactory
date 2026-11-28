@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { compileDarkfactoryConfig as compile, validatePolicyContract } from './config-compiler.mjs';
+import { compileDarkfactoryConfig as compile, canonicalPolicyDigest, validatePolicyContract } from './config-compiler.mjs';
 import { operatorReviewSetup } from './review-setup.mjs';
 
 const sha = 'a'.repeat(40);
@@ -20,6 +20,28 @@ const config = {
   gates: { profile: 'unit', checks: [check], brief: 'ops/brief', reviewPrompt: 'ops/review', reviewGate: 'ops/gate' },
   self_heal: { memoryDir: 'ops/memory', ledgerPath: 'ops/ledger' },
 };
+test('policy identity excludes only slot coordinates and includes every executable input', () => {
+  const policy = compile({ configObject: config, baseDir: '/slot' }).compiledPolicy;
+  const routes = { routes: [{ base: sha, worktree: '/wt', check: { base: 'must stay' } }], workerPresets: { reviewer: critic } };
+  const files = ['brief bytes', 'review bytes', 'gate bytes', 'skill bytes'];
+  const digest = (p = policy, r = routes, f = files) => canonicalPolicyDigest({ policy: p, routes: r,
+    brief: f[0], reviewPrompt: f[1], reviewGate: f[2], skills: f.slice(3) });
+  const original = digest();
+  const moved = structuredClone(policy);
+  Object.assign(moved.route, { worktree: '/another', base: 'HEAD' });
+  const relocated = structuredClone(routes);
+  Object.assign(relocated.routes[0], { worktree: '/another', base: 'b'.repeat(40) });
+  assert.equal(digest(Object.fromEntries(Object.entries(moved).reverse()), relocated), original);
+  for (const change of [p => p.version++, p => p.route.repoId += '2', p => p.route.finish = 'deployed',
+    p => p.profiles.unit.branch += '2', p => p.profiles.unit.l1Profile = 'python-node',
+    p => p.profiles.unit.checks[0].argv.reverse(), p => p.profiles.unit.review.model += '2']) {
+    const p = structuredClone(policy); change(p); assert.notEqual(digest(p), original);
+  }
+  relocated.routes[0].check.base = 'changed';
+  assert.notEqual(digest(moved, relocated), original);
+  for (const i of files.keys()) assert.notEqual(digest(policy, routes, files.map((f, j) => i === j ? f + '!' : f)), original);
+});
+
 const yaml = `# Isolated operator slot; flow collections use JSON syntax.
 project:
   id: proj_x

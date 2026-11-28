@@ -4,7 +4,10 @@ import { advanceQuestion, QUESTION_PHASES } from './question-resume.mjs';
 import { createReleasePackage, releaseQuestionDetails, ReleaseDenied } from './release-contract.mjs';
 import { advanceRelease, RELEASE_PHASES } from './release-flow.mjs';
 import { roundGate, roundSignature, effectiveL2ReworkLimit, l2ReworkLimitExceeded } from './worker-selector.mjs';
-import { partitionFindingsBySeverity } from './review-policy.mjs';
+import { partitionFindingsBySeverity, verbatimOwnerRequestBlock } from './review-policy.mjs';
+import { splitVerdict } from './review-runner.mjs';
+import { judgeOwnerQuestion } from './owner-twin.mjs';
+import { loadSdk } from './sdk.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
 import { PilotDenied } from './pilot-gate.mjs';
 import { isTransientBoardError } from './native-board.mjs';
@@ -132,7 +135,9 @@ function contractOf(labels) {
   if (hasAllowedPaths) pinnedLabels.allowed_paths = labels.allowed_paths;
   return {
     repo_id: labels?.repo_id,
+    ...(labels?.verbatim_request_id ? { verbatim_request_id: labels.verbatim_request_id } : {}),
     spec_digest: labels?.spec_digest,
+    ...(labels?.expected_base_sha !== undefined ? { expected_base_sha: labels.expected_base_sha } : {}),
     policy_digest: labels?.policy_digest,
     fixtures_digest: typeof labels?.fixtures_digest === 'string' ? labels.fixtures_digest : null,
     // Явный L1-выбор оператора при постановке — контрактная метка:
@@ -182,12 +187,76 @@ function attemptOf(record, route) {
   return attempt;
 }
 
+// Project Teamlead consumes authenticated SPLIT posts in <repo>/requests. The
+// enrolled route.teamlead pins owner_actor and arbiter_actor (as on the intake
+// watcher); it grants no identity. Use the existing controller's Board session.
+// All writes have replay-safe identity: the post ID or the native claim fence.
+async function advanceSplit({ route, record, handle, leaseAlive, save, visible }) {
+  const { taskId, epoch, token, contract, split } = record;
+  const policy = route.teamlead;
+  const channel = `${route.repoId}/requests`;
+  const uncertain = async reason => { await save({ phase: 'uncertain', reason }); return visible(); };
+  try {
+    if (!policy?.arbiter_actor || !policy.owner_actor || policy.arbiter_actor === policy.owner_actor ||
+        !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(route.repoId ?? '') || contract?.repo_id !== route.repoId ||
+        !/^[1-9]\d{0,14}$/.test(contract.verbatim_request_id ?? '')) return uncertain('split_route_unconfirmed');
+    const client = handle ?? (process.env.BOARD_URL && loadSdk().board());
+    if ((await client?.me())?.actor !== policy.arbiter_actor) return uncertain('split_actor_unconfirmed');
+    const parent = (await client.thread(taskId, { limit: 1 })).message;
+    if (parent?.id !== taskId || parent.deleted || parent.task?.epoch !== epoch || parent.labels?.repo_id !== route.repoId ||
+        ['spec_digest', 'policy_digest', 'allowed_paths', 'verbatim_request_id'].some(k => parent.labels[k] !== contract[k]) ||
+        parent.text !== contract.specText ||
+        createHash('sha256').update(parent.text).digest('hex') !== contract.spec_digest) return uncertain('split_card_changed');
+    const finish = async requestId => {
+      // `done` ends the controller attempt, not a verified candidate. No SHA
+      // projection, verified ref, dependent release, or acceptance receipt.
+      await save({ phase: 'done', reason: 'superseded_by_split', sha: null,
+        receipt: { kind: 'superseded', request_id: requestId, candidate_sha: record.sha } });
+      return visible();
+    };
+    const superseded = id => `superseded_by_split: ${channel}#${id}`;
+    if (record.splitRequestId && parent.task.state === 'failed' && parent.task.reason === superseded(record.splitRequestId)) {
+      return finish(record.splitRequestId);
+    }
+    const root = (await client.thread(contract.verbatim_request_id, { limit: 1 })).message;
+    if (root?.id !== contract.verbatim_request_id || root.channel !== channel || root.by?.actor !== policy.owner_actor ||
+        root.re !== null || root.deleted || root.editedAt || !parent.text.endsWith(verbatimOwnerRequestBlock({
+          verbatim_request_id: root.id, verbatim_owner_quote: root.text }))) return uncertain('split_request_changed');
+    if (!await leaseAlive()) return uncertain('split_lease_unconfirmed');
+    let requestId = record.splitRequestId;
+    if (!requestId) {
+      const text = JSON.stringify({ to: 'Project Teamlead', original_card: taskId, allowed_paths: contract.allowed_paths,
+        ...split }).replaceAll('@', '＠'); // planning text must not notify arbitrary actors
+      const posted = await client.post(channel, { text, noSync: true, id: `split-${record.attemptId}`,
+        labels: { decision: 'SPLIT', verbatim_request_id: root.id } });
+      if (typeof posted?.id !== 'string' || !/^[1-9]\d{0,14}$/.test(posted.id) || posted.by?.actor !== policy.arbiter_actor ||
+          posted.channel !== channel || posted.text !== text || posted.labels?.decision !== 'SPLIT' ||
+          posted.labels.verbatim_request_id !== root.id) return uncertain('split_post_unconfirmed');
+      requestId = posted.id;
+      await save({ splitRequestId: requestId });
+    }
+    if (!await leaseAlive()) return uncertain('split_lease_unconfirmed');
+    // Native cancel is owner-only and has no epoch fence. End this exact claim
+    // unsuccessfully instead; unlike complete(), fail() cannot unlock dependents.
+    const reason = superseded(requestId);
+    const ended = await client.tasks.held(taskId, { epoch, token }).fail(reason);
+    if (ended?.id !== taskId || ended.task?.epoch !== epoch || ended.task.state !== 'failed' ||
+        ended.task.reason !== reason) return uncertain('split_supersession_unconfirmed');
+    return finish(requestId);
+  } catch (error) {
+    // A transport interruption can be retried from the intent: post is keyed,
+    // and the exact observed failed-task receipt reconciles a lost settle reply.
+    if (isTransientBoardError(error)) return visible();
+    return uncertain('split_handoff_unconfirmed');
+  }
+}
+
 // One serialized tick. Board keeps the work queue; state records only effects of this attempt.
 // Unconfirmed external effects never become another spawn, tell or settle on restart.
 // workerSelector (опционально, обратная совместимость) реализует политику выбора
 // исполнителя, кросс-семейственную триаду и содержательный арбитраж (спека §4).
 export async function advance({ route, state, board, bb, submissions, verify, authorize,
-  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger, eventBus,
+  recheckRejectedHandoff, workerSelector, mutants, questionGate, release, decisionLedger, eventBus, splitBoard,
   recoverInterruptedChecking = false, workingTimeoutMs = 90 * 60 * 1000 }) {
   checkRoute(route);
   // Wall-clock бюджет фазы 'working': зависший воркер не может продлевать
@@ -210,6 +279,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     lastEmittedPhase = phase;
     const attempt = attemptOf(record, route);
     const kind = phase === 'awaiting_answer' ? 'question_blocked'
+      : record.reason === 'superseded_by_split' ? 'phase'
       : phase === 'done' ? 'completed'
       : TERMINAL.has(phase) ? phase
       : 'phase';
@@ -408,6 +478,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
         }
         return visible();
       };
+      const expectedBase = contract?.expected_base_sha;
+      if (expectedBase !== undefined &&
+          (typeof expectedBase !== 'string' || !shaRE.test(expectedBase) || route.base !== expectedBase)) {
+        return blockBeforeSpawn('expected_base_sha_mismatch');
+      }
       if (!await authorize('claimed', record.taskId)) {
         return blockBeforeSpawn('route_changed_before_spawn');
       }
@@ -511,6 +586,8 @@ export async function advance({ route, state, board, bb, submissions, verify, au
     return visible();
   }
   if (TERMINAL.has(record.phase) && !recheck) return visible();
+  const deliverSplit = () => advanceSplit({ route, record, handle: splitBoard, leaseAlive, save, visible });
+  if (record.phase === 'splitting') return deliverSplit();
   if (QUESTION_PHASES.has(record.phase)) {
     if (!questionGate) throw new Error('An enrolled owner answer gate is required to resume');
     return advanceQuestion({ record, save, visible, board, gate: questionGate,
@@ -716,6 +793,11 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       }
     }
   }
+  const consultTwin = (kind, prompt, evidence, history) => judgeOwnerQuestion({ kind, prompt, evidence,
+    principal: questionGate?.principal ?? route.allowlist?.owner,
+    dbPath: route.decisionLedger?.sqlitePath ?? process.env.DF_UNIFIED_LEDGER_DB,
+    projectId: record.contract?.repo_id ?? route.repoId, worktree: route.worktree,
+    context: [attempt.specText, history && JSON.stringify(history)].filter(Boolean).join('\n') });
   const askOwner = async ({ kind, prompt, evidence, result, extraState, releasePlan }) => {
     const sha = await questionGate.capture({ attempt, turnSeq });
     const candidateSha = result?.receipt?.evidence?.sha;
@@ -735,8 +817,24 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       if (!(error instanceof RangeError)) throw error;
       return stopWith('owner_question_too_large', extraState);
     }
+    const twin = await consultTwin(kind, prompt, evidence, extraState?.roundsHistory);
+    if (twin.verdict === 'RESOLVE') {
+      if (!await leaseAlive()) return lostLease();
+      if (!await questionGate.canResume({ stage: 'claimed', question, threadId: record.threadId, contract: record.contract })) {
+        return stopWith('question_resume_checkpoint_drift', extraState);
+      }
+      const feedbackId = `${attempt.attempt_id}:twin:${turnSeq}`;
+      await save({ ...extraState, phase: 'returning', turnSeq, feedbackId, twinDecision: { question, ...twin },
+        intent: { kind: 'feedback', attemptId: record.attemptId, epoch: attempt.epoch, feedbackId, sha, turnSeq } });
+      const sent = await bb.feedback({ attempt, feedbackId, sha, question, contract: record.contract,
+        reason: 'owner_twin_citation', evidence: { citation: twin.citation } }).catch(() => null);
+      if (!sent?.confirmed) return reconcileInFlight();
+      await save({ phase: 'working', receipt: { kind: 'feedback', feedbackId } });
+      return visible();
+    }
     const blockText = questionBlockText(question);
     await save({ phase: 'blocking', turnSeq, question, ownerAnswer: null, ...(extraState ?? {}),
+      ...(kind === 'product' ? { twinDecision: { question_id: question.question_id, ...twin } } : {}),
       releaseVerification: kind === 'release' ? result.receipt : null,
       releasePlan: releasePlan ?? null,
       intent: { kind: 'block', reason: 'owner_answer_required', questionId: question.question_id,
@@ -873,16 +971,21 @@ export async function advance({ route, state, board, bb, submissions, verify, au
       contradictory: result.contradictory === true,
     };
     roundsHistory = [...(record.roundsHistory ?? []), round];
-    // Circuit breaker L2 (Board #1666): лимитный L2-раунд останавливает
-    // попытку без следующего круга и до арбитража — directed_rework был бы
-    // пятым раундом. Эскалация — hold карточки владельцу с причиной.
+    // On the L2 ceiling, only an explicit scope referral can still be heard,
+    // and only for decomposition. It must never extend the rework budget.
     const l2Limit = effectiveL2LimitOf(route.maxL2ReworkRounds);
-    if (l2LimitExceededOf({ roundsHistory, limit: l2Limit })) {
-      return stopWith('l2_rework_limit_exceeded', { roundsHistory },
-        JSON.stringify({ limit: l2Limit }));
-    }
+    const atLimit = l2LimitExceededOf({ roundsHistory, limit: l2Limit });
+    const limitStop = () => stopWith('l2_rework_limit_exceeded', { roundsHistory }, JSON.stringify({ limit: l2Limit }));
+    // Only a scoped L2 objection can ask for early decomposition. This is a
+    // referral to the independent arbiter, never authority from critic prose.
+    const scopeObjection = route.teamlead && record.contract?.verbatim_request_id && round.gate === 'l2' &&
+      /\b(over[- ]?scoped|mixed concerns|split (?:the |this )?card)\b/i.test([round.excerpt,
+        ...roundFindings.flatMap(f => [f?.expected, f?.actual])].join('\n'));
+    if (atLimit && !(workerSelector && scopeObjection)) return limitStop();
     if (workerSelector) {
-      const progress = workerSelector.evaluateReworkProgress({ roundsHistory });
+      const normalProgress = workerSelector.evaluateReworkProgress({ roundsHistory });
+      const splitOnly = scopeObjection && !normalProgress.trigger;
+      const progress = splitOnly ? { trigger: 'scope_review', kind: 'over_scoped', evidence: round } : normalProgress;
       if (progress.trigger === 'no_progress' && progress.deterministicGate) {
         // Красный детерминированный гейт без прогресса не арбитрируется.
         return stopWith('no_progress_deterministic_gate', { roundsHistory },
@@ -897,6 +1000,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           .filter(r => r.gate === 'l2')
           .flatMap(r => Array.isArray(r.findings) ? r.findings : []);
         const allFindings = [...priorL2Findings, ...roundFindings];
+        let split;
         const ruling = await workerSelector.resolveArbitration({
           attempt, trigger: progress, arbitrationUsed,
           arbiter: selArbiter,
@@ -906,16 +1010,31 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           dodViolation: workerSelector.hasDodViolation?.(allFindings) === true,
           verifyHeld: (id, ep) => board.verifyHeld(id, ep),
           arbitrate: typeof workerSelector.arbitrate === 'function'
-            ? request => workerSelector.arbitrate({ ...request,
-                ...(attempt.spec_digest !== undefined ? { spec_digest: attempt.spec_digest } : {}),
-                ...(attempt.specText !== undefined ? { specText: attempt.specText } : {}) })
+            ? async request => {
+                const raw = await workerSelector.arbitrate({ ...request,
+                  ...(attempt.spec_digest !== undefined ? { spec_digest: attempt.spec_digest } : {}),
+                  ...(attempt.specText !== undefined ? { specText: attempt.specText } : {}) });
+                split = splitVerdict(raw);
+                // Reuse the selector's non-accepting escalation path (including
+                // its subject/triad/harm/budget gates). Change the recipient only
+                // after the selector actually admits the bound escalation.
+                return split ? { decision: 'escalate_owner', question: split.reason,
+                  subject_digest: split.subject_digest } : raw;
+              }
             : workerSelector.arbitrate,
         });
         if (ruling.decision === 'lease_lost') {
           await save({ phase: 'lease_lost', reason: ruling.reason, roundsHistory });
           return visible();
         }
-        if (ruling.decision === 'directed_rework') {
+        // Even for a scope referral, the circuit breaker forbids a fifth
+        // writer round or arbiter acceptance. Only a bound split can retire it.
+        if (atLimit && !(split && ruling.decision === 'escalate_owner')) return limitStop();
+        if (splitOnly && !split && ['directed_rework', 'accept_with_notes'].includes(ruling.decision)) {
+          // A scope-only referral confers no new acceptance or override power.
+          // Keep the original critic's REWORK if the arbiter declines to split.
+          arbitrationUsed = 1;
+        } else if (ruling.decision === 'directed_rework') {
           arbitrationUsed = 1;
           feedbackReason = 'arbiter_directed_rework';
           feedbackEvidence = { directive: ruling.directive, findings: ruling.findings,
@@ -969,11 +1088,26 @@ export async function advance({ route, state, board, bb, submissions, verify, au
           await save({ phase: 'hold', reason: sealed.reason ?? 'arbitrated_seal_failed' });
           return visible();
         } else if (ruling.decision === 'escalate_owner') {
+          if (split) {
+            if (!route.teamlead || !record.contract?.verbatim_request_id) {
+              return stopWith('split_teamlead_not_enrolled', { roundsHistory, split });
+            }
+            await save({ phase: 'splitting', roundsHistory, arbitrationUsed: 1, split });
+            return deliverSplit();
+          }
           if (questionGate && ruling.question.length <= 220) {
             return askOwner({ kind: 'product', prompt: ruling.question, evidence: 'Содержательный спор L2.',
-              extraState: { roundsHistory } });
+              extraState: { roundsHistory, arbitrationUsed: 1 } });
           }
-          return stopWith('arbiter_escalated_to_owner', { roundsHistory }, ruling.question);
+          // Routes without a signed question gate can still cite a decision to
+          // the writer via ordinary lease-checked rework. Never synthesize a signature.
+          const twin = await consultTwin('product', ruling.question, '', roundsHistory);
+          if (twin.verdict !== 'RESOLVE') return stopWith('arbiter_escalated_to_owner', { roundsHistory }, ruling.question);
+          arbitrationUsed = 1;
+          feedbackReason = 'owner_twin_citation';
+          feedbackEvidence = { citation: twin.citation };
+          feedbackSuffix = ':twin';
+          await save({ twinDecision: { prompt: ruling.question, ...twin } });
         } else {
           return stopWith(ruling.reason ?? 'arbitration_hold', { roundsHistory },
             JSON.stringify(ruling.evidence ?? {}));
@@ -1039,7 +1173,7 @@ export async function advance({ route, state, board, bb, submissions, verify, au
 export async function advanceWithProjection(options) {
   const result = await advance(options);
   const { board, state, route } = options;
-  if (!board.project || !['done', 'hold'].includes(result.phase)) return result;
+  if (!board.project || result.reason === 'superseded_by_split' || !['done', 'hold'].includes(result.phase)) return result;
   const record = await state.load();
   const taskId = record?.taskId ?? route.taskId;
   if (!taskId || !record?.epoch) return result;

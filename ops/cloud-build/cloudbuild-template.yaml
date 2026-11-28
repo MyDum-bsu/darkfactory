@@ -1,0 +1,28 @@
+{
+  "timeout": "600s",
+  "options": { "logging": "NONE" },
+  "steps": [
+    {
+      "id": "python-syntax",
+      "name": "python:3.12-slim-bookworm",
+      "entrypoint": "find",
+      "args": [
+        ".", "-name", ".git", "-prune", "-o", "-type", "f", "-name", "*.py",
+        "-exec", "python3", "-I", "-S", "-X", "pycache_prefix=/tmp/portfolio-pyc",
+        "-m", "py_compile",
+        "{}", "+"
+      ]
+    },
+    {
+      "id": "javascript-syntax",
+      "name": "node:22-bookworm-slim",
+      "entrypoint": "find",
+      "args": [
+        ".", "-name", ".git", "-prune", "-o", "-type", "f", "(",
+        "-name", "*.js", "-o", "-name", "*.mjs", "-o", "-name", "*.cjs", ")",
+        "-exec", "sh", "-ec", "for file do node --check \"$$file\" </dev/null; done",
+        "sh", "{}", "+"
+      ]
+    }
+  ]
+}

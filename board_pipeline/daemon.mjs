@@ -1,8 +1,77 @@
-import { mkdir, open, rename, statfs } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, statfs } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { kernelLock, saveState } from './slot.mjs';
+import { planSlotAssignments } from './scope-lock-scheduler.mjs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { checkBudget } from './workspace-budget.mjs';
 import { PilotDenied } from './pilot-gate.mjs';
+
+// Admission is at the native claim boundary, not the dispatcher's ready hint.
+// The private slots registry is already validated and this slot is exclusively
+// held by reserveWorktree. flock serializes changes; the reservation itself
+// survives controller exit (hc writers can outlive their controller).
+export function scopeLockedBoard(board, { registry, slot, repoId, exclusive = false, baseCurrent }) {
+  async function transaction(repo, fn) {
+    if (typeof repo !== 'string' || !repo.trim()) throw new Error('scope_repo_required');
+    const key = createHash('sha256').update(repo.trim().toLowerCase()).digest('hex');
+    const path = join(registry, `scope-${key}`);
+    const unlock = await kernelLock(`${path}.lock`);
+    try {
+      let rows;
+      try { rows = JSON.parse(await readFile(`${path}.json`, 'utf8')); }
+      catch (e) { if (e.code !== 'ENOENT') throw e; rows = []; }
+      if (!Array.isArray(rows)) throw new Error('scope_registry_invalid');
+      return await fn(rows, next => saveState(`${path}.json`, next));
+    } finally { await unlock(); }
+  }
+  const conflict = () => Object.assign(new Error('scope_claim_conflict'), { code: 'claim_conflict' });
+  async function admit(task, claim) {
+    return transaction(task.repoId, async (rows, save) => {
+      const own = rows.find(row => row.slot === slot);
+      if (own && (own.taskId !== task.taskId || own.allowedPaths !== task.allowedPaths)) throw conflict();
+      const { assignments } = planSlotAssignments({ slots: [slot],
+        activeTasks: rows.filter(r => r !== own), readyTasks: [task] });
+      if (!assignments.length || (claim && !own && baseCurrent && !await baseCurrent())) throw conflict();
+      const result = await claim?.();
+      // No writer can be spawned until the durable reservation is synced.
+      if (!own) await save([...rows, task]);
+      return result;
+    });
+  }
+  async function taskFor(taskId, repo, paths) {
+    if (paths != null && typeof paths !== 'string') throw conflict();
+    const repoWide = !paths || (typeof exclusive === 'function' ? await exclusive() : exclusive);
+    return { slot, taskId, repoId: repoId ?? repo, allowedPaths: repoWide ? null : paths };
+  }
+  // nativeBoardPort checks this exact fresh root before calling tasks.claim.
+  // There is only one native claim loop per reserved controller slot.
+  let fresh;
+  const handle = { ...board,
+    async thread(...args) {
+      const result = await board.thread(...args);
+      fresh = result.message;
+      return result;
+    },
+    tasks: { ...board.tasks, async claim(taskId, options) {
+      if (fresh?.id !== taskId) throw new Error('scope_claim_snapshot_missing');
+      const task = await taskFor(taskId, fresh.labels?.repo_id, fresh.labels?.allowed_paths);
+      return admit(task, () => board.tasks.claim(taskId, options)).catch(error => {
+        if (error.message === 'Worktree controller is already running') throw conflict();
+        throw error;
+      });
+    } },
+  };
+  return { handle,
+    async resume(record) {
+      await admit(await taskFor(record.taskId, record.contract?.repo_id, record.contract?.allowed_paths));
+    },
+    release: ({ taskId, repoId: repo }) => transaction(repoId ?? repo, async (rows, save) => {
+      const next = rows.filter(row => row.slot !== slot || row.taskId !== taskId);
+      if (next.length !== rows.length) await save(next);
+    }),
+  };
+}
 
 export const DEFAULT_INTERVAL_MS = 3500;
 export const MIN_INTERVAL_MS = 250;

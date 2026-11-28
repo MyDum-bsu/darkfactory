@@ -102,6 +102,12 @@ test('reconcileFeedback: точный заголовок в tell input text — 
   assert.deepEqual(await reconcileFeedbackFromBb({ execBb: delivered.execBb,
     threadId: 'thr_abc1', feedbackId: 'f1' }), { status: 'delivered' });
 
+  const english = turnEvent('Factory feedback f1. SHA deadbeef.', 10, 'tell');
+  for (const [log, status] of [[[english], 'delivered'], [[turnEvent(header('f1'), 9, 'tell'), english], 'ambiguous']]) {
+    const { execBb } = fakeBb({ logs: { thr_abc1: log } });
+    assert.deepEqual(await reconcileFeedbackFromBb({ execBb, threadId: 'thr_abc1', feedbackId: 'f1' }), { status });
+  }
+
   const empty = fakeBb({ logs: { thr_abc1: [turnEvent('другой текст без маркера', 9, 'tell')] } });
   assert.deepEqual(await reconcileFeedbackFromBb({ execBb: empty.execBb,
     threadId: 'thr_abc1', feedbackId: 'f1' }), { status: 'empty' });

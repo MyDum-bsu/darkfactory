@@ -15,12 +15,12 @@ const OPS_DIR = dirname(fileURLToPath(import.meta.url));
 const ARCHIVE_CLI = join(OPS_DIR, 'df-archive.mjs');
 const DECISIONS_CLI = join(OPS_DIR, 'df-decisions.mjs');
 
-async function runCli(script, args) {
+async function runCli(script, args, env = process.env) {
   try {
     const { stdout, stderr } = await execFileAsync(
       process.execPath,
       ['--no-warnings', script, ...args],
-      { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 },
+      { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, env },
     );
     return { code: 0, stdout, stderr };
   } catch (error) {
@@ -169,6 +169,100 @@ test('df-archive end-to-end: agy/pi ingest, idempotence, search, filters, stats,
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+async function archiveFixture(t, texts) {
+  const dir = await mkdtemp(join(tmpdir(), 'df-archive-embed-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, 'archive.db');
+  const file = join(dir, 'transcript.jsonl');
+  await writeJsonl(file, texts.map(content => ({ type: 'user_message', content })));
+  const run = (args, options) => runArchiveCli(args, { defaultDbPath: dbPath, ...options });
+  await run(['ingest', '--file', file, '--harness', 'agy', '--host', 'test', '--project', 'archive']);
+  return run;
+}
+
+test('df-archive embed persists one pending batch; hybrid and auto combine FTS and query vectors', async t => {
+  const run = await archiveFixture(t, ['bicycle', 'pedal']);
+  const embedder = t.mock.fn(async texts => texts.map(() => [0, 1]));
+  const search = mode => run(['search', '--query', 'bicycle', '--mode', mode], { embedder });
+  assert.equal((await search('auto'))[0].matchSource, 'fts');
+  assert.equal(embedder.mock.callCount(), 0);
+
+  const index = () => run(['embed', '--batch', '1', '--model', 'offline'], { embedder });
+  assert.deepEqual(await index(), { embedded: 1, remaining: 1, model: 'offline' });
+  assert.deepEqual(await index(), { embedded: 1, remaining: 0, model: 'offline' });
+  assert.deepEqual(await index(), { embedded: 0, remaining: 0, model: 'offline' });
+  assert.equal((await run(['stats'])).embeddings, 2);
+  assert.deepEqual(embedder.mock.calls.map(call => call.arguments[0]), [['bicycle'], ['pedal']]);
+
+  assert.deepEqual((await search('fts')).map(row => row.matchSource), ['fts']);
+  assert.equal(embedder.mock.callCount(), 2);
+  for (const mode of ['hybrid', 'auto']) {
+    assert.deepEqual((await search(mode)).map(row => row.matchSource), ['both', 'vector']);
+  }
+  assert.deepEqual(embedder.mock.calls.slice(2).map(call => call.arguments[0]), [['bicycle'], ['bicycle']]);
+});
+
+test('df-archive embed skips only unconfigured best-effort runs and rejects invalid flags', async () => {
+  const args = ['embed', '--db', ':memory:', '--json'];
+  const skipped = await runCli(ARCHIVE_CLI, [...args, '--best-effort'], {});
+  assert.equal(skipped.code, 0, skipped.stderr);
+  assert.deepEqual(JSON.parse(skipped.stdout), { embedded: 0, skipped: true, reason: 'embedder_unconfigured' });
+  const failure = await runCli(ARCHIVE_CLI, args, {});
+  assert.equal(failure.code, 2);
+  assert.match(failure.stderr, /df_archive_embedder_unconfigured/);
+  for (const batch of ['0', '129', '-1', '1.5', '2e1']) {
+    await assert.rejects(runArchiveCli([...args, '--batch', batch, '--best-effort']), /--batch/);
+  }
+  await assert.rejects(runArchiveCli(['search', '--db', ':memory:', '--query', 'q', '--mode', 'vector']), /--mode/);
+});
+
+test('df-archive translates AI Studio batches and Vertex predict calls without live HTTP', async t => {
+  const texts = Array.from({ length: 128 }, (_, i) => `document ${i}`);
+  const run = await archiveFixture(t, texts);
+  const originalEnv = process.env;
+  process.env = { ...originalEnv, GEMINI_API_KEY: 'test-key', DF_VERTEX_PROJECT: 'project',
+    DF_VERTEX_LOCATION: 'us-central1', DF_VERTEX_ACCESS_TOKEN: 'test-token' };
+  t.after(() => { process.env = originalEnv; });
+  const fetchMock = t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(options.method, 'POST');
+    const { requests } = JSON.parse(options.body);
+    assert.equal(url, 'https://generativelanguage.googleapis.com/v1beta/models/test-model:batchEmbedContents');
+    assert.equal(options.headers['x-goog-api-key'], 'test-key');
+    for (const request of requests) {
+      assert.equal(request.model, 'models/test-model');
+      assert.equal(request.taskType, 'RETRIEVAL_DOCUMENT');
+    }
+    return Response.json({ embeddings: requests.map(() => ({ values: [1, 2] })) });
+  });
+  assert.equal((await run(['embed', '--batch', '128', '--model', 'test-model'])).embedded, 128);
+  const batches = fetchMock.mock.calls.map(call => JSON.parse(call.arguments[1].body).requests);
+  assert.deepEqual(batches.map(batch => batch.length), [100, 28]);
+  assert.deepEqual(batches.flat().map(request => request.content.parts[0].text), texts);
+
+  delete process.env.GEMINI_API_KEY;
+  const vertex = await archiveFixture(t, ['first', 'second']);
+  const instances = [];
+  fetchMock.mock.mockImplementation(async (url, options) => {
+    assert.equal(url, 'https://us-central1-aiplatform.googleapis.com/v1/projects/project/locations/us-central1/publishers/google/models/gemini-embedding-001:predict');
+    assert.equal(options.headers.authorization, 'Bearer test-token');
+    const body = JSON.parse(options.body);
+    assert.equal(body.instances.length, 1);
+    instances.push(body.instances[0]);
+    return Response.json({ predictions: [{ embeddings: { values: [1, 2] } }] });
+  });
+  assert.equal((await vertex(['embed'])).embedded, 2);
+  assert.equal((await vertex(['search', '--query', 'unrelated', '--mode', 'hybrid']))[0].matchSource, 'vector');
+  assert.deepEqual(instances, [
+    { content: 'first', task_type: 'RETRIEVAL_DOCUMENT' },
+    { content: 'second', task_type: 'RETRIEVAL_DOCUMENT' },
+    { content: 'unrelated', task_type: 'RETRIEVAL_QUERY' },
+  ]);
+  const unavailable = await archiveFixture(t, ['pending']);
+  fetchMock.mock.mockImplementation(async () => new Response(null, { status: 503 }));
+  await assert.rejects(unavailable(['embed', '--best-effort']), /HTTP 503/);
+  assert.equal((await unavailable(['stats'])).embeddings, 0);
 });
 
 test('df-decisions end-to-end: approval gate, deterministic export, reject workflow', async () => {
@@ -549,9 +643,11 @@ test('df-decisions: export --area delegates to the ledger renderer — entry-bou
   }
 });
 
-test('package.json: v1.1.0 release version and all hardening and wiring suites registered in scripts.test', async () => {
+test('package.json: v1.2.0 release version, test suites and operator scripts are registered', async () => {
   const pkg = JSON.parse(await readFile(join(OPS_DIR, '..', 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '1.1.0');
+  assert.equal(pkg.version, '1.2.0');
+  assert.equal(pkg.scripts['fleet:smoke'], 'node ops/check-fleet.mjs');
+  assert.equal(pkg.scripts.graduate, 'node ops/df-graduate.mjs');
   for (const suite of [
     'board_pipeline/pi-guard.test.mjs',
     'ops/df-models.test.mjs',
@@ -564,6 +660,16 @@ test('package.json: v1.1.0 release version and all hardening and wiring suites r
     'ops/docs-fresh.test.mjs',
     'ops/df-explain.test.mjs',
     'ops/df-sentinel.test.mjs',
+    'board_pipeline/field-mode.test.mjs',
+    'board_pipeline/baseline-cache.test.mjs',
+    'board_pipeline/blast-radius.test.mjs',
+    'ops/check-fleet.test.mjs',
+    'ops/df-graduate.test.mjs',
+    'board_pipeline/english-prompt-invariant.test.mjs',
+    'board_pipeline/dispatcher.test.mjs',
+    'board_pipeline/review-panel.test.mjs',
+    'ops/control-room/action-gate.test.mjs',
+    'specs/tla/trace-validate.test.mjs',
   ]) {
     assert.ok(pkg.scripts.test.split(/\s+/).includes(suite),
       `scripts.test must register ${suite}`);

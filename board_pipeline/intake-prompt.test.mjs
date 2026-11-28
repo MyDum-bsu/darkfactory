@@ -4,6 +4,11 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { loadProjectProfile, projectTasteBlock } from './taste-profile.mjs';
+import { verbatimOwnerRequestBlock } from './review-policy.mjs';
+import { taskPlanPromptBlock } from './field-mode.mjs';
+import { formatBlastRadiusSummary } from './blast-radius.mjs';
 import { arbiterIntakePrompt, buildPromptBom, decisionsPromptBlock, lessonsPromptBlock, projectMemoryPromptBlock,
   workerIntakePrompt } from './intake-prompt.mjs';
 
@@ -46,13 +51,60 @@ test('arbitration reads the approved spec before escalating only an unresolved f
 const slice = { text: '- [global] CSV for export (dec-1)',
   digest: 'a'.repeat(64), ids: ['dec-1'], truncated: false, total: 1 };
 
-test('P1.1 worker gets the pinned read-only ledger slice before the question rules', () => {
-  const prompt = workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice });
-  const block = prompt.indexOf('Accepted owner decisions (read-only');
-  const check = prompt.indexOf('Before asking a product question');
-  assert.ok(block > 0 && check > block);
-  assert.match(prompt, /digest a{64}/);
-  assert.match(prompt, /- \[global\] CSV for export \(dec-1\)/);
+test('hc writer ignores ledger and project memory even when a legacy caller supplies both', () => {
+  const noise = { ...slice, text: '[global] Портфель: bb thread create --provider obsolete\n[project:other] FOREIGN' };
+  const args = { ...worker, runtime: 'hc', productQuestions: true, allowedPaths: ['src/api.js'],
+    handoff: { ...handoff, candidate_sha: '<full Git SHA>' },
+    projectContext: 'Owner taste and project profile', skillBlock: 'Resolved domain skill', lessons };
+  const prompt = workerIntakePrompt({ ...args, decisions: noise, projectMemory: noise });
+  assert.equal(prompt, workerIntakePrompt(args));
+  assert.doesNotMatch(prompt, /Accepted owner decisions|Project memory|bb thread create|FOREIGN|\p{Script=Cyrillic}/u);
+  assert.ok(prompt.startsWith(spec));
+  assert.match(prompt, /Scope Fence \(hard constraint\):[\s\S]*- src\/api\.js/);
+  const profile = prompt.indexOf(args.projectContext);
+  const skill = prompt.indexOf(args.skillBlock);
+  const submission = prompt.indexOf(JSON.stringify({ ...handoff, candidate_sha: '<full Git SHA>' }));
+  const checklist = prompt.indexOf('Lessons from prior REWORK');
+  const precheck = prompt.indexOf('Before asking a product question');
+  const question = prompt.indexOf('question instead of candidate_sha');
+  assert.ok(profile >= spec.length && skill > profile && submission > skill, 'context precedes the typed handoff');
+  assert.ok(checklist > submission && precheck > checklist && question > precheck, 'apply lessons and precheck before escalation');
+});
+
+test('hc does not dispatch untranslated required inputs or legacy BB rules from conventions', () => {
+  for (const placeholder of ['<полный Git SHA>', '<α>', '<版本>']) {
+    assert.throws(() => workerIntakePrompt({ ...worker, runtime: 'hc',
+      handoff: { ...handoff, candidate_sha: placeholder } }), /worker_prompt_english_required/);
+  }
+  for (const field of ['brief', 'projectContext', 'skillBlock']) {
+    assert.throws(() => workerIntakePrompt({ ...worker, runtime: 'hc', [field]: 'English. Не переведено.' }),
+      /worker_prompt_english_required/);
+  }
+  assert.throws(() => workerIntakePrompt({ ...worker, runtime: 'hc', projectContext: 'Use bb thread create --provider old.' }),
+    /worker_prompt_bb_rule/);
+  assert.throws(() => workerIntakePrompt({ ...worker, runtime: 'hc', brief: 'Always use bb thread create --provider obsolete.' }),
+    /worker_prompt_bb_rule/);
+  assert.throws(() => workerIntakePrompt({ ...worker, runtime: 'hc', brief: `${spec}\n${decisionsPromptBlock(slice)}` }),
+    /worker_prompt_contains_ledger/);
+  // Mentioning the obsolete command in an English task about its removal is valid.
+  assert.match(workerIntakePrompt({ ...worker, runtime: 'hc', brief: 'Remove bb thread create rules.' }),
+    /Remove bb thread create rules/);
+});
+
+test('hc dispatches the shipped project taste, mathematical notation, and bounded owner quotes verbatim', () => {
+  const profile = loadProjectProfile(fileURLToPath(new URL('../', import.meta.url)));
+  assert.equal(profile.taste.length, 4);
+  const projectContext = projectTasteBlock(profile);
+  const render = (brief, extra) => workerIntakePrompt({ ...worker, runtime: 'hc', projectContext, brief, ...extra });
+  const quote = verbatimOwnerRequestBlock({ verbatim_request_id: 'owner-42', verbatim_owner_quote: 'Покажи измерения.' });
+  const brief = `Compare μs, µm, α + Ω and ℝ.\n${quote}\nSummarize in English.\n${quote}`;
+  const prompt = render(brief);
+  assert.ok(prompt.includes(projectContext));
+  assert.ok(prompt.includes(brief));
+  for (const text of ['Αλλαγή κώδικα', '修改代码', `${brief}\nСделай иначе.`, `Before\n${quote.split('\nEnd')[0]}`]) {
+    assert.throws(() => render(text), /worker_prompt_english_required/);
+  }
+  assert.throws(() => render(brief, { projectContext: 'Не инструкция.' }), /worker_prompt_english_required/);
 });
 
 test('worker without a configured ledger gets no decisions block', () => {
@@ -60,12 +112,12 @@ test('worker without a configured ledger gets no decisions block', () => {
   assert.doesNotMatch(prompt, /read-only, slice digest/);
 });
 
-test('arbiter receives the same pinned slice alongside manual extra rules', () => {
+test('arbiter keeps explicit operator rules but does not receive the ledger', () => {
   const prompt = arbiterIntakePrompt(spec, 'Operator rules.', slice);
-  assert.match(prompt, /Accepted owner decisions \(read-only, slice digest a{64}\)/);
-  assert.match(prompt, /Operator rules\./);
-  // Старый ручной owner-decisions текст в extra сохраняется без изменений.
-  assert.ok(prompt.indexOf('Operator rules.') < prompt.indexOf('Accepted owner decisions'));
+  assert.doesNotMatch(prompt, /Accepted owner decisions|dec-1/);
+  const rules = prompt.indexOf('Operator rules.');
+  const precheck = prompt.indexOf('Before asking a product question');
+  assert.ok(prompt.indexOf(spec) >= 0 && rules > prompt.indexOf(spec) && precheck > rules);
 });
 
 test('decisionsPromptBlock is fail-closed on an unpinned slice', () => {
@@ -141,20 +193,21 @@ test('worker and arbiter receive pinned read-only project memory block', () => {
   const decIdx = wPrompt.indexOf('Accepted owner decisions');
   const memIdx = wPrompt.indexOf('Project memory (read-only, slice digest');
   const checkIdx = wPrompt.indexOf('Before asking a product question');
-  assert.ok(decIdx > 0 && memIdx > decIdx && checkIdx > memIdx);
+  assert.equal(decIdx, -1);
+  assert.ok(memIdx > 0 && checkIdx > memIdx);
   assert.match(wPrompt, /digest b{64}/);
   assert.match(wPrompt, /Board is single source of truth/);
   assert.match(wPrompt, /direct writes by the worker are forbidden/);
 
   const aPrompt = arbiterIntakePrompt(spec, 'Operator rules.', slice, memorySlice);
   assert.match(aPrompt, /Project memory \(read-only, slice digest b{64}\)/);
-  assert.ok(aPrompt.indexOf('Accepted owner decisions') < aPrompt.indexOf('Project memory'));
+  assert.doesNotMatch(aPrompt, /Accepted owner decisions/);
 });
 
-test('worker sees decisions, pinned project memory and canonical lessons together before questions', () => {
+test('legacy worker keeps project memory and canonical lessons before questions', () => {
   const prompt = workerIntakePrompt({ ...worker, productQuestions: true, decisions: slice,
     projectMemory: memorySlice, lessons });
-  const markers = ['Accepted owner decisions (read-only', 'Project memory (read-only',
+  const markers = ['Project memory (read-only',
     'Lessons from prior REWORK rounds (read-only', 'Before asking a product question'];
   assert.ok(markers.map(text => prompt.indexOf(text)).every((at, i, all) => at >= 0 && (!i || at > all[i - 1])));
 });
@@ -191,7 +244,7 @@ test('executor-aware worker prompt embeds the complete legacy contract verbatim'
   assert.match(prompt, /# Context/);
   assert.match(prompt, /# Scope Fence/);
   assert.match(prompt, /board_pipeline\/intake-prompt\.mjs/);
-  for (const required of ['Accepted owner decisions (read-only', 'Project memory (read-only',
+  for (const required of ['Project memory (read-only',
     'Lessons from prior REWORK rounds', 'Before asking a product question',
     'Write JSON atomically', 'Do not touch other threads or boards.']) {
     assert.ok(prompt.includes(required), required);
@@ -285,8 +338,29 @@ test('taste opt-in loads both layers, bounds the whole block and preserves the e
   assert.equal(workerIntakePrompt(args), original, 'no implicit load');
 });
 
+test('worker intake renders only the supplied plan and blast-radius blocks', () => {
+  const blastRadius = { changedPaths: ['src/api.js'], directImporters: ['src/app.js'],
+    transitiveDependents: ['src/app.js'], affectedTests: [], riskLevel: 'low', truncated: false };
+  const summary = formatBlastRadiusSummary(blastRadius);
+  const plan = taskPlanPromptBlock('mvp', 'greenfield');
+  const render = options => workerIntakePrompt({ ...worker, ...options });
+  const legacy = render({});
+  assert.equal(render({ fieldMode: 'greenfield', taskPlan: null, blastRadius: null }), legacy);
+  const withPlan = render({ taskPlan: 'mvp', fieldMode: 'greenfield' });
+  assert.ok(withPlan.includes(plan));
+  assert.doesNotMatch(withPlan, /Blast radius:/);
+  const withRadius = render({ blastRadius });
+  assert.ok(withRadius.includes(summary));
+  assert.doesNotMatch(withRadius, /Task plan:/);
+  const both = render({ taskPlan: 'mvp', fieldMode: 'greenfield', blastRadius });
+  assert.ok(both.includes(plan) && both.includes(summary));
+  assert.doesNotMatch(legacy, /Task plan:|Blast radius:/);
+  assert.ok(render({ taskPlan: 'bugfix' }).includes(taskPlanPromptBlock('bugfix')));
+  assert.throws(() => render({ taskPlan: '' }), { code: 'task_plan_invalid' });
+});
+
 test('prompt BOM describes exactly the supplied rendered blocks in stable order without their text', () => {
-  const names = ['spec', 'decisions', 'memory', 'taste', 'skills', 'lessons', 'scope'];
+  const names = ['spec', 'decisions', 'memory', 'taste', 'skills', 'lessons', 'scope', 'taskPlan', 'blastRadius'];
   const parts = Object.fromEntries(names.map(name => [name, ` ${name}: я🌊\n`]).reverse());
   const bom = buildPromptBom(parts);
   assert.deepEqual(Object.keys(bom), names);
@@ -336,27 +410,25 @@ test('empty decision and project memory stores skip redundant boilerplate', () =
   assert.doesNotMatch(arbiter, /Accepted owner decisions/);
   assert.doesNotMatch(arbiter, /Project memory \(read-only/);
 
-  // Non-empty stores keep their digest-pinned blocks in worker and arbiter prompts.
+  // Only project memory is eligible in these legacy execution prompts.
   const pinned = workerIntakePrompt({ ...worker, productQuestions: false,
     decisions: slice, projectMemory: memorySlice });
-  assert.match(pinned, /digest a{64}/);
+  assert.doesNotMatch(pinned, /digest a{64}/);
   assert.match(pinned, /digest b{64}/);
   const pinnedArbiter = arbiterIntakePrompt(spec, 'Operator rules.', slice, memorySlice);
-  assert.match(pinnedArbiter, /slice digest a{64}/);
+  assert.doesNotMatch(pinnedArbiter, /slice digest a{64}/);
   assert.match(pinnedArbiter, /slice digest b{64}/);
 });
 
 test('empty-store skipping stays fail-closed on invalid or truncated slices', () => {
   const truncated = { text: '', digest: 'c'.repeat(64), ids: [], truncated: true, total: 3 };
-  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false, decisions: truncated }),
-    /decision_ledger_slice_truncated/);
-  assert.throws(() => arbiterIntakePrompt(spec, 'extra', truncated), /decision_ledger_slice_truncated/);
+  assert.equal(workerIntakePrompt({ ...worker, decisions: truncated }), workerIntakePrompt(worker));
+  assert.equal(arbiterIntakePrompt(spec, 'extra', truncated), arbiterIntakePrompt(spec, 'extra'));
   const truncatedMemory = { text: '', digest: 'd'.repeat(64), ids: [], truncated: true, total: 2 };
   assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false, projectMemory: truncatedMemory }),
     /project_memory_slice_truncated/);
   const invalid = { text: '', digest: 'short', ids: [] };
-  assert.throws(() => workerIntakePrompt({ ...worker, productQuestions: false, decisions: invalid }),
-    /decision_ledger_slice_invalid/);
+  assert.equal(workerIntakePrompt({ ...worker, decisions: invalid }), workerIntakePrompt(worker));
   assert.throws(() => arbiterIntakePrompt(spec, 'extra', null, invalid), /project_memory_slice_invalid/);
 });
 
@@ -393,12 +465,11 @@ test('arbiterIntakePrompt shapes the prompt by the arbiter model family when pro
   assert.match(cognition, /output only an arbitration decision/);
   assert.match(cognition, /escalate_owner/);
 
-  // Pinned non-empty slices survive family shaping with their digests intact.
+  // Family shaping keeps pinned memory but cannot reintroduce decisions.
   const pinned = arbiterIntakePrompt(spec, 'Operator rules.', slice, memorySlice,
     { provider: 'openai', model: 'gpt-6.2-sol' });
-  assert.match(pinned, /slice digest a{64}/);
+  assert.doesNotMatch(pinned, /slice digest a{64}|dec-1/);
   assert.match(pinned, /slice digest b{64}/);
-  assert.match(pinned, /- \[global\] CSV for export \(dec-1\)/);
 });
 
 test('worker prompt without executor still emits the scope fence when allowedPaths is present (F-08)', () => {

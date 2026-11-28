@@ -1,0 +1,9 @@
+[Unit]
+Description=Collect Darkfactory host telemetry
+
+[Service]
+Type=oneshot
+NoNewPrivileges=true
+ExecStart="@REPO@/ops/local/df-fleet-telemetry.sh" --out "@OUT@"
+# Set DF_FLEET_REMOTE to a host-specific object in a user service drop-in.
+ExecStartPost=/bin/sh -c 'if [ -n "$${DF_FLEET_REMOTE:-}" ]; then exec rclone copyto --checksum "$$1" "$$DF_FLEET_REMOTE"; fi' sh "@OUT@"

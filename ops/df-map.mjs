@@ -24,6 +24,7 @@ const FIXED_ENTRYPOINTS = Object.freeze([
   'ops/factory-run.mjs',
   'ops/factory-enqueue.mjs',
   'ops/check-host.mjs',
+  'ops/check-fleet.mjs',
   'ops/control-room/aggregator.mjs',
   'ops/control-room/df-herd.mjs',
   'ops/herdr/deploy-herdr.mjs',

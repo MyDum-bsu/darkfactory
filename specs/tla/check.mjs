@@ -1,82 +1,78 @@
-// Прогон TLC по базовой модели и пяти парным мутантам.
-// База: exit 0 и "No error has been found".
-// Каждый мутант: строго exit 12 и точная строка "Invariant <Name> is violated."
-// «Любая ошибка» мутантом не считается — только ожидаемый инвариант.
-
+// TLC gate: a clean base and an exact, named safety counterexample per mutant.
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { statSync } from 'node:fs';
+import { copyFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const exec = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
-const SPEC = join(here, 'ControllerProtocol.tla');
+const spec = join(here, 'ControllerProtocol.tla');
+const walMutants = ['SingleLiveWriter', 'NoDuplicateSpawn', 'NoStaleCommit',
+  'NoWatermarkRegression', 'NoBlindRoundClose'];
+const productionMutants = { hc: 'HcReceiptAttested', scope: 'ScopeLocksDisjoint',
+  review: 'MergeReviewed', owner: 'MergeAuthorized', cas: 'MergeHeadCurrent', smoke: 'RebaseSmokePassed' };
 
-const JAR = process.env.TLA_TOOLS_JAR;
-if (!JAR || !isAbsolute(JAR) || !statSync(JAR, { throwIfNoEntry: false })?.isFile()) {
-  console.error('tla-check: TLA_TOOLS_JAR must name the absolute path of an installed tla2tools.jar');
-  process.exit(1);
-}
-
-const MUTANTS = [
-  ['Mutant1_SingleLiveWriter.cfg', 'SingleLiveWriter'],
-  ['Mutant2_NoDuplicateSpawn.cfg', 'NoDuplicateSpawn'],
-  ['Mutant3_NoStaleCommit.cfg', 'NoStaleCommit'],
-  ['Mutant4_NoWatermarkRegression.cfg', 'NoWatermarkRegression'],
-  ['Mutant5_NoBlindRoundClose.cfg', 'NoBlindRoundClose'],
-];
-
-async function tlc(cfg) {
-  const metadir = await mkdtemp(join(tmpdir(), 'tla-metadir-'));
+export async function runTlc(module, config) {
+  const jar = process.env.TLA_TOOLS_JAR;
+  if (!jar || !isAbsolute(jar) || !(await stat(jar).catch(() => null))?.isFile()) {
+    throw new Error('TLA_TOOLS_JAR must name the absolute path of an installed tla2tools.jar');
+  }
+  const scratch = await mkdtemp(join(tmpdir(), 'tlc-'));
   try {
-    const run = await exec('java',
-      ['-XX:+UseParallelGC', '-Xmx512m', '-jar', JAR, '-workers', '1', '-deadlock',
-        '-metadir', metadir, '-config', join(here, cfg), SPEC],
-      { timeout: 25_000, maxBuffer: 16 * 1024 * 1024 })
-      .then(r => ({ code: 0, out: r.stdout + r.stderr }))
-      .catch(e => ({ code: typeof e.code === 'number' ? e.code : -1, out: (e.stdout ?? '') + (e.stderr ?? '') }));
-    return run;
-  } finally {
-    await rm(metadir, { recursive: true, force: true });
+    await copyFile(spec, join(scratch, 'ControllerProtocol.tla'));
+    if (module !== spec) await copyFile(module, join(scratch, basename(module)));
+    await writeFile(join(scratch, 'Model.cfg'), config);
+    const args = ['-XX:+UseParallelGC', '-XX:ActiveProcessorCount=2', '-Xmx512m', '-jar', jar,
+      '-workers', '1', '-deadlock', '-metadir', join(scratch, 'states'), '-config', 'Model.cfg', basename(module)];
+    try {
+      const r = await exec('java', args, { cwd: scratch, timeout: 25_000, maxBuffer: 4 << 20 });
+      return { code: 0, out: r.stdout + r.stderr };
+    } catch (e) {
+      if (typeof e.code !== 'number') throw e;
+      return { code: e.code, out: e.stdout + e.stderr };
+    }
+  } finally { await rm(scratch, { recursive: true, force: true }); }
+}
+
+export function requireGreen({ code, out }) {
+  if (code !== 0 || !out.includes('No error has been found')) {
+    throw new Error(`TLC exit ${code}: ${out.slice(0, 2500)}\n${out.slice(-2500)}`);
   }
 }
 
-const started = Date.now();
-const failures = [];
-
-const base = await tlc('ControllerProtocol.cfg');
-if (base.code !== 0 || !base.out.includes('No error has been found')) {
-  failures.push(`base: exit=${base.code}, expected 0 and "No error has been found"\n${base.out.slice(-2000)}`);
-} else {
-  const states = /(\d[\d,]*) distinct states/.exec(base.out)?.[1] ?? '?';
-  console.log(`base: OK (${states} distinct states)`);
-}
-
-for (const [cfg, invariant] of MUTANTS) {
-  const res = await tlc(cfg);
-  // Нарушен должен быть ровно один инвариант — целевой. «Любая ошибка» или
-  // пачка нарушений мутантом не считаются.
-  const violated = [...res.out.matchAll(/Invariant (\w+) is violated\./g)].map(x => x[1]);
-  const unique = [...new Set(violated)];
-  if (res.code === 12 && unique.length === 1 && unique[0] === invariant) {
-    console.log(`${cfg}: OK (exit 12, ${invariant})`);
-  } else {
-    failures.push(`${cfg}: exit=${res.code}, violated=${JSON.stringify(unique)}, ` +
-      `expected exit 12 and exactly "${invariant}"\n${res.out.slice(-2000)}`);
+async function main() {
+  const start = performance.now();
+  const base = await readFile(join(here, 'ControllerProtocol.cfg'), 'utf8');
+  const safety = Object.values(productionMutants).map(i => `INVARIANT ${i}\n`).join('');
+  requireGreen(await runTlc(spec, base + safety));
+  console.log('base: OK');
+  async function mutant(cfg, invariant) {
+    const { code, out } = await runTlc(spec, cfg);
+    const violations = [...out.matchAll(/Invariant (\w+) is violated\./g)].map(m => m[1]);
+    if (code !== 12 || violations.length !== 1 || violations[0] !== invariant) {
+      throw new Error(`expected exit 12 (${invariant}), got ${code}: ${out.slice(-2500)}`);
+    }
+    console.log(`mutant: OK (exit 12, ${invariant})`);
   }
+  for (const [i, name] of walMutants.entries()) {
+    await mutant(await readFile(join(here, `Mutant${i + 1}_${name}.cfg`), 'utf8'), name);
+  }
+  for (const [fault, name] of Object.entries(productionMutants)) {
+    await mutant(`${base}${safety}CONSTANT ProductionFault = "${fault}"\n`, name);
+  }
+  const seconds = (performance.now() - start) / 1000;
+  if (seconds > 30) throw new Error(`TLC budget exceeded: ${seconds.toFixed(1)}s > 30s`);
+  console.log(`tla-check: 5/5 mutants caught (WAL), 6/6 production mutants caught, ${seconds.toFixed(1)}s`);
+  // This is the existing integration entry point; do not leave trace tests orphaned.
+  // conformance.test.mjs invokes this gate inside node:test. Inheriting its
+  // child marker makes `node --test` silently skip the entire nested suite.
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const test = await exec(process.execPath, ['--test', join(here, 'trace-validate.test.mjs')],
+    { env, timeout: 30_000 }).catch(e => { throw new Error(`trace tests failed: ${e.stdout}\n${e.stderr}`); });
+  process.stdout.write(test.stdout);
 }
 
-const elapsed = ((Date.now() - started) / 1000).toFixed(1);
-if (failures.length) {
-  console.error(`tla-check: FAILED in ${elapsed}s`);
-  for (const f of failures) console.error(`---\n${f}`);
-  process.exit(1);
-}
-if (Date.now() - started > 30_000) {
-  console.error(`tla-check: budget exceeded (${elapsed}s > 30s)`);
-  process.exit(1);
-}
-console.log(`tla-check: 1/1 base green, 5/5 mutants caught, ${elapsed}s`);
+if (import.meta.main) await main();

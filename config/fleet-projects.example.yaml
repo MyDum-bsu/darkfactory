@@ -1,0 +1,28 @@
+# Copy to a trusted path outside ALL slot worktrees. Start one dispatcher per
+# host: node ops/factory-dispatch.mjs --config /absolute/path/to/fleet.yaml
+# Real Board :44100 additionally requires explicit --allow-live-pilot.
+intervalMs: 5000
+pool:
+  minSlots: 1          # minimum under CPU load, still bounded by available RAM/CPUs
+  memoryPerSlotMiB: 2048
+  # maxSlots: 16       # optional operator ceiling; otherwise only RAM/CPU limit
+
+# Pre-enroll one clean linked feature worktree and accepted queue policy per
+# project. Each policy pins channel, route.repoId/worktree, bb.provider/model,
+# a private handoffDir and pilot.killSwitch. The dispatcher never creates or
+# cleans a checkout itself. Prepare the distinct private state dirs beforehand.
+projects:
+  - repo_id: optimization
+    repo_dir: /srv/projects/optimization
+    herdr_space_name: MO Tracker
+    channel: optimization
+    worktree: /srv/slots/optimization
+    policy: /srv/factory/policies/optimization.json
+    state: /srv/factory/state/optimization
+  - repo_id: music-restoration
+    repo_dir: /srv/projects/music-restoration
+    herdr_space_name: Music Restoration
+    channel: music-restoration
+    worktree: /srv/slots/music-restoration
+    policy: /srv/factory/policies/music-restoration.json
+    state: /srv/factory/state/music-restoration

@@ -4,7 +4,8 @@
 // aggregator. Сам budget-файл symlink'ом быть не должен; symlink родительского
 // каталога допустим (проверяется lstat конечного пути).
 
-import { lstat, readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, open, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -119,7 +120,7 @@ const PUBLIC_FINOPS_ENTRY_KEYS = new Set([
   'id', 'label', 'provider', 'totalEur', 'remainingEur', 'monthlyEur', 'usedMonthEur', 'expires', 'notes',
   'machineType', 'hourlyCostUsd', 'hourlyCostEur', 'pricing', 'state',
   'runningMinutesToday', 'runningMinutesMonth', 'activeMinutesToday', 'wakesMonth',
-  'usageUpdatedAt', 'costTodayEur', 'costMonthEur',
+  'usageUpdatedAt', 'costTodayEur', 'costMonthEur', 'source', 'activeTasks', 'activeSlots', 'claimedTasks',
   'unit', 'totalUnits', 'usedUnits', 'utilizationPct', 'status',
   'model', 'quota', 'reset',
 ]);
@@ -212,12 +213,17 @@ function usageFor(vm, usage, { allowRootUsage = true } = {}) {
   // Плоский корневой usage относится к одной машине. При нескольких metered
   // VM он применяется только к явно названной (vmId/вложенный ключ); иначе
   // одни и те же минуты были бы посчитаны несколько раз.
-  if (!nested && !explicitRoot && !allowRootUsage) return null;
-  const source = isRecord(nested) ? { ...usage, ...nested } : usage;
+  if (!nested && !explicitRoot && (!allowRootUsage || usage.vmId || usage.vms)) return null;
+  const source = isRecord(nested) ? nested : usage;
+  if (!['runningMinutesToday', 'runningMinutesMonth', 'activeMinutesToday', 'activeMinutes', 'state', 'status',
+    'activeTasks', 'activeSlots', 'claimedTasks', 'wakesMonth'].some(k => source[k] != null)) return null;
   return {
-    runningMinutesToday: Math.max(0, num(source.runningMinutesToday) ?? 0),
+    runningMinutesToday: nonNegativeNum(source.runningMinutesToday),
     runningMinutesMonth: Math.max(0, num(source.runningMinutesMonth) ?? 0),
-    activeMinutesToday: Math.max(0, num(source.activeMinutesToday ?? source.activeMinutes) ?? 0),
+    activeMinutesToday: nonNegativeNum(source.activeMinutesToday ?? source.activeMinutes),
+    activeSlots: nonNegativeNum(source.activeSlots),
+    activeTasks: nonNegativeNum(source.activeTasks),
+    claimedTasks: nonNegativeNum(source.claimedTasks),
     wakesMonth: Math.max(0, num(source.wakesMonth) ?? 0),
     updatedAt: iso(source.updatedAt) ?? null,
     state: text(source.state ?? source.status) ?? null,
@@ -271,24 +277,16 @@ function daysInMonth(at) {
 // --- Spend Dynamics & Dead-Load Detector --------------------------------------
 //
 // Чистые детерминированные функции: вход — уже нормализованные записи VM и
-// журнал usage, выход — timeseries расхода и флаги мёртвой нагрузки. Worker
-// VM (pricing spot или id c 'worker'), которая RUNNING при нуле активных и
-// взятых задач дольше порога — это инфраструктурный баг, сжигающий деньги
-// 24/7: алерт dead_load_detected (severity bad) поднимается немедленно.
+// журнал usage, выход — timeseries расхода и флаги мёртвой нагрузки.
+// Ноль работы — наблюдение; отсутствие счётчиков не равно нулю.
 
 const round2 = n => Number(n.toFixed(2));
 const round4 = n => Number(n.toFixed(4));
 
-const workerishVm = entry => {
-  const pricing = typeof entry?.pricing === 'string' ? entry.pricing.trim().toLowerCase() : '';
-  const id = typeof entry?.id === 'string' ? entry.id : '';
-  return pricing === 'spot' || /worker/i.test(id);
-};
-
-export function analyzeDeadLoad({ vmUsage, activeTasks = 0, claimedTasks = 0,
+export function analyzeDeadLoad({ vmUsage, activeTasks = null, claimedTasks = null, activeSlots = null,
   idleMinutesSinceLastTask = 0, deadLoadThresholdMinutes = 20 } = {}) {
-  activeTasks = Math.max(0, num(activeTasks) ?? 0);
-  claimedTasks = Math.max(0, num(claimedTasks) ?? 0);
+  activeTasks = nonNegativeNum(activeTasks);
+  claimedTasks = nonNegativeNum(claimedTasks);
   idleMinutesSinceLastTask = Math.max(0, num(idleMinutesSinceLastTask) ?? 0);
   deadLoadThresholdMinutes = Math.max(0, num(deadLoadThresholdMinutes) ?? 20);
   const vms = (Array.isArray(vmUsage) ? vmUsage : []).filter(isRecord).map(entry => {
@@ -300,8 +298,13 @@ export function analyzeDeadLoad({ vmUsage, activeTasks = 0, claimedTasks = 0,
     const idleMinutes = explicitIdle ?? Math.max(0, runningMinutes - activeMinutes);
     const idleWastePct = runningMinutes > 0 ? round4(idleMinutes / runningMinutes * 100) : 0;
     const running = typeof entry.state === 'string' && entry.state.trim().toLowerCase() === 'running';
-    const deadLoad = workerishVm(entry) && running && activeTasks === 0 && claimedTasks === 0 &&
-      idleMinutesSinceLastTask >= deadLoadThresholdMinutes;
+    const counts = [entry.activeSlots ?? activeSlots, entry.activeTasks ?? activeTasks,
+      entry.claimedTasks ?? claimedTasks].map(nonNegativeNum).filter(n => n !== null);
+    const noWork = counts.every(n => n === 0) &&
+      [entry.activeSlots ?? activeSlots, entry.activeTasks ?? activeTasks].some(n => nonNegativeNum(n) === 0);
+    const idleObserved = !counts.length && idleMinutesSinceLastTask > 0 && idleMinutesSinceLastTask >= deadLoadThresholdMinutes;
+    const unusedToday = runningMinutes > 30 && nonNegativeNum(entry.activeMinutesToday ?? entry.activeMinutes) === 0;
+    const deadLoad = entry.source !== 'static' && (unusedToday || (running && (noWork || idleObserved)));
     return {
       id: clean(entry.id ?? ''),
       state: text(entry.state) ?? null,
@@ -310,15 +313,15 @@ export function analyzeDeadLoad({ vmUsage, activeTasks = 0, claimedTasks = 0,
       activeMinutes: round4(activeMinutes),
       idleMinutes: round4(idleMinutes),
       idleWastePct,
-      deadLoad,
+      deadLoad, unusedToday,
     };
   });
   const alerts = [];
   for (const vm of vms) {
     if (!vm.deadLoad) continue;
     alerts.push({ severity: 'bad', code: 'dead_load_detected', resourceId: vm.id,
-      message: `${vm.id}: worker RUNNING ${round4(vm.runningMinutes)}min без задач ` +
-        `(idle ${idleMinutesSinceLastTask}min >= ${deadLoadThresholdMinutes}min) — мёртвая нагрузка` });
+      message: vm.unusedToday ? `${vm.id}: ${vm.runningMinutes} running minutes today, zero active minutes`
+        : `${vm.id}: running idle without active slots/tasks` });
   }
   const totalRunning = vms.reduce((sum, vm) => sum + vm.runningMinutes, 0);
   const totalIdle = vms.reduce((sum, vm) => sum + vm.idleMinutes, 0);
@@ -397,6 +400,104 @@ export function buildSpendDynamics({ dailyHistory = [], todayEur = 0,
   };
 }
 
+// Read only the bounded tail of the optional append-only journal. A torn
+// last write, oversized line or rotated/missing journal is an observation gap.
+async function readHistory(path) {
+  const fd = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW).catch(() => null);
+  if (!fd) return [];
+  try {
+    const st = await fd.stat();
+    if (!st.isFile()) return [];
+    const start = Math.max(0, st.size - 2 * 1024 * 1024);
+    const buf = Buffer.alloc(st.size - start);
+    const { bytesRead } = await fd.read(buf, 0, buf.length, start);
+    const lines = buf.toString('utf8', 0, bytesRead).split('\n');
+    if (start) lines.shift();
+    const rows = [];
+    for (const line of lines) {
+      try { const row = JSON.parse(line); if (isRecord(row)) rows.push(row); } catch { /* partial row */ }
+    }
+    return rows;
+  } catch { return []; } finally { await fd.close(); }
+}
+
+const DAY_MS = 86400000;
+const utcDay = ms => new Date(ms).toISOString().slice(0, 10);
+
+// Rows describe bucket TOTALS, not deltas: a repeated sample replaces its
+// bucket. Timestamped eur rows are hourly; spentTodayCostEur is cumulative
+// for that UTC day. An explicit daily total supersedes the sum of its hours.
+function spendSeries(history, dailyHistory, todayEstimate, at) {
+  const today = utcDay(at), midnight = Date.parse(today);
+  const days = new Map(), hours = new Map();
+  function put(row) {
+    const stamp = row?.date ?? row?.day ?? row?.hour ?? row?.ts ?? row?.updatedAt;
+    if (typeof stamp !== 'string' || !/^\d{4}-\d\d-\d\d(?:T|$)/.test(stamp)) return;
+    const ms = Date.parse(stamp);
+    const cumulative = row.spentTodayCostEur ?? row.totals?.spentTodayCostEur;
+    const eur = nonNegativeNum(cumulative ?? row.eur ?? row.costEur ?? row.amount);
+    if (!Number.isFinite(ms) || ms > at || eur === null) return;
+    if (stamp.length === 10 || cumulative != null || row.granularity === 'daily') days.set(utcDay(ms), eur);
+    else hours.set(new Date(ms).toISOString().slice(0, 13) + ':00:00Z', eur);
+  }
+  dailyHistory.forEach((row, i) => put(isRecord(row) ? row : {
+    date: utcDay(midnight - (dailyHistory.length - i) * DAY_MS), eur: row }));
+  history.forEach(put);
+  const totals = new Map();
+  const hourly = [...hours].sort(([a], [b]) => a.localeCompare(b)).map(([date, eur]) => {
+    const day = date.slice(0, 10);
+    totals.set(day, (totals.get(day) ?? 0) + eur);
+    return { date, eur: round4(eur) };
+  });
+  for (const [day, total] of days) totals.set(day, total);
+  if (!totals.has(today) && todayEstimate != null) totals.set(today, todayEstimate);
+  // Missing days aren't observations of zero spend. Exclude the current
+  // day, even when it already has a partial daily snapshot.
+  const baseline = date => {
+    const ms = Date.parse(date), prior = [];
+    for (let i = 1; i <= 7; i++) {
+      const n = totals.get(utcDay(ms - i * DAY_MS));
+      if (n !== undefined) prior.push(n);
+    }
+    return prior.length ? prior.reduce((sum, n) => sum + n, 0) / prior.length : null;
+  };
+  const series = [...totals].sort(([a], [b]) => a.localeCompare(b)).map(([date, eur]) => {
+    const avg = baseline(date);
+    return { date, eur: round4(eur), baseline7dEur: avg === null ? null : round4(avg),
+      burnRatio: avg > 0 ? round4(eur / avg) : null };
+  });
+  const base = baseline(today), current = totals.get(today);
+  return { series, hourly, baseline7dEur: base === null ? null : round4(base),
+    burnRatio: base > 0 && current != null ? round4(current / base) : null,
+    spike: base !== null && current > 2 * base };
+}
+
+// Monthly usage accepts per-service summaries or service-tagged cost rows.
+// Prefer the summary for a service when both representations are supplied.
+function aiMonthlySpend(usage, at) {
+  const month = utcDay(at).slice(0, 7);
+  const tagged = entries(usage?.services ?? usage?.entries);
+  const groups = [
+    [usage?.vertexAi ?? usage?.vertexAI ?? usage?.vertex_ai, 'vertex'],
+    [usage?.embeddings ?? usage?.embedding, 'embedding'],
+  ];
+  const category = row => {
+    const name = row.service ?? row.id ?? '';
+    return /embedding/i.test(name) ? 'embedding' : /vertex/i.test(name) ? 'vertex' : null;
+  };
+  let total = 0;
+  for (const [summary, service] of groups) {
+    const rows = summary == null ? tagged.filter(row => category(row) === service)
+      : Array.isArray(summary) ? summary : [summary];
+    for (const row of rows) {
+      const period = row?.month ?? row?.date ?? row?.ts ?? usage?.month;
+      if (period && String(period).slice(0, 7) !== month) continue;
+      total += nonNegativeNum(row?.costMonthEur ?? row?.costEur ?? row?.eur) ?? 0;
+    }
+  }
+  return total;
+}
+
 function monthlyCreditBalances(rawCredits, spentMonthCostEur) {
   const credits = entries(rawCredits).map((entry, index) => publicEntry(entry, {
     id: text(entry.id) ?? `credit-${index + 1}`,
@@ -405,6 +506,7 @@ function monthlyCreditBalances(rawCredits, spentMonthCostEur) {
     remainingEur: num(entry.remaining_eur ?? entry.remainingEur),
     monthlyEur: num(entry.monthly_eur ?? entry.monthlyEur),
     usedMonthEur: 0,
+    source: 'static',
     expires: iso(entry.expires ?? entry.until),
     notes: text(entry.notes) ?? null,
   }));
@@ -416,6 +518,7 @@ function monthlyCreditBalances(rawCredits, spentMonthCostEur) {
     const used = Math.min(Math.max(0, baseRemaining), remainingSpendToCover);
     credit.remainingEur = round2(Math.max(0, baseRemaining - used));
     credit.usedMonthEur = round2(used);
+    if (used > 0) credit.source = 'estimated';
     remainingSpendToCover -= used;
   }
 
@@ -429,18 +532,23 @@ function monthlyCreditBalances(rawCredits, spentMonthCostEur) {
   return credits;
 }
 
-function normalize(raw, usage, sourcePath, at) {
+function normalize(raw, usage, sourcePath, at, history) {
   const alerts = [];
   const usdToEur = nonNegativeNum(raw.usd_to_eur ?? raw.fx?.usd_to_eur) ?? 0.92;
   const monthlyBudgetEur = num(raw.monthly_budget_eur ?? raw.budgets?.monthly_eur) ?? null;
   const utilizationThresholdPct = num(raw.underutilized_below_pct ??
     raw.budgets?.utilization_alert_below_pct) ?? 5;
 
-  let spentMonthCostEur = 0;
+  let spentMonthCostEur = aiMonthlySpend(usage, at);
   let spentTodayCostEur = 0;
+  let observedTodaySpend = false;
   let runningMinutesMonth = 0;
   let runningMinutesToday = 0;
   const vmEntries = entries(raw.compute_vms);
+  const known = new Set(vmEntries.map(vm => text(vm.usage_key ?? vm.id)));
+  for (const [id, sample] of Object.entries(isRecord(usage?.vms) ? usage.vms : {})) {
+    if (!known.has(id) && isRecord(sample)) vmEntries.push({ id });
+  }
   const meteredCount = vmEntries.filter(meteredVm).length;
   const computeVms = vmEntries.map((entry, index) => {
     const id = text(entry.id) ?? `vm-${index + 1}`;
@@ -459,22 +567,29 @@ function normalize(raw, usage, sourcePath, at) {
       { allowRootUsage: meteredCount <= 1 });
     const monthMinutes = live?.runningMinutesMonth ?? 0;
     const todayMinutes = live?.runningMinutesToday ?? 0;
+    if (live?.runningMinutesToday != null && (parsedHourlyEur !== null || hourlyUsd !== null)) observedTodaySpend = true;
     const monthCost = hourlyEur * monthMinutes / 60;
     const todayCost = hourlyEur * todayMinutes / 60;
     spentMonthCostEur += monthCost;
     spentTodayCostEur += todayCost;
     runningMinutesMonth += monthMinutes;
     runningMinutesToday += todayMinutes;
+    const state = live?.state ?? text(entry.state);
+    const stopped = /^(stopped|terminated|suspended|stopping)$/i.test(state ?? '');
+    const pricing = text(entry.pricing ?? entry.price_note);
     return publicEntry(entry, {
       id,
+      source: live ? 'metered' : 'static',
+      activeTasks: live?.activeTasks ?? null, activeSlots: live?.activeSlots ?? null,
+      claimedTasks: live?.claimedTasks ?? null,
       machineType: text(entry.machine_type ?? entry.machineType) ?? null,
       hourlyCostUsd: hourlyUsd,
       hourlyCostEur: Number(hourlyEur.toFixed(6)),
-      pricing: text(entry.pricing ?? entry.price_note) ?? null,
-      state: live?.state ?? text(entry.state) ?? null,
+      pricing: stopped && /(?:\/\s*h|per hour)/i.test(pricing ?? '') ? null : pricing,
+      state,
       runningMinutesToday: todayMinutes,
       runningMinutesMonth: monthMinutes,
-      activeMinutesToday: live?.activeMinutesToday ?? 0,
+      activeMinutesToday: live?.activeMinutesToday ?? null,
       wakesMonth: live?.wakesMonth ?? 0,
       usageUpdatedAt: live?.updatedAt ?? null,
       costTodayEur: Number(todayCost.toFixed(4)),
@@ -527,6 +642,13 @@ function normalize(raw, usage, sourcePath, at) {
   const projectedMonthCostEur = spentMonthCostEur / elapsedDays * dim;
   const dailyBurnEur = projectedMonthCostEur / dim;
   const cloudCredits = monthlyCreditBalances(raw.cloud_credits, spentMonthCostEur);
+  // A provider-reported balance is already net of usage. Never apply the
+  // estimate again, and never let a source label in YAML assert metering.
+  const balances = new Map(entries(usage?.cloudCredits).map(c => [text(c.id), nonNegativeNum(c.remainingEur)]));
+  for (const credit of cloudCredits) {
+    const balance = balances.get(credit.id);
+    if (balance != null) { credit.source = 'metered'; credit.remainingEur = balance; }
+  }
   const activeCredits = cloudCredits.filter(credit =>
     !credit.expires || Date.parse(credit.expires) >= at);
   const remainingCreditsEur = activeCredits.reduce((sum, credit) =>
@@ -566,10 +688,9 @@ function normalize(raw, usage, sourcePath, at) {
   };
   const deadLoadAnalysis = analyzeDeadLoad({
     vmUsage: computeVms,
-    activeTasks: journalNumber('activeTasks', 'active_tasks') ??
-      nonNegativeNum(raw.active_tasks) ?? 0,
-    claimedTasks: journalNumber('claimedTasks', 'claimed_tasks') ??
-      nonNegativeNum(raw.claimed_tasks) ?? 0,
+    activeSlots: journalNumber('activeSlots', 'active_slots'),
+    activeTasks: journalNumber('activeTasks', 'active_tasks') ?? nonNegativeNum(raw.active_tasks),
+    claimedTasks: journalNumber('claimedTasks', 'claimed_tasks') ?? nonNegativeNum(raw.claimed_tasks),
     idleMinutesSinceLastTask: journalNumber('idleMinutesSinceLastTask',
       'idle_minutes_since_last_task', 'idleMinutes') ?? 0,
     deadLoadThresholdMinutes: nonNegativeNum(raw.dead_load_threshold_minutes) ?? 20,
@@ -579,15 +700,29 @@ function normalize(raw, usage, sourcePath, at) {
 
   const dailyHistoryRaw = usage?.dailySpendEur ?? usage?.daily_history ??
     raw.spend_daily_eur ?? raw.daily_history ?? [];
-  const spendDynamics = buildSpendDynamics({
-    dailyHistory: Array.isArray(dailyHistoryRaw) ? dailyHistoryRaw : [],
-    todayEur: spentTodayCostEur,
+  const hourlyHistory = Array.isArray(usage?.hourlySpendEur) ? usage.hourlySpendEur : [];
+  const snapshots = Array.isArray(usage?.snapshots) ? usage.snapshots : [];
+  const { spike, ...dynamics } = spendSeries([...hourlyHistory, ...snapshots, ...history],
+    Array.isArray(dailyHistoryRaw) ? dailyHistoryRaw : [],
+    nonNegativeNum(usage?.spentTodayCostEur) ?? (observedTodaySpend ? spentTodayCostEur : null), at);
+  const today = utcDay(at);
+  const todayEur = dynamics.series.find(p => p.date === today)?.eur ?? spentTodayCostEur;
+  const spendDynamics = { ...dynamics, ...buildSpendDynamics({
+    dailyHistory: dynamics.series.filter(p => p.date !== today && p.date.startsWith(today.slice(0, 7))),
+    todayEur,
     monthlyTargetEur: monthlyBudgetEur ?? 25,
     dayOfMonth: elapsedDays,
     daysInMonth: dim,
     spentMonthCostEur,
     projectedMonthCostEur,
-  });
+  }) };
+  const deadLoads = [...deadLoadAnalysis.alerts];
+  if (spike) {
+    const alert = { severity: 'bad', code: 'spend_spike', resourceId: 'daily_spend',
+      message: `Daily spend exceeds twice the trailing 7-day baseline (€${dynamics.baseline7dEur})` };
+    deadLoads.push(alert);
+    alerts.push(alert);
+  }
 
   const workspaceLinks = flattenWorkspace(raw.workspace_links, alerts);
   const totals = {
@@ -598,7 +733,7 @@ function normalize(raw, usage, sourcePath, at) {
     runningMinutesMonth,
     runningHoursToday: Number((runningMinutesToday / 60).toFixed(2)),
     runningHoursMonth: Number((runningMinutesMonth / 60).toFixed(2)),
-    spentTodayCostEur: Number(spentTodayCostEur.toFixed(4)),
+    spentTodayCostEur: round4(todayEur),
     spentMonthCostEur: Number(spentMonthCostEur.toFixed(4)),
     estimatedMonthCostEur: Number(spentMonthCostEur.toFixed(4)),
     projectedMonthCostEur: round2(projectedMonthCostEur),
@@ -623,23 +758,24 @@ function normalize(raw, usage, sourcePath, at) {
     estimatedMonthCostEur: totals.estimatedMonthCostEur,
     creditRunway,
     spendDynamics,
+    deadLoads,
     deadLoad,
     alerts: alerts.map(alert => ({ ...alert, message: clean(alert.message) })),
   };
 }
 
-export function createFinopsProvider({ budgetPath, workerUsagePath, workerStatePath, now } = {}) {
+export function createFinopsProvider({ budgetPath, workerUsagePath, workerStatePath, historyPath, now } = {}) {
   return async () => {
     try {
       const at = nowMs(now);
       const resolved = await resolveBudgetPath(budgetPath);
       const usagePath = workerUsagePath ??
         join(stateHome(), 'darkfactory', 'cloud-worker-usage.json');
-      const [raw, usageJournal, stateJournal] = await Promise.all([
+      const [raw, usageJournal, stateJournal, history] = await Promise.all([
         readYamlFile(resolved), readWorkerUsage(usagePath),
-        readWorkerUsage(workerStatePath)]);
+        readWorkerUsage(workerStatePath), readHistory(historyPath ?? join(dirname(usagePath), 'finops-history.ndjson'))]);
       const usage = mergeUsageJournals(stateJournal, usageJournal);
-      return normalize(raw, usage, resolved, at);
+      return normalize(raw, usage, resolved, at, history);
     } catch (error) {
       return { ok: false, error: clean(error?.message ?? error ?? 'finops read failed') };
     }

@@ -2,6 +2,7 @@ import { execFile, spawn as nodeSpawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile as readFileDefault } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
+import { workerSpace } from './herdr-spaces.mjs';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -20,6 +21,8 @@ export const EXECUTOR_COMMANDS = Object.freeze({
   pi: 'pi',
   'acp-antigravity-acp': 'agy',
   agy: 'agy',
+  'acp-zcode-start': 'zcode',
+  zcode: 'zcode',
 });
 
 function fail(code) { throw new Error(code); }
@@ -63,6 +66,8 @@ function validatePermissionMode(permissionMode) {
 
 function permissionArguments(spec, permissionMode) {
   const mode = validatePermissionMode(permissionMode);
+  // ZCode's headless default is yolo; do not grant it without an explicit full mode.
+  if (spec.command === 'zcode') return ['--mode', mode === 'full' ? 'yolo' : mode === 'accept-edits' ? 'edit' : 'guarded'];
   if (mode === undefined) return [];
   if (spec.command === 'devin') {
     return ['--permission-mode', mode === 'full' ? 'dangerous' : 'accept-edits',
@@ -81,50 +86,71 @@ function promptArguments(spec, { prompt, promptFile } = {}) {
   if (spec.command === 'devin' && promptFile !== undefined) {
     return ['--prompt-file', text(promptFile, 'prompt_file_invalid')];
   }
+  if (spec.command === 'zcode') return [text(prompt, 'worker_prompt_invalid')];
   return ['--', text(prompt, 'worker_prompt_invalid')];
 }
 
 function effortArguments(spec) {
   if (spec.command === 'pi' && spec.effort !== undefined) return ['--thinking', spec.effort];
-  if (spec.command === 'agy' && spec.effort !== undefined) return ['--effort', spec.effort];
+  if ((spec.command === 'agy' || spec.command === 'zcode') && spec.effort !== undefined) return ['--effort', spec.effort];
   return [];
 }
 
-export function buildExecutorCommand(executor, { prompt, promptFile, permissionMode,
-  interactive = true, followUp = false } = {}) {
-  const spec = normalizeExecutor(executor);
-  const argv = ['--model', spec.model, ...effortArguments(spec),
-    ...permissionArguments(spec, permissionMode)];
-  if (interactive) {
-    if (spec.command === 'agy') argv.push('--prompt-interactive');
-  } else {
-    if (followUp) argv.push('--continue');
-    argv.push('--print');
+const ZCODE_MODELS = new Map([['glm-5.3-flash', 'GLM-5.3-Flash'], ['glm-5.3', 'GLM-5.3']]);
+const ZCODE_ACCOUNTS = new Set(['account:zai-start-plan', 'account:zai-individual-coding-plan']);
+
+function zcodeModel(spec) {
+  const slash = spec.model.indexOf('/');
+  if (slash < 0) {
+    const id = ZCODE_MODELS.get(spec.model.toLowerCase());
+    if (!id) fail('executor_model_invalid');
+    const account = spec.provider === 'acp-zcode-start' ? 'account:zai-start-plan' : 'account:zai-individual-coding-plan';
+    return `${account}/${id}`;
   }
-  argv.push(...promptArguments(spec, { prompt, promptFile }));
-  return Object.freeze({ command: spec.command, argv: Object.freeze(argv), executor: spec });
+  const account = spec.model.slice(0, slash).toLowerCase();
+  const id = ZCODE_MODELS.get(spec.model.slice(slash + 1).toLowerCase());
+  if (!ZCODE_ACCOUNTS.has(account) || !id) fail('executor_model_invalid');
+  return `${account}/${id}`;
 }
 
-export function buildResumeCommand(executor, { sessionId, prompt, promptFile, permissionMode,
-  interactive = true } = {}) {
-  const spec = normalizeExecutor(executor);
-  const argv = ['--model', spec.model, ...effortArguments(spec),
-    ...permissionArguments(spec, permissionMode)];
-  if (spec.command === 'devin') {
-    if (sessionId !== undefined) argv.push('-r', token(sessionId, 'session_id_invalid'));
-  } else if (spec.command === 'pi') {
-    argv.push('--continue');
-  } else if (spec.command === 'agy') {
-    if (sessionId === undefined) argv.push('--continue');
-    else argv.push('--resume', token(sessionId, 'session_id_invalid'));
-  }
-  if (interactive) {
-    if (spec.command === 'agy') argv.push('--prompt-interactive');
+function buildCommand(spec, { prompt, promptFile, permissionMode, interactive = true }, continuation) {
+  let model = spec.model;
+  if (spec.command === 'zcode') model = zcodeModel(spec);
+  const argv = ['--model', model, ...effortArguments(spec), ...permissionArguments(spec, permissionMode), ...continuation];
+  const args = promptArguments(spec, { prompt, promptFile });
+  let initialInput;
+  if (spec.command === 'zcode') {
+    // Positional text is a TUI subcommand. Herdr delivers the initial turn to the launched PTY instead.
+    if (interactive) initialInput = args[0];
+    else if (args[0].startsWith('-')) argv.push(`-p${args[0]}`);
+    else argv.push('-p', ...args);
   } else {
-    argv.push('--print');
+    if (!interactive) argv.push('--print');
+    else if (spec.command === 'agy') argv.push('--prompt-interactive');
+    argv.push(...args);
   }
-  argv.push(...promptArguments(spec, { prompt, promptFile }));
-  return Object.freeze({ command: spec.command, argv: Object.freeze(argv), executor: spec });
+  return Object.freeze({ command: spec.command, argv: Object.freeze(argv), executor: spec,
+    ...(initialInput === undefined ? {} : { initialInput }) });
+}
+
+export function buildExecutorCommand(executor, options = {}) {
+  const spec = normalizeExecutor(executor);
+  const followUp = options.interactive === false && options.followUp;
+  return buildCommand(spec, options, followUp ? [spec.command === 'zcode' ? '-c' : '--continue'] : []);
+}
+
+export function buildResumeCommand(executor, options = {}) {
+  const spec = normalizeExecutor(executor);
+  const { sessionId } = options;
+  const continuation = [];
+  if (spec.command === 'devin') {
+    if (sessionId !== undefined) continuation.push('-r', token(sessionId, 'session_id_invalid'));
+  } else if (spec.command === 'pi') continuation.push('--continue');
+  else if (spec.command === 'agy' || spec.command === 'zcode') {
+    if (sessionId === undefined) continuation.push(spec.command === 'zcode' ? '-c' : '--continue');
+    else continuation.push('--resume', token(sessionId, 'session_id_invalid'));
+  }
+  return buildCommand(spec, options, continuation);
 }
 
 export function buildFollowUpMessage({ taskId, attemptId, message }) {
@@ -207,6 +233,17 @@ function terminalExitCode(terminal) {
   return Number.isSafeInteger(terminal?.exit_code) ? terminal.exit_code : undefined;
 }
 
+const WORKER_COMMANDS = new Set(Object.values(EXECUTOR_COMMANDS));
+const SHELL_NAMES = new Set(['bash', 'sh', 'zsh']);
+const SHELL_COMMANDS = new Set([...SHELL_NAMES].flatMap(name => [name, `/bin/${name}`, `/usr/bin/${name}`]));
+function isRespawnedWorkerShell(terminal) {
+  const foreground = terminal?.foreground;
+  return terminal?.state === 'live' && WORKER_COMMANDS.has(terminal.labels?.['darkfactory.executor']) &&
+    Array.isArray(terminal.argv) && terminal.argv.length === 1 && SHELL_COMMANDS.has(terminal.argv[0]) &&
+    (foreground == null || (typeof foreground === 'object' && !Array.isArray(foreground) &&
+      (foreground.name == null || SHELL_NAMES.has(foreground.name))));
+}
+
 function hcState(terminal) {
   if (terminal?.state === 'finished' || terminal?.finished_ms !== null && terminal?.finished_ms !== undefined ||
       terminal?.exit_code !== null && terminal?.exit_code !== undefined || terminal?.reason === 'killed') {
@@ -244,7 +281,7 @@ function validateRuntimeId(runtimeId) {
 }
 
 export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.env,
-  spawn: spawnProcess = nodeSpawn, readFile = readFileDefault } = {}) {
+  spawn: spawnProcess = nodeSpawn, readFile = readFileDefault, project, docsPath } = {}) {
   if (!['hc', 'subproc'].includes(kind)) fail('worker_runtime_kind_invalid');
   if (typeof exec !== 'function') fail('worker_runtime_exec_invalid');
   if (typeof spawnProcess !== 'function') fail('worker_runtime_spawn_invalid');
@@ -302,14 +339,44 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     const launched = await hc(argv, { timeout: 30_000 });
     const terminalId = launched?.address;
     if (typeof terminalId !== 'string' || !terminalId) fail('hc_spawn_unattested');
+    if (built.initialInput !== undefined) {
+      try {
+        const info = await hc(['get', '--json', '--', terminalId]);
+        if (info?.state !== 'live' || hcState(info) === 'exited' || info.argv?.[0] !== built.command ||
+            info.labels?.['darkfactory.attempt'] !== input.attemptId || info.labels?.['darkfactory.executor'] !== built.command) {
+          fail('hc_prompt_target_mismatch');
+        }
+        await feedbackHc(terminalId, built.initialInput);
+      } catch (error) {
+        // Release the launched address without replacing the original delivery error.
+        try { await stopHc(terminalId); } catch { /* best effort */ }
+        try { await hc(['rm', '--json', '--', terminalId], { timeout: 15_000 }); } catch { /* best effort */ }
+        throw error;
+      }
+    }
     return Object.freeze({ runtimeId, transport: 'hc', terminalId,
       ...(Number.isSafeInteger(launched.pid) ? { pid: launched.pid } : {}) });
+  }
+
+  async function bindSpace(input) {
+    // Preserve the raw argv adapter for callers supplying BOTH their own I/O
+    // ports (no host project). Replacing only the command runner, e.g. for
+    // tracing, must not turn off host space validation.
+    const encoded = env.DF_HERDR_PROJECT;
+    if (encoded === undefined && project === undefined && docsPath === undefined &&
+        exec !== execFileAsync && readFile !== readFileDefault && input.spaceLabel !== undefined) return input;
+    let owner = project;
+    if (encoded !== undefined && owner === undefined) {
+      try { owner = JSON.parse(encoded); } catch { fail('herdr_space_mismatch'); }
+      if (!owner || typeof owner !== 'object') fail('herdr_space_mismatch');
+    }
+    return { ...input, spaceLabel: await workerSpace(input, { project: owner, docsPath }) };
   }
 
   async function spawnHc(input, prompt) {
     const built = buildExecutorCommand(input.executor, { prompt, promptFile: input.promptFile,
       permissionMode: input.permissionMode, interactive: true });
-    return runHc(input, built);
+    return runHc(await bindSpace(input), built);
   }
 
   function pruneTerminalSessions(protectRuntimeId) {
@@ -390,30 +457,42 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     return kind === 'hc' ? spawnHc(input, prompt) : spawnSubproc(input, prompt);
   }
 
-  function hcProbeNotFound(error) {
-    const detail = `${error?.stderr ?? ''}\n${error?.stdout ?? ''}\n${error?.message ?? ''}`;
-    return detail.includes('"not_found"') || detail.includes('no terminal');
+  function hcProbeNotFound(error, runtimeId) {
+    if (error?.killed || error?.signal || typeof error?.code === 'string') return false;
+    // An exec timeout or a message like "no terminal response from daemon"
+    // isn't proof that the addressed PTY is gone. Match hc's diagnostic, not
+    // the echoed command line in execFile's error message.
+    return [error?.stderr, error?.stdout, error?.message].some(detail => {
+      const line = String(detail ?? '').trim().replace(/^(?:hc(?: get)?|error):\s*/i, '');
+      if (line === 'not_found' || line === 'no terminal' || line === `no terminal ${runtimeId}` ||
+          line === `no terminal ${JSON.stringify(runtimeId)}`) return true;
+      try {
+        const body = JSON.parse(line);
+        return body?.error?.kind === 'not_found' || body?.error === 'not_found' || body === 'not_found';
+      } catch {
+        return false;
+      }
+    });
   }
 
-  // Crash-resume под уже занятым именем: мёртвый терминал сначала убирается,
-  // иначе hc run создаст дубликат имени и observe/send/kill по имени станут
-  // неоднозначными. Живой терминал никогда не снимается — fail-closed, как
-  // worker_busy у subproc; неподтверждённый сбой probe пробрасывается, а не
-  // маскируется под чистое имя.
+  // Retire only an exited terminal or a confirmed replacement shell before reusing its name.
   async function removeCrashedHcTerminal(runtimeId) {
     let terminal;
     try {
       terminal = await hc(['get', '--json', '--', runtimeId]);
     } catch (error) {
-      if (hcProbeNotFound(error)) return;
+      if (hcProbeNotFound(error, runtimeId)) return;
       throw error;
     }
     if (terminal?.error?.kind === 'not_found') return;
-    if (hcState(terminal) !== 'exited') fail('worker_runtime_exists');
-    try {
-      await hc(['kill', '--json', '--', runtimeId], { timeout: 15_000 });
-    } catch { /* kill уже завершённого терминала идемпотентен — best-effort */ }
-    await hc(['rm', '--json', '--', runtimeId], { timeout: 15_000 });
+    const terminalId = terminal?.address ?? runtimeId;
+    if (hcState(terminal) !== 'exited') {
+      if (!isRespawnedWorkerShell(terminal)) fail('worker_runtime_exists');
+      await stopHc(terminalId);
+    } else {
+      try { await stopHc(terminalId); } catch { /* An exited terminal may already be stopped. */ }
+    }
+    await hc(['rm', '--json', '--', terminalId], { timeout: 15_000 });
   }
 
   async function resumeWorker(rawInput) {
@@ -423,8 +502,12 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
       promptFile: input.promptFile, permissionMode: input.permissionMode,
       interactive: kind === 'hc' });
     if (kind === 'hc') {
-      if (input.runtimeId !== undefined) await removeCrashedHcTerminal(input.runtimeId);
-      return runHc(input, built, { resumed: true });
+      const bound = await bindSpace(input);
+      if (input.runtimeId === undefined) return runHc(bound, built, { resumed: true });
+      await removeCrashedHcTerminal(input.runtimeId);
+      // Cleanup involves several hc round trips. Don't reuse an ID that lost
+      // its folder/name binding while waiting for the old terminal to retire.
+      return runHc(await bindSpace(bound), built, { resumed: true });
     }
     const runtimeId = input.runtimeId ?? freshRuntimeId('subproc');
     return startSubprocSession(input, built, runtimeId, { replaceTerminal: true });
@@ -457,7 +540,20 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
   }
 
   async function observeHc(runtimeId) {
-    const terminal = await hc(['get', '--json', '--', runtimeId]);
+    let terminal;
+    try {
+      terminal = await hc(['get', '--json', '--', runtimeId]);
+    } catch (error) {
+      if (!hcProbeNotFound(error, runtimeId)) throw error;
+      // hc is reachable, but the persisted worker no longer has a PTY.
+      return Object.freeze({ state: 'exited', exitCode: 137, missing: true });
+    }
+    const state = hcState(terminal);
+    if (state !== 'exited' && isRespawnedWorkerShell(terminal)) {
+      // The worker is already gone even if the replacement shell races cleanup.
+      try { await stopHc(terminal.address ?? runtimeId); } catch { /* best effort */ }
+      return Object.freeze({ state: 'exited', exitCode: 137, missing: true, respawnedShell: true });
+    }
     let read = null;
     try {
       read = await hc(['read', '--json', '--lines', '40', '--', runtimeId]);
@@ -466,7 +562,7 @@ export function createWorkerRuntime({ kind, exec = execFileAsync, env = process.
     }
     const exitCode = terminalExitCode(terminal);
     const tail = typeof read?.text === 'string' ? read.text.slice(-TAIL_LIMIT) : undefined;
-    return Object.freeze({ state: hcState(terminal),
+    return Object.freeze({ state,
       ...(Number.isSafeInteger(terminal?.turn) ? { turn: terminal.turn } : {}),
       ...(exitCode === undefined ? {} : { exitCode }),
       ...(tail === undefined || tail === '' ? {} : { tail }) });

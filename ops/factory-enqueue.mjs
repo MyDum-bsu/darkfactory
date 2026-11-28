@@ -9,14 +9,12 @@
 //     --repo-id R --profile P --finish verified|deployed \
 //     (--spec-digest HEX64 | --brief FILE) \
 //     (--policy-digest HEX64 | --policy FILE) \
-//     [--label k=v ...] [--ticket ID] [--worktree DIR] [--memory-dir DIR] \
+//     [--field-mode MODE] [--task-plan PLAN] \
+//     [--label k=v ...] [--ticket ID] [--supersedes TASK | --allow-duplicate-ticket]
+//     [--worktree DIR] [--memory-dir DIR] \
 //     [--ledger-path FILE] [--vb PATH] [--dry-run] [--json]
 //
-// --policy FILE: дайджест считается так же, как контроллер закрепляет
-// входы при приёмке — sha256 JSON-массива sha256-хэшей файлов маршрута
-// [policyFile, brief, reviewPrompt, reviewGate, routes.json, ...skillPaths]
-// (board_pipeline/run-isolated.mjs readOperatorInputs); иначе метка
-// policy_digest не сойдётся с отпечатком и seal вернёт policy_digest_drift.
+// --policy FILE uses the controller's canonical rule digest (not its slot-specific WAL pin).
 import { isUtf8 } from 'node:buffer';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -24,7 +22,9 @@ import { lstat, readFile, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, normalize, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
+import { canonicalPolicyDigest, policySkillPaths } from '../board_pipeline/config-compiler.mjs';
 import { operatorReviewSetup } from '../board_pipeline/review-setup.mjs';
+import { normalizeFieldMode, normalizeTaskPlan } from '../board_pipeline/field-mode.mjs';
 import { resolveL1Profile } from '../board_pipeline/l1-profiles.mjs';
 import { assertNoBranchDrift } from '../board_pipeline/branch-drift.mjs';
 import { parseAllowedPaths } from '../board_pipeline/scope-fence.mjs';
@@ -59,7 +59,7 @@ function validateAllowedPathsLabel(value) {
 // не переопределяет (иначе в Board уйдёт путь без проверки).
 const RESERVED_LABELS = new Set(
   ['spec_digest', 'policy_digest', 'repo_id', 'profile_id', 'finish',
-    'memory_dir', 'ledger_path', 'worktree', 'ticket', 'l1_profile']);
+    'memory_dir', 'ledger_path', 'worktree', 'ticket', 'supersedes', 'l1_profile']);
 
 function fail(code) { throw new Error(code); }
 
@@ -129,9 +129,6 @@ async function canonicalInput(path,
   return real;
 }
 
-const sha256File = async path =>
-  createHash('sha256').update(await readFile(path)).digest('hex');
-
 // sha256 utf8-текста спеки — тот же отпечаток, что контроллер сверяет с
 // текстом карточки (sha256Utf8(specText) в run-isolated.mjs): при совпадении
 // текст спеки включается в промпт воркера как проверенный блок.
@@ -165,7 +162,7 @@ const policyStoragePath = (cfg, keys) => {
 // Каждый вложенный вход проходит ту же проверку, что и --brief/--policy:
 // не симлинк и строго вне worktree — контроллер отклонил бы такую политику
 // ('Operator files must be outside worker paths'), карточка не создаётся.
-async function pinnedPolicyDigest(file, policy, { worktrees = [], separate = [] } = {}) {
+async function pinnedPolicyDigest(policy, { worktrees = [], separate = [] } = {}) {
   const reviewSetup = await operatorReviewSetup(policy);
   const check = async p => {
     const real = await canonicalInput(p, { worktrees, mustBe: 'file' });
@@ -178,22 +175,20 @@ async function pinnedPolicyDigest(file, policy, { worktrees = [], separate = [] 
   // Исходные пути навыков проверяются до realpath, который заранее делает
   // operatorReviewSetup: иначе wt/link/skill.md проходит через симлинк
   // воркера. Resolved путь обязан совпасть с привязкой допуска.
-  const skillFiles = await Promise.all(reviewSetup.skills.map(async (skill, i) => {
-    const real = await check(policy.reviewSkillFiles?.[skill]);
-    if (real !== reviewSetup.skillPaths[i]) fail('review_skill_path_mismatch');
-    return real;
-  }));
+  for (const [i, skill] of reviewSetup.skills.entries()) {
+    if (await check(policy.reviewSkillFiles?.[skill]) !== reviewSetup.skillPaths[i]) fail('review_skill_path_mismatch');
+  }
   // Все привязки reviewSkillFiles — операторские файлы контроллера
   // (factory-run проверяет каждое значение, не только выбранные критиком
   // reviewSetup.skills): невыбранная привязка внутри worktree/handoffDir
-  // — отказ до создания карточки, но в состав дайджеста она не входит.
+  // — отказ до создания карточки.
   for (const p of Object.values(policy.reviewSkillFiles ?? {})) {
     if (p !== undefined) await check(p);
   }
-  const files = [file, await check(policy.brief), await check(policy.reviewPrompt),
-    gate, await check(join(dirname(gate), 'routes.json')), ...skillFiles];
-  const hashes = await Promise.all(files.map(sha256File));
-  const computed = createHash('sha256').update(JSON.stringify(hashes)).digest('hex');
+  const files = [await check(policy.brief), await check(policy.reviewPrompt), gate,
+    await check(join(dirname(gate), 'routes.json')), ...policySkillPaths(policy, reviewSetup)];
+  const [brief, reviewPrompt, reviewGate, routes, ...skills] = await Promise.all(files.map(path => readFile(path)));
+  const computed = canonicalPolicyDigest({ policy, reviewSetup, brief, reviewPrompt, reviewGate, routes: JSON.parse(routes), skills });
   // Семантика контроллера (p.policyDigest ?? route.policyDigest): null —
   // вычисленный отпечаток; ненулевое закреплённое значение обязано быть
   // строкой из 64 hex (массив/число проходили бы test за счёт приведения).
@@ -386,7 +381,7 @@ export async function buildEnqueuePlan(values, deps = {}) {
 
   let policyDigest = values['policy-digest'];
   if (values.policy !== undefined) {
-    const pinned = await pinnedPolicyDigest(policyFile, policyJson,
+    const pinned = await pinnedPolicyDigest(policyJson,
       { worktrees, separate: handoff === undefined ? [] : [handoff] });
     // Явный --policy-digest обязан совпадать с вычисленным/закреплённым
     // значением — иначе в Board ушла бы метка, не сходящаяся с приёмкой.
@@ -423,6 +418,10 @@ export async function buildEnqueuePlan(values, deps = {}) {
   if (values.ticket !== undefined) {
     if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(values.ticket)) fail('ticket_invalid');
     extra.ticket = values.ticket;
+  }
+  if (values.supersedes !== undefined) {
+    if (typeof values.supersedes !== 'string' || !/^[1-9]\d*$/.test(values.supersedes)) fail('supersedes_invalid');
+    extra.supersedes = values.supersedes;
   }
   if (worktrees.length) extra.worktree = worktrees[0];
 
@@ -472,6 +471,11 @@ export async function buildEnqueuePlan(values, deps = {}) {
   if (values['l1-profile'] !== undefined || policyProfileL1 !== undefined) {
     labels.l1_profile = l1Profile;
   }
+  const fieldLabels = { field_mode: normalizeFieldMode, task_plan: normalizeTaskPlan };
+  for (const [key, normalize] of Object.entries(fieldLabels)) {
+    const value = values[key.replace('_', '-')];
+    if (value != null) labels[key] = normalize(value);
+  }
   for (const item of values.label ?? []) {
     const i = item.indexOf('=');
     // Метка обязана быть в синтаксисе k=v: без разделителя значение не
@@ -491,7 +495,12 @@ export async function buildEnqueuePlan(values, deps = {}) {
     // allowed_paths — scope fence воркера: malformed-пути отклоняются
     // здесь, а не поздно на verify/seal.
     if (key === 'allowed_paths') validateAllowedPathsLabel(value);
-    labels[key] = value;
+    if (Object.hasOwn(fieldLabels, key)) {
+      if (Object.hasOwn(labels, key)) fail(`${key}_duplicate`);
+      labels[key] = fieldLabels[key](value);
+    } else {
+      labels[key] = value;
+    }
   }
 
   // Реальный синтаксис vb: `vb --url URL tasks create CHANNEL TITLE --label k=v --json`.
@@ -506,11 +515,43 @@ export async function buildEnqueuePlan(values, deps = {}) {
     tool = await executableInput(values.vb,
       { worktrees, outside: handoff === undefined ? [] : [handoff] });
   }
-  return { tool, argv, labels,
+  const preflight = values.supersedes !== undefined
+    ? { cancel: ['--url', url, 'tasks', 'cancel', values.supersedes, 'superseded_by_requeue'] }
+    : values.ticket !== undefined && values['allow-duplicate-ticket'] !== true
+      ? { list: ['--url', url, 'tasks', values.channel, '--json'] } : null;
+  return { tool, argv, labels, ...(preflight && { preflight }),
     meta: { boardUrl: url, channel: values.channel, finish: values.finish, l1Profile,
       ...(driftAllowed ? { branchDrift: { ...drift, allowedByFlag: true } }
         : drift ? { branchDrift: { driftDetected: false, summary: drift.summary } }
         : {}) } };
+}
+
+const openStates = new Set(['ready', 'claimed', 'waiting', 'blocked']);
+const closedStates = new Set(['completed', 'canceled', 'failed', 'done']);
+async function guardDuplicateTicket(plan, exec) {
+  const cursors = new Set();
+  let argv = plan.preflight.list;
+  for (;;) {
+    const page = JSON.parse(await exec(plan.tool, argv));
+    const tasks = Array.isArray(page) ? page : page?.tasks;
+    if (!Array.isArray(tasks)) fail('ticket_listing_invalid');
+    for (const entry of tasks) {
+      const root = entry?.message ?? entry;
+      const state = root?.task?.state ?? root?.state;
+      if ((!openStates.has(state) && !closedStates.has(state)) || (root.labels != null &&
+          (typeof root.labels !== 'object' || Array.isArray(root.labels)))) fail('ticket_listing_invalid');
+      if (root.channel !== undefined && root.channel !== plan.meta.channel) continue;
+      if (root.labels?.ticket !== undefined && typeof root.labels.ticket !== 'string') fail('ticket_listing_invalid');
+      if (openStates.has(state) && root.labels?.ticket === plan.labels.ticket) {
+        fail(`duplicate_open_ticket:${plan.labels.ticket}`);
+      }
+    }
+    if (!tasks.length || page.cursor == null) return;
+    const cursor = String(page.cursor);
+    if (!cursor || cursors.has(cursor)) fail('ticket_listing_cursor_invalid');
+    cursors.add(cursor);
+    argv = [...plan.preflight.list, '--after', cursor];
+  }
 }
 
 export async function runEnqueue(argv, deps = {}) {
@@ -521,9 +562,11 @@ export async function runEnqueue(argv, deps = {}) {
     'spec-digest': { type: 'string' }, brief: { type: 'string' },
     'policy-digest': { type: 'string' }, policy: { type: 'string' },
     label: { type: 'string', multiple: true }, ticket: { type: 'string' },
+    supersedes: { type: 'string' }, 'allow-duplicate-ticket': { type: 'boolean' },
     worktree: { type: 'string' }, 'memory-dir': { type: 'string' },
     'ledger-path': { type: 'string' }, vb: { type: 'string' },
     'l1-profile': { type: 'string' },
+    'field-mode': { type: 'string', multiple: true }, 'task-plan': { type: 'string', multiple: true },
     touch: { type: 'string', multiple: true }, 'drift-base': { type: 'string' },
     'allow-drift': { type: 'boolean' }, 'check-drift': { type: 'boolean' },
     'dry-run': { type: 'boolean' }, json: { type: 'boolean' } } });
@@ -535,12 +578,18 @@ export async function runEnqueue(argv, deps = {}) {
   if (values.brief !== undefined && values.text !== undefined) {
     fail('brief_text_conflict: pass either --brief or --text, not both');
   }
+  for (const flag of ['field-mode', 'task-plan']) {
+    if (values[flag]?.length > 1) fail(`${flag}_duplicate`);
+    values[flag] = values[flag]?.[0];
+  }
   const plan = await buildEnqueuePlan(values, deps);
   if (values['dry-run']) {
     return { dryRun: true, plan };
   }
   const exec = deps.exec ?? (async (cmd, args) =>
     (await execFileAsync(cmd, args, { timeout: 60_000 })).stdout);
+  if (plan.preflight?.list) await guardDuplicateTicket(plan, exec);
+  if (plan.preflight?.cancel) await exec(plan.tool, plan.preflight.cancel);
   const stdout = await exec(plan.tool, plan.argv);
   return { dryRun: false, plan, stdout };
 }

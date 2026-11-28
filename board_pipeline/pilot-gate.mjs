@@ -1,6 +1,7 @@
 import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join } from 'node:path';
+import { checkChannel } from './board-stigmergy.mjs';
 
 const LOOPBACK_BOARD = /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/api\/board$/;
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
@@ -24,7 +25,9 @@ export function boardActivation(policy, { allowLive = false, pilotChannel } = {}
     if (live || channel !== 'pilot') throw new PilotDenied('pilot_route_not_allowed');
     return null;
   }
-  if (scope !== 'pilot' || !isId(pilotChannel) || channel !== pilotChannel || !isId(owner) ||
+  try { checkChannel(pilotChannel); }
+  catch (cause) { throw new PilotDenied('pilot_route_not_allowed', { cause }); }
+  if (scope !== 'pilot' || pilotChannel.length > 128 || channel !== pilotChannel || !isId(owner) ||
       !isId(label?.key) || label.key.startsWith('factory.') ||
       typeof label?.value !== 'string' || !label.value || label.value.length > 128 ||
       !isId(route?.repoId) || !isId(route?.checkProfile) ||

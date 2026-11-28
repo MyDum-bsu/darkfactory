@@ -1,0 +1,9 @@
+[Unit]
+Description=Observe Darkfactory daemon journals for incidents
+
+[Service]
+Type=oneshot
+NoNewPrivileges=true
+# Override DF_SENTINEL_STATE_DIR in a drop-in for a different daemon slot.
+Environment=DF_SENTINEL_STATE_DIR=%h/.local/state/darkfactory/daemon-state
+ExecStart=node "@REPO@/ops/df-sentinel.mjs" --observe --state-dir ${DF_SENTINEL_STATE_DIR} --cursor "@CURSOR@" --out "@OUT@"

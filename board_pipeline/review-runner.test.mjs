@@ -8,11 +8,12 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 import {
-  executorFamily, assertCrossFamily, parseReviewTranscript, parseReviewVerdict,
+  executorFamily, fusionModelMeta, assertCrossFamily, parseReviewTranscript, parseReviewVerdict,
   hasValidFinding, isolatedArbiterRunner, isolatedPiReviewRunner, runInReadOnlySandbox, snapshotDigest,
   worktreeFingerprint, assertToolsAllowed, ReviewDenied, REVIEW_IMAGE, l2CriticSpec,
   runnerReviewSpec,
 } from './review-runner.mjs';
+import { assertTriadIndependent } from './worker-selector.mjs';
 import { isNeonReview } from './review-policy.mjs';
 import { buildSubject, subjectDigest } from './subject.mjs';
 import { acceptHeld } from './acceptance.mjs';
@@ -43,6 +44,12 @@ test('family: строгая таблица provider/model без подстро
   }
   assert.equal(executorFamily({ provider: 'acp-zcode-start',
     model: 'builtin:zai-start-plan\\GLM-5.3-Flash' }), 'glm');
+  for (const provider of ['acp-zcode-start', 'zcode']) {
+    for (const model of ['account:zai-start-plan/GLM-5.3-Flash', 'account:zai-start-plan/GLM-5.3',
+      'account:zai-individual-coding-plan/GLM-5.3-Flash', 'account:zai-individual-coding-plan/GLM-5.3']) {
+      assert.equal(executorFamily({ provider, model }), 'glm');
+    }
+  }
   assert.equal(executorFamily('opencode-go/deepseek-v4'), 'deepseek');
   assert.equal(executorFamily('openai/gpt-6.2-sol'), 'openai');
   assert.equal(executorFamily({ provider: 'openai', model: 'gpt-6.2-astra' }), 'openai');
@@ -77,6 +84,36 @@ test('family: противоречивая пара provider/model и подст
     (e) => e.reason === 'review_unknown_family');
 });
 
+test('Devin Fusion: only enrolled ids attest the lead; independence includes the sidekick', () => {
+  const neon = 'google/gemini-4-neon';
+  for (const lead of ['gpt-6-2-astra-high', 'gpt-6-2-astra-medium', 'gpt-6-2-sol-high', 'gpt-6-2-sol-medium',
+    'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-sonnet-5-5-high']) {
+    const family = lead.startsWith('gpt') ? 'openai' : 'anthropic';
+    for (const sidekick of ['swe-2-medium', 'swe-2-1-medium']) {
+      const model = `fusion-${lead}-sidekick-${sidekick}`;
+      const spec = `acp-devin/${model}`;
+      assert.deepEqual(fusionModelMeta(model), { isFusion: true, leadFamily: family, sidekickFamily: 'cognition' });
+      assert.equal(executorFamily({ harness: 'devin', model }), family);
+      assert.deepEqual(assertCrossFamily(spec, neon), { executor: family, critic: 'google' });
+      const triad = { executor: spec, critic: neon, arbiter: 'deepseek/deepseek-v4' };
+      assert.deepEqual(assertTriadIndependent(triad), { executor: family, critic: 'google', arbiter: 'deepseek' });
+      const sameLead = family === 'openai' ? CRITIC : 'agy/claude-opus-5.5';
+      assert.throws(() => assertTriadIndependent({ ...triad, critic: sameLead }), /review_same_family/);
+      assert.throws(() => assertTriadIndependent({ ...triad, arbiter: sameLead }), /arbiter_family_not_independent/);
+      for (const collision of ['cognition/swe-2-high', sameLead]) {
+        assert.throws(() => assertCrossFamily(spec, collision), /review_same_family/);
+        assert.throws(() => assertCrossFamily(collision, spec), /review_same_family/);
+      }
+      assert.equal(executorFamily(`openai/${model}`), null);
+      assert.equal(executorFamily(`pi/acp-devin/${model}`), null);
+    }
+  }
+  for (const model of [null, '', 'fusion-gpt-unknown-sidekick-swe-2-medium', 'fusion-claude-opus-5-5-high-sidekick-swe-2-max']) {
+    assert.equal(fusionModelMeta(model), null);
+    assert.throws(() => assertCrossFamily({ provider: 'acp-devin', model }, neon), /review_unknown_family/);
+  }
+});
+
 test('family: кросс-семейственный инвариант', () => {
   const neon = { provider: 'google', model: 'gemini-4-neon' };
   for (const model of ['swe-2-1-medium', 'swe-2-1-high', 'swe-2-1-max']) {
@@ -88,6 +125,9 @@ test('family: кросс-семейственный инвариант', () => {
       'opencode-go/deepseek-v4', 'acp-antigravity-acp/gemini-4-neon']) {
     assert.deepEqual(assertCrossFamily(executor, CRITIC).critic, 'openai');
   }
+  assert.deepEqual(assertCrossFamily({ provider: 'acp-zcode-start',
+    model: 'account:zai-start-plan/GLM-5.3-Flash' }, neon),
+    { executor: 'glm', critic: 'google' });
   // Только провайдер без модели — семейство не аттестовано.
   assert.throws(() => assertCrossFamily({ provider: 'acp-devin' }, CRITIC),
     (e) => e.reason === 'review_unknown_family');

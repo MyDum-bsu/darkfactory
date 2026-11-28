@@ -15,6 +15,10 @@ import { assertTriadIndependent, opencodeGoPolicyViolation,
   retiredProviderViolation, workerFamily } from './worker-selector.mjs';
 import { isValidL1Profile } from './l1-profiles.mjs';
 import { isWorkerThreadId } from './worker-runtime.mjs';
+import { resolveFieldPolicy } from './field-mode.mjs';
+import { DEFAULT_PROFILE_RELPATH, parseProjectProfileBytes } from './taste-profile.mjs';
+import { compareAgainstBaseline, extractFailedTests } from './baseline-cache.mjs';
+import { analyzeBlastRadius } from './blast-radius.mjs';
 import { validateSubmissionNotes } from './scope-fence.mjs';
 
 const HANDOFF_KEYS = [
@@ -60,6 +64,8 @@ const ATTEMPT_OPTIONAL = [
   'category',
   'labels',
   'allowed_paths',
+  'field_mode',
+  'task_plan',
 ];
 const CONTRACT_REQUIRED = ['repo_id', 'spec_digest', 'policy_digest'];
 const RELEASE_TARGET_KEYS = ['finish', 'target_id', 'release_channel', 'previous_live_digest'];
@@ -79,6 +85,30 @@ const REVIEW_BLOCKED = 'REVIEW_BLOCKED';
 const REVIEW_ESCALATE = 'REVIEW_ESCALATE';
 const FINISH = new Set(['verified', 'deployed']);
 const execGit = promisify(execFile);
+
+// Read bytes from the enrolled commit, never from the candidate checkout or a Git replacement ref.
+export async function baseFieldPolicy(binding) {
+  let baseProfile = null, baseProfileDigest = null;
+  const git = (...args) => execGit('git', ['--no-replace-objects', ...args], { cwd: binding.worktree,
+    encoding: 'buffer', maxBuffer: 256 * 1024, timeout: 10_000 });
+  try {
+    // An empty listing at a valid commit is absence; a bad ref or unreadable blob is not.
+    if (!SHA_RE.test(binding.base_sha)) throw new Error('invalid_base');
+    if ((await git('ls-tree', binding.base_sha, '--', DEFAULT_PROFILE_RELPATH)).stdout.length) {
+      const { stdout } = await git('show', `${binding.base_sha}:${DEFAULT_PROFILE_RELPATH}`);
+      baseProfile = parseProjectProfileBytes(stdout);
+      baseProfileDigest = createHash('sha256').update(stdout).digest('hex');
+    }
+  } catch (error) {
+    // Port-backed inspections may have no local checkout. They cannot grant fast-track.
+    const noCheckout = error.code === 'ENOENT' &&
+      await lstat(binding.worktree).then(() => false, err => err.code === 'ENOENT');
+    if (!noCheckout) throw new Error('project_profile_invalid', { cause: error });
+  }
+  const fieldPolicy = resolveFieldPolicy({ repoFieldMode: baseProfile?.fieldMode ?? 'brownfield',
+    cardFieldMode: binding.field_mode ?? null, taskPlan: binding.task_plan ?? baseProfile?.defaultPlan ?? null });
+  return { fieldPolicy, baseProfileDigest };
+}
 
 class Denied extends Error {
   constructor(reason) {
@@ -601,7 +631,7 @@ function compactEvidence(evidence, run) {
 
 // Один общий механизм Git-снимка, проверок и ревью для ручного v1 и для приёмки по аренде.
 // Возвращает verified | rework (исправимый дефект) | hold (среда/неизвестный эффект).
-async function runVerification({ binding, profile, ports, intent, step, beforeReview, onInspect, onSnapshot, subjectDigest, journal }) {
+async function runVerification({ binding, profile, ports, intent, step, beforeReview, onInspect, onSnapshot, subjectDigest, journal, basePinned = true }) {
   await intent('inspect');
   let ins;
   try {
@@ -621,6 +651,14 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     if (snapshotVerdict) return snapshotVerdict;
   }
 
+  let fieldPolicy, baseProfileDigest;
+  try {
+    ({ fieldPolicy, baseProfileDigest } = basePinned
+      ? await baseFieldPolicy(binding) : { fieldPolicy: resolveFieldPolicy() });
+  } catch (error) {
+    return { status: 'hold', reason: error.message };
+  }
+
   // Команды берутся из профиля, не из сдачи.
   await intent('local');
   let loc;
@@ -634,7 +672,20 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   if (loc.sha !== binding.candidate_sha) {
     return { status: 'hold', reason: `local_sha_mismatch:${loc.sha}` };
   }
-  if (loc.ok !== true) {
+  let ratchet;
+  if (loc.ok === false && !fieldPolicy.fastTrack && typeof ports.baseline === 'function') {
+    await intent('baseline');
+    try {
+      ratchet = compareAgainstBaseline(await ports.baseline(binding, profile),
+        { ok: false, failedTests: extractFailedTests(loc.output ?? '') }, { mode: 'ratchet' });
+    } catch (error) {
+      await step('baseline', false, messageOf(error));
+    }
+    if (ratchet) await step('baseline', ratchet.ok, ratchet);
+  }
+  if (ratchet?.status === 'preexisting_red' && ratchet.ok === true) {
+    loc = { ...loc, baseline_status: ratchet.status, preexisting_failures: ratchet.preexistingFailures };
+  } else if (loc.ok !== true) {
     return {
       status: 'rework',
       reason: 'local_checks_failed',
@@ -651,13 +702,13 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
   // подключённого порта — операционный стоп, а не молчаливый пропуск.
   // Красный гейт — исправимый дефект воркера, аренда остаётся живой.
   let tamper = null;
-  if (profile.tamper !== false) {
+  if (fieldPolicy.fastTrack || profile.tamper !== false) {
     if (typeof ports.tamper !== 'function') {
       return { status: 'hold', reason: 'tamper_port_missing' };
     }
     await intent('tamper');
     try {
-      tamper = await ports.tamper(binding, profile);
+      tamper = await ports.tamper(binding, fieldPolicy.fastTrack ? { ...profile, secretsOnly: true } : profile);
       await step('tamper', true, { ok: tamper?.ok === true, digest: tamper?.digest ?? null });
     } catch (e) {
       await step('tamper', false, messageOf(e));
@@ -738,6 +789,15 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
     visual = vis;
   }
 
+  if (fieldPolicy.fastTrack) {
+    const actual = { provider: 'policy', model: 'greenfield-fast-track', reasoningLevel: null };
+    const review = { verdict: REVIEW_OK, status: 'PASS', summary: 'greenfield-fast-track', findings: [],
+      checked_invariants: ['greenfield_fast_track', 'secrets_only_tamper'], checkpoint: baseProfileDigest ?? '00000000',
+      fast_track: true, field_mode: fieldPolicy.fieldMode, task_plan: fieldPolicy.taskPlan, grade_cap: fieldPolicy.gradeCap, actual };
+    await step('review', true, review);
+    return { status: 'verified', loc, review, actual, tamper, visual };
+  }
+
   // Policy-Driven Auto-Approve (#1745): доверенная approval-политика
   // применяется только после зелёной L1 и чистого Tamper Gate. Одобрение
   // allowlist-категории (docs/typo/deps) снимает L2-критика, но никогда не
@@ -807,10 +867,19 @@ async function runVerification({ binding, profile, ports, intent, step, beforeRe
       if (binaryDiff) {
         await step('review', true, { auto_approve: { approved: false, reason: 'binary_diff_disallowed' } });
       } else {
-        const decision = evaluateAutoApprove({ policy: loaded.policy, digest: loaded.digest,
+        let decision = evaluateAutoApprove({ policy: loaded.policy, digest: loaded.digest,
           category: binding.category, changedFiles, changedLines,
-          l1Passed: true, tamperPassed: tamper?.ok === true });
-        if (decision.approved === true) autoApprove = decision;
+          l1Passed: loc.ok === true, tamperPassed: tamper?.ok === true });
+        if (decision.approved) {
+          try {
+            if (analyzeBlastRadius({ repoRoot: binding.worktree, changedPaths: changedFiles }).riskLevel === 'high') {
+              decision = { approved: false, reason: 'auto_approve_high_blast_radius' };
+            }
+          } catch {
+            decision = { approved: false, reason: 'auto_approve_blast_radius_unavailable' };
+          }
+          if (decision.approved) autoApprove = decision;
+        }
         await step('review', true, { auto_approve: decision });
       }
     }
@@ -1069,7 +1138,9 @@ export async function accept({ handoff, policy, journal, ports }) {
   }
 
   const verdict = await runVerification({ binding: handoff, profile, ports, intent, step,
-    journal, subjectDigest: () => null });
+    journal, subjectDigest: () => null,
+    // A legacy handoff cannot grant itself fast-track by supplying its own base.
+    basePinned: profile.base === handoff.base_sha && profile.worktree === handoff.worktree });
   if (verdict.status !== 'verified') return block(verdict.reason, epoch);
   const { loc, review: rev, actual, tamper, visual } = verdict;
 
@@ -1111,7 +1182,7 @@ export async function accept({ handoff, policy, journal, ports }) {
 // recoverySeq — монотонный счётчик восстановления из доверенного состояния
 // контроллера (Spot preemption, F-02): 0 — первичный запуск, > 0 — повтор
 // прерванной проверки того же кандидата под свежим ключом журнала.
-export async function acceptHeld({ attempt, submission, policy, journal, ports, recoverySeq = 0 }) {
+export async function acceptHeld({ attempt, submission, policy, journal, ports, recoverySeq = 0, warningNotes = [] }) {
   const journalStat = await stat(journal).catch(() => null);
   if (!journalStat || !journalStat.isDirectory()) {
     throw new Denied('journal_not_directory');
@@ -1223,6 +1294,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports, 
     prior_findings: attempt.prior_findings ?? [],
     prior_sha: attempt.prior_sha,
     category: attempt.category,
+    field_mode: attempt.field_mode,
+    task_plan: attempt.task_plan,
     labels: attempt.labels,
   };
   // Ключ запуска включает контракт и требование L3: новый манифест или смена
@@ -1241,6 +1314,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports, 
       attempt.task_id, attempt.attempt_id, attempt.epoch, submission.candidate_sha,
       policy.version, attempt.has_ui ?? null, key ?? null,
       ...(unpinnedL1 === null ? [] : [unpinnedL1]),
+      ...(attempt.field_mode != null || attempt.task_plan != null
+        ? [{ field_mode: attempt.field_mode, task_plan: attempt.task_plan }] : []),
       ...(seq > 0 ? [seq] : []),
     ])).digest('hex').slice(0, 16));
   const id = journalKeyFor(recoverySeq);
@@ -1414,6 +1489,7 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports, 
         // попытки: посторонние находки воркера доходят до владельца, не нарушая
         // строгий конверт (P1-5).
         ...(validatedNotes !== undefined ? { notes: validatedNotes } : {}),
+        ...(warningNotes.length ? { warning_notes: warningNotes } : {}),
         ...((attempt.fallback_reason !== undefined || attempt.attempted_workers !== undefined)
           ? { worker_trail: { fallback_reason: attempt.fallback_reason ?? null,
               attempted_workers: attempt.attempted_workers ?? [] } }
@@ -1507,6 +1583,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports, 
         finish: attempt.finish,
         spec_digest: attempt.spec_digest,
         policy_digest: attempt.policy_digest,
+        field_mode: attempt.field_mode ?? undefined,
+        task_plan: attempt.task_plan ?? undefined,
       };
       // Закреплённая категория сверяется с живой меткой карточки: auto-approve
       // по allowlist не может завершить кандидата, если категория вышла из
@@ -1775,6 +1853,8 @@ export async function acceptHeld({ attempt, submission, policy, journal, ports, 
   // Полные квитанции L1-tamper и L3 остаются в локальном журнале, привязанные к
   // (task_id, epoch, attempt_id, subject_digest) этой же записью settle.
   const gateReceipts = {
+    ...(rev.fast_track && actual.provider === 'policy' ? { review: rev } : {}),
+    ...(loc.baseline_status ? { baseline_status: loc.baseline_status, preexisting_failures: loc.preexisting_failures } : {}),
     tamper: tamper ? { ok: tamper.ok === true, sha: tamper.sha, base_sha: tamper.base_sha,
       digest: tamper.digest, violations: tamper.violations ?? [] } : null,
     visual: visual.status === 'not_applicable' ? { status: 'not_applicable' } : visual,

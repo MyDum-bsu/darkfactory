@@ -179,7 +179,9 @@ export function planSlotAssignments({ slots, activeTasks, readyTasks } = {}) {
     const blockers = [];
     for (const other of [...activeNorm, ...assigned]) {
       if (other.repoId !== repoId) continue; // different repos never conflict
-      if (pathsOverlap(paths, other.paths)) blockers.push(other.taskId);
+      // A requeued card may carry new labels while an older writer is
+      // still reserved. Changed scope is not proof that writer stopped.
+      if (other.taskId === task.taskId || pathsOverlap(paths, other.paths)) blockers.push(other.taskId);
     }
     if (blockers.length > 0) {
       const conflictingTaskIds = [...new Set(blockers)].sort();

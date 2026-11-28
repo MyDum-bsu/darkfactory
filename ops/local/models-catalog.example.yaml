@@ -97,3 +97,13 @@ models:
     capabilities: [code, reasoning, review]
     quota_source: manual
     notes: Sol временно на паузе по квоте; автоматически возвращается после until.
+
+  - id: glm-5.3-flash
+    provider: zcode
+    model: GLM-5.3-Flash
+    family: glm
+    status: standby
+    cost_tier: subscription
+    capabilities: [code, reasoning, fast, review]
+    quota_source: manual
+    notes: "ZCode GLM-5.3-Flash (free weekend bonus tokens)"

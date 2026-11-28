@@ -1,0 +1,10 @@
+[Unit]
+Description=Scan for recent session transcripts every thirty minutes
+
+[Timer]
+OnCalendar=*:0/30
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

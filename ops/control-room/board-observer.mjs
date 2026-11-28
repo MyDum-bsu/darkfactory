@@ -1,3 +1,4 @@
+import { eventSnapshots, httpBoardFeed } from '../../board_pipeline/native-board.mjs';
 import { inspectWorktreesAndBranches } from '../../board_pipeline/branch-drift.mjs';
 import { sanitizeTerminalText } from './origin-guard.mjs';
 
@@ -68,7 +69,7 @@ export async function loadBoardTasksFromApi(boardUrl, { fetchImpl, token = null,
 // снапшоте как boardStatus. Ответ {"version":"0.54.0","sync":[]} без
 // задач — корректный пустой срез, а не сбой.
 export function createBoardObserver({ boardUrl, token = null,
-  channels = ['darkfactory'], fetchImpl, timeoutMs = 5000 } = {}) {
+  channels = ['darkfactory'], fetchImpl, timeoutMs = 5000, eventFeed } = {}) {
   const fetcher = fetchImpl ?? fetch;
   const channelList = (Array.isArray(channels) ? channels : [channels])
     .filter(c => typeof c === 'string' && c);
@@ -164,6 +165,8 @@ export function createBoardObserver({ boardUrl, token = null,
       labels,
       epoch: task.epoch ?? null,
       channel: message.channel ?? null,
+      ...(taskRepoId(task) ? { repoId: taskRepoId(task) } : {}),
+      ...(textValue(task.herdrSpaceId) ? { herdrSpaceId: textValue(task.herdrSpaceId) } : {}),
       ...(task.priority !== undefined || labels.priority !== undefined
         ? { priority: task.priority ?? labels.priority } : {}),
       ...(updatedAt !== undefined ? { updatedAt } : {}),
@@ -175,12 +178,18 @@ export function createBoardObserver({ boardUrl, token = null,
     };
   };
 
+  // The same GET-only, non-redirecting credential is used for the Board
+  // event feed. Each channel has its own checkpoint; pagination cursors are
+  // local to readChannel. A one-shot snapshot never leaves a watcher behind.
+  const feed = eventFeed ?? httpBoardFeed({ base, headers, fetchImpl: fetcher });
+  const views = new Map(channelList.map(ch => [ch, eventSnapshots(feed, ch)]));
+
   // Явный результат чтения: { ok, tasks, status, code, error }.
   const fetchTasks = async () => {
     const found = new Map();
     let failure = null;
     for (const channel of channelList) {
-      const outcome = await readChannel(channel);
+      const outcome = await views.get(channel).read(() => readChannel(channel), page => page.ok);
       if (!outcome.ok) {
         failure ??= { ...outcome, channel };
         continue;
@@ -204,6 +213,7 @@ export function createBoardObserver({ boardUrl, token = null,
   // История вызовов: наблюдённые задачи (совместимость с провайдером).
   const observer = async () => (await fetchTasks()).tasks;
   observer.fetchTasks = fetchTasks;
+  observer.close = () => { for (const view of views.values()) view.reset(); };
   observer.boardUrl = base;
   observer.channels = [...channelList];
   return observer;

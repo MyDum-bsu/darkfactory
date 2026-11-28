@@ -91,6 +91,8 @@ test('analyzeWiring is deterministic on the real repository and formatArchitectu
     'ops/factory-run.mjs',
     'ops/control-room/aggregator.mjs',
     'ops/df-map.mjs',
+    'ops/check-fleet.mjs',
+    'ops/df-graduate.mjs',
   ]) {
     assert.equal(report.entrypoints.includes(entrypoint), true, entrypoint);
     assert.equal(report.wired.includes(entrypoint), true, entrypoint);

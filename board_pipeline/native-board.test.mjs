@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { memoryBoardSdk } from './board-test-fixture.mjs';
-import { nativeBoardPort, isDefinitiveClaimLoss, isTransientBoardError } from './native-board.mjs';
+import { createDispatcher } from './dispatcher.mjs';
+import { createBoardObserver } from '../ops/control-room/board-observer.mjs';
+import { nativeBoardPort, isDefinitiveClaimLoss, isTransientBoardError, eventSnapshots } from './native-board.mjs';
 import { loadSdk } from './sdk.mjs';
 
 let sdk;
@@ -477,4 +479,108 @@ test('adopt tags lost ownership as definitive claim loss, never as an untranspar
   const { task: fresh } = await contractTask(handle, { ...CONTRACT, queue: 'vs1' });
   const claim = await port.claim(fresh.id, {});
   await port.adopt(fresh.id, { epoch: claim.epoch, token });
+});
+
+test('worker cannot obtain the native settlement capability, even for its own card', async () => {
+  const worker = nativeBoardPort({}, { channel: 'pilot', role: 'worker' });
+  await assert.rejects(worker.claim('42'), /role_denied/);
+  await assert.rejects(worker.adopt('42', { epoch: 1, token: 'x'.repeat(43) }), /role_denied/);
+  await assert.rejects(worker.complete('42', 1, { sha: 'a'.repeat(40) }), /role_denied/);
+});
+
+test('enrolled completion writes the verdict first; failed post does not settle; retry keeps the receipt compact', async t => {
+  const h = await isolated(t);
+  const { task } = await h.tasks.create('pilot', { text: 'fixture', noSync: true });
+  const keys = [];
+  const traceRun = async args => {
+    if (args[2] === 'read') return h.thread(task.id);
+    assert.deepEqual(args.slice(0, 4), ['--as', 'arbiter', 'post', task.id]);
+    assert.equal(args[args.indexOf('--schema') + 1], 'df.l2_verdict@1');
+    assert.equal(args.filter(a => a === '--attach').length, 2);
+    keys.push(args[args.indexOf('--idempotency-key') + 1]);
+    if (keys.length === 1) throw new Error('disconnected');
+    const data = JSON.parse(args[4]);
+    return { message: { channel: 'pilot', re: task.id, blocks: [{ schema: 'df.l2_verdict', version: 1, data }],
+      attachments: [{ name: 'verdict.json', size: Buffer.byteLength(args[4]) },
+        { name: 'l1-tail.txt', size: Buffer.byteLength(JSON.stringify({ ok: true })) }] } };
+  };
+  const port = nativeBoardPort(h, { channel: 'pilot', traceRun });
+  const { epoch } = await port.claim(task.id);
+  const receipt = { sha: 'a'.repeat(40), review: { verdict: 'REVIEW_OK' }, checks: { ok: true } };
+  await assert.rejects(port.complete(task.id, epoch, { ...receipt, extra: 'x'.repeat(1000) }), /compact/);
+  await assert.rejects(port.complete(task.id, epoch, receipt), /disconnected/);
+  assert.equal((await port.lookup(task.id)).state, 'claimed');
+  await port.complete(task.id, epoch, receipt);
+  assert.deepEqual(keys, [keys[0], keys[0]]);
+  assert.equal((await h.thread(task.id)).message.task.result, JSON.stringify(receipt));
+});
+
+test('tail and wait resume after the last delivered opaque cursor, never a task ID', async () => {
+  const queries = [];
+  const port = nativeBoardPort({
+    async *events(query) { queries.push(query); yield { cursor: '2.x' }; throw new Error('reset'); },
+    async wait(query) { queries.push(query); return { cursor: '3.y' }; },
+  }, { channel: 'pilot' });
+  const replay = await Array.fromAsync(port.tailChanges('1.a', { fallbackMs: 1 }));
+  assert.deepEqual(replay, [{ cursor: '2.x', event: { cursor: '2.x' } }, { cursor: '2.x', event: null, fallback: true }]);
+  assert.equal((await port.waitForChange(replay.at(-1).cursor)).cursor, '3.y');
+  assert.deepEqual(queries, [{ channel: 'pilot', after: '1.a' }, { channel: 'pilot', after: '2.x' }]);
+  const mock = nativeBoardPort({}, { channel: 'pilot' });
+  assert.deepEqual(await mock.waitForChange('3.y', { fallbackMs: 1 }), { cursor: '3.y', event: null, fallback: true });
+  await assert.rejects(mock.waitForChange(''), /invalid_board_cursor/);
+  await assert.rejects(mock.waitForChange('c', { fallbackMs: 0 }), /invalid_event_deadline/);
+});
+
+const turn = () => new Promise(resolve => setImmediate(resolve));
+function controlledFeed() {
+  const waits = [];
+  return { waits, async poll(query, signal) {
+    if (query.last === 1) return { events: [], cursor: 'seed' };
+    const { promise, resolve, reject } = Promise.withResolvers();
+    waits.push({ query, resolve, reject });
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    return promise;
+  } };
+}
+test('read cache resumes after disconnect, with bounded reconciliation even on a silent feed', async () => {
+  const feed = controlledFeed(); let now = 10, scans = 0;
+  const view = eventSnapshots(feed, 'pilot', { now: () => now, maxAgeMs: 5000 });
+  const read = () => view.read(async () => ++scans);
+  await read(); assert.equal(await read(), 2); assert.equal(await read(), 2);
+  feed.waits[0].resolve({ cursor: 'ack', events: [{}] }); await turn();
+  assert.equal(await read(), 3); assert.equal(feed.waits[1].query.after, 'ack');
+  feed.waits[1].reject(new Error('disconnect')); await turn();
+  assert.equal(await read(), 4); assert.equal(feed.waits.length, 2);
+  now += 1000; assert.equal(await read(), 5); assert.equal(feed.waits[2].query.after, 'ack');
+  now += 5000; assert.equal(await read(), 6); view.reset();
+});
+
+test('dispatcher wakes between ticks but launches only after an authoritative ready hint', async () => {
+  let ready = false, polls = 0; const launched = [], feed = controlledFeed();
+  const d = createDispatcher({ projects: [{ repo_id: 'r', channel: 'pilot' }], resources: () => ({
+    availableMemoryBytes: 2 ** 32, cpuCount: 1 }), feedFor: () => feed,
+    poll: async () => { ++polls; return ready; }, launch: async p => launched.push(p.repo_id) });
+  await d.tick(); await d.tick(); await d.tick(); assert.equal(polls, 2);
+  feed.waits[0].resolve({ cursor: 'first', events: [{ text: 'launch me' }] }); await turn();
+  assert.deepEqual(launched, []); assert.equal(feed.waits[1].query.after, 'first');
+  ready = true; feed.waits[1].resolve({ cursor: 'next', events: [{}] }); await turn();
+  await d.drain(); assert.deepEqual(launched, ['r']);
+});
+
+test('observer invalidates the right channel on a GET-only event, without using task pagination as a checkpoint', async () => {
+  let snapshots = 0; const feed = controlledFeed();
+  const observer = createBoardObserver({ boardUrl: 'http://offline', channels: ['c'], fetchImpl: async (url, opts) => {
+    assert.equal(opts.method, 'GET'); assert.equal(opts.headers['x-board-can'], 'c=read');
+    const u = new URL(url); assert.equal(u.searchParams.get('channel'), 'c');
+    if (u.pathname.endsWith('/events')) {
+      const query = { ...Object.fromEntries(u.searchParams), last: Number(u.searchParams.get('last')) };
+      return Response.json(await feed.poll(query, opts.signal));
+    }
+    assert.equal(u.pathname, '/api/board/tasks'); ++snapshots; return Response.json({ tasks: [] });
+  } });
+  await observer.fetchTasks(); await observer.fetchTasks(); await observer.fetchTasks();
+  assert.equal(snapshots, 2); assert.equal(feed.waits[0].query.after, 'seed');
+  feed.waits[0].resolve({ events: [{}], cursor: 'new' }); await turn();
+  await observer.fetchTasks(); assert.equal(snapshots, 3);
+  assert.equal(feed.waits[1].query.after, 'new'); observer.close();
 });

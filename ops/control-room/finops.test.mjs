@@ -399,6 +399,55 @@ workspace_links: {}
   }
 });
 
+test('V12-5: UTC history buckets, source provenance, AI drawdown and dead-load refresh', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'finops-history-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const budgetPath = join(dir, 'budget.yaml'), workerUsagePath = join(dir, 'usage.json');
+  await writeFile(budgetPath, `compute_vms:
+  - { id: trainer, hourly_cost_eur: 1 }
+  - { id: off, state: stopped }
+cloud_credits:
+  - { id: ai, monthly_eur: 10 }
+  - { id: reserve, remaining_eur: 50, source: metered }
+`);
+  const usage = { vms: { trainer: { state: 'running', runningMinutesToday: 31, activeMinutesToday: 0, runningMinutesMonth: 60 } },
+    vertexAi: [{ costMonthEur: 2 }], embeddings: { costMonthEur: 0.5 } };
+  const usageFile = () => writeFile(workerUsagePath, JSON.stringify(usage));
+  await usageFile();
+  const rows = [{ date: '2026-11-01', eur: 100 }, { date: '2026-11-15', eur: 2 },
+    { ts: '2026-11-21T10:00:00Z', eur: 1 }, { ts: '2026-11-21T11:00:00Z', eur: 3 },
+    { ts: '2026-11-21T11:00:00Z', eur: 3 }, { date: '2026-11-22', eur: 7 }];
+  const history = join(dir, 'finops-history.ndjson');
+  await writeFile(history, rows.map(row => JSON.stringify(row)).join('\n') + '\n{partial');
+  const snapshot = createFinopsProvider({ budgetPath, workerUsagePath, now: '2026-11-22T12:00:00Z' });
+  const snap = await snapshot();
+  assert.equal(snap.ok, true);
+  assert.deepEqual(snap.spendDynamics.series.map(p => p.eur), [100, 2, 4, 7]);
+  assert.deepEqual(snap.spendDynamics.hourly.map(p => p.eur), [1, 3]);
+  assert.equal(snap.spendDynamics.baseline7dEur, 3);
+  assert.equal(snap.spendDynamics.burnRatio, 2.3333);
+  assert.deepEqual(snap.deadLoads.map(a => a.code), ['dead_load_detected', 'spend_spike']);
+  assert.deepEqual(snap.computeVms.map(v => v.source), ['metered', 'static']);
+  assert.deepEqual(snap.cloudCredits.map(c => c.source), ['estimated', 'static']);
+  assert.equal(snap.cloudCredits[0].remainingEur, 6.5);
+  assert.equal(snap.totals.spentTodayCostEur, 7);
+  assert.deepEqual(await snapshot(), snap);
+  await writeFile(history, '\n' + JSON.stringify({ date: '2026-11-22', eur: 6 }) + '\n', { flag: 'a' });
+  usage.vms.trainer.activeMinutesToday = 1;
+  await usageFile();
+  assert.deepEqual((await snapshot()).deadLoads, []); // exactly 2x is not a spike
+  usage.vms.trainer.activeSlots = 0;
+  await usageFile();
+  assert.deepEqual((await snapshot()).deadLoads.map(a => a.resourceId), ['trainer']);
+  usage.vms.trainer.activeSlots = 1;
+  usage.cloudCredits = [{ id: 'ai', remainingEur: 8 }];
+  await usageFile();
+  const busy = await snapshot();
+  assert.deepEqual(busy.deadLoads, []);
+  assert.equal(busy.cloudCredits[0].source, 'metered');
+  assert.equal(busy.cloudCredits[0].remainingEur, 8);
+});
+
 // --- Spend Dynamics & Dead-Load Detector --------------------------------------
 
 test('analyzeDeadLoad: worker RUNNING >= 20m idle с 0 задач → dead_load_detected (bad)', () => {
@@ -449,14 +498,15 @@ test('analyzeDeadLoad: активные/взятые задачи или ост�
   const belowThreshold = analyzeDeadLoad({ vmUsage: [runningWorker],
     activeTasks: 0, claimedTasks: 0, idleMinutesSinceLastTask: 19,
     deadLoadThresholdMinutes: 20 });
-  assert.equal(belowThreshold.deadLoadDetected, false);
+  assert.equal(belowThreshold.deadLoadDetected, true, 'explicit zero tasks no longer needs the legacy idle timer');
 
   const controlPlane = analyzeDeadLoad({ vmUsage: [
     { id: 'cloud-brain', pricing: 'Always Free', state: 'running',
       runningMinutesToday: 120 }],
     activeTasks: 0, claimedTasks: 0, idleMinutesSinceLastTask: 600 });
-  assert.equal(controlPlane.deadLoadDetected, false,
-    'не-worker control-plane VM не флагается даже при длинном простое');
+  assert.equal(controlPlane.deadLoadDetected, true, 'metered idle is not restricted to worker-named VMs');
+  assert.equal(analyzeDeadLoad({ vmUsage: [{ ...runningWorker, runningMinutesToday: 30, activeMinutesToday: 0 }] }).deadLoadDetected, false);
+  assert.equal(analyzeDeadLoad({ vmUsage: [{ id: 'unknown', state: 'running', runningMinutesToday: 31 }] }).deadLoadDetected, false);
 });
 
 test('analyzeDeadLoad: worker распознаётся по id без spot-pricing, пустой вход — чисто', () => {
@@ -559,10 +609,10 @@ workspace_links: {}
     assert.ok(['rising', 'falling', 'stable'].includes(snap.spendDynamics.trend));
     assert.equal(snap.spendDynamics.daily[0].eur, 2);
 
-    // Свежая задача (idle < порога) → алертов мёртвой нагрузки нет.
+    // Активная задача → алертов мёртвой нагрузки нет.
     await writeFile(usage, JSON.stringify({
       state: 'running', runningMinutesToday: 90, runningMinutesMonth: 90,
-      activeTasks: 0, claimedTasks: 0, idleMinutesSinceLastTask: 5,
+      activeTasks: 1, claimedTasks: 0, idleMinutesSinceLastTask: 5,
       updatedAt: '2026-11-24T10:00:00Z' }));
     const clean = await createFinopsProvider({ budgetPath: budget, workerUsagePath: usage,
       now: new Date('2026-11-24T12:00:00Z') })();

@@ -8,6 +8,8 @@ import { test } from 'node:test';
 import {
   buildProjectContext,
   loadProjectProfile,
+  parseOwnerTaste,
+  parseProjectProfileBytes,
   pickDomainSkills,
 } from './taste-profile.mjs';
 
@@ -64,11 +66,49 @@ async function fixture({ withProfile = true, withAgents = true, withTaste = true
   return { dir, repoRoot, globalTastePath };
 }
 
+test('project skill declarations, expanded domains and intake mode share one strict schema', () => {
+  const parse = text => parseProjectProfileBytes(Buffer.from(text));
+  const profile = parse('intake_mode: managed_dispatcher\nrepo_skills: [audio-check, skills/prove/SKILL.md]\n' +
+    'domain_skills: {dsp: [test-first], math: [property-testing], ops: [prod-recon]}');
+  assert.equal(profile.intakeMode, 'managed_dispatcher');
+  assert.deepEqual(profile.repoSkills, ['audio-check', 'prove']);
+  for (const domain of ['dsp', 'math', 'ops']) assert.equal(pickDomainSkills({ profile, domain }).length, 1);
+  assert.deepEqual(parse('{}').repoSkills, []);
+  for (const yaml of ['intake_mode: null', 'intake_mode: owner', 'repo_skills: null', 'repo_skills: {}',
+    'repo_skills: [../outside]', 'repo_skills: [skills/a/extra.md]']) {
+    assert.throws(() => parse(yaml), { code: 'taste_profile_invalid' });
+  }
+});
+
+test('only named owner sections become hard rules; soft preferences go to the sidecar', async () => {
+  const { applySeverityGating, reviewTasteBlock } = await import('./review-policy.mjs');
+  const tiers = parseOwnerTaste('# Owner Taste\r\nintro\r\n## Tier 1: Hard Taste Rules\r\n- Never hide errors.\r\n' +
+    '### Details\nExplain failure.\n## Notes\nnot a rule\n## Soft Taste Preferences\n- Prefer concise names.');
+  assert.deepEqual(tiers, { hard: '- Never hide errors.\n### Details\nExplain failure.', soft: '- Prefer concise names.' });
+  const block = reviewTasteBlock(tiers);
+  assert.match(block, /Hard Taste Rules[^]*P1[^]*REWORK[^]*Never hide errors/);
+  assert.match(block, /Soft Taste Preferences[^]*nit[^]*sidecar[^]*Prefer concise names/);
+  assert.deepEqual(parseOwnerTaste('legacy preferences'), { hard: '', soft: 'legacy preferences' });
+  assert.equal(reviewTasteBlock(parseOwnerTaste('')), '');
+  const softOnly = '```md\n## Hard Taste Rules\n```\nPrefer plain names.';
+  assert.deepEqual(parseOwnerTaste(`## Soft Taste Preferences (Tier 2)\n${softOnly}`), { hard: '', soft: softOnly });
+  const hard = { expected: tiers.hard, severity: 'P1' }, soft = { expected: tiers.soft, severity: 'nit' };
+  const mixed = await applySeverityGating({ status: 'PASS', findings: [soft, hard] });
+  assert.equal(mixed.status, 'REWORK');
+  assert.deepEqual(mixed.findings, [hard]);
+  assert.deepEqual(mixed.sidecar_findings, [soft]);
+  assert.equal((await applySeverityGating({ status: 'REWORK', findings: [soft] })).status, 'PASS');
+});
+
 test('loadProjectProfile: parses and normalizes valid yaml profile', async () => {
   const { dir, repoRoot } = await fixture();
   try {
     const profile = loadProjectProfile(repoRoot);
     assert.equal(profile.repoId, 'darkfactory-board');
+    assert.equal(profile.fieldMode, null);
+    assert.equal(profile.defaultPlan, null);
+    const fromBytes = parseProjectProfileBytes(Buffer.from(PROFILE_YAML));
+    assert.deepEqual(fromBytes, { ...profile, path: '.darkfactory/project-profile.yaml' });
     assert.deepEqual(profile.stack, ['node', 'sqlite']);
     assert.equal(profile.l1Profile, 'strict');
     assert.equal(profile.agentsMd, 'AGENTS.md');
@@ -77,6 +117,44 @@ test('loadProjectProfile: parses and normalizes valid yaml profile', async () =>
     assert.ok(profile.path.endsWith(join('.darkfactory', 'project-profile.yaml')));
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('repository and snapshot bytes share normalized routing fields and strict UTF-8 decoding', async () => {
+  const { dir, repoRoot } = await fixture({ withProfile: false });
+  try {
+    const bytes = Buffer.from('field_mode: " GreenField "\ndefault_plan: " API-Change "\n');
+    const path = join(repoRoot, '.darkfactory', 'project-profile.yaml');
+    await writeFile(path, bytes);
+    const profile = loadProjectProfile(repoRoot);
+    assert.equal(profile.fieldMode, 'greenfield');
+    assert.equal(profile.defaultPlan, 'api-change');
+    const profileRelPath = 'snapshot.yaml';
+    assert.deepEqual(parseProjectProfileBytes(bytes, { profileRelPath }), { ...profile, path: profileRelPath });
+
+    const invalid = Buffer.concat([Buffer.from('repo_id: repo'), Buffer.from([0xff])]);
+    await writeFile(path, invalid);
+    assert.throws(() => loadProjectProfile(repoRoot), { code: 'taste_profile_yaml_invalid' });
+    assert.throws(() => parseProjectProfileBytes(invalid), { code: 'taste_profile_yaml_invalid' });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('snapshot YAML uses the same fail-closed document, schema and byte bounds', () => {
+  const parse = yaml => parseProjectProfileBytes(Buffer.from(yaml));
+  for (const key of ['field_mode', 'default_plan']) {
+    for (const value of ['typo', 'null', '""', 'false', '1', '[mvp]', '{}']) {
+      assert.throws(() => parse(`${key}: ${value}`), { code: 'taste_profile_invalid' });
+    }
+  }
+  for (const yaml of ['field_mode: [', 'field_mode: brownfield\nfield_mode: greenfield']) {
+    assert.throws(() => parse(yaml), { code: 'taste_profile_yaml_invalid' });
+  }
+  assert.throws(() => parse('unknown: greenfield'), { code: 'taste_profile_invalid' });
+  assert.throws(() => parse('agents_md: ../escape'), { code: 'taste_profile_path_traversal' });
+  for (const bytes of [Buffer.alloc(0), Buffer.alloc(256 * 1024 + 1)]) {
+    assert.throws(() => parseProjectProfileBytes(bytes), { code: 'taste_profile_file_invalid' });
   }
 });
 

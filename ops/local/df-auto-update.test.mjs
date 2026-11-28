@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -493,4 +494,118 @@ test('which/dhcpcd process lines do not defer updates', async t => {
   assert.equal(report.busy, false);
   assert.notEqual(report.status, 'deferred_busy');
   assert.ok(harness.calls.filter(isMutating).length > 0);
+});
+
+async function boardFixture(t) {
+  const env = await fixture(t);
+  const prefix = join(env.home, '.local/share/vercel-board');
+  const dir = join(prefix, 'node_modules/@vercel/board');
+  await mkdir(dir, { recursive: true });
+  const manifest = join(dir, 'package.json');
+  await writeFile(manifest, '{"version":"0.54.0"}');
+  const calls = [], scratchDirs = [];
+  let latest = '0.54.1', busy = '', smoke = 0;
+  const deps = {
+    homedir: env.home, commandExists: () => false, processList: () => busy,
+    spawnBoard: (vb, args, options) => {
+      assert.equal(vb, join(prefix, 'node_modules/.bin/vb'));
+      assert.equal(options.cwd, options.env.HOME);
+      assert.deepEqual(args, ['serve', '--port', '0', '--dir', options.cwd, '--no-open', '--no-inspect']);
+      scratchDirs.push(options.cwd);
+      // Gate tmpfs may be noexec. Use the running Node binary for the fake
+      // server; exercise real startup, banner parsing, termination and cleanup.
+      return spawn(process.execPath, ['-e', `
+        if (process.cwd() !== process.env.HOME) process.exit(1);
+        console.log('serving a local board at http://127.0.0.1:12345/api/board');
+        setInterval(() => {}, 60_000);
+      `], options);
+    },
+    runner: async (cmd, args, options) => {
+      calls.push([cmd, ...args]);
+      if (args.join(' ') === 'view @vercel/board version') return { code: 0, stdout: latest };
+      if (cmd === 'npm' && args.includes(`@vercel/board@${latest}`)) {
+        assert.ok(args.includes(prefix));
+        assert.ok(!args.includes('-g'));
+        await writeFile(manifest, JSON.stringify({ version: latest }));
+        return { code: 0 };
+      }
+      if (cmd === join(prefix, 'node_modules/.bin/vb')) {
+        if (args[0] === '--version') return { code: 0, stdout: latest };
+        assert.deepEqual(args, ['conformance', '--url', 'http://127.0.0.1:12345/api/board']);
+        assert.equal(options.cwd, scratchDirs.at(-1));
+        assert.equal(options.env.HOME, options.cwd);
+        assert.deepEqual(Object.keys(options.env).sort(), ['HOME', 'PATH']);
+        return { code: smoke, stderr: 'scratch check failed' };
+      }
+      return { code: 1, stderr: 'unrelated component' };
+    },
+  };
+  return { deps, calls, scratchDirs, busy: s => { busy = s; }, latest: s => { latest = s; }, smoke: n => { smoke = n; },
+    run: async extra => (await runAutoUpdate(options(env, 'hub', extra), deps)).components.find(x => x.name === '@vercel/board') };
+}
+
+test('Board is deferred even under force, including a busy flip or failed final scan', async t => {
+  const f = await boardFixture(t);
+  for (const line of ['node /opt/node_modules/@vercel/board/dist/cli.mjs serve', '/usr/bin/vb serve', '/bin/hc run task']) {
+    f.busy(line);
+    assert.equal((await f.run({ force: true })).status, 'deferred_busy');
+  }
+  f.busy('');
+  for (const lastScan of [() => true, () => { throw Error('ps failed'); }]) {
+    let scans = 0;
+    f.deps.checkActiveBusy = () => ++scans === 1 ? false : lastScan();
+    assert.equal((await f.run()).status, 'deferred_busy');
+    assert.equal(scans, 2);
+  }
+  assert.ok(!f.calls.some(args => args.includes('install') && args.some(s => s.startsWith('@vercel/board@'))));
+});
+
+test('Board review boundary, exact install and isolated smoke failure receipt', async t => {
+  const f = await boardFixture(t);
+  f.latest('0.57.0');
+  assert.equal((await f.run()).status, 'review_required');
+  f.latest('0.54.1');
+  f.smoke(1);
+  const failed = await f.run();
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.after, '0.54.1');
+  assert.match(failed.error, /scratch check failed/);
+  assert.ok(f.calls.some(args => args.at(-1) === '--version' && args[0].endsWith('/vb')));
+});
+
+test('successful Board smoke uses a disposable home and removes it; repeated run does not reinstall', async t => {
+  const f = await boardFixture(t);
+  assert.equal((await f.run({ dryRun: true })).status, 'dry_run');
+  const updated = await f.run();
+  assert.equal(updated.status, 'updated', updated.error);
+  assert.equal(f.scratchDirs.length, 1);
+  const [scratch] = f.scratchDirs;
+  assert.match(scratch, /\/df-vb-smoke-/);
+  await assert.rejects(stat(scratch), { code: 'ENOENT' });
+  assert.equal((await f.run()).status, 'already_current');
+  assert.equal(f.calls.filter(a => a.includes('@vercel/board@0.54.1')).length, 1);
+});
+
+test('native Herdr updates require an idle window; hex only lists laptop models', async t => {
+  const env = await fixture(t);
+  const calls = [];
+  const deps = { ...fakeHarness(env), commandExists: cmd => ['hc', 'hex', 'herdr-app'].includes(cmd),
+    runner: async (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (['hc', 'herdr-app'].includes(cmd)) return { code: 0, stdout: '1.2.3' };
+      if (cmd === 'hex' && args.join(' ') === 'models list') return { code: 0, stdout: 'gigaam_v4\n' };
+      return { code: 1, stderr: 'unrelated' };
+    } };
+  for (const role of ['laptop', 'worker']) {
+    const report = await runAutoUpdate(options(env, role), deps);
+    const hex = report.components.find(x => x.name === 'hex');
+    if (role === 'laptop') assert.equal(hex.available, true);
+    else assert.equal(hex.status, 'skipped_role');
+  }
+  for (const cmd of ['hc', 'herdr-app']) assert.ok(calls.some(a => a.join(' ') === `${cmd} update`));
+  assert.deepEqual(calls.filter(a => a[0] === 'hex'), [['hex', 'models', 'list']]);
+  calls.length = 0;
+  deps.processList = '/bin/herdr-core server';
+  await runAutoUpdate(options(env, 'laptop', { force: true }), deps);
+  assert.ok(!calls.some(a => a.includes('update')));
 });

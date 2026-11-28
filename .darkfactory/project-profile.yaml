@@ -3,10 +3,10 @@ stack: node22-esm
 l1_profile: node
 agents_md: AGENTS.md
 taste:
-  - минимальные правки строго внутри Scope Fence, без мёртвого кода и лишних абстракций
-  - детерминированные проверки, явные квитанции и честные статусы обязательны
-  - "границы доверия fail-closed: секреты, запись, сеть и исполнение не включать молча"
-  - "UI читабелен под нагрузкой: безопасный DOM, ясные состояния, ноль визуального мусора"
+  - Keep changes minimal and strictly within the Scope Fence. Avoid dead code and unnecessary abstractions.
+  - Require deterministic checks, explicit receipts, and accurate status reports.
+  - "Fail closed at trust boundaries: never silently enable secret access, writes, network access, or execution."
+  - "Keep the UI readable under load: use safe DOM operations, clear states, and no visual clutter."
 domain_skills:
   backend:
     - goal-rules

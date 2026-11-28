@@ -3,11 +3,11 @@
 // FTS5 BM25 полнотекстовый поиск суб-10ms + метаданные (host/project/harness/
 // диапазон дат) + подключаемое векторное хранилище с гибридным поиском
 // Reciprocal Rank Fusion: облачный embedder (gemini-embedding-001 и др.)
-// инъецируется снаружи, локального ML и расхода RAM нет. Модуль не знает
-// путей и не ходит в сеть — входы приходят только из доверенного вызывающего.
+// инъецируется снаружи; без явной настройки облачного адаптера сеть не нужна.
 
 import { createHash } from 'node:crypto';
 import { chmodSync } from 'node:fs';
+import { posix } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 export const SESSION_ARCHIVE_SCHEMA_VERSION = 1;
@@ -29,6 +29,72 @@ const ROLE_SET = new Set(['user', 'assistant', 'system', 'tool']);
 const WORD = /[\p{L}\p{N}_]+/gu;
 const MAX_QUERY_TOKENS = 32;
 const MAX_VECTOR_DIMS = 4096;
+
+const REPOS = new Set(['darkfactory', 'music-restoration', 'optimization', 'autoresearcher',
+  'moml-course', 'bsu-cabinet-skill']);
+
+export function inferSessionProject({ cwd, title, fallback } = {}) {
+  const hasCwd = typeof cwd === 'string' && cwd.trim() !== '';
+  if (hasCwd) {
+    const segments = posix.normalize(cwd.replaceAll('\\', '/')).toLowerCase().split('/');
+    for (const name of segments.reverse()) {
+      if (name === 'darkfactory-hub') return 'cto';
+      if (REPOS.has(name)) return name;
+      if (/^df-.+/.test(name)) return 'darkfactory';
+      if (/^mr-.+/.test(name)) return 'music-restoration';
+    }
+  }
+  if (typeof title === 'string' && /\b(cto|darkfactory-hub|fleet[- ]wide)\b/i.test(title)) return 'cto';
+  // A reported cwd outside the fleet isn't the scanner's default project.
+  return !hasCwd && typeof fallback === 'string' && fallback.trim() ? fallback.trim() : 'general';
+}
+
+// The CLI and terminal hook share the same retrieval model, authentication and
+// request shape. gemini-embedding-001 on Vertex accepts one instance per call;
+// return vectors in input order so the SQLite batch commits all or nothing.
+export function configuredArchiveEmbedder(model, taskType, env = process.env, { vertexOnly = false } = {}) {
+  const { GEMINI_API_KEY: key, DF_VERTEX_PROJECT: project, DF_VERTEX_LOCATION: location,
+    DF_VERTEX_ACCESS_TOKEN: token } = env;
+  const post = async (url, auth, body) => {
+    const response = await fetch(url, { method: 'POST', redirect: 'error',
+      headers: { 'content-type': 'application/json', ...auth }, body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) throw new Error(`df_archive_embedder_http: HTTP ${response.status}`);
+    return response.json();
+  };
+  if (!vertexOnly && key?.trim()) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:batchEmbedContents`;
+    return async texts => {
+      const vectors = [];
+      for (let i = 0; i < texts.length; i += 100) {
+        const requests = texts.slice(i, i + 100).map(text => ({
+          model: `models/${model}`, content: { parts: [{ text }] }, taskType,
+        }));
+        const { embeddings } = await post(url, { 'x-goog-api-key': key }, { requests });
+        if (!Array.isArray(embeddings) || embeddings.length !== requests.length) {
+          throw new Error('df_archive_embedder_invalid_response');
+        }
+        vectors.push(...embeddings.map(embedding => embedding.values));
+      }
+      return vectors;
+    };
+  }
+  if (!project?.trim() || !location?.trim() || !token?.trim()) return null;
+  if (!/^[a-z0-9-]+$/.test(location)) throw new Error('df_archive_vertex_location_invalid');
+  const host = location === 'global' ? 'aiplatform.googleapis.com' : `${location}-aiplatform.googleapis.com`;
+  const url = `https://${host}/v1/projects/${encodeURIComponent(project)}/locations/${location}/publishers/google/models/${encodeURIComponent(model)}:predict`;
+  return async texts => {
+    const vectors = [];
+    for (const content of texts) {
+      const { predictions } = await post(url, { authorization: `Bearer ${token}` }, {
+        instances: [{ content, task_type: taskType }],
+      });
+      if (!Array.isArray(predictions) || predictions.length !== 1) throw new Error('df_archive_embedder_invalid_response');
+      vectors.push(predictions[0].embeddings.values);
+    }
+    return vectors;
+  };
+}
 
 function sha256(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex');
@@ -178,6 +244,128 @@ export function parsePiTranscript(jsonlText) {
   return out;
 }
 
+function jsonRecord(text) {
+  try {
+    const value = JSON.parse(text);
+    return isRecord(value) ? value : null;
+  } catch { return null; }
+}
+
+function* transcriptRows(rawText) {
+  if (typeof rawText !== 'string') return;
+  for (const [seq, line] of rawText.split('\n').entries()) {
+    const row = jsonRecord(line);
+    if (row) yield [seq, row];
+  }
+}
+
+function messageRecord(seq, role, rawContent, timestamp) {
+  const content = extractText(rawContent);
+  return role && content?.trim() ? { seq, role, content, createdAt: normalizeTimestamp(timestamp) } : null;
+}
+
+export function parseCodexTranscript(jsonlText, { includeSystem = false } = {}) {
+  const messages = [];
+  // Rollouts may emit the same turn in both formats. Pair each mirror once,
+  // keeping the earliest physical seq stable even across incremental imports.
+  const unpaired = new Map();
+  for (const [seq, { type, payload, timestamp }] of transcriptRows(jsonlText)) {
+    if (!isRecord(payload)) continue;
+    let role, content;
+    if (type === 'response_item' && payload.type === 'message') {
+      if (payload.role === 'developer' && includeSystem === true) role = 'system';
+      else if (payload.role === 'user' || payload.role === 'assistant') role = payload.role;
+      else continue;
+      content = payload.content;
+    } else if (type === 'event_msg' && ['user_message', 'agent_message'].includes(payload.type)) {
+      role = payload.type === 'user_message' ? 'user' : 'assistant';
+      content = payload.message;
+    } else continue;
+    const message = messageRecord(seq, role, content, timestamp);
+    if (!message) continue;
+    const key = `${role}\0${message.content}`;
+    const delta = type === 'event_msg' ? -1 : 1;
+    const previous = unpaired.get(key) ?? 0;
+    if (previous * delta >= 0) messages.push(message);
+    if (previous + delta === 0) unpaired.delete(key);
+    else unpaired.set(key, previous + delta);
+  }
+  return messages;
+}
+
+export function parseOmpTranscript(jsonlText) {
+  const messages = [];
+  for (const [seq, row] of transcriptRows(jsonlText)) {
+    if (row.type !== 'message' || !isRecord(row.message)) continue;
+    const { role, content, timestamp } = row.message;
+    const entry = messageRecord(seq, normalizeRole(role), content, timestamp ?? row.timestamp);
+    if (entry) messages.push(entry);
+  }
+  return messages;
+}
+
+export function parseClaudeTranscript(jsonlText) {
+  const messages = [];
+  for (const [seq, row] of transcriptRows(jsonlText)) {
+    if (!['user', 'assistant'].includes(row.type)) continue;
+    const role = row.message?.role ?? row.type;
+    if (!['user', 'assistant'].includes(role)) continue;
+    const entry = messageRecord(seq, role, row.message?.content, row.timestamp);
+    if (entry) messages.push(entry);
+  }
+  return messages;
+}
+
+function devinRole(source, includeSystem) {
+  const role = typeof source === 'string' && source.toLowerCase() === 'devin' ? 'assistant' : normalizeRole(source);
+  return role === 'system' && includeSystem !== true ? null : role;
+}
+
+export function parseDevinTranscript(rawText, { includeSystem = false } = {}) {
+  const steps = jsonRecord(rawText)?.steps;
+  const messages = [];
+  for (const [seq, step] of Array.isArray(steps) ? steps.entries() : transcriptRows(rawText)) {
+    if (!isRecord(step)) continue;
+    const eventRole = typeof step.type === 'string' ? step.type.split('_', 1)[0] : null;
+    const role = devinRole(step.source ?? step.message?.role ?? step.role ?? eventRole, includeSystem);
+    const entry = messageRecord(seq, role, step.message?.content ?? step.message?.text ?? step.message ?? step.content ?? step.text,
+      step.timestamp ?? step.message?.timestamp);
+    if (entry) messages.push(entry);
+  }
+  return messages;
+}
+
+export function extractTranscriptMeta(harness, rawText) {
+  const meta = {};
+  function take(row, id) {
+    for (const [key, value] of [['sessionId', id], ['cwd', row.cwd], ['title', row.title]]) {
+      if (!meta[key] && typeof value === 'string' && value.trim()) meta[key] = value.trim();
+    }
+  }
+  if (typeof rawText !== 'string') return meta;
+  if (harness === 'devin') {
+    const session = jsonRecord(rawText);
+    if (session) take(session, session.session_id);
+    return meta;
+  }
+  if (harness === 'pi' || harness === 'agy') {
+    const header = jsonRecord(rawText.trimStart().split('\n', 1)[0]);
+    if (header) take(header, header.sessionId ?? header.session_id ?? (!header.message && !header.role ? header.id : null));
+    return meta;
+  }
+  for (const [, row] of transcriptRows(rawText)) {
+    if (harness === 'codex' && row.type === 'session_meta' && isRecord(row.payload)) {
+      take(row.payload, row.payload.id);
+      break;
+    }
+    if (harness === 'omp' && row.type === 'session') take(row, row.id);
+    if (harness === 'omp' && row.type === 'title') take({ title: row.title });
+    if (harness === 'claude') take(row, row.sessionId);
+    if (meta.sessionId && meta.cwd && meta.title) break;
+  }
+  return meta;
+}
+
 // Санитизация FTS5-запроса: из произвольного пользовательского ввода
 // (кавычки, дефисы, двоеточия, кириллица) извлекаются словоформы Unicode и
 // каждая экранируется двойными кавычками — синтаксическая ошибка MATCH
@@ -270,6 +458,111 @@ END;
 CREATE INDEX IF NOT EXISTS messages_session_idx ON messages(session_id);
 `;
 
+// Each reader exposes only session metadata to the outer cursor. Materialize
+// at most one transcript (ingestSession's transaction boundary) at a time.
+function devinReader(db, includeSystem) {
+  const nodes = db.prepare(`SELECT chat_message, created_at FROM message_nodes
+    WHERE session_id = ? ORDER BY row_id`);
+  return {
+    sessions: `SELECT id, working_directory AS cwd, title, created_at AS startedAt,
+      last_activity_at AS updatedAt FROM sessions`,
+    readMessages(id) {
+      const messages = [];
+      let seq = 0;
+      for (const row of nodes.iterate(id)) {
+        const data = jsonRecord(row.chat_message);
+        // Count skipped nodes too: opting in to system messages on a later
+        // import must not shift the keys of already-archived turns.
+        const entry = messageRecord(seq++, devinRole(data?.role, includeSystem), data?.content, row.created_at);
+        if (entry) messages.push(entry);
+      }
+      return messages;
+    },
+  };
+}
+
+function opencodeReader(db) {
+  // Interpolate only known identifiers, never column names supplied by a DB.
+  const columns = table => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
+  const s = columns('session'), m = columns('message'), p = columns('part');
+  const optional = (cols, key, prefix = '') => cols.has(key) ? prefix + key : 'NULL';
+  const order = (cols, prefix) => ['sequence', 'time_created', cols.has('id') ? 'id' : 'rowid']
+    .filter(key => key === 'rowid' || cols.has(key)).map(key => `${prefix}.${key}`).join(', ');
+  const rows = db.prepare(`SELECT m.id, m.data AS message, ${optional(m, 'time_created', 'm.')} AS created,
+    p.data AS part FROM message m LEFT JOIN part p ON p.message_id = m.id
+    WHERE m.session_id = ? ORDER BY ${order(m, 'm')}, ${order(p, 'p')}`);
+  return {
+    sessions: `SELECT id, COALESCE(${optional(s, 'directory')}, ${optional(s, 'path')}) AS cwd,
+      ${optional(s, 'title')} AS title, ${optional(s, 'time_created')} AS startedAt,
+      ${optional(s, 'time_updated')} AS updatedAt FROM session ${s.has('time_deleted') ? 'WHERE time_deleted IS NULL' : ''}`,
+    readMessages(sessionId) {
+      const messages = [];
+      let previous, role, createdAt, parts = [], seq = -1;
+      function finishMessage() {
+        if (role && parts.length) messages.push({ seq, role, content: parts.join('\n'), createdAt });
+      }
+      for (const row of rows.iterate(sessionId)) {
+        if (row.id !== previous) {
+          finishMessage();
+          previous = row.id;
+          seq++;
+          const data = jsonRecord(row.message);
+          role = normalizeRole(data?.role);
+          createdAt = normalizeTimestamp(row.created ?? data?.time?.created);
+          parts = [];
+        }
+        const part = jsonRecord(row.part);
+        if (part?.type === 'text' && typeof part.text === 'string' && part.text.trim()) parts.push(part.text);
+      }
+      finishMessage();
+      return messages;
+    },
+  };
+}
+
+function importSqlite({ archive, sourceDbPath, host, harness, fallbackProject, since, limit, includeSystem }, reader) {
+  if (typeof host !== 'string' || !host.trim()) throw fail('session_archive_import_host_invalid');
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) throw fail('session_archive_import_limit_invalid');
+  if (since !== undefined && (typeof since !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:T|$)/i.test(since) ||
+      !Number.isFinite(Date.parse(since)))) throw fail('session_archive_import_since_invalid');
+  const report = { harness, sourceDbPath, scannedSessions: 0, ingestedSessions: 0, skippedEmpty: 0,
+    insertedMessages: 0, totalMessages: 0 };
+  const db = new DatabaseSync(sourceDbPath, { readOnly: true });
+  try {
+    const { sessions, readMessages } = reader(db, includeSystem);
+    // Devin may store ISO strings or epoch seconds; OpenCode uses epoch ms.
+    db.function('archive_time', { deterministic: true }, value => Date.parse(normalizeTimestamp(value)));
+    const activity = 'archive_time(COALESCE(updatedAt, startedAt))';
+    const order = limit === undefined ? 'id' : `${activity} DESC, id`;
+    const stmt = db.prepare(`SELECT * FROM (${sessions}) ${since === undefined ? '' : `WHERE ${activity} >= ?`}
+      ORDER BY ${order} LIMIT ?`);
+    const params = since === undefined ? [] : [Date.parse(since)];
+    for (const row of stmt.iterate(...params, limit ?? -1)) {
+      report.scannedSessions++;
+      const messages = readMessages(row.id);
+      if (!messages.length) { report.skippedEmpty++; continue; }
+      const { cwd, title, startedAt, updatedAt } = row;
+      const project = inferSessionProject({ cwd, title, fallback: fallbackProject });
+      const result = archive.ingestSession({ sessionId: `${harness}:${row.id}`, host, harness, cwd, title,
+        project, startedAt, updatedAt, messages });
+      report.ingestedSessions++;
+      report.insertedMessages += result.insertedMessages;
+      report.totalMessages += result.messageCount;
+    }
+    return report;
+  } finally { db.close(); }
+}
+
+export function importDevinSqlite({ harness = 'devin', ...options }) {
+  if (harness !== 'devin') throw fail('session_archive_import_harness_invalid');
+  return importSqlite({ ...options, harness }, devinReader);
+}
+
+export function importOpencodeSqlite({ harness = 'opencode', ...options }) {
+  if (!['opencode', 'zcode'].includes(harness)) throw fail('session_archive_import_harness_invalid');
+  return importSqlite({ ...options, harness }, opencodeReader);
+}
+
 function validateMessage(entry, index) {
   if (!isRecord(entry) || !Number.isSafeInteger(entry.seq) || entry.seq < 0 ||
       typeof entry.role !== 'string' || !entry.role.trim() ||
@@ -284,6 +577,32 @@ function validateMessage(entry, index) {
   };
 }
 
+// Index only the completed attempt, never a host-wide transcript directory.
+// Fixed seqs make replay after a controller restart harmless. The worker tail
+// is optional (e.g. after restart); the durable spec and outcome are not.
+export async function indexTerminalAttempt({ dbPath, result, record, cwd, host, harness, brief,
+  tail, fallback, embedder = null }) {
+  if (!['done', 'hold'].includes(result?.phase) || !result.attemptId ||
+      record?.attemptId !== result.attemptId || record.phase !== result.phase) return null;
+  const sessionId = `attempt:${record.attemptId}`;
+  const title = `Task ${record.taskId ?? ''} attempt ${record.attemptId}`;
+  const summary = [title, result.phase, result.sha, result.reason].filter(Boolean).join(' ');
+  const messages = [
+    { seq: 0, role: 'user', content: record.contract?.specText ?? brief },
+    { seq: 1, role: 'assistant', content: tail },
+    { seq: result.phase === 'hold' ? 2 : 3, role: 'system', content: summary },
+  ].filter(message => typeof message.content === 'string' && message.content.trim());
+  const inferred = inferSessionProject({ cwd, title });
+  // The controller can attest the repo even for a generically named slot.
+  const project = inferred === 'general' ? record.contract?.repo_id ?? fallback ?? inferred : inferred;
+  const archive = openSessionArchive(dbPath, { embedder });
+  try {
+    const ingestion = archive.ingestSession({ sessionId, cwd, host, title, summary, harness, project, messages });
+    if (embedder) await archive.embedPending({ sessionId });
+    return ingestion;
+  } finally { archive.close(); }
+}
+
 export function openSessionArchive(dbPath, { embedder = null } = {}) {
   if (typeof dbPath !== 'string' || !dbPath.trim()) {
     throw fail('session_archive_path_invalid');
@@ -292,10 +611,6 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     throw fail('session_archive_embedder_invalid');
   }
   const db = new DatabaseSync(dbPath);
-  db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA busy_timeout = 5000;');
-  db.exec('PRAGMA foreign_keys = ON;');
-  db.exec(SCHEMA);
   if (dbPath !== ':memory:') {
     // Архив содержит транскрипты сессий — права только владельцу. Best effort:
     // на не-POSIX ФС chmod может не поддерживаться, тогда пропускаем.
@@ -306,13 +621,16 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     }
   }
 
+  // Set the database mode before WAL/SHM sidecars inherit it.
+  db.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  db.exec(SCHEMA);
   const upsertSession = db.prepare(`
     INSERT INTO sessions (session_id, host, harness, project, cwd, title, started_at, updated_at, summary, message_count)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
     ON CONFLICT(session_id) DO UPDATE SET
       host = excluded.host,
       harness = excluded.harness,
-      project = COALESCE(excluded.project, sessions.project),
+      project = CASE WHEN ? THEN excluded.project ELSE COALESCE(sessions.project, excluded.project) END,
       cwd = COALESCE(excluded.cwd, sessions.cwd),
       title = COALESCE(excluded.title, sessions.title),
       started_at = COALESCE(excluded.started_at, sessions.started_at),
@@ -328,7 +646,7 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
   const pendingEmbeddings = db.prepare(`
     SELECT m.id, m.content FROM messages m
     LEFT JOIN message_embeddings e ON e.message_id = m.id
-    WHERE e.message_id IS NULL
+    WHERE e.message_id IS NULL AND (? IS NULL OR m.session_id = ?)
     ORDER BY m.id ASC
     LIMIT ?
   `);
@@ -346,18 +664,21 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     }
     const sessionId = input.sessionId.trim();
     const messages = (input.messages ?? []).map(validateMessage);
+    const inferred = inferSessionProject(input);
+    const project = typeof input.project === 'string' && input.project.trim() ? input.project.trim() : inferred;
     db.exec('BEGIN IMMEDIATE');
     try {
       upsertSession.run(
         sessionId,
         input.host.trim(),
         input.harness.trim(),
-        typeof input.project === 'string' ? input.project : null,
+        project,
         typeof input.cwd === 'string' ? input.cwd : null,
         typeof input.title === 'string' ? input.title : null,
         normalizeTimestamp(input.startedAt),
         normalizeTimestamp(input.updatedAt),
         typeof input.summary === 'string' ? input.summary : null,
+        input.project || input.cwd || inferred !== 'general' ? 1 : 0,
       );
       // Идемпотентный инкремент: INSERT OR IGNORE по UNIQUE(session_id, seq)
       // вставляет только новые сообщения, повторный прогон не плодит дублей.
@@ -586,13 +907,13 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     }));
   };
 
-  const embedPending = async ({ batchSize = DEFAULT_EMBED_BATCH, model = DEFAULT_EMBED_MODEL } = {}) => {
+  const embedPending = async ({ batchSize = DEFAULT_EMBED_BATCH, model = DEFAULT_EMBED_MODEL, sessionId = null } = {}) => {
     if (!Number.isSafeInteger(batchSize) || batchSize < 1 ||
         typeof model !== 'string' || !model.trim()) {
       throw fail('session_archive_embed_invalid');
     }
     if (embedder === null) throw fail('session_archive_embedder_missing');
-    const rows = pendingEmbeddings.all(batchSize);
+    const rows = pendingEmbeddings.all(sessionId, sessionId, batchSize);
     if (!rows.length) return Object.freeze({ embedded: 0, remaining: 0, model });
     const vectors = await embedder(rows.map(row => row.content));
     if (!Array.isArray(vectors) || vectors.length !== rows.length) {
@@ -614,8 +935,8 @@ export function openSessionArchive(dbPath, { embedder = null } = {}) {
     const remaining = Number(db.prepare(`
       SELECT count(*) AS n FROM messages m
       LEFT JOIN message_embeddings e ON e.message_id = m.id
-      WHERE e.message_id IS NULL
-    `).get().n);
+      WHERE e.message_id IS NULL AND (? IS NULL OR m.session_id = ?)
+    `).get(sessionId, sessionId).n);
     return Object.freeze({ embedded: rows.length, remaining, model: model.trim() });
   };
 

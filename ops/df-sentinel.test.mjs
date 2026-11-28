@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeErrorMessage, fingerprintObservation, classifyObservation, scanStateDirs,
-  buildHealthDigest, formatHealthDigest } from './df-sentinel.mjs';
+  detectStaleBoardTasks, buildHealthDigest, formatHealthDigest } from './df-sentinel.mjs';
 
 const line = row => JSON.stringify(row) + '\n';
 const cli = fileURLToPath(new URL('./df-sentinel.mjs', import.meta.url));
@@ -31,6 +31,29 @@ test('fingerprint is exactly SHA-256 of stable source|code|module|normalized mes
   for (const change of [{ source: 'daemon' }, { code: 'other' }, { module: 'fs' }, { message: b.replace('503', '401') }]) {
     assert.notEqual(fp, fingerprintObservation({ ...obs, ...change }));
   }
+});
+
+test('queue findings reflect the current snapshot, with a strict age boundary and optional digest check', async t => {
+  const nowMs = Date.parse('2026-11-25T00:00:00Z');
+  const cutoff = nowMs - 72 * 3600_000;
+  const tasks = [{ message: { id: 'a', task: { state: 'blocked' }, createdAt: new Date(cutoff - 1).toISOString() } },
+    { id: 'b', state: 'blocked', updated_at: cutoff }, { id: 'c', state: 'ready' },
+    { id: 'd', state: 'ready', labels: { policy_digest: 'old' } }, { id: 'e', state: 'ready', labels: { policy_digest: 'active' } },
+    { id: 'f', state: 'done' }, { id: 'g', state: 'blocked', updated_at: 'invalid' }];
+  const options = { nowMs, activePolicyDigests: ['active'] };
+  const findings = detectStaleBoardTasks(tasks, options);
+  assert.deepEqual(findings.map(f => [f.task_id, f.code]), [['a', 'stale_blocked'], ['c', 'policy_digest_drift_ready'], ['d', 'policy_digest_drift_ready']]);
+  assert.deepEqual(detectStaleBoardTasks(tasks, { nowMs }), [findings[0]]);
+  assert.deepEqual(detectStaleBoardTasks(tasks, { nowMs, blockedMaxAgeHours: 73 }), []);
+  const { root, dir, opts } = await fixture(t);
+  const snapshot = join(root, 'tasks.json');
+  await writeFile(snapshot, JSON.stringify({ tasks: tasks.filter(t => t.state === 'ready') }));
+  const report = JSON.parse(execFileSync(process.execPath, [cli, '--observe', '--state-dir', dir, '--board-tasks', snapshot,
+    '--active-policy-digest', 'active', '--json']));
+  assert.deepEqual(report.incidents.map(i => i.evidence[0].task_id), ['c', 'd']);
+  const { incidents } = await scanStateDirs({ ...opts, boardTasks: tasks, ...options });
+  assert.deepEqual(incidents.map(i => i.code).sort(), findings.map(f => f.code).sort());
+  assert.deepEqual((await scanStateDirs({ ...opts, boardTasks: [], ...options })).incidents, []);
 });
 
 const cases = {
